@@ -6,7 +6,7 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
 use dialoguer::console::Term;
 use jiff::Timestamp;
@@ -191,8 +191,15 @@ enum CredsFormat {
 }
 
 pub fn main() -> ExitCode {
+    // Like other command-line tools, end quietly when the reader of stdout
+    // goes away (`fob list | head`) instead of panicking on a broken pipe.
+    #[cfg(unix)]
+    // SAFETY: called first thing in main, before any thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Answers the shell's completion requests (COMPLETE=<shell>) and exits.
-    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+    clap_complete::CompleteEnv::with_factory(command).complete();
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -203,7 +210,7 @@ pub fn main() -> ExitCode {
         .without_time()
         .init();
 
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
     let runtime = tokio::runtime::Runtime::new().expect("starting the async runtime");
     match runtime.block_on(run(cli)) {
         Ok(code) => code,
@@ -211,6 +218,19 @@ pub fn main() -> ExitCode {
             eprintln!("fob: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The command line, named after the binary that was run (`fob` or `omnifob`),
+/// so help, errors and `--version` say what the user typed.
+fn command() -> clap::Command {
+    let invoked = std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+    match invoked.as_deref() {
+        Some("omnifob") => Cli::command().name("omnifob").bin_name("omnifob"),
+        _ => Cli::command(),
     }
 }
 

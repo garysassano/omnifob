@@ -1985,6 +1985,7 @@ dependencies = [
  "clap_complete",
  "dialoguer",
  "jiff",
+ "libc",
  "omnifob-core",
  "open",
  "serde_json",
