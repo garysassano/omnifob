@@ -30,9 +30,12 @@
 - [ ] Cloudflare browser sign-in (OAuth + PKCE) with an omnifob OAuth client.
 - [ ] Per-directory profiles via mise (`[env]` hook or a mise plugin calling `fob env`), like wrangler's directory bindings.
 - [x] `fob import aws`: create integrations from `~/.aws/config` `sso-session` sections and granted profiles.
-- [ ] Generate `~/.aws/config` profiles that call `fob creds --format credential-process`.
+- [x] Generate `~/.aws/config` profiles that call `fob creds --format credential-process` (`fob export aws-config`).
 - [x] Shell completions, including profile ids (bash, zsh, fish, PowerShell; zsh untested).
-- [ ] Release builds for macOS (signed), Linux, Windows; mise registry entry (aqua or ubi backend).
+- [x] CI on Linux, macOS and Windows.
+- [x] Release workflow: binaries for Linux, macOS, Windows with checksums and provenance; installable with `mise use github:garysassano/omnifob`.
+- [ ] Publish the first release (tag `v0.1.0`), then propose an entry in mise's registry.
+- [ ] macOS code signing and notarisation (needed for Keychain prompts to remember the app; not needed to run it).
 
 ## v0.3: More clouds
 

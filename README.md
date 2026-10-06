@@ -26,8 +26,16 @@ Planned: Cloudflare browser sign-in (OAuth with PKCE), Google Cloud (modelled on
 
 ## Install
 
+From source:
+
 ```sh
-cargo install --git <this repository> omnifob
+cargo install --locked --git https://github.com/garysassano/omnifob omnifob
+```
+
+Once releases are published (built for Linux x86_64 and ARM, macOS Apple Silicon and Windows, with checksums and build provenance), with mise:
+
+```sh
+mise use -g github:garysassano/omnifob
 ```
 
 This installs two names for the same binary: `fob` for daily use and `omnifob` for scripts.
@@ -121,11 +129,11 @@ fob creds acme/prod/ReadOnly --format credential-process  # for ~/.aws/config
 fob creds cf/personal/workers --format fnox               # for a fnox command lease
 ```
 
-AWS `credential_process`:
+AWS profiles for tools that want `--profile` or `AWS_PROFILE`: `fob export aws-config` prints one `[profile fob-<integration>-<account>-<role>]` per discovered role, each using `credential_process = fob creds ... --format credential-process`. `--write` keeps them in a marked block of `~/.aws/config` (backing up the previous file) and never touches anything outside it.
 
-```ini
-[profile prod-readonly]
-credential_process = fob creds acme/prod/ReadOnly --format credential-process
+```sh
+fob export aws-config --write
+aws s3 ls --profile fob-acme-prod-ReadOnly
 ```
 
 fnox:

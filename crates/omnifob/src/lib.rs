@@ -125,6 +125,9 @@ enum Command {
     /// Create integrations from other tools' configuration
     #[command(subcommand)]
     Import(ImportCommand),
+    /// Write configuration for other tools
+    #[command(subcommand)]
+    Export(ExportCommand),
     /// Cloudflare helpers
     #[command(subcommand, visible_alias = "cf")]
     Cloudflare(CloudflareCommand),
@@ -144,6 +147,23 @@ enum ImportCommand {
         /// Append the new integrations to the omnifob config instead of printing them
         #[arg(long)]
         write: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportCommand {
+    /// AWS CLI profiles that get credentials from `fob creds`, for tools that
+    /// want --profile or AWS_PROFILE (needs `fob` on PATH)
+    AwsConfig {
+        /// Prefix for the generated profile names
+        #[arg(long, default_value = "fob-")]
+        prefix: String,
+        /// Replace omnifob's marked block in the AWS config file instead of printing it
+        #[arg(long)]
+        write: bool,
+        /// The AWS config file; defaults to $AWS_CONFIG_FILE or ~/.aws/config
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
     },
 }
 
@@ -304,6 +324,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Cloudflare(command) => app.cloudflare(command).await?,
         Command::Import(ImportCommand::Aws { file, write }) => {
             import_aws(&app.config, file, write)?
+        }
+        Command::Export(ExportCommand::AwsConfig {
+            prefix,
+            write,
+            file,
+        }) => {
+            app.ensure_synced().await?;
+            export_aws_config(&app, &prefix, write, file)?;
         }
         Command::Renew { profile } => app.renew(&profile).await?,
     }
@@ -712,16 +740,74 @@ omnifob needs one account-owned token that can create other tokens. Create it on
     }
 }
 
+fn aws_config_file(file: Option<std::path::PathBuf>) -> anyhow::Result<std::path::PathBuf> {
+    file.or_else(|| std::env::var_os("AWS_CONFIG_FILE").map(Into::into))
+        .or_else(|| std::env::home_dir().map(|h| h.join(".aws/config")))
+        .context("cannot find the AWS config file; pass --file")
+}
+
+fn export_aws_config(
+    app: &App,
+    prefix: &str,
+    write: bool,
+    file: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use omnifob_core::import::{aws_config_block, replace_aws_block};
+    let profiles: Vec<&Profile> = app
+        .cache
+        .all()
+        .filter(|p| matches!(p.target, omnifob_core::Target::Aws { .. }))
+        .collect();
+    let regions: std::collections::BTreeMap<String, String> = app
+        .config
+        .integrations
+        .iter()
+        .filter_map(|(name, i)| match i {
+            Integration::AwsSso(c) => Some((name.clone(), c.default_region.clone()?)),
+            _ => None,
+        })
+        .collect();
+    let block = aws_config_block(&profiles, prefix, &regions);
+    if !write {
+        print!("{block}");
+        return Ok(());
+    }
+    let path = aws_config_file(file)?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let updated = replace_aws_block(&existing, &block);
+    if updated == existing {
+        eprintln!("fob: {} is up to date", path.display());
+        return Ok(());
+    }
+    if !existing.is_empty() {
+        let backup = path.with_extension("omnifob-backup");
+        std::fs::write(&backup, &existing)
+            .with_context(|| format!("writing {}", backup.display()))?;
+        eprintln!("fob: backed up the previous file to {}", backup.display());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!(
+        "fob: wrote {} profile(s) to omnifob's block in {}; use them with --profile {prefix}<integration>-<account>-<role>",
+        profiles.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 fn import_aws(
     config: &Config,
     file: Option<std::path::PathBuf>,
     write: bool,
 ) -> anyhow::Result<()> {
     use omnifob_core::import::{aws_portal_toml, aws_portals, normalize_start_url};
-    let file = file
-        .or_else(|| std::env::var_os("AWS_CONFIG_FILE").map(Into::into))
-        .or_else(|| std::env::home_dir().map(|h| h.join(".aws/config")))
-        .context("cannot find the AWS config file; pass --file")?;
+    let file = aws_config_file(file)?;
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
 
