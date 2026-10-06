@@ -33,6 +33,16 @@
 
 ## v0.3: More clouds
 
+See [landscape.md](landscape.md) for how each provider's CLI signs in.
+
+- [ ] Name the provider shapes in the core: session exchange, mint, static.
+- [ ] Generic `static-token` integration in the keychain: Hetzner, DigitalOcean, Vultr, Upstash, Akamai EdgeGrid.
+- [ ] Browser sign-in then mint, shared by Cloudflare, Akamai Cloud (Linode) and Scaleway; OVHcloud consumer keys.
+- [ ] `aws-signin` integration for `aws login` (IAM users, root, console federation), DPoP key in the keychain.
+- [ ] Provisioners beyond env vars: files with cleanup, Google executable-sourced credentials, kubectl exec plugin.
+- [ ] `--agent` mode: shorter lifetimes, marked credentials (AWS session tags or source identity, token names), a record of what went to which agent. After the Azure CLI's agentic sessions.
+- [ ] Fly.io with offline macaroon attenuation.
+
 - [ ] Google Cloud: study `gcloud auth login`, ADC and `--impersonate-service-account`; sign in as the user, discover projects and impersonable service accounts, mint access tokens.
 - [ ] Azure: study `az login` and MSAL; Entra ID device flow, discover subscriptions, tokens for ARM.
 - [ ] Generic long-lived token integration (Hetzner, DigitalOcean, Vercel...) with per-tool variable names, after 1Password shell-plugins.

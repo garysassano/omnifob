@@ -115,6 +115,15 @@ Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnif
 
 Credentials are cached until five minutes before they expire. Cloudflare tokens omnifob mints are named `omnifob:<profile>@<time>`, and expired ones are deleted on the next mint so they do not pile up in the dashboard.
 
+## Credits
+
+omnifob borrows ideas, not code, from these projects. Thank you to their authors.
+
+- Credential tools: [granted](https://github.com/fwdcloudsec/granted), [aws-vault](https://github.com/ByteNess/aws-vault), [Leapp](https://github.com/Noovolari/leapp), [aws-sso-cli](https://github.com/synfinatic/aws-sso-cli), [fnox](https://github.com/jdx/fnox), [1Password shell plugins](https://github.com/1Password/shell-plugins).
+- Provider CLIs whose sign-in flows were studied: [AWS CLI](https://github.com/aws/aws-cli), [gcloud](https://cloud.google.com/sdk), [Azure CLI](https://github.com/Azure/azure-cli), [OCI CLI](https://github.com/oracle/oci-cli), [wrangler](https://github.com/cloudflare/workers-sdk), [cf](https://github.com/cloudflare/cf), [doctl](https://github.com/digitalocean/doctl), [hcloud](https://github.com/hetznercloud/cli), [ovhcloud-cli](https://github.com/ovh/ovhcloud-cli), [linode-cli](https://github.com/linode/linode-cli), [scaleway-cli](https://github.com/scaleway/scaleway-cli), [vercel](https://github.com/vercel/vercel), [flyctl](https://github.com/superfly/flyctl), [neonctl](https://github.com/neondatabase/neonctl), [supabase](https://github.com/supabase/cli), [upstash](https://github.com/upstash/cli).
+
+Notes on what each contributed are in [plan/research.md](plan/research.md) and [plan/landscape.md](plan/landscape.md).
+
 ## License
 
 MIT
