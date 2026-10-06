@@ -71,6 +71,9 @@ enum Command {
         /// Get new credentials even if cached ones are still valid
         #[arg(long)]
         no_cache: bool,
+        /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<jiff::SignedDuration>,
     },
     /// Run a command with a profile's credentials
     Exec {
@@ -78,6 +81,9 @@ enum Command {
         profile: Vec<String>,
         #[arg(long)]
         no_cache: bool,
+        /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<jiff::SignedDuration>,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -97,6 +103,9 @@ enum Command {
         format: CredsFormat,
         #[arg(long)]
         no_cache: bool,
+        /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<jiff::SignedDuration>,
     },
     /// Revoke the credentials omnifob handed out for a profile (Cloudflare
     /// tokens are deleted; AWS role credentials can only be forgotten)
@@ -217,6 +226,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             shell,
             unset,
             no_cache,
+            ttl,
         } => {
             let previous = std::env::var("OMNIFOB_VARS").unwrap_or_default();
             let previous: Vec<&str> = previous.split(',').filter(|v| !v.is_empty()).collect();
@@ -224,7 +234,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 print!("{}", shell::unset(shell, &previous));
             } else {
                 let profile = app.select(query(&profile).as_deref()).await?;
-                let creds = app.credentials(&profile, !no_cache).await?;
+                let creds = app.credentials(&profile, !no_cache, ttl).await?;
                 print!("{}", shell::export(shell, &profile.id, &creds, &previous));
                 eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
             }
@@ -232,17 +242,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Exec {
             profile,
             no_cache,
+            ttl,
             command,
         } => {
             let profile = app.select(query(&profile).as_deref()).await?;
-            let creds = app.credentials(&profile, !no_cache).await?;
+            let creds = app.credentials(&profile, !no_cache, ttl).await?;
             return exec(&profile, &creds, &command);
         }
         Command::Console { profile, print } => {
             let profile = app.select(query(&profile).as_deref()).await?;
             // Only AWS needs credentials to sign in to its console.
             let creds = if matches!(profile.target, omnifob_core::Target::Aws { .. }) {
-                app.credentials(&profile, true).await?
+                app.credentials(&profile, true, None).await?
             } else {
                 Credentials::default()
             };
@@ -258,9 +269,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             profile,
             format,
             no_cache,
+            ttl,
         } => {
             let profile = app.select(query(&profile).as_deref()).await?;
-            let creds = app.credentials(&profile, !no_cache).await?;
+            let creds = app.credentials(&profile, !no_cache, ttl).await?;
             println!("{}", creds_output(&profile, &creds, format)?);
         }
         Command::Revoke { profile } => {
@@ -296,6 +308,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Renew { profile } => app.renew(&profile).await?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_ttl(s: &str) -> anyhow::Result<jiff::SignedDuration> {
+    omnifob_core::config::parse_duration(s)
 }
 
 /// Joins profile words into one query; `None` when no words were given.
@@ -600,9 +616,14 @@ impl App {
         Ok(candidates[picked].clone())
     }
 
-    async fn credentials(&self, profile: &Profile, use_cache: bool) -> anyhow::Result<Credentials> {
+    async fn credentials(
+        &self,
+        profile: &Profile,
+        use_cache: bool,
+        ttl: Option<jiff::SignedDuration>,
+    ) -> anyhow::Result<Credentials> {
         let creds = self
-            .with_login(|| providers::credentials(&self.config, profile, use_cache))
+            .with_login(|| providers::credentials(&self.config, profile, use_cache, ttl))
             .await
             .with_context(|| format!("getting credentials for {}", profile.id))?;
         if use_cache && creds.wants_renewal(Timestamp::now()) {
@@ -620,7 +641,7 @@ impl App {
         let Some(_lock) = RenewalLock::acquire(id)? else {
             return Ok(());
         };
-        providers::credentials(&self.config, &profile, false).await?;
+        providers::credentials(&self.config, &profile, false, None).await?;
         Ok(())
     }
 

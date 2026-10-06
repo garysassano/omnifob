@@ -67,11 +67,24 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
 }
 
 /// Returns credentials for a profile, reusing cached ones while they are fresh.
+///
+/// `ttl` asks for a lifetime other than the configured one. Only minted
+/// credentials (Cloudflare) can honour it; it always mints anew.
 pub async fn credentials(
     config: &Config,
     profile: &Profile,
     use_cache: bool,
+    ttl: Option<jiff::SignedDuration>,
 ) -> Result<Credentials> {
+    if ttl.is_some() && !matches!(profile.target, Target::Cloudflare { .. }) {
+        return Err(anyhow::anyhow!(match profile.target {
+            Target::Aws { .. } => "--ttl does not apply to AWS: the session length is set by the permission set in IAM Identity Center",
+            _ => "--ttl only applies to Cloudflare profiles; this token does not expire",
+        })
+        .into());
+    }
+    let use_cache = use_cache && ttl.is_none();
+
     // Static tokens are read straight from the keychain; caching adds nothing.
     if let (Integration::Token(c), Target::Token {}) =
         (config.integration(&profile.integration)?, &profile.target)
@@ -106,7 +119,16 @@ pub async fn credentials(
                 ..
             },
         ) => {
-            cloudflare::credentials(&profile.integration, c, &profile.id, account_id, template)
+            let c = match ttl {
+                Some(ttl) => {
+                    let mut c = c.clone();
+                    c.ttl = ttl;
+                    c.templates.values_mut().for_each(|t| t.ttl = None);
+                    std::borrow::Cow::Owned(c)
+                }
+                None => std::borrow::Cow::Borrowed(c),
+            };
+            cloudflare::credentials(&profile.integration, &c, &profile.id, account_id, template)
                 .await?
         }
         _ => {

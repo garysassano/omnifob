@@ -23,7 +23,7 @@
 - [x] Background renewal of credentials before they expire.
 
 - [ ] `fob exec --revoke`: delete a minted Cloudflare token as soon as the command exits (needs spawn instead of exec, and Ctrl-C handling).
-- [ ] `fob exec --ttl 4h` to override a template's lifetime for long agent sessions.
+- [x] `--ttl 4h` to override a template's lifetime for long agent sessions.
 - [ ] `fob cf templates --check`: show which template permissions the account offers.
 - [x] `fob revoke <profile>` (Cloudflare tokens deleted, cache cleared).
 

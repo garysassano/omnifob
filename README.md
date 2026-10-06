@@ -92,6 +92,7 @@ fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, 
 fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare
 fob exec cf workers -- claude            # give an agent a token without pasting it anywhere
+fob exec cf workers --ttl 4h -- claude   # longer-lived token for a long session
 fob console prod admin    # opens the AWS console as that role
 fob status
 ```
