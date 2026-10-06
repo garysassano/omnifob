@@ -34,7 +34,8 @@
 - [x] Shell completions, including profile ids (bash, zsh, fish, PowerShell; zsh untested).
 - [x] CI on Linux, macOS and Windows.
 - [x] Release workflow: binaries for Linux, macOS, Windows with checksums and provenance; installable with `mise use github:garysassano/omnifob`.
-- [ ] Publish the first release (tag `v0.1.0`), then propose an entry in mise's registry.
+- [x] Publish the first release (v0.1.0, 2026-10-07).
+- [ ] Propose an entry in mise's registry so `mise use omnifob` works.
 - [ ] macOS code signing and notarisation (needed for Keychain prompts to remember the app; not needed to run it).
 
 ## v0.3: More clouds
