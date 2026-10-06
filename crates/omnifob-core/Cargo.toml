@@ -7,8 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-aws-sdk-sso = "1.114.0"
-aws-sdk-ssooidc = "1.116.0"
+aws-sdk-sso = { version = "1.114.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssooidc = { version = "1.116.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 futures = "0.3.34"
 jiff = { version = "0.2.38", features = ["serde"] }
 keyring-core = "1.0.0"

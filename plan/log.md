@@ -40,3 +40,4 @@
   - Most interesting: `aws login` (OAuth + DPoP for non-Identity Center accounts), Oracle's key-bound session tokens, the Azure CLI's agent-session claims, OVHcloud consumer keys approved in the browser, Linode and Scaleway minting tokens after a browser sign-in, Fly.io's offline macaroon attenuation, Supabase's ECDH-encrypted login handoff.
   - Nearly every CLI stores tokens in plain text; only Cloudflare's, Supabase's and gh keep them in the OS keyring.
   - Akamai has two credential systems: EdgeGrid for CDN and security, Linode tokens for Akamai Cloud (Linode was bought in 2022).
+- Dependabot flagged rustls-webpki 0.101.7 (one high, two low advisories), pulled in by rustls 0.21 through the AWS SDK's legacy `rustls` feature. Turned off the SDK crates' default features and kept `default-https-client` and `rt-tokio`; only rustls 0.23 and rustls-webpki 0.103.15 remain. Verified live against Identity Center afterwards; `cargo audit` clean.
