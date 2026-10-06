@@ -193,6 +193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn posix_export_round_trips_through_sh() {
         let value = "a'b\"c $HOME `x` \\n";
         let code = export(Shell::Posix, "p", &creds(&[("FOB_TEST", value)]), &[]);
