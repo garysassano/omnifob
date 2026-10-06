@@ -303,6 +303,7 @@ impl App {
             );
             return Ok(());
         }
+        println!("Secrets: {}", omnifob_core::store::description()?);
         let now = Timestamp::now();
         for (name, integration) in &self.config.integrations {
             let state = match providers::sign_in(name, integration)? {
@@ -311,7 +312,7 @@ impl App {
                 SignIn::Session {
                     expires_at,
                     refreshable,
-                } if expires_at > now || refreshable => {
+                } if expires_at > now => {
                     let renew = if refreshable {
                         ", renews automatically"
                     } else {
@@ -322,6 +323,9 @@ impl App {
                         expires_at.strftime("%Y-%m-%d %H:%M UTC")
                     )
                 }
+                SignIn::Session {
+                    refreshable: true, ..
+                } => "signed in, token renews on next use".to_string(),
                 SignIn::Session { .. } => "session expired".to_string(),
             };
             let profiles = self
