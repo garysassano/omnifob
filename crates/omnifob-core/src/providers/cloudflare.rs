@@ -744,6 +744,36 @@ async fn prune_expired(client: &Client, tokens: &str, now: Timestamp) -> anyhow:
     Ok(())
 }
 
+/// Deletes every live token omnifob minted for `profile_id`; returns how many.
+pub async fn revoke_minted(
+    client: &Client,
+    tokens: &str,
+    profile_id: &str,
+) -> anyhow::Result<usize> {
+    let prefix = format!("{TOKEN_NAME_PREFIX}{profile_id}@");
+    let all: Vec<Token> = client.get_all(tokens).await?;
+    let mut deleted = 0;
+    for token in all.iter().filter(|t| t.name.starts_with(&prefix)) {
+        client
+            .call::<Value>(Method::DELETE, &format!("{tokens}/{}", token.id), &[], None)
+            .await?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+/// [`revoke_minted`] with the stored bootstrap token.
+pub async fn revoke(
+    integration: &str,
+    config: &CloudflareConfig,
+    profile_id: &str,
+    account_id: &str,
+) -> Result<usize> {
+    let client = bootstrap_client(integration)?;
+    let tokens = Client::tokens_path(config.token_type, account_id);
+    Ok(revoke_minted(&client, &tokens, profile_id).await?)
+}
+
 pub fn console_url(account_id: &str) -> String {
     format!("https://dash.cloudflare.com/{account_id}")
 }

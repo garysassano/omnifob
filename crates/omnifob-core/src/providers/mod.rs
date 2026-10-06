@@ -128,6 +128,28 @@ pub async fn console_url(
     })
 }
 
+/// What revoking a profile did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revoked {
+    /// This many minted tokens were deleted at the provider.
+    Tokens(usize),
+    /// The provider cannot revoke these credentials early; only the cache was cleared.
+    CacheOnly,
+}
+
+/// Revokes what omnifob handed out for a profile and clears its cache.
+pub async fn revoke(config: &Config, profile: &Profile) -> Result<Revoked> {
+    let integration = config.integration(&profile.integration)?;
+    let revoked = match (integration, &profile.target) {
+        (Integration::Cloudflare(c), Target::Cloudflare { account_id, .. }) => Revoked::Tokens(
+            cloudflare::revoke(&profile.integration, c, &profile.id, account_id).await?,
+        ),
+        _ => Revoked::CacheOnly,
+    };
+    store::delete(&store::credentials_key(&profile.id))?;
+    Ok(revoked)
+}
+
 /// Drops cached credentials for every profile in `profiles`.
 pub fn forget_credentials<'a>(profiles: impl IntoIterator<Item = &'a Profile>) {
     for profile in profiles {

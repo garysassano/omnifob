@@ -89,6 +89,9 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
     },
+    /// Revoke the credentials omnifob handed out for a profile (Cloudflare
+    /// tokens are deleted; AWS role credentials can only be forgotten)
+    Revoke { profile: Vec<String> },
     /// Print shell integration: adds `fob use <profile>` and `fob unuse`
     Activate { shell: Shell },
     /// Cloudflare helpers
@@ -214,6 +217,24 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let profile = app.select(query(&profile).as_deref()).await?;
             let creds = app.credentials(&profile, !no_cache).await?;
             println!("{}", creds_output(&profile, &creds, format)?);
+        }
+        Command::Revoke { profile } => {
+            let profile = app.select(query(&profile).as_deref()).await?;
+            let revoked = app
+                .with_login(|| providers::revoke(&app.config, &profile))
+                .await?;
+            match revoked {
+                providers::Revoked::Tokens(n) => {
+                    eprintln!(
+                        "fob: deleted {n} token(s) for {} and cleared its cache",
+                        profile.id
+                    )
+                }
+                providers::Revoked::CacheOnly => eprintln!(
+                    "fob: cleared the cache for {}; credentials already handed out stay valid until they expire",
+                    profile.id
+                ),
+            }
         }
         Command::Activate { shell } => print!("{}", shell::activate(shell)),
         Command::Cloudflare(command) => app.cloudflare(command).await?,

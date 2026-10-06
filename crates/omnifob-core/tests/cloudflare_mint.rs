@@ -2,7 +2,7 @@
 
 use jiff::Timestamp;
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
-use omnifob_core::providers::cloudflare::{Catalog, Client, mint};
+use omnifob_core::providers::cloudflare::{Catalog, Client, mint, revoke_minted};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -509,4 +509,33 @@ async fn a_catalog_missing_a_permission_is_refreshed() {
     .await
     .unwrap();
     assert_eq!(catalog.fetched_at, Some(now()));
+}
+
+#[tokio::test]
+async fn revoke_deletes_only_this_profiles_tokens() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user/tokens"))
+        .respond_with(ok(json!([
+            { "id": "a1", "name": "omnifob:cf/acct/workers@2026-10-06T12:00:00Z", "status": "active" },
+            { "id": "a2", "name": "omnifob:cf/acct/workers@2026-10-06T13:00:00Z", "status": "active" },
+            { "id": "b1", "name": "omnifob:cf/acct/workers-2@2026-10-06T13:00:00Z", "status": "active" },
+            { "id": "c1", "name": "omnifob:cf/acct/dns-edit@2026-10-06T13:00:00Z", "status": "active" },
+            { "id": "d1", "name": "terraform", "status": "active" }
+        ])))
+        .mount(&server)
+        .await;
+    for (id, times) in [("a1", 1), ("a2", 1), ("b1", 0), ("c1", 0), ("d1", 0)] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/user/tokens/{id}")))
+            .respond_with(ok(json!({ "id": id })))
+            .expect(times)
+            .mount(&server)
+            .await;
+    }
+    let client = Client::new(server.uri(), "bootstrap");
+    let n = revoke_minted(&client, "/user/tokens", "cf/acct/workers")
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
 }
