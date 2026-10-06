@@ -2,13 +2,13 @@
 
 One sign-in for every cloud. `fob` signs you in once per identity source, discovers every account and role you can use, and hands out short-lived credentials as environment variables, to a command, to the web console, or to other tools.
 
-It takes its ideas from the tools that solved one cloud each:
+It takes its ideas from tools that each solved part of the problem:
 
-- [granted](https://github.com/fwdcloudsec/granted): `assume`-style switching in the current shell and opening the console.
-- [aws-vault](https://github.com/ByteNess/aws-vault): SSO tokens in the OS keychain, renewed silently with refresh tokens.
-- [Leapp](https://github.com/Noovolari/leapp) and [aws-sso-cli](https://github.com/synfinatic/aws-sso-cli): sign in once, then discover every account and role.
-- [wrangler](https://github.com/cloudflare/workers-sdk) and [cf](https://github.com/cloudflare/cf): Cloudflare sign-in and the variables Cloudflare tools read.
-- [fnox](https://github.com/jdx/fnox): short-lived credential leases for project secrets; `fob creds --format fnox` plugs into it.
+- [granted](https://github.com/fwdcloudsec/granted) (AWS): `assume`-style switching in the current shell and opening the console.
+- [aws-vault](https://github.com/ByteNess/aws-vault) (AWS): SSO tokens in the OS keychain, renewed silently with refresh tokens.
+- [Leapp](https://github.com/Noovolari/leapp) (AWS, Azure) and [aws-sso-cli](https://github.com/synfinatic/aws-sso-cli) (AWS): sign in once, then discover every account and role.
+- [wrangler](https://github.com/cloudflare/workers-sdk) and [cf](https://github.com/cloudflare/cf) (Cloudflare): Cloudflare sign-in and the variables Cloudflare tools read.
+- [fnox](https://github.com/jdx/fnox) (many providers): short-lived credential leases for project secrets; `fob creds --format fnox` plugs into it.
 
 ## Status
 
