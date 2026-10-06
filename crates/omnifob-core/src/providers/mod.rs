@@ -102,6 +102,10 @@ pub async fn credentials(
         }
     };
 
+    let fresh = Credentials {
+        issued_at: Some(Timestamp::now()),
+        ..fresh
+    };
     if let Err(e) = store::set(&key, &fresh) {
         tracing::warn!("could not cache credentials: {e:#}");
     }

@@ -41,3 +41,10 @@
   - Nearly every CLI stores tokens in plain text; only Cloudflare's, Supabase's and gh keep them in the OS keyring.
   - Akamai has two credential systems: EdgeGrid for CDN and security, Linode tokens for Akamai Cloud (Linode was bought in 2022).
 - Dependabot flagged rustls-webpki 0.101.7 (one high, two low advisories), pulled in by rustls 0.21 through the AWS SDK's legacy `rustls` feature. Turned off the SDK crates' default features and kept `default-https-client` and `rt-tokio`; only rustls 0.23 and rustls-webpki 0.103.15 remain. Verified live against Identity Center afterwards; `cargo audit` clean.
+
+## 2026-10-07
+
+- "Do all the improvements you deem necessary." Order chosen: WSL persistence, background renewal, revoke, static tokens, completions, CI.
+- WSL persistence: long-lived secrets (SSO sessions, bootstrap tokens) are also written to `~/.local/state/omnifob/vault/*.dpapi`, encrypted with Windows DPAPI for the current Windows user via `powershell.exe` (0.2 to 0.26 s per call). keyutils remains the fast cache. Simulated reboot (entries dropped from keyutils only): the real AWS session and Cloudflare bootstrap came back in about 190 ms, then 73 µs from keyutils. Cached credentials are not persisted (cheap to recreate).
+- `fob status` showed "signed in until <yesterday>" for an expired but refreshable session; now "token renews on next use". Fetching credentials refreshed it silently overnight.
+- Background renewal: credentials record `issued_at`; when less than a quarter of the lifetime plus the five-minute margin remains (20 minutes of a one-hour token), `fob` hands out the cached credentials and starts a detached `fob renew <profile>` (own process group, lock file per profile). Live: command with an aged Cloudflare token took 0.1 s, renewal finished in the background in about 6 s including the D1 wait, the next command used the new token and D1 accepted it.

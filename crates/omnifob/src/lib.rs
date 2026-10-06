@@ -94,6 +94,9 @@ enum Command {
     /// Cloudflare helpers
     #[command(subcommand, visible_alias = "cf")]
     Cloudflare(CloudflareCommand),
+    /// Get replacement credentials for a profile (started by fob in the background)
+    #[command(hide = true)]
+    Renew { profile: String },
 }
 
 #[derive(Subcommand)]
@@ -214,6 +217,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Activate { shell } => print!("{}", shell::activate(shell)),
         Command::Cloudflare(command) => app.cloudflare(command).await?,
+        Command::Renew { profile } => app.renew(&profile).await?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -457,9 +461,27 @@ impl App {
     }
 
     async fn credentials(&self, profile: &Profile, use_cache: bool) -> anyhow::Result<Credentials> {
-        self.with_login(|| providers::credentials(&self.config, profile, use_cache))
+        let creds = self
+            .with_login(|| providers::credentials(&self.config, profile, use_cache))
             .await
-            .with_context(|| format!("getting credentials for {}", profile.id))
+            .with_context(|| format!("getting credentials for {}", profile.id))?;
+        if use_cache && creds.wants_renewal(Timestamp::now()) {
+            spawn_renewal(&profile.id);
+        }
+        Ok(creds)
+    }
+
+    /// Fetches new credentials for a profile, unless another renewal of the
+    /// same profile is already running. Never prompts.
+    async fn renew(&self, id: &str) -> anyhow::Result<()> {
+        let Some(profile) = self.cache.all().find(|p| p.id == id).cloned() else {
+            return Ok(());
+        };
+        let Some(_lock) = RenewalLock::acquire(id)? else {
+            return Ok(());
+        };
+        providers::credentials(&self.config, &profile, false).await?;
+        Ok(())
     }
 
     async fn cloudflare(&self, command: CloudflareCommand) -> anyhow::Result<()> {
@@ -526,6 +548,84 @@ omnifob needs one account-owned token that can create other tokens. Create it on
   3. Create it and paste it below",
             account_id.unwrap_or(":account")
         ),
+    }
+}
+
+/// Starts `fob renew <profile>` detached from the terminal, so the next
+/// command finds fresh credentials instead of waiting for them.
+fn spawn_renewal(profile_id: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["renew", profile_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own process group: Ctrl-C in the terminal does not reach it.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+    match cmd.spawn() {
+        Ok(_) => tracing::debug!("renewing {profile_id} in the background"),
+        Err(e) => tracing::debug!("could not start a background renewal: {e}"),
+    }
+}
+
+/// A lock file per profile so concurrent commands start one renewal only.
+/// A lock older than two minutes is considered abandoned.
+struct RenewalLock(std::path::PathBuf);
+
+impl RenewalLock {
+    fn acquire(profile_id: &str) -> anyhow::Result<Option<Self>> {
+        let dir = paths::state_dir().join("locks");
+        std::fs::create_dir_all(&dir)?;
+        let name: String = profile_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = dir.join(format!("renew-{name}.lock"));
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Some(Self(path))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok());
+                    if age.is_some_and(|a| a < std::time::Duration::from_secs(120)) {
+                        return Ok(None);
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for RenewalLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

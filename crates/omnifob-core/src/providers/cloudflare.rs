@@ -692,6 +692,7 @@ pub async fn mint(
     Ok(Credentials {
         env,
         expires_at: Some(expires_at),
+        issued_at: None,
     })
 }
 
