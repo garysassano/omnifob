@@ -113,12 +113,29 @@ enum Command {
     Unuse,
     /// Print shell integration: adds `fob use <profile>` and `fob unuse`
     Activate { shell: Shell },
+    /// Create integrations from other tools' configuration
+    #[command(subcommand)]
+    Import(ImportCommand),
     /// Cloudflare helpers
     #[command(subcommand, visible_alias = "cf")]
     Cloudflare(CloudflareCommand),
     /// Get replacement credentials for a profile (started by fob in the background)
     #[command(hide = true)]
     Renew { profile: String },
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// IAM Identity Center portals used by profiles in ~/.aws/config
+    /// (standard sso_* keys, sso-session sections and granted's keys)
+    Aws {
+        /// The AWS config file; defaults to $AWS_CONFIG_FILE or ~/.aws/config
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Append the new integrations to the omnifob config instead of printing them
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -273,6 +290,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Activate { shell } => print!("{}", shell::activate(shell)),
         Command::Cloudflare(command) => app.cloudflare(command).await?,
+        Command::Import(ImportCommand::Aws { file, write }) => {
+            import_aws(&app.config, file, write)?
+        }
         Command::Renew { profile } => app.renew(&profile).await?,
     }
     Ok(ExitCode::SUCCESS)
@@ -669,6 +689,89 @@ omnifob needs one account-owned token that can create other tokens. Create it on
             account_id.unwrap_or(":account")
         ),
     }
+}
+
+fn import_aws(
+    config: &Config,
+    file: Option<std::path::PathBuf>,
+    write: bool,
+) -> anyhow::Result<()> {
+    use omnifob_core::import::{aws_portal_toml, aws_portals, normalize_start_url};
+    let file = file
+        .or_else(|| std::env::var_os("AWS_CONFIG_FILE").map(Into::into))
+        .or_else(|| std::env::home_dir().map(|h| h.join(".aws/config")))
+        .context("cannot find the AWS config file; pass --file")?;
+    let text =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+
+    let configured: Vec<String> = config
+        .integrations
+        .values()
+        .filter_map(|i| match i {
+            Integration::AwsSso(c) => Some(normalize_start_url(&c.start_url)),
+            _ => None,
+        })
+        .collect();
+    let mut taken: Vec<String> = config.integrations.keys().cloned().collect();
+    let mut new = Vec::new();
+    for mut portal in aws_portals(&text) {
+        if configured.contains(&portal.start_url) {
+            eprintln!("fob: {} is already configured; skipped", portal.start_url);
+            continue;
+        }
+        let base = portal.name.clone();
+        let mut n = 1;
+        while taken.contains(&portal.name) {
+            n += 1;
+            portal.name = format!("{base}-{n}");
+        }
+        taken.push(portal.name.clone());
+        eprintln!(
+            "fob: {} ({} profile(s) in {})",
+            portal.start_url,
+            portal.profiles,
+            file.display()
+        );
+        new.push(portal);
+    }
+    if new.is_empty() {
+        eprintln!("fob: nothing new to import");
+        return Ok(());
+    }
+    let toml: String = new
+        .iter()
+        .map(aws_portal_toml)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !write {
+        print!("{toml}");
+        eprintln!(
+            "fob: review the names, then run again with --write to append them to {}",
+            paths::config_file().display()
+        );
+        return Ok(());
+    }
+    let path = paths::config_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let updated = format!("{existing}{separator}{toml}");
+    Config::parse(&updated).context("the result would not be a valid config; nothing written")?;
+    std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!(
+        "fob: added {} integration(s) to {}; sign in with `fob login <name>`",
+        new.len(),
+        path.display()
+    );
+    Ok(())
 }
 
 /// Starts `fob renew <profile>` detached from the terminal, so the next

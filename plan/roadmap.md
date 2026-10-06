@@ -29,7 +29,7 @@
 
 - [ ] Cloudflare browser sign-in (OAuth + PKCE) with an omnifob OAuth client.
 - [ ] Per-directory profiles via mise (`[env]` hook or a mise plugin calling `fob env`), like wrangler's directory bindings.
-- [ ] `fob import aws`: create integrations from `~/.aws/config` `sso-session` sections and granted profiles.
+- [x] `fob import aws`: create integrations from `~/.aws/config` `sso-session` sections and granted profiles.
 - [ ] Generate `~/.aws/config` profiles that call `fob creds --format credential-process`.
 - [x] Shell completions, including profile ids (bash, zsh, fish, PowerShell; zsh untested).
 - [ ] Release builds for macOS (signed), Linux, Windows; mise registry entry (aqua or ubi backend).

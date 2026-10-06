@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod credentials;
+pub mod import;
 pub mod paths;
 pub mod profile;
 pub mod providers;

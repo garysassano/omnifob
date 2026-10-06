@@ -34,6 +34,8 @@ This installs two names for the same binary: `fob` for daily use and `omnifob` f
 
 ## Configure
 
+Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections, granted's keys) and prints matching integrations; `--write` appends them to the config.
+
 `~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`):
 
 ```toml
