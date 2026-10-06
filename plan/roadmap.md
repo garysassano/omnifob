@@ -35,7 +35,6 @@
 - [x] CI on Linux, macOS and Windows.
 - [x] Release workflow: binaries for Linux, macOS, Windows with checksums and provenance; installable with `mise use github:garysassano/omnifob`.
 - [x] Publish the first release (v0.1.0, 2026-10-07).
-- [ ] Propose an entry in mise's registry so `mise use omnifob` works.
 - [ ] macOS code signing and notarisation (needed for Keychain prompts to remember the app; not needed to run it).
 
 ## v0.3: More clouds
@@ -57,6 +56,11 @@ See [landscape.md](landscape.md) for how each provider's CLI signs in.
 
 ## Later
 
-- AWS role chaining, console destinations, multiple console sessions.
+- Not planned: a mise registry entry (user decision, 2026-10-07); install with `github:garysassano/omnifob`.
+- MFA for chained roles (`mfa_serial`), and chains more than one role deep.
+- Google Cloud provider once there is a project to test against.
+
+- [x] AWS role chaining from Identity Center roles (imported from `~/.aws/config`).
+- AWS console destinations, multiple console sessions.
 - Local credential server (ECS-style) for containers.
 - Show jdx; discuss which parts belong in fnox.

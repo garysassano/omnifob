@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use jiff::SignedDuration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +48,42 @@ pub struct AwsSsoConfig {
     /// token, so sessions renew without a browser until the portal session ends.
     #[serde(default = "default_sso_scopes")]
     pub scopes: Vec<String>,
+    /// Roles reached by assuming them from one of this portal's roles
+    /// (`role_arn` + `source_profile` in `~/.aws/config`), keyed by a label
+    /// that becomes the middle of the profile id.
+    #[serde(default)]
+    pub chained: BTreeMap<String, ChainedRole>,
+}
+
+/// A role assumed with the credentials of an Identity Center role.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainedRole {
+    /// Account of the Identity Center role to start from.
+    pub via_account_id: String,
+    /// Name of the Identity Center role (permission set) to start from.
+    pub via_role: String,
+    pub role_arn: String,
+    /// `RoleSessionName`; defaults to "omnifob".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Region exported for this role; defaults to the integration's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+impl ChainedRole {
+    /// The role name at the end of `role_arn` (after any path).
+    pub fn role_name(&self) -> &str {
+        self.role_arn.rsplit('/').next().unwrap_or(&self.role_arn)
+    }
+
+    /// The account in `role_arn`.
+    pub fn account_id(&self) -> Option<&str> {
+        self.role_arn.split(':').nth(4).filter(|a| !a.is_empty())
+    }
 }
 
 fn default_sso_scopes() -> Vec<String> {

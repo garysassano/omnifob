@@ -19,7 +19,7 @@ use futures::StreamExt;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::config::AwsSsoConfig;
+use crate::config::{AwsSsoConfig, ChainedRole};
 use crate::{Credentials, Error, Profile, Result, Target, store};
 
 /// A token expiring within this window is refreshed before use. Matches the
@@ -349,6 +349,7 @@ pub async fn discover(integration: &str, config: &AwsSsoConfig) -> Result<Vec<Pr
     }
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     disambiguate(&mut profiles);
+    add_chained(integration, config, &mut profiles);
     Ok(profiles)
 }
 
@@ -442,6 +443,106 @@ pub async fn credentials(
     })
 }
 
+/// Adds a profile per chained role, `<integration>/<label>/<role name>`. A
+/// label that collides with a discovered profile gets a `-chained` suffix.
+fn add_chained(integration: &str, config: &AwsSsoConfig, profiles: &mut Vec<Profile>) {
+    for (label, role) in &config.chained {
+        let target = Target::AwsChained {
+            label: label.clone(),
+        };
+        let mut profile = Profile::new(integration, label, role.role_name(), target.clone());
+        if profiles.iter().any(|p| p.id == profile.id) {
+            profile = Profile::new(
+                integration,
+                &format!("{label}-chained"),
+                role.role_name(),
+                target,
+            );
+        }
+        profiles.push(profile);
+    }
+}
+
+/// Credentials for a chained role: the Identity Center role's credentials,
+/// then STS AssumeRole. AWS limits chained sessions to one hour.
+pub async fn chained_credentials(
+    integration: &str,
+    config: &AwsSsoConfig,
+    label: &str,
+) -> Result<Credentials> {
+    let role = config.chained.get(label).with_context(|| {
+        format!("no chained role '{label}' in integration '{integration}'; run `fob sync`")
+    })?;
+    let source = credentials(integration, config, &role.via_account_id, &role.via_role).await?;
+    let region = role
+        .region
+        .as_deref()
+        .or(config.default_region.as_deref())
+        .unwrap_or(&config.region);
+    Ok(assume_role(&source, role, region).await?)
+}
+
+async fn assume_role(
+    source: &Credentials,
+    role: &ChainedRole,
+    region: &str,
+) -> anyhow::Result<Credentials> {
+    let get = |k: &str| {
+        source
+            .env
+            .get(k)
+            .cloned()
+            .with_context(|| format!("{k} missing from the source credentials"))
+    };
+    let provider = aws_sdk_sts::config::Credentials::new(
+        get("AWS_ACCESS_KEY_ID")?,
+        get("AWS_SECRET_ACCESS_KEY")?,
+        Some(get("AWS_SESSION_TOKEN")?),
+        None,
+        "omnifob",
+    );
+    let sts = aws_sdk_sts::Client::from_conf(
+        aws_sdk_sts::Config::builder()
+            .region(aws_sdk_sts::config::Region::new(region.to_string()))
+            .credentials_provider(provider)
+            .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest())
+            .build(),
+    );
+    let assumed = sts
+        .assume_role()
+        .role_arn(&role.role_arn)
+        .role_session_name(role.session_name.as_deref().unwrap_or("omnifob"))
+        .set_external_id(role.external_id.clone())
+        .duration_seconds(3600)
+        .send()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "assuming {}: {}",
+                role.role_arn,
+                aws_sdk_sts::error::DisplayErrorContext(&e)
+            )
+        })?;
+    let creds = assumed.credentials().context("no credentials returned")?;
+    let expires_at = Timestamp::from_second(creds.expiration().secs())?;
+
+    let mut env = BTreeMap::new();
+    let mut put = |k: &str, v: &str| {
+        env.insert(k.to_string(), v.to_string());
+    };
+    put("AWS_ACCESS_KEY_ID", creds.access_key_id());
+    put("AWS_SECRET_ACCESS_KEY", creds.secret_access_key());
+    put("AWS_SESSION_TOKEN", creds.session_token());
+    put("AWS_CREDENTIAL_EXPIRATION", &expires_at.to_string());
+    put("AWS_REGION", region);
+    put("AWS_DEFAULT_REGION", region);
+    Ok(Credentials {
+        env,
+        expires_at: Some(expires_at),
+        issued_at: None,
+    })
+}
+
 #[derive(Serialize)]
 struct FederationSession<'a> {
     #[serde(rename = "sessionId")]
@@ -514,6 +615,46 @@ mod tests {
                 role_name: "Admin".into(),
             },
         )
+    }
+
+    #[test]
+    fn chained_roles_become_profiles() {
+        let config = match crate::Config::parse(
+            r#"
+            [integrations.acme]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "eu-west-1"
+            [integrations.acme.chained.prod]
+            via_account_id = "111"
+            via_role = "Admin"
+            role_arn = "arn:aws:iam::222222222222:role/path/Deploy"
+            [integrations.acme.chained.Shared]
+            via_account_id = "111"
+            via_role = "Admin"
+            role_arn = "arn:aws:iam::333333333333:role/Admin"
+            "#,
+        )
+        .unwrap()
+        .integrations
+        .remove("acme")
+        .unwrap()
+        {
+            crate::Integration::AwsSso(c) => c,
+            _ => unreachable!(),
+        };
+        assert_eq!(config.chained["prod"].account_id(), Some("222222222222"));
+        let mut profiles = vec![role("shared", "111")];
+        add_chained("acme", &config, &mut profiles);
+        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "acme/shared/Admin",
+                "acme/shared-chained/Admin",
+                "acme/prod/Deploy"
+            ]
+        );
     }
 
     #[test]

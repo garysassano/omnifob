@@ -16,7 +16,7 @@ Early. Working today:
 
 | Integration | Sign-in | Discovery | Credentials | Console |
 | --- | --- | --- | --- | --- |
-| `aws-sso` (IAM Identity Center) | Device flow, silent refresh | Every account and role | Role credentials | Federated sign-in URL |
+| `aws-sso` (IAM Identity Center) | Device flow, silent refresh | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole | Federated sign-in URL |
 | `cloudflare` | Bootstrap token, stored once | Accounts × templates | Minted tokens, scoped by permission name, expiring | Dashboard |
 | `token` | Paste once, checked against the provider where possible | One profile per integration | The stored token under every variable the provider's tools read | Known console URL |
 
@@ -42,7 +42,7 @@ This installs two names for the same binary: `fob` for daily use and `omnifob` f
 
 ## Configure
 
-Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections, granted's keys) and prints matching integrations; `--write` appends them to the config.
+Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID and region), and prints matching integrations; `--write` appends them to the config. Profiles that need MFA are reported and skipped for now.
 
 `~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`):
 
@@ -52,6 +52,16 @@ type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
 region = "eu-central-1"          # where IAM Identity Center runs
 default_region = "eu-central-1"  # exported as AWS_REGION (optional)
+
+# Roles assumed from an Identity Center role (role_arn + source_profile in ~/.aws/config).
+# Profile id: acme/prod-deploy/Deploy. AWS limits these sessions to one hour.
+[integrations.acme.chained.prod-deploy]
+via_account_id = "111111111111"
+via_role = "AdministratorAccess"
+role_arn = "arn:aws:iam::222222222222:role/Deploy"
+session_name = "me"          # optional, like role_session_name
+external_id = "..."          # optional
+region = "us-east-1"         # optional, defaults to the integration's
 
 [integrations.cf]
 type = "cloudflare"

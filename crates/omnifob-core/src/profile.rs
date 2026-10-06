@@ -31,6 +31,11 @@ pub enum Target {
         template: String,
     },
     Token {},
+    /// A role assumed from an Identity Center role; details live in the
+    /// integration's `chained` table under `label`.
+    AwsChained {
+        label: String,
+    },
 }
 
 impl Profile {

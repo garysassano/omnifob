@@ -79,6 +79,7 @@ pub async fn credentials(
     if ttl.is_some() && !matches!(profile.target, Target::Cloudflare { .. }) {
         return Err(anyhow::anyhow!(match profile.target {
             Target::Aws { .. } => "--ttl does not apply to AWS: the session length is set by the permission set in IAM Identity Center",
+            Target::AwsChained { .. } => "--ttl does not apply to chained AWS roles: AWS limits role-chaining sessions to one hour",
             _ => "--ttl only applies to Cloudflare profiles; this token does not expire",
         })
         .into());
@@ -111,6 +112,9 @@ pub async fn credentials(
                 ..
             },
         ) => aws_sso::credentials(&profile.integration, c, account_id, role_name).await?,
+        (Integration::AwsSso(c), Target::AwsChained { label }) => {
+            aws_sso::chained_credentials(&profile.integration, c, label).await?
+        }
         (
             Integration::Cloudflare(c),
             Target::Cloudflare {
@@ -161,6 +165,9 @@ pub async fn console_url(
     Ok(match (integration, &profile.target) {
         (Integration::AwsSso(c), Target::Aws { .. }) => {
             aws_sso::console_url(creds, c.default_region.as_deref()).await?
+        }
+        (Integration::AwsSso(_), Target::AwsChained { .. }) => {
+            aws_sso::console_url(creds, creds.env.get("AWS_REGION").map(String::as_str)).await?
         }
         (Integration::Cloudflare(_), Target::Cloudflare { account_id, .. }) => {
             cloudflare::console_url(account_id)

@@ -272,7 +272,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Console { profile, print } => {
             let profile = app.select(query(&profile).as_deref()).await?;
             // Only AWS needs credentials to sign in to its console.
-            let creds = if matches!(profile.target, omnifob_core::Target::Aws { .. }) {
+            let creds = if matches!(
+                profile.target,
+                omnifob_core::Target::Aws { .. } | omnifob_core::Target::AwsChained { .. }
+            ) {
                 app.credentials(&profile, true, None).await?
             } else {
                 Credentials::default()
@@ -357,6 +360,7 @@ fn profile_candidates() -> Vec<CompletionCandidate> {
         .map(|p| {
             let kind = match p.target {
                 omnifob_core::Target::Aws { .. } => "aws",
+                omnifob_core::Target::AwsChained { .. } => "aws (chained)",
                 omnifob_core::Target::Cloudflare { .. } => "cloudflare",
                 omnifob_core::Target::Token {} => "token",
             };
@@ -756,15 +760,28 @@ fn export_aws_config(
     let profiles: Vec<&Profile> = app
         .cache
         .all()
-        .filter(|p| matches!(p.target, omnifob_core::Target::Aws { .. }))
+        .filter(|p| {
+            matches!(
+                p.target,
+                omnifob_core::Target::Aws { .. } | omnifob_core::Target::AwsChained { .. }
+            )
+        })
         .collect();
-    let regions: std::collections::BTreeMap<String, String> = app
-        .config
-        .integrations
+    let regions: std::collections::BTreeMap<String, String> = profiles
         .iter()
-        .filter_map(|(name, i)| match i {
-            Integration::AwsSso(c) => Some((name.clone(), c.default_region.clone()?)),
-            _ => None,
+        .filter_map(|p| {
+            let Ok(Integration::AwsSso(c)) = app.config.integration(&p.integration) else {
+                return None;
+            };
+            let region = match &p.target {
+                omnifob_core::Target::AwsChained { label } => c
+                    .chained
+                    .get(label)
+                    .and_then(|r| r.region.clone())
+                    .or_else(|| c.default_region.clone()),
+                _ => c.default_region.clone(),
+            }?;
+            Some((p.id.clone(), region))
         })
         .collect();
     let block = aws_config_block(&profiles, prefix, &regions);
@@ -806,24 +823,48 @@ fn import_aws(
     file: Option<std::path::PathBuf>,
     write: bool,
 ) -> anyhow::Result<()> {
-    use omnifob_core::import::{aws_portal_toml, aws_portals, normalize_start_url};
+    use omnifob_core::import::{aws_portal_toml, aws_portals, chained_toml, normalize_start_url};
     let file = aws_config_file(file)?;
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
 
-    let configured: Vec<String> = config
+    // Configured portals, by normalised start URL.
+    let configured: std::collections::BTreeMap<
+        String,
+        (&String, &omnifob_core::config::AwsSsoConfig),
+    > = config
         .integrations
-        .values()
-        .filter_map(|i| match i {
-            Integration::AwsSso(c) => Some(normalize_start_url(&c.start_url)),
+        .iter()
+        .filter_map(|(name, i)| match i {
+            Integration::AwsSso(c) => Some((normalize_start_url(&c.start_url), (name, c))),
             _ => None,
         })
         .collect();
     let mut taken: Vec<String> = config.integrations.keys().cloned().collect();
-    let mut new = Vec::new();
+    let mut sections = Vec::new();
+    let (mut new_portals, mut new_chained) = (0, 0);
     for mut portal in aws_portals(&text) {
-        if configured.contains(&portal.start_url) {
-            eprintln!("fob: {} is already configured; skipped", portal.start_url);
+        for (profile, reason) in &portal.skipped {
+            eprintln!("fob: skipped chained profile '{profile}': {reason}");
+        }
+        if let Some((name, existing)) = configured.get(&portal.start_url) {
+            portal
+                .chained
+                .retain(|label, _| !existing.chained.contains_key(label));
+            if portal.chained.is_empty() {
+                eprintln!(
+                    "fob: {} is already configured as '{name}'",
+                    portal.start_url
+                );
+            } else {
+                eprintln!(
+                    "fob: {} is configured as '{name}'; {} chained role(s) to add",
+                    portal.start_url,
+                    portal.chained.len()
+                );
+                new_chained += portal.chained.len();
+                sections.push(chained_toml(name, &portal.chained).trim_start().to_string());
+            }
             continue;
         }
         let base = portal.name.clone();
@@ -834,22 +875,21 @@ fn import_aws(
         }
         taken.push(portal.name.clone());
         eprintln!(
-            "fob: {} ({} profile(s) in {})",
+            "fob: {} as '{}': {} profile(s), {} chained role(s)",
             portal.start_url,
+            portal.name,
             portal.profiles,
-            file.display()
+            portal.chained.len()
         );
-        new.push(portal);
+        new_portals += 1;
+        new_chained += portal.chained.len();
+        sections.push(aws_portal_toml(&portal));
     }
-    if new.is_empty() {
+    if sections.is_empty() {
         eprintln!("fob: nothing new to import");
         return Ok(());
     }
-    let toml: String = new
-        .iter()
-        .map(aws_portal_toml)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let toml = sections.join("\n");
     if !write {
         print!("{toml}");
         eprintln!(
@@ -874,8 +914,7 @@ fn import_aws(
     Config::parse(&updated).context("the result would not be a valid config; nothing written")?;
     std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
     eprintln!(
-        "fob: added {} integration(s) to {}; sign in with `fob login <name>`",
-        new.len(),
+        "fob: added {new_portals} integration(s) and {new_chained} chained role(s) to {}; run `fob sync`, or `fob login <name>` for new portals",
         path.display()
     );
     Ok(())
