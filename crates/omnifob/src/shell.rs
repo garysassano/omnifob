@@ -79,8 +79,18 @@ pub fn export(shell: Shell, profile_id: &str, creds: &Credentials, previous: &[&
     out
 }
 
+/// The line to add to a shell's startup file.
+pub fn activation_line(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Posix => r#"eval "$(fob activate bash)"    # or zsh"#,
+        Shell::Fish => "fob activate fish | source",
+        Shell::Powershell => "fob activate powershell | Out-String | Invoke-Expression",
+    }
+}
+
 /// A `fob` wrapper function: `fob use [profile]` and `fob unuse` change the
-/// current shell; everything else runs the binary.
+/// current shell; everything else runs the binary. Also registers completions,
+/// which ask the binary for profile ids as you type.
 pub fn activate(shell: Shell) -> &'static str {
     match shell {
         Shell::Posix => {
@@ -99,6 +109,11 @@ pub fn activate(shell: Shell) -> &'static str {
       ;;
   esac
 }
+if [ -n "${ZSH_VERSION:-}" ]; then
+  source <(COMPLETE=zsh command fob)
+elif [ -n "${BASH_VERSION:-}" ]; then
+  source <(COMPLETE=bash command fob)
+fi
 "#
         }
         Shell::Fish => {
@@ -113,6 +128,7 @@ pub fn activate(shell: Shell) -> &'static str {
       command fob $argv
   end
 end
+COMPLETE=fish command fob | source
 "#
         }
         Shell::Powershell => {
@@ -127,6 +143,9 @@ end
     & fob.exe @args
   }
 }
+$env:COMPLETE = "powershell"
+fob.exe | Out-String | Invoke-Expression
+Remove-Item Env:\COMPLETE
 "#
         }
     }

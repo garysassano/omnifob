@@ -31,7 +31,7 @@
 - [ ] Per-directory profiles via mise (`[env]` hook or a mise plugin calling `fob env`), like wrangler's directory bindings.
 - [ ] `fob import aws`: create integrations from `~/.aws/config` `sso-session` sections and granted profiles.
 - [ ] Generate `~/.aws/config` profiles that call `fob creds --format credential-process`.
-- [ ] Shell completions, including profile ids.
+- [x] Shell completions, including profile ids (bash, zsh, fish, PowerShell; zsh untested).
 - [ ] Release builds for macOS (signed), Linux, Windows; mise registry entry (aqua or ubi backend).
 
 ## v0.3: More clouds

@@ -6,7 +6,8 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{ArgValueCandidates, CompletionCandidate};
 use dialoguer::console::Term;
 use jiff::Timestamp;
 use omnifob_core::config::CloudflareTokenType;
@@ -32,6 +33,7 @@ struct Cli {
 enum Command {
     /// Sign in to an integration, then discover its profiles
     Login {
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integration: String,
         /// Print the sign-in URL instead of opening a browser
         #[arg(long)]
@@ -46,7 +48,10 @@ enum Command {
     /// Show integrations and whether you are signed in
     Status,
     /// Discover profiles (every integration when none is given)
-    Sync { integrations: Vec<String> },
+    Sync {
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        integrations: Vec<String>,
+    },
     /// List profiles, optionally filtered
     #[command(visible_alias = "ls")]
     List {
@@ -56,6 +61,7 @@ enum Command {
     },
     /// Print shell code exporting a profile's credentials (pick one when omitted)
     Env {
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         #[arg(long, value_enum, default_value_t = Shell::detect())]
         shell: Shell,
@@ -68,6 +74,7 @@ enum Command {
     },
     /// Run a command with a profile's credentials
     Exec {
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         #[arg(long)]
         no_cache: bool,
@@ -76,6 +83,7 @@ enum Command {
     },
     /// Open the provider's web console as a profile
     Console {
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         /// Print the URL instead of opening it
         #[arg(long)]
@@ -83,7 +91,7 @@ enum Command {
     },
     /// Print credentials for other tools (fnox, AWS credential_process, scripts)
     Creds {
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         #[arg(long, value_enum, default_value_t = CredsFormat::Json)]
         format: CredsFormat,
@@ -92,7 +100,17 @@ enum Command {
     },
     /// Revoke the credentials omnifob handed out for a profile (Cloudflare
     /// tokens are deleted; AWS role credentials can only be forgotten)
-    Revoke { profile: Vec<String> },
+    Revoke {
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
+        profile: Vec<String>,
+    },
+    /// Switch the current shell to a profile (needs the shell integration from `fob activate`)
+    Use {
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
+        profile: Vec<String>,
+    },
+    /// Remove the active profile's variables from the current shell (needs `fob activate`)
+    Unuse,
     /// Print shell integration: adds `fob use <profile>` and `fob unuse`
     Activate { shell: Shell },
     /// Cloudflare helpers
@@ -107,6 +125,7 @@ enum Command {
 enum CloudflareCommand {
     /// List the permission names templates can use
     Permissions {
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integration: String,
         /// Only show permissions whose name contains this
         filter: Option<String>,
@@ -126,6 +145,9 @@ enum CredsFormat {
 }
 
 pub fn main() -> ExitCode {
+    // Answers the shell's completion requests (COMPLETE=<shell>) and exits.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -242,6 +264,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 ),
             }
         }
+        Command::Use { .. } | Command::Unuse => {
+            let shell = Shell::detect();
+            bail!(
+                "`fob use` and `fob unuse` change the current shell, which needs the shell integration. Add this to your shell's startup file:\n  {}",
+                shell::activation_line(shell)
+            );
+        }
         Command::Activate { shell } => print!("{}", shell::activate(shell)),
         Command::Cloudflare(command) => app.cloudflare(command).await?,
         Command::Renew { profile } => app.renew(&profile).await?,
@@ -252,6 +281,36 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 /// Joins profile words into one query; `None` when no words were given.
 fn query(words: &[String]) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// Profile ids for shell completion, with the provider kind as a hint.
+fn profile_candidates() -> Vec<CompletionCandidate> {
+    let Ok(cache) = ProfileCache::load(&profiles_file()) else {
+        return Vec::new();
+    };
+    cache
+        .all()
+        .map(|p| {
+            let kind = match p.target {
+                omnifob_core::Target::Aws { .. } => "aws",
+                omnifob_core::Target::Cloudflare { .. } => "cloudflare",
+                omnifob_core::Target::Token {} => "token",
+            };
+            CompletionCandidate::new(&p.id).help(Some(kind.into()))
+        })
+        .collect()
+}
+
+/// Integration names for shell completion.
+fn integration_candidates() -> Vec<CompletionCandidate> {
+    let Ok(config) = Config::load(&paths::config_file()) else {
+        return Vec::new();
+    };
+    config
+        .integrations
+        .iter()
+        .map(|(name, i)| CompletionCandidate::new(name).help(Some(i.kind().into())))
+        .collect()
 }
 
 fn profiles_file() -> std::path::PathBuf {

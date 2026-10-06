@@ -103,9 +103,12 @@ Add the wrapper to your shell's startup file:
 ```sh
 eval "$(fob activate bash)"     # or zsh
 fob activate fish | source      # fish
+fob activate powershell | Out-String | Invoke-Expression   # PowerShell
 ```
 
 Then `fob use prod admin` exports the credentials into the current shell, and `fob unuse` removes them. Switching profiles removes variables the previous one set and the new one does not.
+
+The same line enables tab completion of commands, integration names and profile ids (`fob exec cf<TAB>`), read live from your discovered profiles. Only completion, without the `fob use` wrapper: `source <(COMPLETE=bash fob)`, `source <(COMPLETE=zsh fob)` or `COMPLETE=fish fob | source`.
 
 ### With other tools
 
