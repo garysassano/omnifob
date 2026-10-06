@@ -1,0 +1,132 @@
+//! Provider dispatch: each integration kind implements sign-in, discovery,
+//! credentials and a console link.
+
+pub mod aws_sso;
+pub mod cloudflare;
+
+use jiff::Timestamp;
+
+use crate::{Config, Credentials, Integration, Profile, Result, Target, store};
+
+/// Discovers every profile an integration offers.
+pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
+    match integration {
+        Integration::AwsSso(config) => aws_sso::discover(name, config).await,
+        Integration::Cloudflare(config) => cloudflare::discover(name, config).await,
+    }
+}
+
+/// Removes the stored sign-in of an integration; returns whether one existed.
+pub fn logout(name: &str, integration: &Integration) -> anyhow::Result<bool> {
+    match integration {
+        Integration::AwsSso(_) => aws_sso::logout(name),
+        Integration::Cloudflare(_) => cloudflare::logout(name),
+    }
+}
+
+/// Whether an integration has a usable sign-in stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignIn {
+    SignedOut,
+    /// A long-lived secret (such as a Cloudflare bootstrap token) is stored.
+    Token,
+    /// A session that expires; `refreshable` sessions renew without a browser.
+    Session {
+        expires_at: Timestamp,
+        refreshable: bool,
+    },
+}
+
+pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> {
+    Ok(match integration {
+        Integration::AwsSso(_) => match aws_sso::session(name)? {
+            Some((expires_at, refreshable)) => SignIn::Session {
+                expires_at,
+                refreshable,
+            },
+            None => SignIn::SignedOut,
+        },
+        Integration::Cloudflare(_) => {
+            if cloudflare::has_bootstrap_token(name)? {
+                SignIn::Token
+            } else {
+                SignIn::SignedOut
+            }
+        }
+    })
+}
+
+/// Returns credentials for a profile, reusing cached ones while they are fresh.
+pub async fn credentials(
+    config: &Config,
+    profile: &Profile,
+    use_cache: bool,
+) -> Result<Credentials> {
+    let key = store::credentials_key(&profile.id);
+    if use_cache {
+        match store::get::<Credentials>(&key) {
+            Ok(Some(cached)) if cached.is_fresh(Timestamp::now()) => return Ok(cached),
+            Ok(_) => {}
+            Err(e) => tracing::debug!("ignoring unreadable cached credentials: {e:#}"),
+        }
+    }
+
+    let integration = config.integration(&profile.integration)?;
+    let fresh = match (integration, &profile.target) {
+        (
+            Integration::AwsSso(c),
+            Target::Aws {
+                account_id,
+                role_name,
+                ..
+            },
+        ) => aws_sso::credentials(&profile.integration, c, account_id, role_name).await?,
+        (
+            Integration::Cloudflare(c),
+            Target::Cloudflare {
+                account_id,
+                template,
+                ..
+            },
+        ) => {
+            cloudflare::credentials(&profile.integration, c, &profile.id, account_id, template)
+                .await?
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "profile '{}' does not match integration type '{}'; run `fob sync`",
+                profile.id,
+                integration.kind()
+            )
+            .into());
+        }
+    };
+
+    if let Err(e) = store::set(&key, &fresh) {
+        tracing::warn!("could not cache credentials: {e:#}");
+    }
+    Ok(fresh)
+}
+
+/// Returns a URL that opens the provider's web console as this profile.
+pub async fn console_url(
+    config: &Config,
+    profile: &Profile,
+    creds: &Credentials,
+) -> Result<String> {
+    let integration = config.integration(&profile.integration)?;
+    Ok(match (integration, &profile.target) {
+        (Integration::AwsSso(c), Target::Aws { .. }) => {
+            aws_sso::console_url(creds, c.default_region.as_deref()).await?
+        }
+        (_, Target::Cloudflare { account_id, .. }) => cloudflare::console_url(account_id),
+        (_, Target::Aws { .. }) => unreachable!("AWS profiles only come from aws-sso integrations"),
+    })
+}
+
+/// Drops cached credentials for every profile in `profiles`.
+pub fn forget_credentials<'a>(profiles: impl IntoIterator<Item = &'a Profile>) {
+    for profile in profiles {
+        let _ = store::delete(&store::credentials_key(&profile.id));
+    }
+}

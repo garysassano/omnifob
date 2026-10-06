@@ -1,0 +1,38 @@
+# Log
+
+## 2026-10-06
+
+- Discussed the idea: granted's slow pace, no darwin binary for 0.39.0 (cause: Apple certificate, issue #936), wanting Cloudflare and more clouds with granted-like commands.
+- Researched granted, aws-vault (ByteNess), Leapp, aws-sso-cli, fnox, 1Password shell-plugins, teller, saml2aws, wrangler/workers-auth and the new `cf` CLI. Notes in [research.md](research.md) and [providers/](providers/).
+- Key finding: fnox already mints Cloudflare tokens and other leases; omnifob's gap is the human sign-in, discovery, switching and console layer.
+- Key finding: Cloudflare supports third-party OAuth clients (PKCE only), and its own `cf` app has the `account_api_tokens:create` scope.
+- Built v0.1 skeleton: core library, AWS and Cloudflare providers, CLI. 16 unit tests pass, clippy clean with `-D warnings`.
+- Verified live: keychain fallback to keyutils on WSL (no Secret Service).
+- Live AWS test against the user's personal test Identity Center (eu-central-1), with config and state in the session scratchpad:
+  - Device sign-in approved in the browser; discovery found 3 profiles: `<integration>/{management,monitoring,test}/AdministratorAccess`.
+  - `fob exec test admin -- aws sts get-caller-identity` returned the SSO role in the test account. Role credentials last 12 hours.
+  - Cached credential lookups take about 20 ms; fresh ones about 0.6 s.
+  - `creds --format credential-process` and `--format fnox` produce the expected shapes; `console --print` gives a regional federation URL.
+  - Silent refresh verified by moving the stored token's expiry to five minutes away: the next call refreshed it without a browser.
+  - `fob use` / `fob unuse` verified in bash and fish, including switching accounts and removing every variable.
+  - Bug found and fixed: profile queries of several words (`fob exec test admin -- ...`) were rejected; profile arguments now take any number of words.
+- Second test round ("test all the things you deem necessary"):
+  - Built-in Cloudflare permission names checked against developers.cloudflare.com/fundamentals/api/reference/permissions (API-name tabs): all present. The docs page lacks the newest products (Browser Run, Workers Observability, Builds/Agents Configuration, Secrets Store), which the dashboard shows.
+  - Cloudflare minting covered by 6 wiremock tests (user and account tokens, policy shapes, user tag, cleanup of only omnifob's expired tokens, unknown names, API errors). A deliberate bug in cleanup made a test fail, so the tests bite.
+  - Full CLI run against a Python mock of the Cloudflare API (`OMNIFOB_CLOUDFLARE_API`): bad token rejected with Cloudflare's message, login, discovery, `exec`, cache reuse, `use` switching, `console --print`, logout.
+  - AWS failure paths on a copied session under a second integration name: revoked token in GetRoleCredentials and in ListAccounts both delete the session and ask for `fob login`; an expired session without refresh token does the same. The real session was untouched.
+  - Bug fixed: `acme/test` also matched `acme2/test` (integration names where one is a prefix of the other). Matches are now ranked: whole segment beats segment prefix beats substring.
+  - Config errors name the bad field or list valid types; unknown integration and no-match errors are clear.
+  - WSL: the `open` crate detects WSL and hands URLs to Windows; `xdg-open` maps to `wsl-explorer.desktop`. Not exercised by opening a window.
+- User feedback on Cloudflare: the real pain is the dashboard flow (log in, 2FA, profile, API tokens, "Edit Cloudflare Workers" template, then hand-adding D1, Queues, Workers AI, Browser Run... because the template is years out of date), then pasting the token to an agent and remembering to revoke it. They want `assume -x` for Cloudflare with a "full workers" permission set.
+  - Built-in `workers` template now covers the developer platform; templates gained `optional` permissions (skipped when not offered); "Edit" and "Write" names are interchangeable.
+  - `fob exec cf workers -- <agent>` gives an agent a one-hour token in its environment, so nothing is pasted into a chat and it expires by itself.
+- Live Cloudflare test with a real bootstrap token ("Create Additional Tokens" template, the user's personal account, ID from `wrangler whoami`). The token was read from a file the user provided and the file was shredded; it never entered the conversation.
+  - `fob cf permissions` returned 413 permission groups. Corrections to the template: "Containers Write" is really **Workers Containers Write**; Builds configuration is **Workers CI Write**; agent products are **CF Agents Write**, **Agent Memory Write**, **Artifacts Write**; also present: Browser Run Write, Workers Observability Write, Secrets Store Write, AI Gateway Write, AI Search Write, Email Sending Write, Flagship Write, Cloudchamber Write, Images Write.
+  - A minted `workers` token worked with wrangler (`wrangler whoami`) and read-only listings of Workers, Queues, KV, R2, Vectorize, Hyperdrive and Workers AI.
+  - **D1 propagation**: D1 rejects a new token for about 3 s ("Authentication error"), and flaps (accepts, then rejects again) before settling. Other products accept at once. omnifob now polls D1 with the new token after minting a D1-capable token until it accepts three times in a row. Verified live: three fresh tokens, each accepted on 12 of 12 immediate calls.
+  - Cleanup: deleted the 12 tokens minted during testing with a scratch helper; the user's 4 other tokens were untouched. Cached credentials cleared.
+- User asked why `fob exec cf workers -- wrangler whoami` took 5–10 s. Measured: wrangler alone 2.3 s; a fresh mint 6.3 s (cached 0.02 s). The run was a fresh mint because test cleanup had cleared the cache.
+  - Permission groups come back in one call (413 groups, ~0.6 s; paging parameters are ignored). Now kept on disk for 24 h with the user tag (`~/.local/state/omnifob/cloudflare-<integration>.json`), refetched early when a template names a permission it lacks. Cleanup of expired tokens now overlaps the D1 wait; D1 is polled every 250 ms.
+  - What remains is D1 propagation itself: 5 to 12 rejections per new token, 4 to 6 s in total, varying run to run. Cached `fob exec ... wrangler whoami` takes 2.1 s, all of it wrangler.
+  - Options offered to the user: renew in the background before expiry (the wait disappears except on the very first mint), a longer default TTL, or skipping the D1 wait for templates that do not need it.
