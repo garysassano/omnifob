@@ -21,6 +21,7 @@ pub struct Config {
 pub enum Integration {
     AwsSso(AwsSsoConfig),
     Cloudflare(CloudflareConfig),
+    Token(TokenConfig),
 }
 
 impl Integration {
@@ -28,6 +29,7 @@ impl Integration {
         match self {
             Integration::AwsSso(_) => "aws-sso",
             Integration::Cloudflare(_) => "cloudflare",
+            Integration::Token(_) => "token",
         }
     }
 }
@@ -50,6 +52,30 @@ pub struct AwsSsoConfig {
 
 fn default_sso_scopes() -> Vec<String> {
     vec!["sso:account:access".to_string()]
+}
+
+/// Long-lived tokens for providers without short-lived credentials.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenConfig {
+    /// A known provider: its variable names, token check and console URL.
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// Secret name → environment variables that receive it; replaces the
+    /// preset's secrets.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, Vec<String>>,
+    /// Non-secret variables exported along with the secrets.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    /// Middle segment of the profile id; defaults to "default".
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub console: Option<String>,
+    /// URL that answers 2xx when the token is sent as a bearer token.
+    #[serde(default)]
+    pub verify_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

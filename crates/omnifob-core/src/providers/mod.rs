@@ -3,6 +3,7 @@
 
 pub mod aws_sso;
 pub mod cloudflare;
+pub mod token;
 
 use jiff::Timestamp;
 
@@ -13,6 +14,7 @@ pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profi
     match integration {
         Integration::AwsSso(config) => aws_sso::discover(name, config).await,
         Integration::Cloudflare(config) => cloudflare::discover(name, config).await,
+        Integration::Token(config) => Ok(token::discover(name, config)),
     }
 }
 
@@ -21,6 +23,7 @@ pub fn logout(name: &str, integration: &Integration) -> anyhow::Result<bool> {
     match integration {
         Integration::AwsSso(_) => aws_sso::logout(name),
         Integration::Cloudflare(_) => cloudflare::logout(name),
+        Integration::Token(_) => token::logout(name),
     }
 }
 
@@ -46,6 +49,13 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
             },
             None => SignIn::SignedOut,
         },
+        Integration::Token(_) => {
+            if token::has_secrets(name)? {
+                SignIn::Token
+            } else {
+                SignIn::SignedOut
+            }
+        }
         Integration::Cloudflare(_) => {
             if cloudflare::has_bootstrap_token(name)? {
                 SignIn::Token
@@ -62,6 +72,13 @@ pub async fn credentials(
     profile: &Profile,
     use_cache: bool,
 ) -> Result<Credentials> {
+    // Static tokens are read straight from the keychain; caching adds nothing.
+    if let (Integration::Token(c), Target::Token {}) =
+        (config.integration(&profile.integration)?, &profile.target)
+    {
+        return token::credentials(&profile.integration, c);
+    }
+
     let key = store::credentials_key(&profile.id);
     if use_cache {
         match store::get::<Credentials>(&key) {
@@ -123,8 +140,23 @@ pub async fn console_url(
         (Integration::AwsSso(c), Target::Aws { .. }) => {
             aws_sso::console_url(creds, c.default_region.as_deref()).await?
         }
-        (_, Target::Cloudflare { account_id, .. }) => cloudflare::console_url(account_id),
-        (_, Target::Aws { .. }) => unreachable!("AWS profiles only come from aws-sso integrations"),
+        (Integration::Cloudflare(_), Target::Cloudflare { account_id, .. }) => {
+            cloudflare::console_url(account_id)
+        }
+        (Integration::Token(c), Target::Token {}) => token::console_url(c)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no console URL known for '{}'; set `console` in its config",
+                profile.integration
+            )
+        })?,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "profile '{}' does not match integration type '{}'; run `fob sync`",
+                profile.id,
+                integration.kind()
+            )
+            .into());
+        }
     })
 }
 

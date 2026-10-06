@@ -11,7 +11,7 @@ use dialoguer::console::Term;
 use jiff::Timestamp;
 use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::profile::{ProfileCache, SyncedProfiles};
-use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare};
+use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, token};
 use omnifob_core::{Config, Credentials, Error, Integration, Profile, paths};
 
 use crate::shell::Shell;
@@ -36,7 +36,8 @@ enum Command {
         /// Print the sign-in URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
-        /// Read a Cloudflare bootstrap token from stdin instead of prompting
+        /// Read the token (a Cloudflare bootstrap token, or a token integration's
+        /// single secret) from stdin instead of prompting
         #[arg(long)]
         token_stdin: bool,
     },
@@ -200,7 +201,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Console { profile, print } => {
             let profile = app.select(query(&profile).as_deref()).await?;
-            let creds = app.credentials(&profile, true).await?;
+            // Only AWS needs credentials to sign in to its console.
+            let creds = if matches!(profile.target, omnifob_core::Target::Aws { .. }) {
+                app.credentials(&profile, true).await?
+            } else {
+                Credentials::default()
+            };
             let url = providers::console_url(&app.config, &profile, &creds).await?;
             if print {
                 println!("{url}");
@@ -298,6 +304,37 @@ impl App {
                 };
                 cloudflare::login(name, config, &token).await?;
             }
+            Integration::Token(config) => {
+                let names: Vec<String> = token::secrets(config)?
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                let mut values = std::collections::BTreeMap::new();
+                if token_stdin {
+                    let [only] = names.as_slice() else {
+                        bail!(
+                            "--token-stdin works for a single secret; '{name}' has {}",
+                            names.len()
+                        );
+                    };
+                    let mut value = String::new();
+                    std::io::stdin().read_to_string(&mut value)?;
+                    values.insert(only.clone(), value);
+                } else {
+                    if !interactive() {
+                        bail!(
+                            "no terminal to prompt for secrets; pass a single one with --token-stdin"
+                        );
+                    }
+                    for secret in &names {
+                        let value = dialoguer::Password::new()
+                            .with_prompt(format!("{name} {secret}"))
+                            .interact_on(&Term::stderr())?;
+                        values.insert(secret.clone(), value);
+                    }
+                }
+                token::login(name, config, values).await?;
+            }
         }
         eprintln!("fob: signed in to '{name}'");
         Ok(())
@@ -333,7 +370,10 @@ impl App {
         for (name, integration) in &self.config.integrations {
             let state = match providers::sign_in(name, integration)? {
                 SignIn::SignedOut => "signed out".to_string(),
-                SignIn::Token => "signed in (bootstrap token)".to_string(),
+                SignIn::Token if matches!(integration, Integration::Cloudflare(_)) => {
+                    "signed in (bootstrap token)".to_string()
+                }
+                SignIn::Token => "signed in (stored token)".to_string(),
                 SignIn::Session {
                     expires_at,
                     refreshable,

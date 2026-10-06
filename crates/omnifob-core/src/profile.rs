@@ -30,6 +30,7 @@ pub enum Target {
         account_name: String,
         template: String,
     },
+    Token {},
 }
 
 impl Profile {

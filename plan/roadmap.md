@@ -25,7 +25,7 @@
 - [ ] `fob exec --revoke`: delete a minted Cloudflare token as soon as the command exits (needs spawn instead of exec, and Ctrl-C handling).
 - [ ] `fob exec --ttl 4h` to override a template's lifetime for long agent sessions.
 - [ ] `fob cf templates --check`: show which template permissions the account offers.
-- [ ] `fob cf revoke [profile]`: delete live omnifob tokens now (cleanup after testing needed a scratch helper) and clear their cache.
+- [x] `fob revoke <profile>` (Cloudflare tokens deleted, cache cleared).
 
 - [ ] Cloudflare browser sign-in (OAuth + PKCE) with an omnifob OAuth client.
 - [ ] Per-directory profiles via mise (`[env]` hook or a mise plugin calling `fob env`), like wrangler's directory bindings.
@@ -39,7 +39,7 @@
 See [landscape.md](landscape.md) for how each provider's CLI signs in.
 
 - [ ] Name the provider shapes in the core: session exchange, mint, static.
-- [ ] Generic `static-token` integration in the keychain: Hetzner, DigitalOcean, Vultr, Upstash, Akamai EdgeGrid.
+- [x] Generic `token` integration in the keychain with presets: Hetzner, DigitalOcean, Vultr, Akamai Cloud, Upstash, Akamai EdgeGrid, Scaleway, Vercel, Netlify, Fly.io, Neon, Supabase, GitHub.
 - [ ] Browser sign-in then mint, shared by Cloudflare, Akamai Cloud (Linode) and Scaleway; OVHcloud consumer keys.
 - [ ] `aws-signin` integration for `aws login` (IAM users, root, console federation), DPoP key in the keychain.
 - [ ] Provisioners beyond env vars: files with cleanup, Google executable-sourced credentials, kubectl exec plugin.

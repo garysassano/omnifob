@@ -18,6 +18,9 @@ Early. Working today:
 | --- | --- | --- | --- | --- |
 | `aws-sso` (IAM Identity Center) | Device flow, silent refresh | Every account and role | Role credentials | Federated sign-in URL |
 | `cloudflare` | Bootstrap token, stored once | Accounts × templates | Minted tokens, scoped by permission name, expiring | Dashboard |
+| `token` | Paste once, checked against the provider where possible | One profile per integration | The stored token under every variable the provider's tools read | Known console URL |
+
+Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain.
 
 Planned: Cloudflare browser sign-in (OAuth with PKCE), Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), per-directory profiles through mise.
 
@@ -50,6 +53,26 @@ ttl = "1h"                                       # lifetime of minted tokens
 [integrations.cf.templates.pages]
 permissions = ["Pages Write", "Account Settings Read"]
 ttl = "30m"
+```
+
+Providers that only have long-lived tokens use `type = "token"`, usually with a preset:
+
+```toml
+[integrations.hetzner-prod]
+type = "token"
+preset = "hetzner"          # HCLOUD_TOKEN, checked against the Hetzner API at login
+account = "prod"            # profile id: hetzner-prod/prod/hetzner
+
+[integrations.upstash]
+type = "token"
+preset = "upstash"
+vars = { UPSTASH_EMAIL = "me@example.com" }   # non-secret variables
+
+[integrations.internal]
+type = "token"
+secrets = { token = ["INTERNAL_TOKEN"] }      # any provider: secret name → variables
+verify_url = "https://api.example.com/me"     # optional: must answer 2xx for the token
+console = "https://console.example.com"
 ```
 
 Cloudflare comes with built-in templates; `fob cf templates <integration>` lists them and `fob cf permissions <integration> [filter]` lists every permission name your account offers. Names can be written as the API does ("Workers Scripts Write") or as the dashboard does ("Workers Scripts Edit").
@@ -109,11 +132,11 @@ create_command = "fob creds cf/personal/workers --format fnox"
 
 ## Where secrets live
 
-SSO sessions, the Cloudflare bootstrap token and cached credentials are stored in the OS keychain under the service `omnifob`: Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux. Where no Secret Service runs (WSL, servers), the kernel keyring is used; it keeps secrets until reboot. `OMNIFOB_KEYRING` forces a store.
+SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentials are kept in the OS keychain under the service `omnifob`: Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux. Where no Secret Service runs (WSL, servers), the kernel keyring is used; it forgets everything on reboot. On WSL, long-lived secrets are therefore also written to `~/.local/state/omnifob/vault`, encrypted with Windows DPAPI for your Windows user, and restored after a reboot (`OMNIFOB_WSL_DPAPI=0` turns this off). `OMNIFOB_KEYRING` forces a store; `fob status` shows which one is in use.
 
 Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json`.
 
-Credentials are cached until five minutes before they expire. Cloudflare tokens omnifob mints are named `omnifob:<profile>@<time>`, and expired ones are deleted on the next mint so they do not pile up in the dashboard.
+Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob:<profile>@<time>`, and expired ones are deleted on the next mint so they do not pile up in the dashboard.
 
 ## Credits
 

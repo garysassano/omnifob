@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// so a command started with them does not fail halfway through.
 pub const EXPIRY_MARGIN: SignedDuration = SignedDuration::from_mins(5);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
