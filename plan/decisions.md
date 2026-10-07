@@ -53,3 +53,7 @@ A process cannot change its parent's environment, so `fob activate <shell>` prin
 ## 2026-10-07: Release notes in releases only
 
 The user does not want a CHANGELOG.md alongside release notes. Notes are written once, in the signed tag's message (`--cleanup=verbatim` keeps Markdown headings), and the release workflow copies them into the GitHub release. Generated notes are only a fallback: they list merged pull requests, and changes here have gone straight to main.
+
+## 2026-10-07: Pull requests for changes
+
+Changes go through a pull request, squash-merged after CI passes, matching the repository's merge settings (squash only, title and description from the PR). Small changes (a typo, a log line) may still go straight to `main`. Repository settings match `garysassano/shin-bucket-deployment`, except that Dependabot alerts stay enabled here: the baseline never turns a security feature off to match the reference.
