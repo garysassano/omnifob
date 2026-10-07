@@ -20,6 +20,14 @@ fn ok(result: Value) -> ResponseTemplate {
 }
 
 fn config(token_type: &str, permissions: &str) -> CloudflareConfig {
+    config_with_optional(
+        token_type,
+        permissions,
+        r#""Browser Run Write", "Not Offered Here Write""#,
+    )
+}
+
+fn config_with_optional(token_type: &str, permissions: &str, optional: &str) -> CloudflareConfig {
     let text = format!(
         r#"
         [integrations.cf]
@@ -30,7 +38,7 @@ fn config(token_type: &str, permissions: &str) -> CloudflareConfig {
 
         [integrations.cf.templates.t]
         permissions = [{permissions}]
-        optional = ["Browser Run Write", "Not Offered Here Write"]
+        optional = [{optional}]
         ttl = "2h"
         "#
     );
@@ -43,6 +51,16 @@ fn config(token_type: &str, permissions: &str) -> CloudflareConfig {
         Integration::Cloudflare(c) => c,
         _ => unreachable!(),
     }
+}
+
+/// What the account-level endpoint returns: no user-level groups.
+fn account_permission_groups() -> Value {
+    let mut groups = permission_groups();
+    groups
+        .as_array_mut()
+        .unwrap()
+        .retain(|g| g["scopes"][0] != "com.cloudflare.api.user");
+    groups
 }
 
 fn permission_groups() -> Value {
@@ -251,25 +269,37 @@ async fn account_tokens_use_account_endpoints() {
 }
 
 #[tokio::test]
-async fn account_tokens_cannot_carry_user_permissions() {
+async fn account_tokens_leave_out_user_permissions() {
     let server = MockServer::start().await;
+    let base = format!("/accounts/{ACCOUNT}/tokens");
     Mock::given(method("GET"))
-        .and(path(format!(
-            "/accounts/{ACCOUNT}/tokens/permission_groups"
-        )))
-        .respond_with(ok(permission_groups()))
+        .and(path(format!("{base}/permission_groups")))
+        // Like the real API: the account endpoint offers no user-level groups.
+        .respond_with(ok(account_permission_groups()))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(ok(json!({})))
-        .expect(0)
+        .and(path(base.clone()))
+        .respond_with(ok(json!({ "id": "acct-tok", "value": "acct-secret" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!([])))
         .mount(&server)
         .await;
 
+    // Like the built-in workers template: user-level permissions are optional,
+    // so an account-owned bootstrap simply goes without them.
     let client = Client::new(server.uri(), "bootstrap");
-    let err = mint(
+    mint(
         &client,
-        &config("account", r#""User Details Read""#),
+        &config_with_optional(
+            "account",
+            r#""Workers Scripts Write""#,
+            r#""User Details Read", "Browser Run Write""#,
+        ),
         "p",
         ACCOUNT,
         "t",
@@ -277,11 +307,22 @@ async fn account_tokens_cannot_carry_user_permissions() {
         &mut Catalog::default(),
     )
     .await
-    .unwrap_err();
-    assert!(
-        format!("{err:#}").contains("user-owned bootstrap token"),
-        "{err:#}"
-    );
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body = posted_body(&requests, &base);
+    let policies = body["policies"].as_array().unwrap();
+    assert_eq!(policies.len(), 1, "{policies:#?}");
+    let mut ids: Vec<&str> = policies[0]["permission_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    // The test config's optional "Browser Run Write" is account-level and stays.
+    assert_eq!(ids, ["g-browser", "g-workers"]);
+    assert!(!body.to_string().contains("com.cloudflare.api.user"));
 }
 
 #[tokio::test]

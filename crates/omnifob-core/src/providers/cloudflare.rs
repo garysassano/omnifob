@@ -65,8 +65,6 @@ pub fn builtin_templates() -> BTreeMap<String, CloudflareTemplate> {
             t(
                 &[
                     "Account Settings Read",
-                    "User Details Read",
-                    "Memberships Read",
                     "Zone Read",
                     "Workers Scripts Write",
                     "Workers Routes Write",
@@ -83,6 +81,9 @@ pub fn builtin_templates() -> BTreeMap<String, CloudflareTemplate> {
                     "Pipelines Write",
                 ],
                 &[
+                    // User-level: only user-owned bootstraps offer these.
+                    "User Details Read",
+                    "Memberships Read",
                     "AI Gateway Write",
                     "AI Search Write",
                     "Agent Memory Write",
@@ -621,11 +622,35 @@ pub fn forget_catalog(integration: &str) {
     let _ = std::fs::remove_file(catalog_file(integration));
 }
 
+/// Where to create the bootstrap token. For account-owned tokens this is a
+/// template URL that pre-fills the form (name, the "Account API Tokens Edit"
+/// permission and the account); user-owned tokens need the dashboard's
+/// "Create Additional Tokens" template, which no URL can pre-fill.
+pub fn bootstrap_url(config: &CloudflareConfig) -> String {
+    match config.token_type {
+        CloudflareTokenType::User => "https://dash.cloudflare.com/profile/api-tokens".to_string(),
+        CloudflareTokenType::Account => {
+            let account = config.account_id.as_deref().unwrap_or(":account");
+            let mut url = reqwest::Url::parse("https://dash.cloudflare.com/").expect("valid URL");
+            url.query_pairs_mut()
+                .append_pair("to", &format!("/{account}/api-tokens"))
+                .append_pair(
+                    "permissionGroupKeys",
+                    r#"[{"key":"account_api_tokens","type":"edit"}]"#,
+                )
+                .append_pair("name", "omnifob bootstrap");
+            url.to_string()
+        }
+    }
+}
+
 /// Picks the template's permissions from the catalog: all required ones,
-/// and the optional ones the account offers.
+/// and the optional ones the account offers. Account-owned tokens cannot
+/// carry user-level permissions, so those are left out for them.
 fn select<'a>(
     template: &CloudflareTemplate,
     groups: &'a [PermissionGroup],
+    token_type: CloudflareTokenType,
 ) -> anyhow::Result<Vec<&'a PermissionGroup>> {
     let mut selected = resolve_permissions(&template.permissions, groups)?;
     for name in &template.optional {
@@ -633,6 +658,18 @@ fn select<'a>(
             Ok(found) => selected.extend(found),
             Err(_) => tracing::debug!("optional permission '{name}' is not offered; skipped"),
         }
+    }
+    if token_type == CloudflareTokenType::Account {
+        selected.retain(|g| {
+            let user_level = g.scopes.iter().any(|s| s == SCOPE_USER);
+            if user_level {
+                tracing::debug!(
+                    "'{}' is user-level; account-owned tokens leave it out",
+                    g.name
+                );
+            }
+            !user_level
+        });
     }
     selected.sort_by(|a, b| a.id.cmp(&b.id));
     selected.dedup_by(|a, b| a.id == b.id);
@@ -667,14 +704,14 @@ pub async fn mint(
         );
     }
     // A name missing from a stored catalog may be a product added since.
-    let selected = match select(&template, &catalog.groups) {
+    let selected = match select(&template, &catalog.groups, token_type) {
         Ok(selected) => selected,
         Err(_) if catalog.fetched_at != Some(now) => {
             fetch(
                 catalog,
                 client.permission_groups(token_type, account_id).await?,
             );
-            select(&template, &catalog.groups)?
+            select(&template, &catalog.groups, token_type)?
         }
         Err(e) => return Err(e),
     };
@@ -967,6 +1004,35 @@ mod tests {
             "permission_groups": []
         })];
         assert_eq!(user_tag_from_policies(&policies).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn bootstrap_urls() {
+        let mut config: CloudflareConfig = match crate::Config::parse(
+            "[integrations.c]\ntype = \"cloudflare\"\naccount_id = \"abc123\"\ntoken_type = \"account\"\n",
+        )
+        .unwrap()
+        .integrations
+        .remove("c")
+        .unwrap()
+        {
+            crate::Integration::Cloudflare(c) => c,
+            _ => unreachable!(),
+        };
+        let url = reqwest::Url::parse(&bootstrap_url(&config)).unwrap();
+        let q: BTreeMap<_, _> = url.query_pairs().collect();
+        assert_eq!(url.host_str(), Some("dash.cloudflare.com"));
+        assert_eq!(q["to"], "/abc123/api-tokens");
+        assert_eq!(q["name"], "omnifob bootstrap");
+        assert_eq!(
+            q["permissionGroupKeys"],
+            r#"[{"key":"account_api_tokens","type":"edit"}]"#
+        );
+        config.token_type = CloudflareTokenType::User;
+        assert_eq!(
+            bootstrap_url(&config),
+            "https://dash.cloudflare.com/profile/api-tokens"
+        );
     }
 
     #[test]

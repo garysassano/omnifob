@@ -7,7 +7,7 @@ pub mod token;
 
 use jiff::Timestamp;
 
-use crate::{Config, Credentials, Integration, Profile, Result, Target, store};
+use crate::{Config, Credentials, Error, Integration, Profile, Result, Target, store};
 
 /// Discovers every profile an integration offers.
 pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
@@ -24,8 +24,9 @@ pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profi
                 })
                 .collect();
             accounts.dedup();
-            if let Err(e) = cloudflare::cleanup(name, config, &accounts).await {
-                tracing::warn!("could not clean up expired omnifob tokens: {e}");
+            match cloudflare::cleanup(name, config, &accounts).await {
+                Ok(_) | Err(Error::NeedsLogin { .. }) => {}
+                Err(e) => tracing::warn!("could not clean up expired omnifob tokens: {e}"),
             }
             Ok(profiles)
         }
