@@ -6,7 +6,7 @@ These files are the project's memory between sessions; update them as work happe
 - [vision.md](vision.md): what omnifob is, who it is for, and what it deliberately is not.
 - [research.md](research.md): the existing tools studied, what each does well, and what omnifob takes from them.
 - [landscape.md](landscape.md): how about twenty cloud and platform CLIs sign in, store and mint credentials, and what that means for omnifob's design.
-- [tools/catalog.toml](tools/catalog.toml): every tool in omnifob's space worth knowing, with what to study in each; `tools/refresh.sh [status|category]` adds live GitHub data.
+- [tools/](tools/README.md): the active tools in omnifob's space, by category, with what to study in each; `tools/refresh.sh [status]` adds live GitHub data.
 - [decisions.md](decisions.md): design decisions with their reasons, newest last.
 - [roadmap.md](roadmap.md): milestones and the open work in each.
 - [providers/](providers/): one file per provider, with how its official CLI signs in and how omnifob maps onto it.
