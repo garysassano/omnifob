@@ -185,6 +185,8 @@ struct Token {
     expires_on: Option<Timestamp>,
     #[serde(default)]
     policies: Vec<Value>,
+    #[serde(default)]
+    condition: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,27 +614,111 @@ fn user_tag_from_policies(policies: &[Value]) -> Option<String> {
 fn bootstrap_client(integration: &str) -> Result<Client> {
     let token: String = store::get(&bootstrap_key(integration))?
         .ok_or_else(|| Error::not_signed_in(integration))?;
+    if let Some(expires_at) = session_expiry(integration)
+        && expires_at <= Timestamp::now()
+    {
+        return Err(Error::needs_login(
+            integration,
+            format!("the Cloudflare session of '{integration}' expired"),
+        ));
+    }
     Ok(Client::new(api_base(), token))
 }
 
+/// When the stored bootstrap token expires, if it was given a session.
+pub fn session_expiry(integration: &str) -> Option<Timestamp> {
+    load_catalog(integration).bootstrap?.expires_at
+}
+
 /// Verifies and stores the bootstrap token.
+/// Returns when the token expires if the integration has a `session`.
 pub async fn login(
     integration: &str,
     config: &CloudflareConfig,
     token: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Timestamp>> {
     if config.token_type == CloudflareTokenType::Account && config.account_id.is_none() {
         bail!("token_type = \"account\" needs account_id in the integration config");
     }
+    let account_id = config.account_id.as_deref().unwrap_or_default();
     let client = Client::new(api_base(), token.trim());
-    client
-        .verify(
-            config.token_type,
-            config.account_id.as_deref().unwrap_or_default(),
-        )
+    let id = client
+        .verify(config.token_type, account_id)
         .await
         .context("the token was rejected")?;
-    store::set(&bootstrap_key(integration), &token.trim())
+    let mut catalog = load_catalog(integration);
+    let previous = catalog.bootstrap.take().map(|b| b.id).filter(|p| *p != id);
+    let expires_at = match config.session {
+        Some(session) => {
+            let tokens = Client::tokens_path(config.token_type, account_id);
+            Some(start_session(&client, &tokens, &id, session, previous.as_deref()).await?)
+        }
+        None => None,
+    };
+    store::set(&bootstrap_key(integration), &token.trim())?;
+    catalog.bootstrap = Some(Bootstrap { id, expires_at });
+    save_catalog(integration, &catalog)?;
+    Ok(expires_at)
+}
+
+/// Makes the new bootstrap token expire after `session` (unless it already
+/// expires sooner), deletes the previous session's bootstrap, and returns
+/// when the new one expires. A dashboard-made token may edit itself.
+pub async fn start_session(
+    client: &Client,
+    tokens: &str,
+    id: &str,
+    session: jiff::SignedDuration,
+    previous: Option<&str>,
+) -> anyhow::Result<Timestamp> {
+    let own: Token = client.get(&format!("{tokens}/{id}")).await?;
+    let wanted = Timestamp::now().round(Unit::Second)?.checked_add(session)?;
+    let expires_at = match own.expires_on {
+        Some(at) if at <= wanted => at,
+        _ => {
+            let mut body = json!({
+                "name": own.name,
+                "policies": own.policies,
+                "status": "active",
+                "expires_on": wanted.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            });
+            if let Some(condition) = &own.condition {
+                body["condition"] = condition.clone();
+            }
+            client
+                .call::<Value>(Method::PUT, &format!("{tokens}/{id}"), &[], Some(&body))
+                .await
+                .context("setting the bootstrap token's expiry")?;
+            wanted
+        }
+    };
+    if let Some(previous) = previous {
+        match delete_token(client, tokens, previous).await {
+            Ok(()) => tracing::debug!("deleted the previous session's bootstrap token"),
+            Err(e) => tracing::debug!("previous bootstrap token not deleted: {e:#}"),
+        }
+    }
+    Ok(expires_at)
+}
+
+/// Deletes the bootstrap token of a session on Cloudflare, so signing out
+/// ends the session there too. Bootstrap tokens without a session are the
+/// user's own and are left alone. Returns whether one was deleted.
+pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result<bool> {
+    let Some(Bootstrap {
+        id,
+        expires_at: Some(_),
+    }) = load_catalog(integration).bootstrap
+    else {
+        return Ok(false);
+    };
+    let client = bootstrap_client(integration)?;
+    let tokens = Client::tokens_path(
+        config.token_type,
+        config.account_id.as_deref().unwrap_or_default(),
+    );
+    delete_token(&client, &tokens, &id).await?;
+    Ok(true)
 }
 
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
@@ -742,6 +828,15 @@ pub struct Catalog {
     /// IDs of the tokens minted for each profile that may still exist.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub minted: BTreeMap<String, Vec<String>>,
+    /// The stored bootstrap token's ID and expiry, when it has a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<Bootstrap>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bootstrap {
+    pub id: String,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl Catalog {

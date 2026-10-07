@@ -93,10 +93,15 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
             }
         }
         Integration::Cloudflare(_) => {
-            if cloudflare::has_bootstrap_token(name)? {
-                SignIn::Token
-            } else {
+            if !cloudflare::has_bootstrap_token(name)? {
                 SignIn::SignedOut
+            } else if let Some(expires_at) = cloudflare::session_expiry(name) {
+                SignIn::Session {
+                    expires_at,
+                    refreshable: false,
+                }
+            } else {
+                SignIn::Token
             }
         }
     })

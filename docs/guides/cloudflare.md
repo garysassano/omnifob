@@ -19,6 +19,25 @@ Use account-owned when you work in one account (Cloudflare recommends account to
 
 After creating the token, press Enter at the prompt and fob reads it from the clipboard, so it never appears on screen; `--from-clipboard` does the same without a prompt, and `--token-stdin` reads it from a pipe. Templates leave out user-level permissions for account-owned tokens.
 
+## Sessions
+
+A bootstrap token without an expiry works forever and needs no second factor, so anything that copies it from your machine keeps full access to the account. With `session`, the bootstrap works like an AWS IAM Identity Center sign-in instead:
+
+```toml
+[integrations.cf]
+type = "cloudflare"
+token_type = "account"
+account_id = "..."
+session = "12h"
+```
+
+- `fob login cf` opens the pre-filled form as usual. The dashboard asks for your password and second factor when its own session has lapsed. Create the token, copy it, and fob makes it expire after `session`.
+- When the session ends, fob asks you to sign in again, as it does for AWS. Cloudflare enforces the expiry, so a stolen copy stops working too.
+- Signing in again deletes the previous session's bootstrap, and `fob logout cf` deletes the current one, so they do not pile up.
+- Tokens minted during the session keep their own lifetime.
+
+Someone who controls your machine during a session can still create long-lived tokens with it, just as someone holding an AWS administrator session can create IAM users. A session limits how long a stolen bootstrap works; it does not replace keeping your machine clean.
+
 ## Templates
 
 Cloudflare comes with built-in templates; `fob cf templates <integration>` lists them and `fob cf permissions <integration> [filter]` lists every permission name your account offers. Names can be written as the API does ("Workers Scripts Write") or as the dashboard does ("Workers Scripts Edit").

@@ -539,7 +539,12 @@ impl App {
                         typed
                     }
                 };
-                cloudflare::login(name, config, &token).await?;
+                if let Some(expires_at) = cloudflare::login(name, config, &token).await? {
+                    eprintln!(
+                        "fob: Cloudflare session for '{name}' lasts until {} (the bootstrap token expires then)",
+                        expires_at.strftime("%Y-%m-%d %H:%M UTC")
+                    );
+                }
             }
             Integration::Token(config) => {
                 let names: Vec<String> = token::secrets(config)?
@@ -603,6 +608,13 @@ impl App {
             Ok(0) | Err(Error::NeedsLogin { .. }) => {}
             Ok(n) => eprintln!("fob: deleted {n} token(s) omnifob had minted"),
             Err(e) => eprintln!("fob: could not delete minted tokens: {e:#}"),
+        }
+        if let Integration::Cloudflare(config) = &integration {
+            match cloudflare::end_session(name, config).await {
+                Ok(true) => eprintln!("fob: deleted the session's bootstrap token"),
+                Ok(false) | Err(Error::NeedsLogin { .. }) => {}
+                Err(e) => eprintln!("fob: could not delete the session's bootstrap token: {e:#}"),
+            }
         }
         let existed = providers::logout(name, &integration)?;
         if let Some(synced) = self.cache.integrations.get(name) {
