@@ -165,6 +165,7 @@ mod tests {
                 .collect::<BTreeMap<_, _>>(),
             expires_at: None,
             issued_at: None,
+            token_id: None,
         }
     }
 

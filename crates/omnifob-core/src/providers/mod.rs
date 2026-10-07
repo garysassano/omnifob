@@ -138,6 +138,23 @@ pub async fn credentials(
         }
     }
 
+    let fresh = fetch(config, profile, ttl).await?;
+    let fresh = Credentials {
+        issued_at: Some(Timestamp::now()),
+        ..fresh
+    };
+    if let Err(e) = store::set(&key, &fresh) {
+        tracing::warn!("could not cache credentials: {e:#}");
+    }
+    Ok(fresh)
+}
+
+/// Gets new credentials from the provider, bypassing the cache.
+async fn fetch(
+    config: &Config,
+    profile: &Profile,
+    ttl: Option<jiff::SignedDuration>,
+) -> Result<Credentials> {
     let integration = config.integration(&profile.integration)?;
     let fresh = match (integration, &profile.target) {
         (
@@ -180,15 +197,36 @@ pub async fn credentials(
             .into());
         }
     };
-
-    let fresh = Credentials {
-        issued_at: Some(Timestamp::now()),
-        ..fresh
-    };
-    if let Err(e) = store::set(&key, &fresh) {
-        tracing::warn!("could not cache credentials: {e:#}");
-    }
     Ok(fresh)
+}
+/// Mints credentials for one command and does not cache them, so they can be
+/// revoked with [`revoke_token`] when the command ends. Only Cloudflare
+/// tokens can be revoked early.
+pub async fn one_off_credentials(
+    config: &Config,
+    profile: &Profile,
+    ttl: Option<jiff::SignedDuration>,
+) -> Result<Credentials> {
+    if !matches!(profile.target, Target::Cloudflare { .. }) {
+        return Err(anyhow::anyhow!(
+            "only Cloudflare tokens can be revoked when the command ends; {} expires on its own",
+            profile.id
+        )
+        .into());
+    }
+    let mut fresh = fetch(config, profile, ttl).await?;
+    fresh.issued_at = Some(Timestamp::now());
+    Ok(fresh)
+}
+
+/// Revokes one set of credentials from [`one_off_credentials`].
+pub async fn revoke_token(config: &Config, profile: &Profile, token_id: &str) -> Result<()> {
+    match (config.integration(&profile.integration)?, &profile.target) {
+        (Integration::Cloudflare(c), Target::Cloudflare { account_id, .. }) => {
+            cloudflare::revoke_token(&profile.integration, c, account_id, token_id).await
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Returns a URL that opens the provider's web console as this profile.

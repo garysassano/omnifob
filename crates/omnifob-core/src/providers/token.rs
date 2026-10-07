@@ -259,7 +259,7 @@ pub fn credentials(integration: &str, config: &TokenConfig) -> Result<Credential
     Ok(Credentials {
         env,
         expires_at: None,
-        issued_at: None,
+        ..Default::default()
     })
 }
 

@@ -150,7 +150,7 @@ pub enum CloudflareTokenType {
 
 /// A named set of permissions, written as they appear in the dashboard's API
 /// names (e.g. "Workers Scripts Write"), never as IDs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudflareTemplate {
     pub permissions: Vec<String>,
@@ -217,6 +217,55 @@ pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<St
     integrations.insert_formatted(&renamed, item);
     let text = doc.to_string();
     Config::parse(&text).context("the renamed config is not valid")?;
+    Ok(text)
+}
+
+/// Adds a template to a Cloudflare integration in the config text, keeping
+/// the rest of the file as it is. An existing template of that name is
+/// replaced only with `replace`.
+pub fn add_cloudflare_template(
+    text: &str,
+    integration: &str,
+    name: &str,
+    template: &CloudflareTemplate,
+    replace: bool,
+) -> anyhow::Result<String> {
+    if name.is_empty() || name.contains('/') {
+        bail!("template name '{name}' must be non-empty and contain no '/'");
+    }
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the config")?;
+    let table = doc
+        .get_mut("integrations")
+        .and_then(|i| i.get_mut(integration))
+        .and_then(|i| i.as_table_mut())
+        .with_context(|| format!("no integration named '{integration}'"))?;
+    if table.get("type").and_then(|t| t.as_str()) != Some("cloudflare") {
+        bail!("'{integration}' is not a cloudflare integration");
+    }
+    let templates = table
+        .entry("templates")
+        .or_insert_with(|| {
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            toml_edit::Item::Table(t)
+        })
+        .as_table_mut()
+        .context("`templates` must be a table")?;
+    if templates.contains_key(name) && !replace {
+        bail!("integration '{integration}' already has a template named '{name}'");
+    }
+    let mut new = toml_edit::Table::new();
+    new["permissions"] =
+        toml_edit::value(template.permissions.iter().collect::<toml_edit::Array>());
+    if !template.optional.is_empty() {
+        new["optional"] = toml_edit::value(template.optional.iter().collect::<toml_edit::Array>());
+    }
+    if let Some(ttl) = template.ttl {
+        new["ttl"] = toml_edit::value(format!("{ttl:#}"));
+    }
+    templates.insert(name, toml_edit::Item::Table(new));
+    let text = doc.to_string();
+    Config::parse(&text).context("the new template does not make a valid config")?;
     Ok(text)
 }
 
@@ -322,6 +371,42 @@ mod tests {
                 .contains("no integration")
         );
         assert!(rename_integration(text, "gary", "a/b").is_err());
+    }
+
+    #[test]
+    fn adds_cloudflare_templates() {
+        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare\"\n\n[integrations.gary]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
+        let template = CloudflareTemplate {
+            permissions: vec!["Pages Write".into(), "Zone Read".into()],
+            optional: vec![],
+            ttl: Some(SignedDuration::from_mins(90)),
+        };
+        let added = add_cloudflare_template(text, "cf", "pages", &template, false).unwrap();
+        assert!(
+            added.starts_with("# mine\n[integrations.cf] # work\n"),
+            "{added}"
+        );
+        let config = Config::parse(&added).unwrap();
+        let Integration::Cloudflare(cf) = config.integration("cf").unwrap() else {
+            panic!("not cloudflare");
+        };
+        assert_eq!(cf.templates["pages"], template);
+        let err = |r: anyhow::Result<String>| r.unwrap_err().to_string();
+        assert!(
+            err(add_cloudflare_template(
+                &added, "cf", "pages", &template, false
+            ))
+            .contains("already has")
+        );
+        assert!(add_cloudflare_template(&added, "cf", "pages", &template, true).is_ok());
+        assert!(
+            err(add_cloudflare_template(text, "gary", "x", &template, false))
+                .contains("not a cloudflare")
+        );
+        assert!(
+            err(add_cloudflare_template(text, "nope", "x", &template, false))
+                .contains("no integration")
+        );
     }
 
     #[test]

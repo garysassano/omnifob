@@ -94,3 +94,9 @@ The 15 tools marked "to study" in [tools/](tools/README.md), read for the specif
 - **gh**: several accounts per host with `gh auth switch`; `gh auth token` for other tools; acts as git's credential helper.
 - **Azure Developer CLI**: can hand sign-in to `az` (`auth.useAzCliAuth`) instead of duplicating it; supports letting official CLIs own sign-in for Azure and Google.
 - **kubelogin (int128)**: a kubectl exec plugin with a choice of token cache (disk, keyring or none); the model for an omnifob kubectl plugin.
+
+## Cloudflare token tools (2026-10-07)
+
+- **create-cf-token**: an interactive picker over the permission catalogue, grouped by service (the name without Read, Write or Edit), with Read or Write per service and live fuzzy filtering; write also adds read. When Cloudflare rejects a permission it parses the name from the error, leaves it out and retries, and it always leaves out token-management permissions, which child tokens cannot carry. It can revoke the token it just made before exiting. **Taken:** the service-grouped picker (`fob cf add-template`) and revoking a token as soon as it is no longer needed (`fob exec --revoke`).
+- **cftoken**: scoped tokens per zone, with requester IP ranges (`allow-cidrs`, required unless the config sets defaults), TTL and per-zone permission templates in one JSON config. **To take:** IP restrictions on minted tokens and zone-limited templates.
+- **terraform-cloudflare-r2-api-token**: tokens limited to named R2 buckets, read or write. **To take:** bucket-limited templates, and the S3 credentials R2 derives from a token (the token ID as access key, the SHA-256 of the token as secret).

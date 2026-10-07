@@ -18,6 +18,10 @@ pub struct Credentials {
     /// When omnifob obtained them; with `expires_at` this gives the lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_at: Option<Timestamp>,
+    /// The provider's ID for these credentials when they can be revoked
+    /// before they expire (a minted Cloudflare token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
 }
 
 impl Credentials {
@@ -52,6 +56,7 @@ mod tests {
             env: BTreeMap::new(),
             expires_at: Some(now + SignedDuration::from_mins(mins)),
             issued_at: None,
+            token_id: None,
         };
         assert!(creds(6).is_fresh(now));
         assert!(!creds(4).is_fresh(now));
@@ -60,6 +65,7 @@ mod tests {
                 env: BTreeMap::new(),
                 expires_at: None,
                 issued_at: None,
+                token_id: None,
             }
             .is_fresh(now)
         );
@@ -72,6 +78,7 @@ mod tests {
             env: BTreeMap::new(),
             issued_at: Some(issued),
             expires_at: Some(issued + SignedDuration::from_hours(1)),
+            token_id: None,
         };
         assert!(!creds.wants_renewal(issued + SignedDuration::from_mins(39)));
         assert!(creds.wants_renewal(issued + SignedDuration::from_mins(41)));
