@@ -1,0 +1,43 @@
+# Providers
+
+Every provider omnifob has worked on, and how it gets credentials for each. Update this table when a provider is added or its handling changes; [landscape.md](../landscape.md) has the research behind it.
+
+Three shapes cover them all:
+
+- **Session exchange**: sign in once, then exchange the session for short-lived credentials per account and role.
+- **Mint**: a stored bootstrap credential creates short-lived, narrowly scoped tokens on demand.
+- **Static**: the provider only has long-lived tokens; omnifob stores them in the keychain and hands them out under the variables the provider's tools read.
+
+## Supported
+
+| Provider                | Integration                       | Shape            | Sign-in                                                  | Credentials                                                                       | Check                      | Console                | Notes                                                            |
+| ----------------------- | --------------------------------- | ---------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------- | -------------------------- | ---------------------- | ---------------------------------------------------------------- |
+| AWS IAM Identity Center | `aws-sso`                         | Session exchange | OIDC device flow, refreshed silently                     | `GetRoleCredentials` per account and role; chained roles through STS `AssumeRole` | `GetCallerIdentity`        | Federation sign-in URL | [aws.md](aws.md)                                                 |
+| Cloudflare              | `cloudflare`                      | Mint             | Bootstrap token, account- or user-owned, pasted once     | Tokens minted from permission names, expiring, revoked on logout                  | Token verify endpoint      | Dashboard              | [cloudflare.md](cloudflare.md), [guide](../guides/cloudflare.md) |
+| Hetzner Cloud           | `token`, preset `hetzner`         | Static           | Paste the project token                                  | `HCLOUD_TOKEN`                                                                    | `GET /v1/locations`        | Cloud console          | One token per project                                            |
+| DigitalOcean            | `token`, preset `digitalocean`    | Static           | Paste a personal access token                            | `DIGITALOCEAN_ACCESS_TOKEN` (doctl), `DIGITALOCEAN_TOKEN` (Terraform)             | `GET /v2/account`          | Control panel          |                                                                  |
+| Vultr                   | `token`, preset `vultr`           | Static           | Paste the API key                                        | `VULTR_API_KEY`                                                                   | `GET /v2/account`          | Customer portal        |                                                                  |
+| Akamai Cloud (Linode)   | `token`, preset `linode`          | Static           | Paste a personal access token                            | `LINODE_TOKEN` (Terraform), `LINODE_CLI_TOKEN` (linode-cli)                       | `GET /v4/profile`          | Cloud Manager          |                                                                  |
+| Akamai CDN and security | `token`, preset `akamai-edgegrid` | Static           | Paste the EdgeGrid client token, secret and access token | `AKAMAI_CLIENT_TOKEN`, `AKAMAI_CLIENT_SECRET`, `AKAMAI_ACCESS_TOKEN`              | None (requests are signed) | Control Center         | Set `AKAMAI_HOST` under `vars`                                   |
+| Scaleway                | `token`, preset `scaleway`        | Static           | Paste the access and secret key                          | `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`                                                | None                       | Console                |                                                                  |
+| Upstash                 | `token`, preset `upstash`         | Static           | Paste the API key                                        | `UPSTASH_API_KEY`                                                                 | None                       | Console                | Set `UPSTASH_EMAIL` under `vars`                                 |
+| Vercel                  | `token`, preset `vercel`          | Static           | Paste an access token                                    | `VERCEL_TOKEN`                                                                    | `GET /v2/user`             | Dashboard              |                                                                  |
+| Netlify                 | `token`, preset `netlify`         | Static           | Paste a personal access token                            | `NETLIFY_AUTH_TOKEN`                                                              | `GET /api/v1/user`         | App                    |                                                                  |
+| Fly.io                  | `token`, preset `fly`             | Static           | Paste a token from `fly tokens create`                   | `FLY_API_TOKEN`                                                                   | None                       | Dashboard              |                                                                  |
+| Neon                    | `token`, preset `neon`            | Static           | Paste an API key                                         | `NEON_API_KEY`                                                                    | `GET /api/v2/users/me`     | Console                |                                                                  |
+| Supabase                | `token`, preset `supabase`        | Static           | Paste an access token                                    | `SUPABASE_ACCESS_TOKEN`                                                           | `GET /v1/projects`         | Dashboard              |                                                                  |
+| GitHub                  | `token`, preset `github`          | Static           | Paste a token                                            | `GH_TOKEN` (gh), `GITHUB_TOKEN`                                                   | `GET /user`                | github.com             |                                                                  |
+| Anything else           | `token`, `secrets` table          | Static           | Paste each named secret                                  | The variables configured                                                          | Optional `verify_url`      | Optional `console`     |                                                                  |
+
+## Studied, not supported yet
+
+| Provider                      | Official sign-in                                                        | Likely shape                                                           |
+| ----------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| AWS sign-in (IAM users, root) | `aws login`: OAuth PKCE with DPoP-bound tokens                          | Session exchange                                                       |
+| Google Cloud                  | `gcloud auth login`: OAuth installed-app flow                           | Session exchange (impersonated service account tokens)                 |
+| Azure                         | `az login`: MSAL, brokers, device code                                  | Session exchange (tokens per tenant and subscription)                  |
+| Oracle Cloud                  | `oci session authenticate`: browser login, key-bound session token      | Session exchange                                                       |
+| IBM Cloud                     | `ibmcloud login --sso`: one-time passcode from the browser              | Session exchange (IAM access tokens from API keys or trusted profiles) |
+| OVHcloud                      | `ovhcloud login`: application key, consumer key approved in the browser | Mint (consumer keys with access rules and a validity)                  |
+
+The landscape's summary table has the details for each.
