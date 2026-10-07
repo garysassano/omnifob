@@ -84,13 +84,11 @@ jobs:
       - name: Release notes
         env:
           TAG: ${{ github.ref_name }}
-        # The version's section of CHANGELOG.md, without its heading.
+        # The notes are the signed tag's message after its first line. Tags
+        # are created with --cleanup=verbatim so Markdown headings survive.
         run: |
-          awk -v v="${TAG#v}" '
-            $0 ~ "^## \\[" v "\\]" { found = 1; next }
-            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
-            found { print }
-          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          git fetch --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          git tag -l --format='%(contents:body)' "$TAG" | sed '/./,$!d' > notes.md
           cat notes.md
       - name: Publish
         env:
@@ -100,7 +98,7 @@ jobs:
           if [ -s notes.md ]; then
             notes=(--notes-file notes.md)
           else
-            echo "::warning::CHANGELOG.md has no section for $TAG; using generated notes"
+            echo "::warning::tag $TAG has no release notes in its message; using generated notes"
             notes=(--generate-notes)
           fi
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" "${notes[@]}" --verify-tag

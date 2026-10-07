@@ -49,3 +49,7 @@ A process cannot change its parent's environment, so `fob activate <shell>` prin
 ## 2026-10-06: Credential output formats for other tools
 
 `--format json` (generic), `fnox` (command lease contract), `credential-process` (AWS SDKs). This makes omnifob useful before every provider is native, and is the integration point with fnox.
+
+## 2026-10-07: Release notes in releases only
+
+The user does not want a CHANGELOG.md alongside release notes. Notes are written once, in the signed tag's message (`--cleanup=verbatim` keeps Markdown headings), and the release workflow copies them into the GitHub release. Generated notes are only a fallback: they list merged pull requests, and changes here have gone straight to main.

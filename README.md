@@ -12,7 +12,7 @@ It takes its ideas from tools that each solved part of the problem:
 
 ## Status
 
-Early. Changes are listed in [CHANGELOG.md](CHANGELOG.md). Working today:
+Early. What changed in each version is in the [release notes](https://github.com/garysassano/omnifob/releases). Working today:
 
 | Integration | Sign-in | Discovery | Credentials | Console |
 | --- | --- | --- | --- | --- |

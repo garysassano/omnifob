@@ -10,3 +10,4 @@ These files are the project's memory between sessions; update them as work happe
 - [roadmap.md](roadmap.md): milestones and the open work in each.
 - [providers/](providers/): one file per provider, with how its official CLI signs in and how omnifob maps onto it.
 - [log.md](log.md): dated log of sessions, including what was verified live.
+- [releasing.md](releasing.md): how to cut a release and where its notes come from.
