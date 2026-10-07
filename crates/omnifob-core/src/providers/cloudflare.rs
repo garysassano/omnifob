@@ -65,8 +65,6 @@ pub fn builtin_templates() -> BTreeMap<String, CloudflareTemplate> {
             t(
                 &[
                     "Account Settings Read",
-                    "User Details Read",
-                    "Memberships Read",
                     "Zone Read",
                     "Workers Scripts Write",
                     "Workers Routes Write",
@@ -83,6 +81,9 @@ pub fn builtin_templates() -> BTreeMap<String, CloudflareTemplate> {
                     "Pipelines Write",
                 ],
                 &[
+                    // User-level: only user-owned bootstraps offer these.
+                    "User Details Read",
+                    "Memberships Read",
                     "AI Gateway Write",
                     "AI Search Write",
                     "Agent Memory Write",

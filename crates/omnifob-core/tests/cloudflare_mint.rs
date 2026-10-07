@@ -20,6 +20,14 @@ fn ok(result: Value) -> ResponseTemplate {
 }
 
 fn config(token_type: &str, permissions: &str) -> CloudflareConfig {
+    config_with_optional(
+        token_type,
+        permissions,
+        r#""Browser Run Write", "Not Offered Here Write""#,
+    )
+}
+
+fn config_with_optional(token_type: &str, permissions: &str, optional: &str) -> CloudflareConfig {
     let text = format!(
         r#"
         [integrations.cf]
@@ -30,7 +38,7 @@ fn config(token_type: &str, permissions: &str) -> CloudflareConfig {
 
         [integrations.cf.templates.t]
         permissions = [{permissions}]
-        optional = ["Browser Run Write", "Not Offered Here Write"]
+        optional = [{optional}]
         ttl = "2h"
         "#
     );
@@ -43,6 +51,16 @@ fn config(token_type: &str, permissions: &str) -> CloudflareConfig {
         Integration::Cloudflare(c) => c,
         _ => unreachable!(),
     }
+}
+
+/// What the account-level endpoint returns: no user-level groups.
+fn account_permission_groups() -> Value {
+    let mut groups = permission_groups();
+    groups
+        .as_array_mut()
+        .unwrap()
+        .retain(|g| g["scopes"][0] != "com.cloudflare.api.user");
+    groups
 }
 
 fn permission_groups() -> Value {
@@ -256,7 +274,8 @@ async fn account_tokens_leave_out_user_permissions() {
     let base = format!("/accounts/{ACCOUNT}/tokens");
     Mock::given(method("GET"))
         .and(path(format!("{base}/permission_groups")))
-        .respond_with(ok(permission_groups()))
+        // Like the real API: the account endpoint offers no user-level groups.
+        .respond_with(ok(account_permission_groups()))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -271,12 +290,16 @@ async fn account_tokens_leave_out_user_permissions() {
         .mount(&server)
         .await;
 
-    // Like the built-in workers template: account permissions plus the
-    // user-level "User Details Read", which account tokens cannot carry.
+    // Like the built-in workers template: user-level permissions are optional,
+    // so an account-owned bootstrap simply goes without them.
     let client = Client::new(server.uri(), "bootstrap");
     mint(
         &client,
-        &config("account", r#""Workers Scripts Write", "User Details Read""#),
+        &config_with_optional(
+            "account",
+            r#""Workers Scripts Write""#,
+            r#""User Details Read", "Browser Run Write""#,
+        ),
         "p",
         ACCOUNT,
         "t",
