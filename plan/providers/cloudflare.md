@@ -51,3 +51,10 @@ From developers.cloudflare.com/fundamentals/oauth:
 - New tokens reach D1 about 3 s after creation and flap before settling; omnifob waits for three consecutive acceptances when the token includes a D1 permission. Workers, KV, Queues, R2, Vectorize, Hyperdrive and Workers AI accept new tokens immediately.
 - The `/user/tokens/verify` endpoint says "active" before D1 accepts the token, so it cannot be used to detect readiness.
 - A "Create Additional Tokens" bootstrap token can list permission groups (413 on 2026-10-06) and create, list and delete user tokens.
+
+## Bootstrap kinds (2026-10-07)
+
+- User-owned and account-owned bootstraps both stay first-class; the user's framing: like AWS, one identity for many accounts (user-owned) versus a role in one account (account-owned). No prompt to choose; the README documents both.
+- Account-owned: template URL pre-fills name, `account_api_tokens` edit and the account; tested in the browser on 2026-10-07 (the dashboard's buttons are "Review token" then "Create token"; the docs still say "Continue to summary"). Tokens are `cfat_`-prefixed. Product support: everything omnifob's `workers` template needs; not Turnstile, Registrar, Page Rules, Super Bot Fight Mode, Intel Data Platform, Zero Trust Client Platform.
+- The account token list has a "Created via" column ("Direct" for dashboard-made tokens); what it shows for API-minted tokens is still to be seen.
+- No OAuth route for third parties: none of the 392 OAuth scopes creates API tokens.
