@@ -45,6 +45,7 @@ const LEGACY_NAME_PREFIX: &str = "omnifob:";
 const SCOPE_ACCOUNT: &str = "com.cloudflare.api.account";
 const SCOPE_ZONE: &str = "com.cloudflare.api.account.zone";
 const SCOPE_USER: &str = "com.cloudflare.api.user";
+const SCOPE_R2_BUCKET: &str = "com.cloudflare.edge.r2.bucket";
 
 /// Templates available without configuration. A template in the config file
 /// with the same name replaces the built-in one.
@@ -52,7 +53,7 @@ pub fn builtin_templates() -> BTreeMap<String, CloudflareTemplate> {
     let t = |permissions: &[&str], optional: &[&str]| CloudflareTemplate {
         permissions: permissions.iter().map(|p| p.to_string()).collect(),
         optional: optional.iter().map(|p| p.to_string()).collect(),
-        ttl: None,
+        ..Default::default()
     };
     BTreeMap::from([
         // Everything `wrangler deploy` and the usual Worker bindings need: the
@@ -425,11 +426,12 @@ pub fn services(groups: &[PermissionGroup], token_type: CloudflareTokenType) -> 
 
 /// Builds token policies: one per resource kind the permissions apply to,
 /// each limited to the given account (and, for zone permissions, every zone
-/// in that account).
+/// in that account; for R2 bucket permissions, the listed buckets).
 pub fn build_policies(
     groups: &[&PermissionGroup],
     account_id: &str,
     user_tag: Option<&str>,
+    r2_buckets: &[String],
 ) -> anyhow::Result<Vec<Value>> {
     let mut by_scope: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for group in groups {
@@ -456,11 +458,142 @@ pub fn build_policies(
                     )?;
                     json!({ format!("{SCOPE_USER}.{tag}"): "*" })
                 }
-                other => bail!("permissions scoped to '{other}' are not supported yet"),
+                SCOPE_R2_BUCKET => {
+                    if r2_buckets.is_empty() {
+                        bail!(
+                            "{} apply to single R2 buckets; list them in the template's `r2_buckets`",
+                            names(&permission_groups)
+                        );
+                    }
+                    let buckets: serde_json::Map<String, Value> = r2_buckets
+                        .iter()
+                        .map(|b| {
+                            let (jurisdiction, name) = b.split_once('/').unwrap_or(("default", b));
+                            (format!("{SCOPE_R2_BUCKET}.{account_id}_{jurisdiction}_{name}"), json!("*"))
+                        })
+                        .collect();
+                    Value::Object(buckets)
+                }
+                other => bail!(
+                    "{} apply to '{other}', which omnifob cannot scope yet",
+                    names(&permission_groups)
+                ),
             };
             Ok(json!({ "effect": "allow", "resources": resources, "permission_groups": permission_groups }))
         })
         .collect()
+}
+
+fn names(permission_groups: &[Value]) -> String {
+    let names: Vec<&str> = permission_groups
+        .iter()
+        .filter_map(|g| g["name"].as_str())
+        .collect();
+    format!("'{}'", names.join("', '"))
+}
+
+/// Resolves the addresses a token may be used from to CIDR ranges.
+/// "current" is this machine's public IPv4 and IPv6 address, as Cloudflare
+/// sees them at `api_base`.
+pub async fn resolve_ips(ips: &[String], api_base: &str) -> anyhow::Result<Vec<String>> {
+    let mut resolved = Vec::new();
+    for ip in ips {
+        if ip == "current" {
+            let current = current_ips(api_base).await;
+            if current.is_empty() {
+                bail!("could not find this machine's public address for `ips = [\"current\"]`");
+            }
+            resolved.extend(current.iter().map(|ip| cidr(*ip)));
+            continue;
+        }
+        let (addr, prefix) = ip
+            .split_once('/')
+            .map_or((ip.as_str(), None), |(a, p)| (a, Some(p)));
+        let addr: std::net::IpAddr = addr
+            .parse()
+            .with_context(|| format!("'{ip}' is not an IP address or CIDR range"))?;
+        resolved.push(match prefix {
+            Some(prefix) => {
+                let max = if addr.is_ipv4() { 32 } else { 128 };
+                match prefix.parse::<u8>() {
+                    Ok(p) if p <= max => format!("{addr}/{p}"),
+                    _ => bail!("'{ip}' has an invalid prefix length"),
+                }
+            }
+            None => cidr(addr),
+        });
+    }
+    resolved.dedup();
+    Ok(resolved)
+}
+
+fn cidr(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) => format!("{ip}/32"),
+        std::net::IpAddr::V6(ip) => format!("{ip}/128"),
+    }
+}
+
+/// This machine's public addresses, one per IP version that works, from
+/// Cloudflare's trace endpoint. Tools may connect over either version, so
+/// both are allowed.
+async fn current_ips(api_base: &str) -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let trace = match api_base.find("/client/v4") {
+        Some(i) => format!("{}/cdn-cgi/trace", &api_base[..i]),
+        None => format!("{api_base}/cdn-cgi/trace"),
+    };
+    let lookup = |local: IpAddr| {
+        let trace = trace.clone();
+        async move {
+            let client = reqwest::Client::builder()
+                .local_address(local)
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .ok()?;
+            let text = client.get(&trace).send().await.ok()?.text().await.ok()?;
+            text.lines()
+                .find_map(|l| l.strip_prefix("ip="))
+                .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
+        }
+    };
+    let (v4, v6) = tokio::join!(
+        lookup(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        lookup(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+    );
+    v4.into_iter().chain(v6).collect()
+}
+
+/// The S3-compatible credentials R2 derives from an API token: the token ID
+/// is the access key, the SHA-256 of the token the secret.
+fn r2_s3_env(
+    account_id: &str,
+    token_id: &str,
+    token: &str,
+    r2_buckets: &[String],
+) -> BTreeMap<String, String> {
+    use sha2::Digest;
+    let secret: String = sha2::Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // Buckets in a jurisdiction have their own endpoint.
+    let jurisdictions: std::collections::BTreeSet<&str> = r2_buckets
+        .iter()
+        .map(|b| b.split_once('/').map_or("default", |(j, _)| j))
+        .collect();
+    let host = match jurisdictions.iter().next() {
+        Some(&j) if jurisdictions.len() == 1 && j != "default" => {
+            format!("{account_id}.{j}.r2.cloudflarestorage.com")
+        }
+        _ => format!("{account_id}.r2.cloudflarestorage.com"),
+    };
+    BTreeMap::from([
+        ("AWS_ACCESS_KEY_ID".to_string(), token_id.to_string()),
+        ("AWS_SECRET_ACCESS_KEY".to_string(), secret),
+        ("AWS_ENDPOINT_URL_S3".to_string(), format!("https://{host}")),
+        ("AWS_REGION".to_string(), "auto".to_string()),
+    ])
 }
 
 /// The user tag appears in the resources of the bootstrap token's own policy;
@@ -812,17 +945,21 @@ pub async fn mint(
     } else {
         None
     };
-    let policies = build_policies(&selected, account_id, user_tag)?;
+    let policies = build_policies(&selected, account_id, user_tag, &template.r2_buckets)?;
+    let ips = resolve_ips(template.ips.as_ref().unwrap_or(&config.ips), &client.base).await?;
     let uses_d1 = selected.iter().any(|g| g.name.starts_with("D1 "));
 
     let ttl = template.ttl.unwrap_or(config.ttl);
     let now = now.round(Unit::Second)?;
     let expires_at = now.checked_add(ttl)?;
-    let body = json!({
+    let mut body = json!({
         "name": format!("{TOKEN_NAME_PREFIX} {template_name}"),
         "policies": policies,
         "expires_on": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });
+    if !ips.is_empty() {
+        body["condition"] = json!({ "request_ip": { "in": ips } });
+    }
     let (created, _): (CreatedToken, _) = client
         .call(Method::POST, &tokens, &[], Some(&body))
         .await
@@ -844,10 +981,15 @@ pub async fn mint(
         tracing::warn!("could not clean up expired omnifob tokens: {e:#}");
     }
 
-    let env = BTreeMap::from([
-        ("CLOUDFLARE_API_TOKEN".to_string(), created.value),
-        ("CLOUDFLARE_ACCOUNT_ID".to_string(), account_id.to_string()),
-    ]);
+    let mut env = BTreeMap::new();
+    if template.s3 {
+        let id = token_id
+            .as_deref()
+            .context("Cloudflare returned no token ID, which the S3 credentials need")?;
+        env = r2_s3_env(account_id, id, &created.value, &template.r2_buckets);
+    }
+    env.insert("CLOUDFLARE_API_TOKEN".to_string(), created.value);
+    env.insert("CLOUDFLARE_ACCOUNT_ID".to_string(), account_id.to_string());
     Ok(Credentials {
         env,
         expires_at: Some(expires_at),
@@ -1076,7 +1218,7 @@ mod tests {
     fn policies_group_by_scope_and_limit_to_account() {
         let groups = groups();
         let selected: Vec<_> = groups.iter().collect();
-        let policies = build_policies(&selected, "acct", Some("tag")).unwrap();
+        let policies = build_policies(&selected, "acct", Some("tag"), &[]).unwrap();
         assert_eq!(policies.len(), 3);
         let resources: Vec<_> = policies.iter().map(|p| p["resources"].clone()).collect();
         assert!(resources.contains(&json!({ "com.cloudflare.api.account.acct": "*" })));
@@ -1095,7 +1237,7 @@ mod tests {
     fn user_permissions_need_a_user_tag() {
         let groups = groups();
         let user: Vec<_> = groups.iter().filter(|g| g.id == "u").collect();
-        assert!(build_policies(&user, "acct", None).is_err());
+        assert!(build_policies(&user, "acct", None, &[]).is_err());
     }
 
     #[test]
@@ -1133,6 +1275,71 @@ mod tests {
         assert_eq!(
             bootstrap_url(&config),
             "https://dash.cloudflare.com/profile/api-tokens"
+        );
+    }
+
+    #[test]
+    fn bucket_permissions_need_and_use_buckets() {
+        let groups = [group(
+            "b",
+            "Workers R2 Storage Bucket Item Write",
+            SCOPE_R2_BUCKET,
+        )];
+        let selected: Vec<&PermissionGroup> = groups.iter().collect();
+        let err = build_policies(&selected, "acct", None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("r2_buckets"), "{err}");
+        let policies = build_policies(
+            &selected,
+            "acct",
+            None,
+            &["logs".into(), "eu/backups".into()],
+        )
+        .unwrap();
+        let resources = policies[0]["resources"].as_object().unwrap();
+        let keys: Vec<&str> = resources.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "com.cloudflare.edge.r2.bucket.acct_default_logs",
+                "com.cloudflare.edge.r2.bucket.acct_eu_backups"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ips_become_cidr_ranges() {
+        let ips = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_ips(
+                &ips(&["203.0.113.7", "198.51.100.0/24", "2001:db8::1"]),
+                API_BASE
+            )
+            .await
+            .unwrap(),
+            ["203.0.113.7/32", "198.51.100.0/24", "2001:db8::1/128"]
+        );
+        assert!(resolve_ips(&ips(&["10.0.0.0/33"]), API_BASE).await.is_err());
+        assert!(resolve_ips(&ips(&["example.com"]), API_BASE).await.is_err());
+    }
+
+    #[test]
+    fn r2_s3_credentials_derive_from_the_token() {
+        let env = r2_s3_env("acct", "token-id", "abc", &[]);
+        assert_eq!(env["AWS_ACCESS_KEY_ID"], "token-id");
+        assert_eq!(
+            env["AWS_SECRET_ACCESS_KEY"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            env["AWS_ENDPOINT_URL_S3"],
+            "https://acct.r2.cloudflarestorage.com"
+        );
+        let eu = r2_s3_env("acct", "id", "abc", &["eu/a".into(), "eu/b".into()]);
+        assert_eq!(
+            eu["AWS_ENDPOINT_URL_S3"],
+            "https://acct.eu.r2.cloudflarestorage.com"
         );
     }
 

@@ -61,6 +61,7 @@ account_id = "0123456789abcdef0123456789abcdef"  # required for token_type = "ac
 account_name = "personal"
 token_type = "account"   # bootstrap owned by the account; "user" (default) for a user-owned one
 ttl = "1h"               # lifetime of minted tokens
+ips = ["current"]        # optional: tokens only work from this machine's public addresses
 
 # Templates name permissions as the dashboard does; never IDs.
 # `fob cf add-template` writes them for you.

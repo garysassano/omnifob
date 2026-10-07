@@ -964,6 +964,16 @@ impl App {
                     if !template.optional.is_empty() {
                         println!("  when available: {}", template.optional.join(", "));
                     }
+                    if !template.r2_buckets.is_empty() {
+                        println!("  R2 buckets: {}", template.r2_buckets.join(", "));
+                    }
+                    if template.s3 {
+                        println!("  with R2 S3 credentials");
+                    }
+                    let ips = template.ips.as_ref().unwrap_or(&config.ips);
+                    if !ips.is_empty() {
+                        println!("  usable from: {}", ips.join(", "));
+                    }
                 }
             }
             CloudflareCommand::AddTemplate { .. } => unreachable!("handled in run"),
@@ -1022,8 +1032,8 @@ impl App {
 
         let template = omnifob_core::config::CloudflareTemplate {
             permissions,
-            optional: Vec::new(),
             ttl,
+            ..Default::default()
         };
         let path = paths::config_file();
         let text = std::fs::read_to_string(&path)

@@ -625,3 +625,85 @@ async fn revoke_deletes_only_this_profiles_tokens() {
     assert!(!catalog.minted.contains_key("cf/acct/workers"));
     assert_eq!(catalog.minted["cf/other/workers"], ["n2"]);
 }
+
+#[tokio::test]
+async fn narrow_tokens_carry_ip_conditions_buckets_and_s3_credentials() {
+    let server = MockServer::start().await;
+    let base = format!("/accounts/{ACCOUNT}/tokens");
+    Mock::given(method("GET"))
+        .and(path("/cdn-cgi/trace"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("fl=1\nip=203.0.113.9\nts=1\n"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{base}/permission_groups")))
+        .respond_with(ok(json!([
+            { "id": "g-item", "name": "Workers R2 Storage Bucket Item Write", "scopes": ["com.cloudflare.edge.r2.bucket"] }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!({ "id": "tok-id", "value": "abc" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!([])))
+        .mount(&server)
+        .await;
+
+    let text = format!(
+        r#"
+        [integrations.cf]
+        type = "cloudflare"
+        account_id = "{ACCOUNT}"
+        token_type = "account"
+        ips = ["198.51.100.0/24"]
+
+        [integrations.cf.templates.backup]
+        permissions = ["Workers R2 Storage Bucket Item Edit"]
+        r2_buckets = ["logs"]
+        s3 = true
+        ips = ["current", "2001:db8::/32"]
+        "#
+    );
+    let Integration::Cloudflare(config) = Config::parse(&text)
+        .unwrap()
+        .integrations
+        .remove("cf")
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let client = Client::new(server.uri(), "bootstrap");
+    let creds = mint(
+        &client,
+        &config,
+        "cf/a/backup",
+        ACCOUNT,
+        "backup",
+        now(),
+        &mut Catalog::default(),
+    )
+    .await
+    .unwrap();
+
+    let body = posted_body(&server.received_requests().await.unwrap(), &base);
+    assert_eq!(
+        body["condition"],
+        json!({ "request_ip": { "in": ["203.0.113.9/32", "2001:db8::/32"] } }),
+        "the template's ips replace the integration's, and current is resolved"
+    );
+    assert_eq!(
+        body["policies"][0]["resources"],
+        json!({ format!("com.cloudflare.edge.r2.bucket.{ACCOUNT}_default_logs"): "*" })
+    );
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "tok-id");
+    assert_eq!(
+        creds.env["AWS_SECRET_ACCESS_KEY"],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(creds.env["CLOUDFLARE_API_TOKEN"], "abc");
+}
