@@ -68,6 +68,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -78,8 +81,26 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
+      - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        # The version's section of CHANGELOG.md, without its heading.
+        run: |
+          awk -v v="${TAG#v}" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          cat notes.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+        run: |
+          if [ -s notes.md ]; then
+            notes=(--notes-file notes.md)
+          else
+            echo "::warning::CHANGELOG.md has no section for $TAG; using generated notes"
+            notes=(--generate-notes)
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" "${notes[@]}" --verify-tag

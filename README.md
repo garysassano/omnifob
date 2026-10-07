@@ -12,7 +12,7 @@ It takes its ideas from tools that each solved part of the problem:
 
 ## Status
 
-Early. Working today:
+Early. Changes are listed in [CHANGELOG.md](CHANGELOG.md). Working today:
 
 | Integration | Sign-in | Discovery | Credentials | Console |
 | --- | --- | --- | --- | --- |
