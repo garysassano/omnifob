@@ -1,6 +1,7 @@
 # Tools in omnifob's space, for studying what to borrow and what to avoid.
 #
-# Each entry: repo (GitHub owner/name), category, scope (clouds or IdPs),
+# Each entry: repo (GitHub owner/name; for moved or forked projects, only
+# the current, maintained repository), category, scope (clouds or IdPs),
 # why (what makes it worth a look), status, and optionally look_at (what to
 # read when studying it) and notes. Live data (stars, last push, archived) is
 # not stored here; run plan/tools/refresh.sh for it.
@@ -28,15 +29,6 @@ status = "studied"
 
 [[tool]]
 name = "aws-vault"
-repo = "99designs/aws-vault"
-category = "credential-manager"
-scope = ["aws"]
-why = "the original keychain-backed AWS credential vault"
-status = "reference"
-notes = "Maintained fork: ByteNess/aws-vault."
-
-[[tool]]
-name = "aws-vault (ByteNess fork)"
 repo = "ByteNess/aws-vault"
 category = "credential-manager"
 scope = ["aws"]
@@ -77,7 +69,6 @@ scope = ["aws"]
 why = "Ben Kehoe's Identity Center helpers: config population, role listing, login"
 status = "to-study"
 look_at = "how it names generated profiles for large organisations; its credential_process"
-notes = "Moved from benkehoe/aws-sso-util."
 
 [[tool]]
 name = "yawsso"
