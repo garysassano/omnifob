@@ -62,6 +62,35 @@ Shallow clones were read in the session scratchpad; re-clone to look again.
 
 See [providers/cloudflare.md](providers/cloudflare.md).
 
-## Google Cloud, Azure
+## Google Cloud, Azure and other providers
 
-Not studied yet. Plan: read the `gcloud` SDK source (installed by mise) for `auth login`, application default credentials and `--impersonate-service-account`; read azure-cli and MSAL for `az login` and subscriptions.
+Studied on 2026-10-06 with about twenty other provider CLIs; see [landscape.md](landscape.md).
+
+## Second round (2026-10-07)
+
+The 15 tools marked "to study" in [tools/](tools/README.md), read for the specific points listed there, plus a second look at aws-sso-cli.
+
+### AWS Identity Center tools
+
+- **aws-sso-util** (`61418/aws-sso-util`): `run-as --account-id ... --role-name ...` runs a command without knowing any profile name; account IDs are stable and can be shared with colleagues, account names cannot. `check` diagnoses the Identity Center configuration and whether you can reach an account and role, with a quiet mode for scripts. Generated profile names are built from configurable components; whitespace in account names becomes `-` because SDKs parse such names inconsistently (omnifob's slugs already avoid that).
+- **aws-sso-cli** (second look): a *History* of recently used roles (`HistoryLimit`, `HistoryMinutes`) shown first in the picker; per-account and per-role tags; console URLs can be opened, printed, copied, sent with OSC 52 (copies to the local clipboard over SSH), or opened in a **Firefox container** per role (granted's extension or "Open URL in Container"), so several accounts' consoles stay signed in side by side, colour-coded.
+- **aws-cli-auth**: deliberately does not store the Identity Center refresh token and is meant for `credential_process`; less risk if the machine is compromised, at the cost of more sign-ins.
+- **aws-sso-creds**: a terminal UI that generates profiles into `~/.aws/config` and browses them with a fuzzy finder; nothing omnifob lacks.
+- **yawsso**: copies an Identity Center session into `~/.aws/credentials` for tools that predate SSO and `credential_process`.
+- **aws-mfa**: the reference for MFA sessions from long-term IAM keys (GetSessionToken with a TOTP code); relevant to chained roles with `mfa_serial`, which `fob import aws` skips today.
+
+### Federation through an identity provider
+
+- **saml2aws**: about 20 identity providers (Okta, Entra ID, ADFS, Keycloak, Ping, Shibboleth...), including a generic *browser* provider that captures the SAML response from a real browser. Many organisations sign in to AWS through SAML without Identity Center; omnifob cannot serve them yet.
+- **okta-aws-cli**: Okta's own tool pairs an Okta OIDC native app with the AWS federation app, signs in with the **device flow** (it can also print a **QR code** to finish on a phone), then calls `AssumeRoleWithSAML`; with the `okta.users.read.self` grant it discovers which AWS environments the user is assigned. A native Okta integration is feasible, but needs an Okta admin to set up the apps.
+- **gimme-aws-creds**: also recommends Okta's device flow, and reuses the same SAML sign-in for **Alibaba Cloud** RAM credentials: one sign-in, two clouds.
+- **aws-azure-login**: drives a hidden Chrome (Puppeteer) through Entra ID's login. Brittle and heavy; a pattern to avoid.
+- **clisso**: providers for Okta and OneLogin behind one CLI, with YubiKey support; a small version of the same idea.
+
+### Extensibility and multi-tool patterns
+
+- **awsume**: a plugin system (pluggy hooks) for collecting profiles and fetching credentials. A lighter equivalent for omnifob: a `command` integration, where any program that prints credentials as JSON becomes a profile, covering saml2aws, gimme-aws-creds and in-house scripts without in-process plugins.
+- **secretenv**: a "three-file model": the repository commits only alias names, and each machine maps aliases to real backends. For omnifob this solves naming a profile from a project, since profile ids contain each person's own integration names.
+- **gh**: several accounts per host with `gh auth switch`; `gh auth token` for other tools; acts as git's credential helper.
+- **Azure Developer CLI**: can hand sign-in to `az` (`auth.useAzCliAuth`) instead of duplicating it; supports letting official CLIs own sign-in for Azure and Google.
+- **kubelogin (int128)**: a kubectl exec plugin with a choice of token cache (disk, keyring or none); the model for an omnifob kubectl plugin.
