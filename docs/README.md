@@ -9,7 +9,6 @@
 - [Vision](vision.md): what omnifob is, who it is for, and what it deliberately is not.
 - [Decisions](decisions.md): design decisions with their reasons, newest last.
 - [Providers](providers/README.md): every provider omnifob has worked on and how it gets credentials for each, with detailed notes for [AWS](providers/aws.md) and [Cloudflare](providers/cloudflare.md).
-- [Releasing](releasing.md): how a release is cut and where its notes come from.
 
 ## Research
 
