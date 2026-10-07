@@ -70,6 +70,8 @@ permissions = ["Pages Write", "Account Settings Read"]
 ttl = "30m"
 ```
 
+If you know IAM Identity Center through granted, the Cloudflare integration works the same way: the bootstrap token plays the part of the sign-in, templates the part of permission sets, and each `account × template` profile the part of an `account × role`; `fob exec` mints a short-lived token the way granted fetches role credentials. Unlike permission sets, templates live in your config, not in Cloudflare, and the bootstrap token can mint any permission, so treat it like an administrator credential.
+
 Creating the Cloudflare bootstrap token, account-owned or user-owned, is explained in [docs/guides/cloudflare.md](docs/guides/cloudflare.md).
 
 Providers that only have long-lived tokens use `type = "token"`, usually with a preset:
@@ -110,7 +112,7 @@ fob check prod admin      # do this profile's credentials work, and what do they
 fob rename acme work      # rename an integration; keeps its sign-in and profiles
 ```
 
-Profiles are `<integration>/<account>/<role or template>`. Any words that together match one profile select it (`prod admin`), and so does an account ID (`fob exec 123456789012 admin -- ...`); with no match or several, `fob` shows a fuzzy picker that lists recently used profiles first.
+Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first.
 
 ### In the current shell
 
