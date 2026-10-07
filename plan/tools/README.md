@@ -25,6 +25,13 @@ Local sign-in, session and profile managers for people. The closest relatives of
 | [aws-mfa](https://github.com/broamski/aws-mfa) | aws | MFA session tokens for IAM users; relevant to MFA on chained roles | studied | MFA prompt and caching, for chained roles with mfa_serial |
 | [awsp](https://github.com/antonbabenko/awsp) | aws | Minimal shell profile switcher. Inactive since 2022 | reference |  |
 | [aws-profile-manager](https://github.com/99stealth/aws-profile-manager) | aws | Interactive manager for ~/.aws/credentials profiles. Inactive since 2023 | reference |  |
+| [Rolle](https://github.com/nateships/rolle) | aws, azure, gcp | The closest project to omnifob: desktop app and CLI; Identity Center with chaining, IAM users with MFA, `aws login`; Azure subscriptions and Google Cloud projects as sessions; imports from the AWS CLI, granted, az, gcloud and Leapp. GPL-3.0, so ideas only | **to study** | Session model (start/stop, a default profile), agent rules and exit codes, mise and Kubernetes integrations, Azure and GCP providers |
+| [mairu](https://github.com/sorah/mairu) | aws | In-memory credential agent for Identity Center, like ssh-agent; nothing cached on disk | **to study** | The agent process design, and what in-memory-only means for renewal and several terminals |
+| [awsesh](https://github.com/elva-labs/awsesh) | aws | Session and credential manager with an SDK | **to study** | What its SDK exposes to other programs |
+| [ctx](https://github.com/vlebo/ctx) | aws, gcp, azure, kubernetes, vpn, ssh | One switcher for cloud, Kubernetes, VPN, SSH tunnel and secret-manager contexts | **to study** | How it bundles several kinds of context into one switch |
+| [aws-sso-creds (jaxxstorm)](https://github.com/jaxxstorm/aws-sso-creds) | aws | Temporary credentials from an SSO profile | reference | |
+| [go-aws-sso](https://github.com/theurichde/go-aws-sso) | aws | Interactive Identity Center login and role selection | reference | |
+| [awsd](https://github.com/radiusmethod/awsd) | aws | AWS profile switcher | reference | |
 
 ## IdP federation
 
@@ -63,6 +70,10 @@ Official CLIs, studied for how they sign in and store credentials. Findings in [
 | [supabase](https://github.com/supabase/cli) | supabase | Browser login with an ECDH-encrypted handoff | studied |  |
 | [upstash](https://github.com/upstash/cli) | upstash | Email plus management API key | studied |  |
 | [gh](https://github.com/cli/cli) | github | Device flow, keyring storage, several accounts with gh auth switch | studied | Multi-account switching and how gh auth token is exposed to other tools |
+| [create-cf-token](https://github.com/mynameistito/create-cf-token) | cloudflare | Interactive, guided creation of Cloudflare user API tokens | **to study** | How it presents the permission catalogue, compared with omnifob templates |
+| [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager) | github, azure-repos, bitbucket | Credential helper with OS stores, including WSL bridged to Windows | reference | |
+| [amazon-ecr-credential-helper](https://github.com/awslabs/amazon-ecr-credential-helper) | aws | Docker credential helper; the model for handing credentials to Docker | reference | |
+| [rolesanywhere-credential-helper](https://github.com/aws/rolesanywhere-credential-helper) | aws | AWS credentials from an X.509 certificate (IAM Roles Anywhere) | reference | |
 
 ## Secret managers and brokers
 
@@ -101,3 +112,24 @@ Server-side access tooling.
 | Tool | Covers | Why it matters | Status | What to look at |
 | --- | --- | --- | --- | --- |
 | [Geodesic](https://github.com/cloudposse/geodesic) | aws | DevOps toolbox container with credential helpers | reference |  |
+
+## Agents
+
+Credentials for AI agents: brokers and proxies that keep secrets away from the agent itself.
+
+| Tool | Covers | Why it matters | Status | What to look at |
+| --- | --- | --- | --- | --- |
+| [Agent Vault](https://github.com/Infisical/agent-vault) | many | HTTP credential proxy and vault for agents such as Claude Code; the agent never holds the secret | **to study** | The proxy model versus omnifob's environment variables and credential_process |
+| [Kontext](https://github.com/kontext-security/kontext) | many | Runtime credentials and permission mapping for AI agents | **to study** | How it scopes and records what an agent was given |
+| [HOL Guard](https://github.com/hashgraph-online/hol-guard) | many | Guard for AI agents that blocks risky tools and access to secrets | reference | |
+| [sandbox-shell](https://github.com/agentic-dev3o/sandbox-shell) | aws, ssh, gpg | macOS Seatbelt sandbox that hides SSH, AWS and GPG credentials from untrusted processes | reference | |
+
+## Browser and console
+
+Several cloud consoles at once, and telling them apart.
+
+| Tool | Covers | Why it matters | Status | What to look at |
+| --- | --- | --- | --- | --- |
+| [AWS SSO Containers](https://github.com/pyro2927/AWS_SSO_Containers) | aws | Firefox extension that opens each Identity Center sign-in in its own container | **to study** | The URL format, for `fob console` containers |
+| [aws-sso-extender](https://github.com/WTFender/aws-sso-extender) | aws | Browser extension for the Identity Center portal | reference | |
+| [AWS Peacock](https://github.com/xhiroga/aws-peacock-management-console) | aws | Browser extension that colours the AWS console by account | reference | |

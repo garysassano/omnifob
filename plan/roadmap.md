@@ -43,7 +43,7 @@ Ordered by value for daily use against effort; reasons in [research.md](research
 
 - [x] Find profiles by AWS account ID too (`fob exec 123456789012 admin -- ...`), after aws-sso-util's `run-as`. Small.
 - [x] Order the picker by recent use, after aws-sso-cli's History; matters with hundreds of profiles. Small.
-- [ ] `fob console`: `--copy`, OSC 52 for SSH sessions, and Firefox containers so several accounts' consoles stay open side by side, after aws-sso-cli. Medium.
+- [ ] `fob console`: Firefox containers so several accounts' consoles stay open side by side, plus `--copy` and OSC 52 for SSH sessions, after aws-sso-cli and granted. Medium. **Raised in priority**: in r/aws threads (2024 to 2026) containers are the feature people value most in granted ("the only thing that makes this usable" with dozens of accounts).
 - [x] `fob check [profile]`: diagnose sign-in and access, with a quiet mode for scripts, after aws-sso-util. Small.
 - [ ] A `command` integration: any program that prints credentials as JSON becomes a profile; covers saml2aws, gimme-aws-creds and scripts, instead of awsume-style plugins. Medium.
 - [ ] Per-directory profiles through aliases: the repository names an alias, each machine maps it to a profile (secretenv's model; wrangler's directory bindings). Medium.
@@ -52,6 +52,10 @@ Ordered by value for daily use against effort; reasons in [research.md](research
 - [ ] Okta integration: device flow, then `AssumeRoleWithSAML` for AWS and Alibaba Cloud, after okta-aws-cli and gimme-aws-creds; needs an Okta admin to set up the apps. Large.
 - [ ] Opt-in `store_refresh_token = false`, after aws-cli-auth. Small, niche.
 - [ ] Export to `~/.aws/credentials` for tools that predate SSO, after yawsso. Small, niche.
+- [ ] Stable exit codes on every command (for example 3 when a sign-in is needed, 4 for an unknown profile) and `--json` for `status`, `check` and `list`, after Rolle; documents how agents and scripts should call fob.
+- [ ] Agent guidance: give agents a profile name (`AWS_PROFILE` with `credential_process`) rather than keys in their environment, after Rolle; compare with credential proxies such as Infisical's Agent Vault.
+- [ ] Documented mise recipes: `[env]` with `exec()` templates and `redactions` so tokens stay out of `mise env`, and an `enter` hook per directory, after Rolle.
+- [ ] `fob kube`: list the EKS, AKS or GKE clusters a profile can reach and write kubeconfig contexts whose exec plugin asks fob for a token, after Rolle and kubelogin.
 - Not planned: headless-browser sign-in scraping (aws-azure-login), in-process plugins (awsume), tags (aws-sso-cli).
 
 ## v0.3: More clouds
