@@ -132,6 +132,11 @@ pub struct CloudflareConfig {
     /// Extra templates, added to (or replacing) the built-in ones.
     #[serde(default)]
     pub templates: BTreeMap<String, CloudflareTemplate>,
+    /// Addresses minted tokens may be used from, unless a template sets its
+    /// own: IPs or CIDR ranges, or "current" for this machine's public
+    /// addresses at minting time. Empty means anywhere.
+    #[serde(default)]
+    pub ips: Vec<String>,
 }
 
 fn default_cloudflare_ttl() -> SignedDuration {
@@ -150,7 +155,7 @@ pub enum CloudflareTokenType {
 
 /// A named set of permissions, written as they appear in the dashboard's API
 /// names (e.g. "Workers Scripts Write"), never as IDs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudflareTemplate {
     pub permissions: Vec<String>,
@@ -160,6 +165,17 @@ pub struct CloudflareTemplate {
     pub optional: Vec<String>,
     #[serde(default, with = "opt_duration")]
     pub ttl: Option<SignedDuration>,
+    /// R2 buckets that bucket-level permissions ("Workers R2 Storage Bucket
+    /// Item Write") apply to; "eu/name" for a bucket in a jurisdiction.
+    #[serde(default)]
+    pub r2_buckets: Vec<String>,
+    /// Also hand out the S3-compatible credentials R2 derives from the token
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`).
+    #[serde(default)]
+    pub s3: bool,
+    /// Overrides the integration's `ips` for this template.
+    #[serde(default)]
+    pub ips: Option<Vec<String>>,
 }
 
 impl Config {
@@ -262,6 +278,16 @@ pub fn add_cloudflare_template(
     }
     if let Some(ttl) = template.ttl {
         new["ttl"] = toml_edit::value(format!("{ttl:#}"));
+    }
+    if !template.r2_buckets.is_empty() {
+        new["r2_buckets"] =
+            toml_edit::value(template.r2_buckets.iter().collect::<toml_edit::Array>());
+    }
+    if template.s3 {
+        new["s3"] = toml_edit::value(true);
+    }
+    if let Some(ips) = &template.ips {
+        new["ips"] = toml_edit::value(ips.iter().collect::<toml_edit::Array>());
     }
     templates.insert(name, toml_edit::Item::Table(new));
     let text = doc.to_string();
@@ -380,6 +406,7 @@ mod tests {
             permissions: vec!["Pages Write".into(), "Zone Read".into()],
             optional: vec![],
             ttl: Some(SignedDuration::from_mins(90)),
+            ..Default::default()
         };
         let added = add_cloudflare_template(text, "cf", "pages", &template, false).unwrap();
         assert!(

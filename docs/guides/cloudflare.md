@@ -38,6 +38,26 @@ fob cf add-template cf pages -p "Pages Edit" -p "Account Settings Read" --ttl 30
 
 `--replace` overwrites a template of the same name. A template named like a built-in one replaces it for that integration.
 
+## Narrower tokens
+
+Three template settings narrow what a minted token can do beyond its permissions:
+
+```toml
+[integrations.cf]
+type = "cloudflare"
+ips = ["current"]                  # every template: usable only from here
+
+[integrations.cf.templates.backups]
+permissions = ["Workers R2 Storage Bucket Item Edit"]
+r2_buckets = ["backups", "eu/archive"]   # only these buckets; "eu/" for a jurisdiction
+s3 = true                                # also hand out R2's S3 credentials
+ips = ["203.0.113.0/24"]                 # replaces the integration's ips
+```
+
+- `ips` limits where the token can be used from: IP addresses, CIDR ranges, or `"current"` for this machine's public IPv4 and IPv6 addresses when the token is minted. Cloudflare rejects the token anywhere else ("Cannot use the access token from location"). A cached token stops working if your address changes; `fob exec --no-cache` or `fob revoke` gets a new one.
+- `r2_buckets` lists the buckets that bucket-level permissions ("Workers R2 Storage Bucket Item Read" or "Edit") apply to. Account-level R2 permissions ("Workers R2 Storage Write") still cover every bucket.
+- `s3 = true` adds the S3-compatible credentials R2 derives from the token, so S3 tools work without creating R2 API keys in the dashboard: `AWS_ACCESS_KEY_ID` (the token ID), `AWS_SECRET_ACCESS_KEY` (the SHA-256 of the token), `AWS_ENDPOINT_URL_S3` and `AWS_REGION=auto`. For example `fob exec cf backups -- aws s3 ls s3://backups`. These variables replace AWS credentials in that shell, so prefer `fob exec` over `fob use` for such templates.
+
 ## Tokens for one command
 
 `fob exec <profile> --revoke -- <command>` mints a token for that command alone, outside the cache, and deletes it as soon as the command ends, including after Ctrl-C or when the terminal closes. Use it to hand a token to an agent or a script without leaving it valid for the rest of its lifetime. Tokens that cannot be deleted then (the network is down, say) still expire, and `fob revoke <profile>` deletes them later.
