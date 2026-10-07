@@ -35,7 +35,23 @@ pub enum Target {
     /// integration's `chained` table under `label`.
     AwsChained {
         label: String,
+        /// The account of the assumed role, for searching by account ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     },
+}
+
+impl Target {
+    /// The provider account this profile acts in, when it has one.
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            Target::Aws { account_id, .. } | Target::Cloudflare { account_id, .. } => {
+                Some(account_id)
+            }
+            Target::AwsChained { account_id, .. } => account_id.as_deref(),
+            Target::Token {} => None,
+        }
+    }
 }
 
 impl Profile {
@@ -121,11 +137,12 @@ impl ProfileCache {
     }
 
     /// Finds profiles matching `query`: an exact id wins; otherwise every
-    /// profile whose id contains all whitespace- or `/`-separated words of the
-    /// query, case-insensitively. When some profiles match better, only those
-    /// are returned: a word equal to a whole id segment beats one starting a
-    /// segment, which beats one found anywhere. So `acme/test` picks
-    /// `acme/test/...` over `acme2/test/...`.
+    /// profile whose id, or account ID, contains all whitespace- or
+    /// `/`-separated words of the query, case-insensitively. When some
+    /// profiles match better, only those are returned: a word equal to a
+    /// whole id segment or the account ID beats one starting a segment, which
+    /// beats one found anywhere. So `acme/test` picks `acme/test/...` over
+    /// `acme2/test/...`, and `123456789012 admin` finds that account's admin role.
     pub fn find(&self, query: &str) -> Vec<&Profile> {
         if let Some(exact) = self.all().find(|p| p.id == query) {
             return vec![exact];
@@ -137,7 +154,7 @@ impl ProfileCache {
             .collect();
         let scored: Vec<(u8, &Profile)> = self
             .all()
-            .filter_map(|p| match_quality(&p.id, &words).map(|q| (q, p)))
+            .filter_map(|p| match_quality(p, &words).map(|q| (q, p)))
             .collect();
         let best = scored.iter().map(|(q, _)| *q).min();
         scored
@@ -148,12 +165,17 @@ impl ProfileCache {
     }
 }
 
-/// How well `words` match `id`: 0 when every word is a whole segment, 1 when
-/// every word at least starts a segment, 2 when every word appears somewhere,
-/// `None` when some word does not appear.
-fn match_quality(id: &str, words: &[String]) -> Option<u8> {
-    let id = id.to_lowercase();
-    let segments: Vec<&str> = id.split('/').collect();
+/// How well `words` match a profile: 0 when every word is a whole id
+/// segment (or the account ID), 1 when every word at least starts one, 2 when
+/// every word appears somewhere, `None` when some word does not appear.
+fn match_quality(profile: &Profile, words: &[String]) -> Option<u8> {
+    let mut id = profile.id.to_lowercase();
+    let mut segments: Vec<String> = id.split('/').map(str::to_string).collect();
+    if let Some(account) = profile.target.account_id() {
+        segments.push(account.to_string());
+        id.push('/');
+        id.push_str(account);
+    }
     words
         .iter()
         .map(|w| {
@@ -217,6 +239,59 @@ mod tests {
         );
         assert_eq!(cache.find("admin").len(), 2);
         assert!(cache.find("dev").is_empty());
+    }
+
+    #[test]
+    fn find_by_account_id() {
+        let role = |account: &str, id: &str, role: &str| {
+            Profile::new(
+                "acme",
+                account,
+                role,
+                Target::Aws {
+                    account_id: id.into(),
+                    account_name: account.into(),
+                    role_name: role.into(),
+                },
+            )
+        };
+        let mut cache = ProfileCache::default();
+        cache.integrations.insert(
+            "acme".into(),
+            SyncedProfiles {
+                synced_at: Timestamp::UNIX_EPOCH,
+                profiles: vec![
+                    role("prod", "111122223333", "Admin"),
+                    role("prod", "111122223333", "ReadOnly"),
+                    role("dev", "444455556666", "Admin"),
+                    Profile::new(
+                        "acme",
+                        "deploy",
+                        "Deploy",
+                        Target::AwsChained {
+                            label: "deploy".into(),
+                            account_id: Some("777788889999".into()),
+                        },
+                    ),
+                ],
+            },
+        );
+        let ids = |q: &str| {
+            cache
+                .find(q)
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("111122223333 admin"), ["acme/prod/Admin"]);
+        assert_eq!(ids("111122223333").len(), 2);
+        assert_eq!(ids("4444"), ["acme/dev/Admin"], "an ID prefix works too");
+        assert_eq!(
+            ids("777788889999"),
+            ["acme/deploy/Deploy"],
+            "chained roles too"
+        );
+        assert!(ids("999999999999").is_empty());
     }
 
     #[test]

@@ -466,6 +466,7 @@ fn add_chained(integration: &str, config: &AwsSsoConfig, profiles: &mut Vec<Prof
     for (label, role) in &config.chained {
         let target = Target::AwsChained {
             label: label.clone(),
+            account_id: role.account_id().map(str::to_string),
         };
         let mut profile = Profile::new(integration, label, role.role_name(), target.clone());
         if profiles.iter().any(|p| p.id == profile.id) {
@@ -499,17 +500,14 @@ pub async fn chained_credentials(
     Ok(assume_role(&source, role, region).await?)
 }
 
-async fn assume_role(
-    source: &Credentials,
-    role: &ChainedRole,
-    region: &str,
-) -> anyhow::Result<Credentials> {
+/// An STS client authenticated with `creds`.
+fn sts_client(creds: &Credentials, region: &str) -> anyhow::Result<aws_sdk_sts::Client> {
     let get = |k: &str| {
-        source
+        creds
             .env
             .get(k)
             .cloned()
-            .with_context(|| format!("{k} missing from the source credentials"))
+            .with_context(|| format!("{k} missing from the credentials"))
     };
     let provider = aws_sdk_sts::config::Credentials::new(
         get("AWS_ACCESS_KEY_ID")?,
@@ -518,13 +516,55 @@ async fn assume_role(
         None,
         "omnifob",
     );
-    let sts = aws_sdk_sts::Client::from_conf(
+    Ok(aws_sdk_sts::Client::from_conf(
         aws_sdk_sts::Config::builder()
             .region(aws_sdk_sts::config::Region::new(region.to_string()))
             .credentials_provider(provider)
             .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest())
             .build(),
-    );
+    ))
+}
+
+/// The ARN these credentials act as, from STS GetCallerIdentity.
+pub async fn caller_identity(creds: &Credentials, region: &str) -> anyhow::Result<String> {
+    let identity = sts_client(creds, region)?
+        .get_caller_identity()
+        .send()
+        .await
+        .map_err(|e| anyhow!("{}", aws_sdk_sts::error::DisplayErrorContext(&e)))?;
+    Ok(identity.arn().unwrap_or("unknown").to_string())
+}
+
+/// Checks that the stored session works: it is refreshed when needed, and
+/// the portal must answer with it.
+pub async fn check(integration: &str, config: &AwsSsoConfig) -> Result<String> {
+    let token = access_token(integration, config).await?;
+    match portal_client(&config.region)
+        .list_accounts()
+        .access_token(&token)
+        .max_results(1)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(format!("session valid for {}", config.start_url)),
+        Err(e)
+            if matches!(
+                e.as_service_error(),
+                Some(ListAccountsError::UnauthorizedException(_))
+            ) =>
+        {
+            Err(unauthorized(integration))
+        }
+        Err(e) => Err(anyhow!("the portal did not answer: {}", DisplayErrorContext(&e)).into()),
+    }
+}
+
+async fn assume_role(
+    source: &Credentials,
+    role: &ChainedRole,
+    region: &str,
+) -> anyhow::Result<Credentials> {
+    let sts = sts_client(source, region)?;
     let assumed = sts
         .assume_role()
         .role_arn(&role.role_arn)

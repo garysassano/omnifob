@@ -453,6 +453,34 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
     store::delete(&bootstrap_key(integration))
 }
 
+/// Checks that the stored bootstrap token is active.
+pub async fn check(integration: &str, config: &CloudflareConfig) -> Result<String> {
+    let client = bootstrap_client(integration)?;
+    client
+        .verify(
+            config.token_type,
+            config.account_id.as_deref().unwrap_or_default(),
+        )
+        .await?;
+    let kind = match config.token_type {
+        CloudflareTokenType::User => "user-owned",
+        CloudflareTokenType::Account => "account-owned",
+    };
+    Ok(format!("{kind} bootstrap token active"))
+}
+
+/// Checks that a minted token is active.
+pub async fn check_token(
+    config: &CloudflareConfig,
+    account_id: &str,
+    token: &str,
+) -> anyhow::Result<()> {
+    Client::new(api_base(), token)
+        .verify(config.token_type, account_id)
+        .await
+        .map(|_| ())
+}
+
 pub fn has_bootstrap_token(integration: &str) -> anyhow::Result<bool> {
     Ok(store::get::<String>(&bootstrap_key(integration))?.is_some())
 }

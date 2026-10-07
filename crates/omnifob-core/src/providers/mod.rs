@@ -148,7 +148,7 @@ pub async fn credentials(
                 ..
             },
         ) => aws_sso::credentials(&profile.integration, c, account_id, role_name).await?,
-        (Integration::AwsSso(c), Target::AwsChained { label }) => {
+        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
             aws_sso::chained_credentials(&profile.integration, c, label).await?
         }
         (
@@ -223,6 +223,50 @@ pub async fn console_url(
             .into());
         }
     })
+}
+
+/// Checks that an integration's stored sign-in works, without signing in.
+pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<String> {
+    match integration {
+        Integration::AwsSso(config) => aws_sso::check(name, config).await,
+        Integration::Cloudflare(config) => cloudflare::check(name, config).await,
+        Integration::Token(config) => token::check(name, config).await,
+    }
+}
+
+/// Gets a profile's credentials and proves they work; returns what they act as.
+pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String> {
+    let creds = credentials(config, profile, true, None).await?;
+    let integration = config.integration(&profile.integration)?;
+    match (integration, &profile.target) {
+        (Integration::AwsSso(c), Target::Aws { .. } | Target::AwsChained { .. }) => {
+            let region = creds
+                .env
+                .get("AWS_REGION")
+                .cloned()
+                .unwrap_or_else(|| c.region.clone());
+            Ok(format!(
+                "acts as {}",
+                aws_sso::caller_identity(&creds, &region).await?
+            ))
+        }
+        (Integration::Cloudflare(c), Target::Cloudflare { account_id, .. }) => {
+            let token = creds
+                .env
+                .get("CLOUDFLARE_API_TOKEN")
+                .ok_or_else(|| anyhow::anyhow!("no token in the credentials"))?;
+            cloudflare::check_token(c, account_id, token).await?;
+            Ok("minted token active".to_string())
+        }
+        (Integration::Token(_), Target::Token {}) => {
+            check_sign_in(&profile.integration, integration).await
+        }
+        _ => Err(anyhow::anyhow!(
+            "profile '{}' does not match its integration; run `fob sync`",
+            profile.id
+        )
+        .into()),
+    }
 }
 
 /// What revoking a profile did.

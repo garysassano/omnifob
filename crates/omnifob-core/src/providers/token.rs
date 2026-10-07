@@ -181,18 +181,41 @@ pub async fn login(
     if let [only] = expected.as_slice()
         && let Some(url) = verify_url(config)?
     {
-        let response = reqwest::Client::new()
-            .get(url)
-            .bearer_auth(&values[only])
-            .header("user-agent", "omnifob")
-            .send()
-            .await
-            .with_context(|| format!("checking the token against {url}"))?;
-        if !response.status().is_success() {
-            bail!("the token was rejected ({} from {url})", response.status());
-        }
+        verify(url, &values[only]).await?;
     }
     store::set(&secrets_key(integration), &Stored(values))
+}
+
+async fn verify(url: &str, token: &str) -> anyhow::Result<()> {
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .header("user-agent", "omnifob")
+        .send()
+        .await
+        .with_context(|| format!("checking the token against {url}"))?;
+    if !response.status().is_success() {
+        bail!("the token was rejected ({} from {url})", response.status());
+    }
+    Ok(())
+}
+
+/// Checks the stored token against the provider when a check is known.
+pub async fn check(integration: &str, config: &TokenConfig) -> Result<String> {
+    let Some(Stored(values)) = store::get(&secrets_key(integration))? else {
+        return Err(Error::not_signed_in(integration));
+    };
+    let names: Vec<String> = secrets(config)?.into_iter().map(|(name, _)| name).collect();
+    match (names.as_slice(), verify_url(config)?) {
+        ([only], Some(url)) => {
+            let token = values
+                .get(only)
+                .ok_or_else(|| Error::not_signed_in(integration))?;
+            verify(url, token).await?;
+            Ok(format!("token accepted by {url}"))
+        }
+        _ => Ok("token stored; this provider has no check".to_string()),
+    }
 }
 
 fn verify_url(config: &TokenConfig) -> anyhow::Result<Option<&str>> {
