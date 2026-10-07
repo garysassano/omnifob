@@ -21,11 +21,26 @@ pub use profile::{Profile, Target};
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The integration has no usable sign-in; the caller should run a login.
-    #[error("not signed in to '{integration}'; run `fob login {integration}`")]
-    NeedsLogin { integration: String },
+    /// `reason` says why, for the user.
+    #[error("{reason}; run `fob login {integration}`")]
+    NeedsLogin { integration: String, reason: String },
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl Error {
+    /// No sign-in is stored for the integration.
+    pub fn not_signed_in(integration: &str) -> Self {
+        Self::needs_login(integration, format!("not signed in to '{integration}'"))
+    }
+
+    pub fn needs_login(integration: &str, reason: impl Into<String>) -> Self {
+        Self::NeedsLogin {
+            integration: integration.to_string(),
+            reason: reason.into(),
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

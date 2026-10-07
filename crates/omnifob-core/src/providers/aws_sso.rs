@@ -203,14 +203,14 @@ pub fn session(integration: &str) -> anyhow::Result<Option<(Timestamp, bool)>> {
 
 /// Returns a usable access token, refreshing it when it is about to expire.
 async fn access_token(integration: &str, config: &AwsSsoConfig) -> Result<String> {
-    let needs_login = || Error::NeedsLogin {
-        integration: integration.to_string(),
-    };
     let Some(token) = store::get::<SsoToken>(&token_key(integration))? else {
-        return Err(needs_login());
+        return Err(Error::not_signed_in(integration));
     };
     if token.start_url != config.start_url || token.region != config.region {
-        return Err(needs_login());
+        return Err(Error::needs_login(
+            integration,
+            format!("the stored sign-in for '{integration}' is for another portal or region"),
+        ));
     }
 
     let now = Timestamp::now();
@@ -219,6 +219,7 @@ async fn access_token(integration: &str, config: &AwsSsoConfig) -> Result<String
     if !expires_soon {
         return Ok(token.access_token);
     }
+    let mut refresh_failed = false;
     if token.can_refresh(now) {
         match refresh(&token).await {
             Ok(refreshed) => {
@@ -227,13 +228,26 @@ async fn access_token(integration: &str, config: &AwsSsoConfig) -> Result<String
             }
             // A refresh token is single use; another process may already have
             // used it. Keep the stored entry and fall through.
-            Err(e) => tracing::debug!("refreshing the IAM Identity Center token failed: {e:#}"),
+            Err(e) => {
+                tracing::debug!("refreshing the IAM Identity Center token failed: {e:#}");
+                refresh_failed = true;
+            }
         }
     }
     if token.expires_at > now {
         Ok(token.access_token)
+    } else if refresh_failed {
+        Err(Error::needs_login(
+            integration,
+            format!(
+                "the IAM Identity Center session for '{integration}' has ended (sessions last 8 hours unless the administrator changed it)"
+            ),
+        ))
     } else {
-        Err(needs_login())
+        Err(Error::needs_login(
+            integration,
+            format!("the sign-in for '{integration}' has expired"),
+        ))
     }
 }
 
@@ -265,9 +279,12 @@ async fn refresh(token: &SsoToken) -> anyhow::Result<SsoToken> {
 /// ended: drop it so the next attempt signs in again.
 fn unauthorized(integration: &str) -> Error {
     let _ = store::delete(&token_key(integration));
-    Error::NeedsLogin {
-        integration: integration.to_string(),
-    }
+    Error::needs_login(
+        integration,
+        format!(
+            "IAM Identity Center no longer accepts the sign-in for '{integration}' (revoked, or the session ended)"
+        ),
+    )
 }
 
 /// Lists every account and role reachable through this integration.

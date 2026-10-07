@@ -414,10 +414,8 @@ fn user_tag_from_policies(policies: &[Value]) -> Option<String> {
 }
 
 fn bootstrap_client(integration: &str) -> Result<Client> {
-    let token: String =
-        store::get(&bootstrap_key(integration))?.ok_or_else(|| Error::NeedsLogin {
-            integration: integration.to_string(),
-        })?;
+    let token: String = store::get(&bootstrap_key(integration))?
+        .ok_or_else(|| Error::not_signed_in(integration))?;
     Ok(Client::new(api_base(), token))
 }
 

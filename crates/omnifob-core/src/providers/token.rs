@@ -222,15 +222,13 @@ pub fn discover(integration: &str, config: &TokenConfig) -> Vec<Profile> {
 
 pub fn credentials(integration: &str, config: &TokenConfig) -> Result<Credentials> {
     let Some(Stored(values)) = store::get(&secrets_key(integration))? else {
-        return Err(Error::NeedsLogin {
-            integration: integration.to_string(),
-        });
+        return Err(Error::not_signed_in(integration));
     };
     let mut env: BTreeMap<String, String> = config.vars.clone();
     for (name, vars) in secrets(config)? {
-        let value = values.get(&name).ok_or_else(|| Error::NeedsLogin {
-            integration: integration.to_string(),
-        })?;
+        let value = values
+            .get(&name)
+            .ok_or_else(|| Error::not_signed_in(integration))?;
         for var in vars {
             env.insert(var, value.clone());
         }

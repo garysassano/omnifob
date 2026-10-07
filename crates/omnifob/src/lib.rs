@@ -537,7 +537,7 @@ impl App {
                 }
                 SignIn::Session {
                     refreshable: true, ..
-                } => "signed in, token renews on next use".to_string(),
+                } => "signed in; renews on next use while the portal session lasts".to_string(),
                 SignIn::Session { .. } => "session expired".to_string(),
             };
             let profiles = self
@@ -560,8 +560,11 @@ impl App {
         Fut: std::future::Future<Output = omnifob_core::Result<T>>,
     {
         match f().await {
-            Err(Error::NeedsLogin { integration }) if interactive() => {
-                eprintln!("fob: '{integration}' needs a sign-in");
+            Err(Error::NeedsLogin {
+                integration,
+                reason,
+            }) if interactive() => {
+                eprintln!("fob: {reason}; signing in again");
                 self.login(&integration, false, false).await?;
                 Ok(f().await?)
             }
