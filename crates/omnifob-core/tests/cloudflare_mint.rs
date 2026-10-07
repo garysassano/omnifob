@@ -101,11 +101,13 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
             { "id": "old-ours", "name": "omnifob:cf/a/t@2026-10-01T00:00:00Z", "status": "expired" },
             { "id": "old-expiry", "name": "omnifob:cf/a/t@x", "status": "active", "expires_on": "2026-10-06T11:00:00Z" },
             { "id": "fresh-ours", "name": "omnifob:cf/a/t@y", "status": "active", "expires_on": "2026-10-06T13:00:00Z" },
-            { "id": "theirs", "name": "terraform", "status": "expired" }
+            { "id": "theirs", "name": "terraform", "status": "expired" },
+            { "id": "tracked-old", "name": "omnifob t", "status": "expired" },
+            { "id": "bootstrap", "name": "omnifob bootstrap", "status": "expired" }
         ])))
         .mount(&server)
         .await;
-    for id in ["old-ours", "old-expiry"] {
+    for id in ["old-ours", "old-expiry", "tracked-old"] {
         Mock::given(method("DELETE"))
             .and(path(format!("/user/tokens/{id}")))
             .respond_with(ok(json!({ "id": id })))
@@ -113,7 +115,9 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
             .mount(&server)
             .await;
     }
-    for id in ["fresh-ours", "theirs"] {
+    // Never touched: a live legacy token, someone else's token, and an
+    // omnifob-looking name that omnifob did not mint (the bootstrap).
+    for id in ["fresh-ours", "theirs", "bootstrap"] {
         Mock::given(method("DELETE"))
             .and(path(format!("/user/tokens/{id}")))
             .respond_with(ok(json!({})))
@@ -127,6 +131,10 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
         "user",
         r#""Workers Scripts Edit", "DNS Write", "Zone Read", "User Details Read""#,
     );
+    let mut catalog = Catalog::default();
+    catalog
+        .minted
+        .insert("cf/a/t".into(), vec!["tracked-old".into()]);
     let creds = mint(
         &client,
         &config,
@@ -134,10 +142,15 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
         ACCOUNT,
         "t",
         now(),
-        &mut Catalog::default(),
+        &mut catalog,
     )
     .await
     .unwrap();
+    assert_eq!(
+        catalog.minted["cf/a/t"],
+        ["new"],
+        "the new token is tracked, the deleted one forgotten"
+    );
 
     assert_eq!(creds.env["CLOUDFLARE_API_TOKEN"], "minted-secret");
     assert_eq!(creds.env["CLOUDFLARE_ACCOUNT_ID"], ACCOUNT);
@@ -148,7 +161,7 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
 
     let requests = server.received_requests().await.unwrap();
     let body = posted_body(&requests, "/user/tokens");
-    assert_eq!(body["name"], "omnifob:cf/a/t@2026-10-06T12:00:00Z");
+    assert_eq!(body["name"], "omnifob t");
     assert_eq!(body["expires_on"], "2026-10-06T14:00:00Z");
     assert!(body.get("not_before").is_none());
 
@@ -495,6 +508,7 @@ async fn a_catalog_missing_a_permission_is_refreshed() {
         )
         .unwrap()],
         user_tag: None,
+        minted: Default::default(),
     };
     let client = Client::new(server.uri(), "bootstrap");
     mint(
@@ -517,6 +531,8 @@ async fn revoke_deletes_only_this_profiles_tokens() {
     Mock::given(method("GET"))
         .and(path("/user/tokens"))
         .respond_with(ok(json!([
+            { "id": "n1", "name": "omnifob workers", "status": "active" },
+            { "id": "n2", "name": "omnifob workers", "status": "active" },
             { "id": "a1", "name": "omnifob:cf/acct/workers@2026-10-06T12:00:00Z", "status": "active" },
             { "id": "a2", "name": "omnifob:cf/acct/workers@2026-10-06T13:00:00Z", "status": "active" },
             { "id": "b1", "name": "omnifob:cf/acct/workers-2@2026-10-06T13:00:00Z", "status": "active" },
@@ -525,7 +541,17 @@ async fn revoke_deletes_only_this_profiles_tokens() {
         ])))
         .mount(&server)
         .await;
-    for (id, times) in [("a1", 1), ("a2", 1), ("b1", 0), ("c1", 0), ("d1", 0)] {
+    // n1 is tracked for this profile; n2 has the same name but belongs to
+    // another profile; a1 and a2 are legacy names of this profile.
+    for (id, times) in [
+        ("n1", 1),
+        ("n2", 0),
+        ("a1", 1),
+        ("a2", 1),
+        ("b1", 0),
+        ("c1", 0),
+        ("d1", 0),
+    ] {
         Mock::given(method("DELETE"))
             .and(path(format!("/user/tokens/{id}")))
             .respond_with(ok(json!({ "id": id })))
@@ -533,9 +559,23 @@ async fn revoke_deletes_only_this_profiles_tokens() {
             .mount(&server)
             .await;
     }
+    let mut catalog = Catalog::default();
+    catalog
+        .minted
+        .insert("cf/acct/workers".into(), vec!["n1".into()]);
+    catalog
+        .minted
+        .insert("cf/other/workers".into(), vec!["n2".into()]);
     let client = Client::new(server.uri(), "bootstrap");
-    let n = revoke_minted(&client, "/user/tokens", "cf/acct/workers")
-        .await
-        .unwrap();
-    assert_eq!(n, 2);
+    let n = revoke_minted(
+        &client,
+        "/user/tokens",
+        Some("cf/acct/workers"),
+        &mut catalog,
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 3);
+    assert!(!catalog.minted.contains_key("cf/acct/workers"));
+    assert_eq!(catalog.minted["cf/other/workers"], ["n2"]);
 }

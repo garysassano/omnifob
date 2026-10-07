@@ -34,7 +34,13 @@ fn api_base() -> String {
 
 /// Minted tokens are named with this prefix so expired ones can be cleaned up
 /// without touching tokens omnifob did not create.
-const TOKEN_NAME_PREFIX: &str = "omnifob:";
+/// Minted tokens are named `omnifob <template>`. The IDs of minted tokens are
+/// tracked in the catalog, so cleanup and revocation never rely on names.
+const TOKEN_NAME_PREFIX: &str = "omnifob";
+
+/// Prefix of the names used before 0.3 (`omnifob:<profile>@<time>`); such
+/// tokens are still cleaned up and revoked.
+const LEGACY_NAME_PREFIX: &str = "omnifob:";
 
 const SCOPE_ACCOUNT: &str = "com.cloudflare.api.account";
 const SCOPE_ZONE: &str = "com.cloudflare.api.account.zone";
@@ -181,6 +187,8 @@ struct Token {
 
 #[derive(Debug, Deserialize)]
 struct CreatedToken {
+    #[serde(default)]
+    id: String,
     value: String,
 }
 
@@ -515,6 +523,31 @@ pub struct Catalog {
     pub groups: Vec<PermissionGroup>,
     #[serde(default)]
     pub user_tag: Option<String>,
+    /// IDs of the tokens minted for each profile that may still exist.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub minted: BTreeMap<String, Vec<String>>,
+}
+
+impl Catalog {
+    fn track(&mut self, profile_id: &str, token_id: &str) {
+        self.minted
+            .entry(profile_id.to_string())
+            .or_default()
+            .push(token_id.to_string());
+    }
+
+    fn untrack(&mut self, token_id: &str) {
+        for ids in self.minted.values_mut() {
+            ids.retain(|id| id != token_id);
+        }
+        self.minted.retain(|_, ids| !ids.is_empty());
+    }
+
+    fn is_tracked(&self, token_id: &str) -> bool {
+        self.minted
+            .values()
+            .any(|ids| ids.iter().any(|id| id == token_id))
+    }
 }
 
 /// How long a stored catalog is trusted before it is fetched again.
@@ -559,7 +592,7 @@ pub async fn credentials(
 ) -> Result<Credentials> {
     let client = bootstrap_client(integration)?;
     let mut catalog = load_catalog(integration);
-    let before = (catalog.fetched_at, catalog.user_tag.clone());
+    let before = serde_json::to_string(&catalog).unwrap_or_default();
     let minted = mint(
         &client,
         config,
@@ -570,7 +603,7 @@ pub async fn credentials(
         &mut catalog,
     )
     .await;
-    if (catalog.fetched_at, catalog.user_tag.clone()) != before
+    if serde_json::to_string(&catalog).unwrap_or_default() != before
         && let Err(e) = save_catalog(integration, &catalog)
     {
         tracing::warn!("could not save the Cloudflare permission catalog: {e:#}");
@@ -667,7 +700,7 @@ pub async fn mint(
     let now = now.round(Unit::Second)?;
     let expires_at = now.checked_add(ttl)?;
     let body = json!({
-        "name": format!("{TOKEN_NAME_PREFIX}{profile_id}@{now}"),
+        "name": format!("{TOKEN_NAME_PREFIX} {template_name}"),
         "policies": policies,
         "expires_on": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });
@@ -675,6 +708,9 @@ pub async fn mint(
         .call(Method::POST, &tokens, &[], Some(&body))
         .await
         .context("minting a Cloudflare token")?;
+    if !created.id.is_empty() {
+        catalog.track(profile_id, &created.id);
+    }
 
     // Cleaning up overlaps with waiting for D1 to accept the new token.
     let minted = client.with_token(&created.value);
@@ -683,7 +719,7 @@ pub async fn mint(
             wait_for_d1(&minted, account_id).await;
         }
     };
-    let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now));
+    let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now, catalog, false));
     if let Err(e) = pruned {
         tracing::warn!("could not clean up expired omnifob tokens: {e:#}");
     }
@@ -733,48 +769,111 @@ const D1_WAIT_ATTEMPTS: u32 = 60;
 const D1_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Deletes tokens omnifob minted that have expired, so they do not pile up
-/// in the dashboard.
-async fn prune_expired(client: &Client, tokens: &str, now: Timestamp) -> anyhow::Result<()> {
-    let all: Vec<Token> = client.get_all(tokens).await?;
-    for token in all.iter().filter(|t| t.name.starts_with(TOKEN_NAME_PREFIX)) {
-        let expired = token.status == "expired" || token.expires_on.is_some_and(|at| at <= now);
-        if expired {
-            client
-                .call::<Value>(Method::DELETE, &format!("{tokens}/{}", token.id), &[], None)
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-/// Deletes every live token omnifob minted for `profile_id`; returns how many.
-pub async fn revoke_minted(
+/// in the dashboard: tracked ones, and legacy-named ones. With
+/// `forget_missing`, tracked IDs absent from the list are forgotten; not
+/// right after minting, when a new token may not be listed yet.
+pub async fn prune_expired(
     client: &Client,
     tokens: &str,
-    profile_id: &str,
+    now: Timestamp,
+    catalog: &mut Catalog,
+    forget_missing: bool,
 ) -> anyhow::Result<usize> {
-    let prefix = format!("{TOKEN_NAME_PREFIX}{profile_id}@");
     let all: Vec<Token> = client.get_all(tokens).await?;
     let mut deleted = 0;
-    for token in all.iter().filter(|t| t.name.starts_with(&prefix)) {
-        client
-            .call::<Value>(Method::DELETE, &format!("{tokens}/{}", token.id), &[], None)
-            .await?;
-        deleted += 1;
+    for token in &all {
+        let ours = catalog.is_tracked(&token.id) || token.name.starts_with(LEGACY_NAME_PREFIX);
+        let expired = token.status == "expired" || token.expires_on.is_some_and(|at| at <= now);
+        if ours && expired {
+            delete_token(client, tokens, &token.id).await?;
+            catalog.untrack(&token.id);
+            deleted += 1;
+        }
+    }
+    if forget_missing {
+        let existing: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
+        for ids in catalog.minted.values_mut() {
+            ids.retain(|id| existing.contains(&id.as_str()));
+        }
+        catalog.minted.retain(|_, ids| !ids.is_empty());
     }
     Ok(deleted)
 }
 
-/// [`revoke_minted`] with the stored bootstrap token.
+async fn delete_token(client: &Client, tokens: &str, id: &str) -> anyhow::Result<()> {
+    client
+        .call::<Value>(Method::DELETE, &format!("{tokens}/{id}"), &[], None)
+        .await?;
+    Ok(())
+}
+
+/// Deletes the tokens omnifob minted for `profile_id` (or for every profile
+/// when `None`), live or not; returns how many.
+pub async fn revoke_minted(
+    client: &Client,
+    tokens: &str,
+    profile_id: Option<&str>,
+    catalog: &mut Catalog,
+) -> anyhow::Result<usize> {
+    let all: Vec<Token> = client.get_all(tokens).await?;
+    let legacy = profile_id.map_or(LEGACY_NAME_PREFIX.to_string(), |p| {
+        format!("{LEGACY_NAME_PREFIX}{p}@")
+    });
+    let tracked: Vec<String> = match profile_id {
+        Some(p) => catalog.minted.get(p).cloned().unwrap_or_default(),
+        None => catalog.minted.values().flatten().cloned().collect(),
+    };
+    let mut deleted = 0;
+    for token in &all {
+        if tracked.contains(&token.id) || token.name.starts_with(&legacy) {
+            delete_token(client, tokens, &token.id).await?;
+            deleted += 1;
+        }
+    }
+    for id in tracked {
+        catalog.untrack(&id);
+    }
+    Ok(deleted)
+}
+
+/// [`revoke_minted`] with the stored bootstrap token and catalog.
 pub async fn revoke(
     integration: &str,
     config: &CloudflareConfig,
-    profile_id: &str,
+    profile_id: Option<&str>,
     account_id: &str,
 ) -> Result<usize> {
     let client = bootstrap_client(integration)?;
     let tokens = Client::tokens_path(config.token_type, account_id);
-    Ok(revoke_minted(&client, &tokens, profile_id).await?)
+    let mut catalog = load_catalog(integration);
+    let deleted = revoke_minted(&client, &tokens, profile_id, &mut catalog).await;
+    save_catalog(integration, &catalog)?;
+    Ok(deleted?)
+}
+
+/// Deletes expired tokens omnifob minted in each of the integration's accounts.
+pub async fn cleanup(
+    integration: &str,
+    config: &CloudflareConfig,
+    account_ids: &[String],
+) -> Result<usize> {
+    let client = bootstrap_client(integration)?;
+    let mut catalog = load_catalog(integration);
+    let mut deleted = 0;
+    let mut result = Ok(());
+    for account_id in account_ids {
+        let tokens = Client::tokens_path(config.token_type, account_id);
+        match prune_expired(&client, &tokens, Timestamp::now(), &mut catalog, true).await {
+            Ok(n) => deleted += n,
+            Err(e) => result = Err(e),
+        }
+        if config.token_type == CloudflareTokenType::User {
+            break; // user tokens are listed once, not per account
+        }
+    }
+    save_catalog(integration, &catalog)?;
+    result?;
+    Ok(deleted)
 }
 
 pub fn console_url(account_id: &str) -> String {

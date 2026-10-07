@@ -161,7 +161,7 @@ SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentia
 
 Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json`.
 
-Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob:<profile>@<time>`, and expired ones are deleted on the next mint so they do not pile up in the dashboard.
+Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
 
 ## Credits
 
