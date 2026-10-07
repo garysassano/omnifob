@@ -63,6 +63,7 @@ token_type = "account"   # bootstrap owned by the account; "user" (default) for 
 ttl = "1h"               # lifetime of minted tokens
 
 # Templates name permissions as the dashboard does; never IDs.
+# `fob cf add-template` writes them for you.
 [integrations.cf.templates.pages]
 permissions = ["Pages Write", "Account Settings Read"]
 ttl = "30m"
@@ -99,6 +100,8 @@ fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare
 fob exec cf workers -- claude            # give an agent a token without pasting it anywhere
 fob exec cf workers --ttl 4h -- claude   # longer-lived token for a long session
+fob exec cf workers --revoke -- claude   # token for this command only, deleted when it ends
+fob cf add-template cf pages             # pick services and access levels, save a template
 fob console prod admin    # opens the AWS console as that role
 fob status
 fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts)

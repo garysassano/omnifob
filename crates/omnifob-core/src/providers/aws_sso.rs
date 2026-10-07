@@ -456,7 +456,7 @@ pub async fn credentials(
     Ok(Credentials {
         env,
         expires_at: Some(expires_at),
-        issued_at: None,
+        ..Default::default()
     })
 }
 
@@ -596,7 +596,7 @@ async fn assume_role(
     Ok(Credentials {
         env,
         expires_at: Some(expires_at),
-        issued_at: None,
+        ..Default::default()
     })
 }
 

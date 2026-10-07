@@ -103,6 +103,10 @@ enum Command {
         /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<jiff::SignedDuration>,
+        /// Mint a token for this command only and revoke it when the command
+        /// ends (Cloudflare)
+        #[arg(long, conflicts_with = "no_cache")]
+        revoke: bool,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -197,6 +201,24 @@ enum CloudflareCommand {
     },
     /// List templates and their permissions
     Templates { integration: String },
+    /// Create a template: pick services and their access level from the
+    /// account's permissions, or name the permissions with --permission
+    AddTemplate {
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        integration: String,
+        /// Template name; profiles become <integration>/<account>/<name>
+        name: String,
+        /// A permission, as `fob cf permissions` lists it ("Pages Write");
+        /// repeat for more. Without it, fob asks interactively.
+        #[arg(long = "permission", short)]
+        permissions: Vec<String>,
+        /// Lifetime of the template's tokens, e.g. "30m" (default: the integration's)
+        #[arg(long, value_parser = parse_ttl)]
+        ttl: Option<jiff::SignedDuration>,
+        /// Replace a template of that name in the config
+        #[arg(long)]
+        replace: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -308,9 +330,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             profile,
             no_cache,
             ttl,
+            revoke,
             command,
         } => {
             let profile = app.select(query(&profile).as_deref()).await?;
+            if revoke {
+                return app.exec_and_revoke(&profile, ttl, &command).await;
+            }
             let creds = app.credentials(&profile, !no_cache, ttl).await?;
             return exec(&profile, &creds, &command);
         }
@@ -370,6 +396,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
         }
         Command::Activate { shell } => print!("{}", shell::activate(shell)),
+        Command::Cloudflare(CloudflareCommand::AddTemplate {
+            integration,
+            name,
+            permissions,
+            ttl,
+            replace,
+        }) => {
+            app.add_template(&integration, &name, permissions, ttl, replace)
+                .await?
+        }
         Command::Cloudflare(command) => app.cloudflare(command).await?,
         Command::Import(ImportCommand::Aws { file, write }) => {
             import_aws(&app.config, file, write)?
@@ -848,6 +884,32 @@ impl App {
         Ok(creds)
     }
 
+    /// Runs a command with a token minted for it alone, and revokes the token
+    /// when the command ends, also after Ctrl-C.
+    async fn exec_and_revoke(
+        &self,
+        profile: &Profile,
+        ttl: Option<jiff::SignedDuration>,
+        command: &[String],
+    ) -> anyhow::Result<ExitCode> {
+        let creds = self
+            .with_login(|| providers::one_off_credentials(&self.config, profile, ttl))
+            .await
+            .with_context(|| format!("getting credentials for {}", profile.id))?;
+        record_use(&profile.id);
+        let status = run_to_end(profile, &creds, command).await;
+        if let Some(id) = &creds.token_id {
+            match providers::revoke_token(&self.config, profile, id).await {
+                Ok(()) => eprintln!("fob: revoked the token for {}", profile.id),
+                Err(e) => eprintln!(
+                    "fob: could not revoke the token for {} ({e:#}); run `fob revoke {}`",
+                    profile.id, profile.id
+                ),
+            }
+        }
+        status
+    }
+
     /// Fetches new credentials for a profile, unless another renewal of the
     /// same profile is already running. Never prompts.
     async fn renew(&self, id: &str) -> anyhow::Result<()> {
@@ -904,8 +966,148 @@ impl App {
                     }
                 }
             }
+            CloudflareCommand::AddTemplate { .. } => unreachable!("handled in run"),
         }
         Ok(())
+    }
+
+    /// Writes a new Cloudflare template to the config and syncs, so its
+    /// profiles can be used at once.
+    async fn add_template(
+        &mut self,
+        integration: &str,
+        name: &str,
+        permissions: Vec<String>,
+        ttl: Option<jiff::SignedDuration>,
+        replace: bool,
+    ) -> anyhow::Result<()> {
+        let config = match self.config.integration(integration)? {
+            Integration::Cloudflare(c) => c.clone(),
+            other => bail!(
+                "'{integration}' is an {} integration, not cloudflare",
+                other.kind()
+            ),
+        };
+        if config.templates.contains_key(name) && !replace {
+            bail!(
+                "'{integration}' already has a template named '{name}'; add --replace to overwrite it"
+            );
+        }
+        let groups = self
+            .with_login(|| cloudflare::permission_groups(integration, &config))
+            .await?;
+        let permissions = if permissions.is_empty() {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "name the permissions with --permission, or run this in a terminal to pick them"
+                );
+            }
+            pick_permissions(&cloudflare::services(&groups, config.token_type))?
+        } else {
+            // Check the names now rather than at the first mint, and store
+            // them as Cloudflare spells them.
+            cloudflare::resolve_permissions(&permissions, &groups)?
+                .into_iter()
+                .map(|g| g.name.clone())
+                .collect()
+        };
+        if permissions.is_empty() {
+            bail!("no permissions picked; nothing was saved");
+        }
+        if cloudflare::builtin_templates().contains_key(name) {
+            eprintln!(
+                "fob: '{name}' replaces the built-in template of that name for '{integration}'"
+            );
+        }
+
+        let template = omnifob_core::config::CloudflareTemplate {
+            permissions,
+            optional: Vec::new(),
+            ttl,
+        };
+        let path = paths::config_file();
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let text = omnifob_core::config::add_cloudflare_template(
+            &text,
+            integration,
+            name,
+            &template,
+            replace,
+        )?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .with_context(|| format!("writing {}", path.display()))?;
+        self.config = Config::parse(&text)?;
+        eprintln!(
+            "fob: added template '{name}' to '{integration}' ({}):",
+            path.display()
+        );
+        for permission in &template.permissions {
+            eprintln!("       {permission}");
+        }
+        self.sync(&[integration.to_string()]).await
+    }
+}
+
+/// Lets the user pick services and an access level for each, the way the
+/// dashboard's token form does, but searchable. Returns permission names.
+fn pick_permissions(services: &[cloudflare::Service]) -> anyhow::Result<Vec<String>> {
+    // Index of the chosen permission per service: read, write or another.
+    let mut chosen: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    let mut cursor = 0;
+    let term = Term::stderr();
+    eprintln!("fob: pick a service, then its access; pick \"Done\" to save.");
+    loop {
+        let mut items = vec![match chosen.len() {
+            0 => "Done (cancel: nothing picked yet)".to_string(),
+            n => format!("Done: save {n} permission{}", if n == 1 { "" } else { "s" }),
+        }];
+        items.extend(services.iter().enumerate().map(|(i, s)| {
+            let picked = chosen.get(&i).map_or(String::new(), |p| format!("  [{p}]"));
+            format!("{:<44} {:<8}{picked}", s.name, s.scope())
+        }));
+        let Some(picked) = dialoguer::FuzzySelect::new()
+            .with_prompt(format!("Services ({} picked)", chosen.len()))
+            .items(&items)
+            .default(cursor)
+            .interact_on_opt(&term)?
+        else {
+            bail!("cancelled; nothing was saved");
+        };
+        if picked == 0 {
+            return Ok(chosen.into_values().collect());
+        }
+        cursor = picked;
+        let index = picked - 1;
+        let service = &services[index];
+        let mut options: Vec<(String, Option<String>)> = Vec::new();
+        if let Some(g) = &service.read {
+            options.push(("Read".into(), Some(g.name.clone())));
+        }
+        if let Some(g) = &service.write {
+            options.push(("Edit (read and write)".into(), Some(g.name.clone())));
+        }
+        for g in &service.other {
+            options.push((g.name.clone(), Some(g.name.clone())));
+        }
+        if chosen.contains_key(&index) {
+            options.push(("None (remove)".into(), None));
+        }
+        let labels: Vec<&str> = options.iter().map(|(label, _)| label.as_str()).collect();
+        let Some(level) = dialoguer::Select::new()
+            .with_prompt(service.name.as_str())
+            .items(&labels)
+            .default(0)
+            .interact_on_opt(&term)?
+        else {
+            continue;
+        };
+        match &options[level].1 {
+            Some(name) => chosen.insert(index, name.clone()),
+            None => chosen.remove(&index),
+        };
     }
 }
 
@@ -1213,6 +1415,56 @@ fn creds_output(
         }
     };
     Ok(serde_json::to_string(&value)?)
+}
+
+/// Runs a command to its end and returns its exit status. Ctrl-C reaches the
+/// command, not omnifob, so omnifob can clean up after it.
+async fn run_to_end(
+    profile: &Profile,
+    creds: &Credentials,
+    command: &[String],
+) -> anyhow::Result<ExitCode> {
+    let mut child = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .envs(&creds.env)
+        .env("OMNIFOB_PROFILE", &profile.id)
+        .spawn()
+        .with_context(|| format!("running {}", command[0]))?;
+    // The terminal sends Ctrl-C, and a hangup when it closes, to the command
+    // too; omnifob waits for the command to end instead of ending first.
+    #[cfg(unix)]
+    let (mut hangup, mut terminate) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::hangup())?,
+            signal(SignalKind::terminate())?,
+        )
+    };
+    let status = loop {
+        #[cfg(unix)]
+        tokio::select! {
+            status = child.wait() => break status?,
+            _ = tokio::signal::ctrl_c() => {}
+            _ = hangup.recv() => {}
+            _ = terminate.recv() => {
+                // Unlike Ctrl-C, nobody else told the command to stop.
+                if let Some(pid) = child.id() {
+                    // SAFETY: sends a signal to the child, which has not been reaped.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::select! {
+            status = child.wait() => break status?,
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    };
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        return Ok(ExitCode::from(128 + signal as u8));
+    }
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
 fn exec(profile: &Profile, creds: &Credentials, command: &[String]) -> anyhow::Result<ExitCode> {

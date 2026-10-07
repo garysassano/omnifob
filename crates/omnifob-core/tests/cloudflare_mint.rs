@@ -171,6 +171,11 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
     );
 
     assert_eq!(creds.env["CLOUDFLARE_API_TOKEN"], "minted-secret");
+    assert_eq!(
+        creds.token_id.as_deref(),
+        Some("new"),
+        "the token ID is kept so the token can be revoked early"
+    );
     assert_eq!(creds.env["CLOUDFLARE_ACCOUNT_ID"], ACCOUNT);
     assert_eq!(
         creds.expires_at.unwrap().to_string(),

@@ -369,6 +369,60 @@ pub fn resolve_permissions<'a>(
     Ok(resolved)
 }
 
+/// The permissions of one service ("Workers Scripts"), as the dashboard
+/// shows them: a Read and an Edit (API: Write) level, and any other ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    pub name: String,
+    pub read: Option<PermissionGroup>,
+    pub write: Option<PermissionGroup>,
+    pub other: Vec<PermissionGroup>,
+}
+
+impl Service {
+    /// What the service applies to: account, zone or user.
+    pub fn scope(&self) -> &str {
+        self.read
+            .iter()
+            .chain(&self.write)
+            .chain(&self.other)
+            .find_map(|g| g.scopes.first())
+            .map_or("", |s| s.rsplit('.').next().unwrap_or(s))
+    }
+}
+
+/// Groups permissions by service, sorted by name. Account-owned tokens
+/// cannot carry user-level permissions, so those are left out for them.
+pub fn services(groups: &[PermissionGroup], token_type: CloudflareTokenType) -> Vec<Service> {
+    let mut by_name: BTreeMap<String, Service> = BTreeMap::new();
+    for group in groups {
+        if token_type == CloudflareTokenType::Account
+            && group.scopes.iter().any(|s| s == SCOPE_USER)
+        {
+            continue;
+        }
+        let (base, level) = match group.name.rsplit_once(' ') {
+            Some((base, "Read")) => (base, Some(false)),
+            Some((base, "Write" | "Edit")) => (base, Some(true)),
+            _ => (group.name.as_str(), None),
+        };
+        let service = by_name
+            .entry(base.to_lowercase())
+            .or_insert_with(|| Service {
+                name: base.to_string(),
+                read: None,
+                write: None,
+                other: Vec::new(),
+            });
+        match level {
+            Some(false) if service.read.is_none() => service.read = Some(group.clone()),
+            Some(true) if service.write.is_none() => service.write = Some(group.clone()),
+            _ => service.other.push(group.clone()),
+        }
+    }
+    by_name.into_values().collect()
+}
+
 /// Builds token policies: one per resource kind the permissions apply to,
 /// each limited to the given account (and, for zone permissions, every zone
 /// in that account).
@@ -773,8 +827,9 @@ pub async fn mint(
         .call(Method::POST, &tokens, &[], Some(&body))
         .await
         .context("minting a Cloudflare token")?;
-    if !created.id.is_empty() {
-        catalog.track(profile_id, &created.id);
+    let token_id = (!created.id.is_empty()).then(|| created.id.clone());
+    if let Some(id) = &token_id {
+        catalog.track(profile_id, id);
     }
 
     // Cleaning up overlaps with waiting for D1 to accept the new token.
@@ -797,6 +852,7 @@ pub async fn mint(
         env,
         expires_at: Some(expires_at),
         issued_at: None,
+        token_id,
     })
 }
 
@@ -914,6 +970,23 @@ pub async fn revoke(
     let deleted = revoke_minted(&client, &tokens, profile_id, &mut catalog).await;
     save_catalog(integration, &catalog)?;
     Ok(deleted?)
+}
+
+/// Deletes one token omnifob minted, for example when the command it was
+/// minted for has ended.
+pub async fn revoke_token(
+    integration: &str,
+    config: &CloudflareConfig,
+    account_id: &str,
+    token_id: &str,
+) -> Result<()> {
+    let client = bootstrap_client(integration)?;
+    let tokens = Client::tokens_path(config.token_type, account_id);
+    delete_token(&client, &tokens, token_id).await?;
+    let mut catalog = load_catalog(integration);
+    catalog.untrack(token_id);
+    save_catalog(integration, &catalog)?;
+    Ok(())
 }
 
 /// Deletes expired tokens omnifob minted in each of the integration's accounts.
@@ -1061,6 +1134,30 @@ mod tests {
             bootstrap_url(&config),
             "https://dash.cloudflare.com/profile/api-tokens"
         );
+    }
+
+    #[test]
+    fn services_pair_read_and_write() {
+        let groups = vec![
+            group("1", "Workers Scripts Read", SCOPE_ACCOUNT),
+            group("2", "Workers Scripts Write", SCOPE_ACCOUNT),
+            group("3", "DNS Read", SCOPE_ZONE),
+            group("4", "Memberships Read", SCOPE_USER),
+            group("5", "Cache Purge", SCOPE_ZONE),
+        ];
+        let all = services(&groups, CloudflareTokenType::User);
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Cache Purge", "DNS", "Memberships", "Workers Scripts"]
+        );
+        let workers = &all[3];
+        assert_eq!(workers.read.as_ref().unwrap().id, "1");
+        assert_eq!(workers.write.as_ref().unwrap().id, "2");
+        assert_eq!(all[0].other.len(), 1);
+        assert_eq!(all[1].scope(), "zone");
+        let account = services(&groups, CloudflareTokenType::Account);
+        assert!(account.iter().all(|s| s.name != "Memberships"));
     }
 
     #[test]
