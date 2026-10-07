@@ -137,6 +137,11 @@ pub struct CloudflareConfig {
     /// addresses at minting time. Empty means anywhere.
     #[serde(default)]
     pub ips: Vec<String>,
+    /// Sign-in session length. When set, `fob login` makes the new bootstrap
+    /// token expire after this long, so it works like an SSO session: a
+    /// stolen copy stops working, and a new one needs the dashboard sign-in.
+    #[serde(default, with = "opt_duration")]
+    pub session: Option<SignedDuration>,
 }
 
 fn default_cloudflare_ttl() -> SignedDuration {

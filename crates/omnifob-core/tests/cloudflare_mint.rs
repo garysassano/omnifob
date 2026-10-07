@@ -2,7 +2,7 @@
 
 use jiff::Timestamp;
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
-use omnifob_core::providers::cloudflare::{Catalog, Client, mint, revoke_minted};
+use omnifob_core::providers::cloudflare::{Catalog, Client, mint, revoke_minted, start_session};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -554,7 +554,7 @@ async fn a_catalog_missing_a_permission_is_refreshed() {
         )
         .unwrap()],
         user_tag: None,
-        minted: Default::default(),
+        ..Default::default()
     };
     let client = Client::new(server.uri(), "bootstrap");
     mint(
@@ -706,4 +706,64 @@ async fn narrow_tokens_carry_ip_conditions_buckets_and_s3_credentials() {
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert_eq!(creds.env["CLOUDFLARE_API_TOKEN"], "abc");
+}
+
+#[tokio::test]
+async fn a_session_makes_the_bootstrap_expire_and_ends_the_previous_one() {
+    let server = MockServer::start().await;
+    let tokens = format!("/accounts/{ACCOUNT}/tokens");
+    Mock::given(method("GET"))
+        .and(path(format!("{tokens}/boot")))
+        .respond_with(ok(json!({
+            "id": "boot", "name": "omnifob bootstrap", "status": "active",
+            "policies": [{ "effect": "allow", "resources": {}, "permission_groups": [] }],
+            "condition": { "request_ip": { "in": ["198.51.100.0/24"] } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("{tokens}/boot")))
+        .respond_with(ok(json!({ "id": "boot" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("{tokens}/old-boot")))
+        .respond_with(ok(json!({ "id": "old-boot" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new(server.uri(), "bootstrap");
+    let session = jiff::SignedDuration::from_hours(12);
+    let before = Timestamp::now();
+    let expires_at = start_session(&client, &tokens, "boot", session, Some("old-boot"))
+        .await
+        .unwrap();
+    assert!(expires_at > before + jiff::SignedDuration::from_mins(719));
+
+    let requests = server.received_requests().await.unwrap();
+    let put = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&put.body).unwrap();
+    assert_eq!(body["name"], "omnifob bootstrap");
+    assert_eq!(
+        body["policies"].as_array().unwrap().len(),
+        1,
+        "policies are kept"
+    );
+    assert_eq!(
+        body["condition"]["request_ip"]["in"][0], "198.51.100.0/24",
+        "an IP filter is kept"
+    );
+    assert_eq!(
+        body["expires_on"]
+            .as_str()
+            .unwrap()
+            .parse::<Timestamp>()
+            .unwrap(),
+        expires_at
+    );
 }

@@ -56,3 +56,10 @@ From developers.cloudflare.com/fundamentals/oauth:
 - The account token list has a "Created via" column ("Direct" for dashboard-made tokens); what it shows for API-minted tokens is still to be seen.
 - No OAuth route for third parties: none of the 392 OAuth scopes creates API tokens.
 - Tokens created through the API cannot manage tokens: asking the bootstrap to mint a child with "Account API Tokens Write" fails with code 1001, "sub-token is not allowed to have permissions to manage other tokens" (2026-10-07). Only dashboard-made tokens can create, roll or delete tokens, so nothing omnifob mints can, and the bootstrap can only be retired in the dashboard or by rolling. Whether a dashboard-made token may delete itself is untested.
+
+## Sessions (2026-10-07)
+
+- A dashboard-made token with "Account API Tokens Edit" can edit itself: setting and removing its own `expires_on` worked live, and the token stayed active. `session` uses this right after login, keeping the token's name, policies and IP condition.
+- The same holds for anyone holding the token, so a session limits a stolen copy's lifetime but cannot stop an intruder during the session from removing the expiry or minting long-lived tokens.
+- Template URLs cannot pre-fill an expiry or IP filter (only `permissionGroupKeys`, `name`, and for user tokens `accountId` and `zoneId`), which is why fob sets the expiry itself.
+- Cloudflare has no second factor for API token creation and no OAuth scope that creates tokens for third-party clients; the dashboard sign-in is the only Cloudflare-enforced second factor, hence a new bootstrap per session.
