@@ -263,7 +263,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             app.login(&integration, no_browser, token_stdin).await?;
             app.sync(std::slice::from_ref(&integration)).await?;
         }
-        Command::Logout { integration } => app.logout(&integration)?,
+        Command::Logout { integration } => app.logout(&integration).await?,
         Command::Status => app.status()?,
         Command::Rename { old, new } => app.rename(&old, &new)?,
         Command::Sync { integrations } => app.sync(&integrations).await?,
@@ -494,9 +494,34 @@ impl App {
         Ok(())
     }
 
-    fn logout(&mut self, name: &str) -> anyhow::Result<()> {
-        let integration = self.config.integration(name)?;
-        let existed = providers::logout(name, integration)?;
+    async fn logout(&mut self, name: &str) -> anyhow::Result<()> {
+        let integration = self.config.integration(name)?.clone();
+        let accounts: Vec<String> = self
+            .cache
+            .integrations
+            .get(name)
+            .map(|s| {
+                let mut ids: Vec<String> = s
+                    .profiles
+                    .iter()
+                    .filter_map(|p| match &p.target {
+                        omnifob_core::Target::Cloudflare { account_id, .. } => {
+                            Some(account_id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                ids.dedup();
+                ids
+            })
+            .unwrap_or_default();
+        // Signing out also ends the access omnifob handed out.
+        match providers::revoke_all(name, &integration, &accounts).await {
+            Ok(0) | Err(Error::NeedsLogin { .. }) => {}
+            Ok(n) => eprintln!("fob: deleted {n} token(s) omnifob had minted"),
+            Err(e) => eprintln!("fob: could not delete minted tokens: {e:#}"),
+        }
+        let existed = providers::logout(name, &integration)?;
         if let Some(synced) = self.cache.integrations.get(name) {
             providers::forget_credentials(&synced.profiles);
         }

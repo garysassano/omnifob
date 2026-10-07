@@ -13,9 +13,44 @@ use crate::{Config, Credentials, Integration, Profile, Result, Target, store};
 pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
     match integration {
         Integration::AwsSso(config) => aws_sso::discover(name, config).await,
-        Integration::Cloudflare(config) => cloudflare::discover(name, config).await,
+        Integration::Cloudflare(config) => {
+            let profiles = cloudflare::discover(name, config).await?;
+            // A good moment to delete expired tokens omnifob minted.
+            let mut accounts: Vec<String> = profiles
+                .iter()
+                .filter_map(|p| match &p.target {
+                    Target::Cloudflare { account_id, .. } => Some(account_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            accounts.dedup();
+            if let Err(e) = cloudflare::cleanup(name, config, &accounts).await {
+                tracing::warn!("could not clean up expired omnifob tokens: {e}");
+            }
+            Ok(profiles)
+        }
         Integration::Token(config) => Ok(token::discover(name, config)),
     }
+}
+
+/// Deletes every token omnifob minted through a Cloudflare integration, in
+/// the given accounts; returns how many. Called before signing out.
+pub async fn revoke_all(
+    name: &str,
+    integration: &Integration,
+    account_ids: &[String],
+) -> Result<usize> {
+    let Integration::Cloudflare(config) = integration else {
+        return Ok(0);
+    };
+    let mut deleted = 0;
+    for account_id in account_ids {
+        deleted += cloudflare::revoke(name, config, None, account_id).await?;
+        if config.token_type == crate::config::CloudflareTokenType::User {
+            break; // user tokens are listed once, not per account
+        }
+    }
+    Ok(deleted)
 }
 
 /// Removes the stored sign-in of an integration; returns whether one existed.
@@ -203,7 +238,7 @@ pub async fn revoke(config: &Config, profile: &Profile) -> Result<Revoked> {
     let integration = config.integration(&profile.integration)?;
     let revoked = match (integration, &profile.target) {
         (Integration::Cloudflare(c), Target::Cloudflare { account_id, .. }) => Revoked::Tokens(
-            cloudflare::revoke(&profile.integration, c, &profile.id, account_id).await?,
+            cloudflare::revoke(&profile.integration, c, Some(&profile.id), account_id).await?,
         ),
         _ => Revoked::CacheOnly,
     };

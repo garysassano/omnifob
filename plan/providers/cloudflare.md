@@ -36,7 +36,7 @@ From developers.cloudflare.com/fundamentals/oauth:
 - Built-in templates: `workers` (the full developer platform: the dashboard's "Edit Cloudflare Workers" set plus D1, Queues, Workers AI, Vectorize, Hyperdrive, Containers, Pipelines, and optional Browser Run, AI Gateway, Observability, Builds, Agents, Secrets Store, CI, Cloudchamber, Images, AI Search, Email Sending), `dns-read`, `dns-edit`, `read`. Required names verified against the docs; optional names are guesses where the docs lag the dashboard, which is why they are optional.
 - Dashboard "Edit" and API "Write" names are interchangeable in templates.
 - The dashboard's own "Edit Cloudflare Workers" template (seen 2026-10-06): Workers Scripts, Workers Routes, Account Settings Read, User Details Read, Workers Tail Read, Workers R2 Storage, Cloudflare Pages, Workers Builds Configuration, Workers Agents Configuration, Memberships Read, Workers Observability, Containers. No D1, Queues, Workers AI, Vectorize, Hyperdrive or Browser Run.
-- Tokens named `omnifob:<profile>@<time>`; expired ones deleted after each mint.
+- Tokens named `omnifob <template>` (until 0.2: `omnifob:<profile>@<time>`, still recognised). Their IDs are tracked per profile in the catalog state file; expired ones are deleted after each mint and on `sync`, all of them on `logout`, and those of one profile on `revoke`. The API can report an expired token as `active`, so expiry is judged by `expires_on`.
 - Console: `https://dash.cloudflare.com/<account_id>`.
 
 ## Next
