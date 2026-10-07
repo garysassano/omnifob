@@ -848,13 +848,13 @@ fn cloudflare_bootstrap_help(token_type: CloudflareTokenType) -> &'static str {
             "\
 fob: omnifob needs one token that can create other tokens. In the page that opens:
      Create Token > \"Create Additional Tokens\" > Use template, name it \"omnifob bootstrap\",
-     then Continue to summary > Create Token > Copy."
+     then create it and copy the token."
         }
         CloudflareTokenType::Account => {
             "\
 fob: omnifob needs one token that can create other tokens. The page that opens is
      pre-filled (name \"omnifob bootstrap\", permission Account API Tokens: Edit):
-     Continue to summary > Create Token > Copy."
+     Review token > Create token > copy the token with the copy icon."
         }
     }
 }
