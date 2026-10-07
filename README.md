@@ -131,10 +131,12 @@ fob exec cf workers -- claude            # give an agent a token without pasting
 fob exec cf workers --ttl 4h -- claude   # longer-lived token for a long session
 fob console prod admin    # opens the AWS console as that role
 fob status
+fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts)
+fob check prod admin      # do this profile's credentials work, and what do they act as?
 fob rename acme work      # rename an integration; keeps its sign-in and profiles
 ```
 
-Profiles are `<integration>/<account>/<role or template>`. Any words that together match one profile select it (`prod admin`); with no match or several, `fob` shows a fuzzy picker.
+Profiles are `<integration>/<account>/<role or template>`. Any words that together match one profile select it (`prod admin`), and so does an account ID (`fob exec 123456789012 admin -- ...`); with no match or several, `fob` shows a fuzzy picker that lists recently used profiles first.
 
 ### In the current shell
 

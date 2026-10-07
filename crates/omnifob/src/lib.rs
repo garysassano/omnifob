@@ -12,6 +12,7 @@ use clap_complete::{ArgValueCandidates, CompletionCandidate};
 use dialoguer::console::Term;
 use jiff::Timestamp;
 use omnifob_core::config::CloudflareTokenType;
+use omnifob_core::history::{self, History};
 use omnifob_core::profile::{ProfileCache, SyncedProfiles};
 use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, token};
 use omnifob_core::{Config, Credentials, Error, Integration, Profile, paths};
@@ -51,6 +52,14 @@ enum Command {
     Logout { integration: String },
     /// Show integrations and whether you are signed in
     Status,
+    /// Check that sign-ins work, or that a profile's credentials do (never signs in)
+    Check {
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
+        profile: Vec<String>,
+        /// Print nothing; only the exit status tells whether everything works
+        #[arg(long, short)]
+        quiet: bool,
+    },
     /// Rename an integration, keeping its sign-in and discovered profiles
     Rename {
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
@@ -271,6 +280,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Logout { integration } => app.logout(&integration).await?,
         Command::Status => app.status()?,
+        Command::Check { profile, quiet } => {
+            return app.check(query(&profile).as_deref(), quiet).await;
+        }
         Command::Rename { old, new } => app.rename(&old, &new)?,
         Command::Sync { integrations } => app.sync(&integrations).await?,
         Command::List { query, json } => app.list(query.as_deref(), json).await?,
@@ -314,6 +326,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Credentials::default()
             };
             let url = providers::console_url(&app.config, &profile, &creds).await?;
+            record_use(&profile.id);
             if print {
                 println!("{url}");
             } else {
@@ -412,6 +425,16 @@ fn integration_candidates() -> Vec<CompletionCandidate> {
         .iter()
         .map(|(name, i)| CompletionCandidate::new(name).help(Some(i.kind().into())))
         .collect()
+}
+
+/// Remembers that a profile was used, for the picker's ordering.
+fn record_use(profile_id: &str) {
+    let path = history::file();
+    let mut history = History::load(&path);
+    history.record(profile_id, Timestamp::now());
+    if let Err(e) = history.save(&path) {
+        tracing::debug!("could not save the usage history: {e:#}");
+    }
 }
 
 fn profiles_file() -> std::path::PathBuf {
@@ -598,6 +621,47 @@ impl App {
         Ok(())
     }
 
+    /// Checks every integration's sign-in, or one profile's credentials.
+    async fn check(&mut self, query: Option<&str>, quiet: bool) -> anyhow::Result<ExitCode> {
+        let report = |ok: bool, what: &str, detail: &str| {
+            if !quiet {
+                println!("{} {what}: {detail}", if ok { "ok  " } else { "FAIL" });
+            }
+        };
+        let mut failed = false;
+        if let Some(query) = query {
+            let profile = self.select(Some(query)).await?;
+            match providers::check_profile(&self.config, &profile).await {
+                Ok(detail) => report(true, &profile.id, &detail),
+                Err(e) => {
+                    failed = true;
+                    report(false, &profile.id, &format!("{e:#}"));
+                }
+            }
+        } else {
+            if self.config.integrations.is_empty() {
+                bail!(
+                    "no integrations configured in {}",
+                    paths::config_file().display()
+                );
+            }
+            for (name, integration) in &self.config.integrations {
+                match providers::check_sign_in(name, integration).await {
+                    Ok(detail) => report(true, name, &detail),
+                    Err(e) => {
+                        failed = true;
+                        report(false, name, &format!("{e:#}"));
+                    }
+                }
+            }
+        }
+        Ok(if failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
+    }
+
     fn status(&self) -> anyhow::Result<()> {
         if self.config.integrations.is_empty() {
             println!(
@@ -734,10 +798,12 @@ impl App {
     /// or ambiguous and a terminal is available.
     async fn select(&mut self, query: Option<&str>) -> anyhow::Result<Profile> {
         self.ensure_synced().await?;
-        let candidates: Vec<&Profile> = match query {
+        let mut candidates: Vec<&Profile> = match query {
             Some(q) => self.cache.find(q),
             None => self.cache.all().collect(),
         };
+        // Recently used profiles first, in the picker and in error messages.
+        History::load(&history::file()).sort_recent_first(&mut candidates, |p| p.id.as_str());
         match candidates.as_slice() {
             [] if query.is_some() => bail!(
                 "no profile matches '{}'; see `fob list`",
@@ -778,6 +844,7 @@ impl App {
         if use_cache && creds.wants_renewal(Timestamp::now()) {
             spawn_renewal(&profile.id);
         }
+        record_use(&profile.id);
         Ok(creds)
     }
 
@@ -889,7 +956,7 @@ fn export_aws_config(
                 return None;
             };
             let region = match &p.target {
-                omnifob_core::Target::AwsChained { label } => c
+                omnifob_core::Target::AwsChained { label, .. } => c
                     .chained
                     .get(label)
                     .and_then(|r| r.region.clone())

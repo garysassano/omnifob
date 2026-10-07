@@ -41,10 +41,10 @@
 
 Ordered by value for daily use against effort; reasons in [research.md](research.md#second-round-2026-10-07).
 
-- [ ] Find profiles by AWS account ID too (`fob exec 123456789012 admin -- ...`), after aws-sso-util's `run-as`. Small.
-- [ ] Order the picker by recent use, after aws-sso-cli's History; matters with hundreds of profiles. Small.
+- [x] Find profiles by AWS account ID too (`fob exec 123456789012 admin -- ...`), after aws-sso-util's `run-as`. Small.
+- [x] Order the picker by recent use, after aws-sso-cli's History; matters with hundreds of profiles. Small.
 - [ ] `fob console`: `--copy`, OSC 52 for SSH sessions, and Firefox containers so several accounts' consoles stay open side by side, after aws-sso-cli. Medium.
-- [ ] `fob check [profile]`: diagnose sign-in and access, with a quiet mode for scripts, after aws-sso-util. Small.
+- [x] `fob check [profile]`: diagnose sign-in and access, with a quiet mode for scripts, after aws-sso-util. Small.
 - [ ] A `command` integration: any program that prints credentials as JSON becomes a profile; covers saml2aws, gimme-aws-creds and scripts, instead of awsume-style plugins. Medium.
 - [ ] Per-directory profiles through aliases: the repository names an alias, each machine maps it to a profile (secretenv's model; wrangler's directory bindings). Medium.
 - [ ] MFA for chained roles: TOTP prompt, or an `mfa_command` (ykman, 1Password), after aws-mfa; unblocks profiles `fob import aws` skips. Medium.
