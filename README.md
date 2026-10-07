@@ -65,15 +65,18 @@ region = "us-east-1"         # optional, defaults to the integration's
 
 [integrations.cf]
 type = "cloudflare"
-account_id = "0123456789abcdef0123456789abcdef"  # optional: discovered when omitted
+account_id = "0123456789abcdef0123456789abcdef"  # required for token_type = "account"
 account_name = "personal"
-ttl = "1h"                                       # lifetime of minted tokens
+token_type = "account"   # bootstrap owned by the account; "user" (default) for a user-owned one
+ttl = "1h"               # lifetime of minted tokens
 
 # Templates name permissions as the dashboard does; never IDs.
 [integrations.cf.templates.pages]
 permissions = ["Pages Write", "Account Settings Read"]
 ttl = "30m"
 ```
+
+`fob login cf` needs one bootstrap token that can create other tokens, made once in the dashboard. With `token_type = "account"` it opens a pre-filled form (name "omnifob bootstrap", permission Account API Tokens: Edit): click Create Token, then Copy, then press Enter, and fob reads the token from the clipboard so it never appears on screen. With user-owned tokens it opens the API Tokens page, where you pick the "Create Additional Tokens" template. Account-owned tokens cannot carry user-level permissions such as "User Details Read"; templates leave those out for them (wrangler works without them, except `wrangler whoami`).
 
 Providers that only have long-lived tokens use `type = "token"`, usually with a preset:
 

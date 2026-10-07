@@ -1,5 +1,6 @@
 //! The `fob` / `omnifob` command line.
 
+mod clipboard;
 mod shell;
 
 use std::io::{IsTerminal, Read};
@@ -40,8 +41,11 @@ enum Command {
         no_browser: bool,
         /// Read the token (a Cloudflare bootstrap token, or a token integration's
         /// single secret) from stdin instead of prompting
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_clipboard")]
         token_stdin: bool,
+        /// Read the Cloudflare bootstrap token from the clipboard instead of prompting
+        #[arg(long)]
+        from_clipboard: bool,
     },
     /// Forget an integration's sign-in and cached credentials
     Logout { integration: String },
@@ -259,8 +263,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             integration,
             no_browser,
             token_stdin,
+            from_clipboard,
         } => {
-            app.login(&integration, no_browser, token_stdin).await?;
+            app.login(&integration, no_browser, token_stdin, from_clipboard)
+                .await?;
             app.sync(std::slice::from_ref(&integration)).await?;
         }
         Command::Logout { integration } => app.logout(&integration).await?,
@@ -426,7 +432,13 @@ fn expiry_note(creds: &Credentials) -> String {
 }
 
 impl App {
-    async fn login(&self, name: &str, no_browser: bool, token_stdin: bool) -> anyhow::Result<()> {
+    async fn login(
+        &self,
+        name: &str,
+        no_browser: bool,
+        token_stdin: bool,
+        from_clipboard: bool,
+    ) -> anyhow::Result<()> {
         match self.config.integration(name)? {
             Integration::AwsSso(config) => {
                 aws_sso::login(name, config, |prompt| {
@@ -444,17 +456,29 @@ impl App {
                     let mut token = String::new();
                     std::io::stdin().read_to_string(&mut token)?;
                     token
+                } else if from_clipboard {
+                    clipboard::read_token()?
                 } else {
                     if !interactive() {
-                        bail!("no terminal to prompt for the token; pass it with --token-stdin");
+                        bail!(
+                            "no terminal to prompt for the token; copy it and use --from-clipboard, or pipe it to --token-stdin"
+                        );
                     }
-                    eprintln!(
-                        "{}",
-                        cloudflare_bootstrap_help(config.token_type, config.account_id.as_deref())
-                    );
-                    dialoguer::Password::new()
-                        .with_prompt("Bootstrap token")
-                        .interact_on(&Term::stderr())?
+                    let url = cloudflare::bootstrap_url(config);
+                    eprintln!("{}", cloudflare_bootstrap_help(config.token_type));
+                    eprintln!("     {url}");
+                    if !no_browser && let Err(e) = open::that(&url) {
+                        eprintln!("fob: could not open a browser ({e}); open the URL above");
+                    }
+                    let typed = dialoguer::Password::new()
+                        .with_prompt("Paste the token, or copy it and press Enter")
+                        .allow_empty_password(true)
+                        .interact_on(&Term::stderr())?;
+                    if typed.trim().is_empty() {
+                        clipboard::read_token()?
+                    } else {
+                        typed
+                    }
                 };
                 cloudflare::login(name, config, &token).await?;
             }
@@ -635,7 +659,7 @@ impl App {
                 reason,
             }) if interactive() => {
                 eprintln!("fob: {reason}; signing in again");
-                self.login(&integration, false, false).await?;
+                self.login(&integration, false, false, false).await?;
                 Ok(f().await?)
             }
             other => Ok(other?),
@@ -818,22 +842,20 @@ impl App {
     }
 }
 
-fn cloudflare_bootstrap_help(token_type: CloudflareTokenType, account_id: Option<&str>) -> String {
+fn cloudflare_bootstrap_help(token_type: CloudflareTokenType) -> &'static str {
     match token_type {
-        CloudflareTokenType::User => "\
-omnifob needs one token that can create other tokens. Create it once:
-  1. Open https://dash.cloudflare.com/profile/api-tokens
-  2. Create Token > \"Create additional tokens\" template > Use template
-  3. Optionally restrict it to your IP addresses, then create it and paste it below"
-            .to_string(),
-        CloudflareTokenType::Account => format!(
+        CloudflareTokenType::User => {
             "\
-omnifob needs one account-owned token that can create other tokens. Create it once:
-  1. Open https://dash.cloudflare.com/{}/api-tokens
-  2. Create Token > Custom token > permission \"Account API Tokens\" Edit
-  3. Create it and paste it below",
-            account_id.unwrap_or(":account")
-        ),
+fob: omnifob needs one token that can create other tokens. In the page that opens:
+     Create Token > \"Create Additional Tokens\" > Use template, name it \"omnifob bootstrap\",
+     then Continue to summary > Create Token > Copy."
+        }
+        CloudflareTokenType::Account => {
+            "\
+fob: omnifob needs one token that can create other tokens. The page that opens is
+     pre-filled (name \"omnifob bootstrap\", permission Account API Tokens: Edit):
+     Continue to summary > Create Token > Copy."
+        }
     }
 }
 

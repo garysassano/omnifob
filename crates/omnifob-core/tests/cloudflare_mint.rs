@@ -251,25 +251,32 @@ async fn account_tokens_use_account_endpoints() {
 }
 
 #[tokio::test]
-async fn account_tokens_cannot_carry_user_permissions() {
+async fn account_tokens_leave_out_user_permissions() {
     let server = MockServer::start().await;
+    let base = format!("/accounts/{ACCOUNT}/tokens");
     Mock::given(method("GET"))
-        .and(path(format!(
-            "/accounts/{ACCOUNT}/tokens/permission_groups"
-        )))
+        .and(path(format!("{base}/permission_groups")))
         .respond_with(ok(permission_groups()))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(ok(json!({})))
-        .expect(0)
+        .and(path(base.clone()))
+        .respond_with(ok(json!({ "id": "acct-tok", "value": "acct-secret" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!([])))
         .mount(&server)
         .await;
 
+    // Like the built-in workers template: account permissions plus the
+    // user-level "User Details Read", which account tokens cannot carry.
     let client = Client::new(server.uri(), "bootstrap");
-    let err = mint(
+    mint(
         &client,
-        &config("account", r#""User Details Read""#),
+        &config("account", r#""Workers Scripts Write", "User Details Read""#),
         "p",
         ACCOUNT,
         "t",
@@ -277,11 +284,22 @@ async fn account_tokens_cannot_carry_user_permissions() {
         &mut Catalog::default(),
     )
     .await
-    .unwrap_err();
-    assert!(
-        format!("{err:#}").contains("user-owned bootstrap token"),
-        "{err:#}"
-    );
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body = posted_body(&requests, &base);
+    let policies = body["policies"].as_array().unwrap();
+    assert_eq!(policies.len(), 1, "{policies:#?}");
+    let mut ids: Vec<&str> = policies[0]["permission_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    // The test config's optional "Browser Run Write" is account-level and stays.
+    assert_eq!(ids, ["g-browser", "g-workers"]);
+    assert!(!body.to_string().contains("com.cloudflare.api.user"));
 }
 
 #[tokio::test]
