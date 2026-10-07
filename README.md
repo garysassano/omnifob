@@ -2,25 +2,17 @@
 
 One sign-in for every cloud. `fob` signs you in once per identity source, discovers every account and role you can use, and hands out short-lived credentials as environment variables, to a command, to the web console, or to other tools.
 
-It takes its ideas from tools that each solved part of the problem:
-
-- [granted](https://github.com/fwdcloudsec/granted) (AWS): `assume`-style switching in the current shell and opening the console.
-- [aws-vault](https://github.com/ByteNess/aws-vault) (AWS): SSO tokens in the OS keychain, renewed silently with refresh tokens.
-- [Leapp](https://github.com/Noovolari/leapp) (AWS, Azure) and [aws-sso-cli](https://github.com/synfinatic/aws-sso-cli) (AWS): sign in once, then discover every account and role.
-- [wrangler](https://github.com/cloudflare/workers-sdk) and [cf](https://github.com/cloudflare/cf) (Cloudflare): Cloudflare sign-in and the variables Cloudflare tools read.
-- [fnox](https://github.com/jdx/fnox) (many providers): short-lived credential leases for project secrets; `fob creds --format fnox` plugs into it.
-
 ## Status
 
 Early. What changed in each version is in the [release notes](https://github.com/garysassano/omnifob/releases). Working today:
 
-| Integration | Sign-in | Discovery | Credentials | Console |
-| --- | --- | --- | --- | --- |
-| `aws-sso` (IAM Identity Center) | Device flow, silent refresh | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole | Federated sign-in URL |
-| `cloudflare` | Bootstrap token, stored once | Accounts × templates | Minted tokens, scoped by permission name, expiring | Dashboard |
-| `token` | Paste once, checked against the provider where possible | One profile per integration | The stored token under every variable the provider's tools read | Known console URL |
+| Integration                     | Sign-in                                                 | Discovery                                             | Credentials                                                     | Console               |
+| ------------------------------- | ------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------- | --------------------- |
+| `aws-sso` (IAM Identity Center) | Device flow, silent refresh                             | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole          | Federated sign-in URL |
+| `cloudflare`                    | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring              | Dashboard             |
+| `token`                         | Paste once, checked against the provider where possible | One profile per integration                           | The stored token under every variable the provider's tools read | Known console URL     |
 
-Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain.
+Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
 Planned: Cloudflare browser sign-in (OAuth with PKCE), Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), per-directory profiles through mise.
 
@@ -76,22 +68,7 @@ permissions = ["Pages Write", "Account Settings Read"]
 ttl = "30m"
 ```
 
-#### The Cloudflare bootstrap token
-
-Cloudflare has no sign-in that lets another app create API tokens, so `fob login cf` needs one bootstrap token that can create others. You make it once in the dashboard; omnifob keeps it in the keychain and mints short-lived tokens from it. There are two kinds, set with `token_type`, and they map onto the AWS model:
-
-| | Account-owned (`token_type = "account"`) | User-owned (`token_type = "user"`, the default) |
-| --- | --- | --- |
-| Like in AWS | An IAM role scoped to one account | One Identity Center sign-in that reaches many accounts |
-| Reaches | The configured `account_id` only | Every account you belong to; omnifob discovers them |
-| Owned by | The account, not a person; keeps working if you leave it | You; acts as you |
-| Creating it | `fob login` opens a pre-filled form (name "omnifob bootstrap", permission Account API Tokens: Edit): Review token, Create token, copy | `fob login` opens the API Tokens page: Create Token, "Create Additional Tokens" template, name it "omnifob bootstrap", create, copy |
-| If it leaks | Limited to one account; the `cfat_` format is recognised by secret scanners | Can create tokens for all your accounts |
-| Limits | No user-level permissions (User Details, Memberships), so `wrangler whoami` shows less; not yet supported by Turnstile, Registrar, Page Rules, Super Bot Fight Mode, Intel Data Platform and the Zero Trust Client Platform | None |
-
-Use account-owned when you work in one account (Cloudflare recommends account tokens for durable integrations), user-owned when one token should cover several accounts. You can configure both, as two integrations.
-
-After creating the token, press Enter at the prompt and fob reads it from the clipboard, so it never appears on screen; `--from-clipboard` does the same without a prompt, and `--token-stdin` reads it from a pipe. Templates leave out user-level permissions for account-owned tokens.
+Creating the Cloudflare bootstrap token, account-owned or user-owned, is explained in [docs/guides/cloudflare.md](docs/guides/cloudflare.md).
 
 Providers that only have long-lived tokens use `type = "token"`, usually with a preset:
 
@@ -112,13 +89,6 @@ secrets = { token = ["INTERNAL_TOKEN"] }      # any provider: secret name → va
 verify_url = "https://api.example.com/me"     # optional: must answer 2xx for the token
 console = "https://console.example.com"
 ```
-
-Cloudflare comes with built-in templates; `fob cf templates <integration>` lists them and `fob cf permissions <integration> [filter]` lists every permission name your account offers. Names can be written as the API does ("Workers Scripts Write") or as the dashboard does ("Workers Scripts Edit").
-
-- `workers`: everything a Worker and its usual bindings need. The dashboard's "Edit Cloudflare Workers" template plus what it never caught up with: D1, Queues, Workers AI, Vectorize, Hyperdrive, Containers, Pipelines, and when your account offers them Browser Run, AI Gateway, Observability, Builds, Agents, Secrets Store and more.
-- `dns-read`, `dns-edit`, `read`.
-
-A template lists `permissions` (required) and `optional` ones, which are added when the account offers them and skipped otherwise.
 
 ## Use
 
@@ -183,13 +153,6 @@ Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnif
 
 Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
 
-## Credits
+## Documentation
 
-omnifob borrows ideas, not code, from these projects. Thank you to their authors.
-
-- Credential tools: [granted](https://github.com/fwdcloudsec/granted), [aws-vault](https://github.com/ByteNess/aws-vault), [Leapp](https://github.com/Noovolari/leapp), [aws-sso-cli](https://github.com/synfinatic/aws-sso-cli), [fnox](https://github.com/jdx/fnox), [1Password shell plugins](https://github.com/1Password/shell-plugins).
-- Provider CLIs whose sign-in flows were studied: [AWS CLI](https://github.com/aws/aws-cli), [gcloud](https://cloud.google.com/sdk), [Azure CLI](https://github.com/Azure/azure-cli), [OCI CLI](https://github.com/oracle/oci-cli), [wrangler](https://github.com/cloudflare/workers-sdk), [cf](https://github.com/cloudflare/cf), [doctl](https://github.com/digitalocean/doctl), [hcloud](https://github.com/hetznercloud/cli), [ovhcloud-cli](https://github.com/ovh/ovhcloud-cli), [linode-cli](https://github.com/linode/linode-cli), [scaleway-cli](https://github.com/scaleway/scaleway-cli), [vercel](https://github.com/vercel/vercel), [flyctl](https://github.com/superfly/flyctl), [neonctl](https://github.com/neondatabase/neonctl), [supabase](https://github.com/supabase/cli), [upstash](https://github.com/upstash/cli).
-
-## License
-
-MIT
+[docs/](docs/README.md) has the guides, the design notes and the research behind omnifob, including the other tools in its space.
