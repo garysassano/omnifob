@@ -37,6 +37,23 @@
 - [x] Publish the first release (v0.1.0, 2026-10-07).
 - [ ] macOS code signing and notarisation (needed for Keychain prompts to remember the app; not needed to run it).
 
+## Next: from the second study round
+
+Ordered by value for daily use against effort; reasons in [research.md](research.md#second-round-2026-10-07).
+
+- [ ] Find profiles by AWS account ID too (`fob exec 123456789012 admin -- ...`), after aws-sso-util's `run-as`. Small.
+- [ ] Order the picker by recent use, after aws-sso-cli's History; matters with hundreds of profiles. Small.
+- [ ] `fob console`: `--copy`, OSC 52 for SSH sessions, and Firefox containers so several accounts' consoles stay open side by side, after aws-sso-cli. Medium.
+- [ ] `fob check [profile]`: diagnose sign-in and access, with a quiet mode for scripts, after aws-sso-util. Small.
+- [ ] A `command` integration: any program that prints credentials as JSON becomes a profile; covers saml2aws, gimme-aws-creds and scripts, instead of awsume-style plugins. Medium.
+- [ ] Per-directory profiles through aliases: the repository names an alias, each machine maps it to a profile (secretenv's model; wrangler's directory bindings). Medium.
+- [ ] MFA for chained roles: TOTP prompt, or an `mfa_command` (ykman, 1Password), after aws-mfa; unblocks profiles `fob import aws` skips. Medium.
+- [ ] QR code for the AWS device sign-in, for SSH and headless machines, after okta-aws-cli. Small.
+- [ ] Okta integration: device flow, then `AssumeRoleWithSAML` for AWS and Alibaba Cloud, after okta-aws-cli and gimme-aws-creds; needs an Okta admin to set up the apps. Large.
+- [ ] Opt-in `store_refresh_token = false`, after aws-cli-auth. Small, niche.
+- [ ] Export to `~/.aws/credentials` for tools that predate SSO, after yawsso. Small, niche.
+- Not planned: headless-browser sign-in scraping (aws-azure-login), in-process plugins (awsume), tags (aws-sso-cli).
+
 ## v0.3: More clouds
 
 See [landscape.md](landscape.md) for how each provider's CLI signs in.
