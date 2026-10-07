@@ -6,8 +6,7 @@
 # not stored here; run plan/tools/refresh.sh for it.
 #
 # status: "studied" (read, findings in research.md or landscape.md),
-#         "to-study" (worth reading), "reference" (known, no study planned),
-#         "excluded" (looked similar but is not; kept so it is not re-added).
+#         "to-study" (worth reading), "reference" (known, no study planned).
 #
 # Categories:
 #   credential-manager  local sign-in, session and profile managers for people
@@ -524,22 +523,3 @@ category = "access-platform"
 scope = ["aws"]
 why = "DevOps toolbox container with credential helpers"
 status = "reference"
-
-# --- excluded --------------------------------------------------------------------
-
-[[tool]]
-name = "CloudFox"
-repo = "BishopFox/cloudfox"
-category = "excluded"
-scope = ["aws", "azure", "gcp"]
-why = "penetration-testing recon tool, not a credential manager"
-status = "excluded"
-
-[[tool]]
-name = "SecretHub"
-repo = "secrethub/secrethub-cli"
-category = "excluded"
-scope = ["any"]
-why = "secrets platform that shut down"
-status = "excluded"
-notes = "Archived."
