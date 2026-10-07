@@ -194,6 +194,32 @@ impl Config {
     }
 }
 
+/// Renames an integration in the text of a config file, keeping comments,
+/// layout and its sub-tables (chained roles, templates).
+pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<String> {
+    if new.is_empty() || new.contains('/') {
+        bail!("integration name '{new}' must be non-empty and contain no '/'");
+    }
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the config")?;
+    let integrations = doc
+        .get_mut("integrations")
+        .and_then(|i| i.as_table_mut())
+        .context("the config has no [integrations] table")?;
+    if integrations.contains_key(new) {
+        bail!("an integration named '{new}' already exists");
+    }
+    let (key, item) = integrations
+        .remove_entry(old)
+        .with_context(|| format!("no integration named '{old}'"))?;
+    let renamed = toml_edit::Key::new(new)
+        .with_leaf_decor(key.leaf_decor().clone())
+        .with_dotted_decor(key.dotted_decor().clone());
+    integrations.insert_formatted(&renamed, item);
+    let text = doc.to_string();
+    Config::parse(&text).context("the renamed config is not valid")?;
+    Ok(text)
+}
+
 /// Parses durations written like "1h", "30m" or "1h 30m".
 pub fn parse_duration(s: &str) -> anyhow::Result<SignedDuration> {
     let d: SignedDuration = s
@@ -273,6 +299,29 @@ mod tests {
     fn rejects_slash_in_integration_name() {
         let err = Config::parse("[integrations.\"a/b\"]\ntype = \"cloudflare\"\n").unwrap_err();
         assert!(err.to_string().contains("no '/'"));
+    }
+
+    #[test]
+    fn renames_keep_comments_order_and_subtables() {
+        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"1\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::2:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare\"\n";
+        let renamed = rename_integration(text, "gary", "aws").unwrap();
+        assert_eq!(
+            renamed,
+            text.replace("integrations.gary", "integrations.aws")
+        );
+        assert!(
+            rename_integration(text, "gary", "cf")
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert!(
+            rename_integration(text, "nope", "x")
+                .unwrap_err()
+                .to_string()
+                .contains("no integration")
+        );
+        assert!(rename_integration(text, "gary", "a/b").is_err());
     }
 
     #[test]

@@ -47,6 +47,12 @@ enum Command {
     Logout { integration: String },
     /// Show integrations and whether you are signed in
     Status,
+    /// Rename an integration, keeping its sign-in and discovered profiles
+    Rename {
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        old: String,
+        new: String,
+    },
     /// Discover profiles (every integration when none is given)
     Sync {
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
@@ -259,6 +265,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Logout { integration } => app.logout(&integration)?,
         Command::Status => app.status()?,
+        Command::Rename { old, new } => app.rename(&old, &new)?,
         Command::Sync { integrations } => app.sync(&integrations).await?,
         Command::List { query, json } => app.list(query.as_deref(), json).await?,
         Command::Env {
@@ -501,6 +508,44 @@ impl App {
                 "was not signed in"
             }
         );
+        Ok(())
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
+        let path = paths::config_file();
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let renamed = omnifob_core::config::rename_integration(&text, old, new)?;
+        let integration = self.config.integration(old)?.clone();
+
+        if let Some(synced) = self.cache.integrations.get(old) {
+            providers::forget_credentials(&synced.profiles);
+        }
+        let moved = providers::rename_sign_in(old, new, &integration)?;
+        let tmp = path.with_extension("toml.tmp");
+        let written = std::fs::write(&tmp, &renamed).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            // Put the sign-in back so nothing is left half renamed.
+            let _ = providers::rename_sign_in(new, old, &integration);
+            return Err(e).with_context(|| format!("writing {}", path.display()));
+        }
+        self.cache.rename_integration(old, new);
+        self.cache.save(&profiles_file())?;
+
+        let kept = if moved {
+            "kept the sign-in"
+        } else {
+            "no sign-in to keep"
+        };
+        eprintln!("fob: renamed '{old}' to '{new}' ({kept}); profiles are now {new}/...");
+        let aws_config = aws_config_file(None)
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        if aws_config.is_some_and(|t| t.contains(&format!("fob creds {old}/"))) {
+            eprintln!(
+                "fob: ~/.aws/config still has profiles for '{old}'; run `fob export aws-config --write` to update them"
+            );
+        }
         Ok(())
     }
 

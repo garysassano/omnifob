@@ -113,6 +113,7 @@ fob exec cf workers -- claude            # give an agent a token without pasting
 fob exec cf workers --ttl 4h -- claude   # longer-lived token for a long session
 fob console prod admin    # opens the AWS console as that role
 fob status
+fob rename acme work      # rename an integration; keeps its sign-in and profiles
 ```
 
 Profiles are `<integration>/<account>/<role or template>`. Any words that together match one profile select it (`prod admin`); with no match or several, `fob` shows a fuzzy picker.

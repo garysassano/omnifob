@@ -211,6 +211,27 @@ pub async fn revoke(config: &Config, profile: &Profile) -> Result<Revoked> {
     Ok(revoked)
 }
 
+/// Moves an integration's stored sign-in to a new integration name.
+pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow::Result<bool> {
+    match integration {
+        Integration::AwsSso(_) => store::rename(
+            &format!("aws-sso/{old}/token"),
+            &format!("aws-sso/{new}/token"),
+        ),
+        Integration::Cloudflare(_) => {
+            cloudflare::rename_catalog(old, new);
+            store::rename(
+                &format!("cloudflare/{old}/bootstrap"),
+                &format!("cloudflare/{new}/bootstrap"),
+            )
+        }
+        Integration::Token(_) => store::rename(
+            &format!("token/{old}/secrets"),
+            &format!("token/{new}/secrets"),
+        ),
+    }
+}
+
 /// Drops cached credentials for every profile in `profiles`.
 pub fn forget_credentials<'a>(profiles: impl IntoIterator<Item = &'a Profile>) {
     for profile in profiles {

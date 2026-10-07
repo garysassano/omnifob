@@ -1970,6 +1970,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "windows-native-keyring-store",
  "wiremock",
@@ -2875,6 +2876,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

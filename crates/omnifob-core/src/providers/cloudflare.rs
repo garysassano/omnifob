@@ -578,6 +578,11 @@ pub async fn credentials(
     Ok(minted?)
 }
 
+/// Moves the stored catalog to a renamed integration.
+pub fn rename_catalog(old: &str, new: &str) {
+    let _ = std::fs::rename(catalog_file(old), catalog_file(new));
+}
+
 /// Removes the stored catalog, for example after signing out.
 pub fn forget_catalog(integration: &str) {
     let _ = std::fs::remove_file(catalog_file(integration));

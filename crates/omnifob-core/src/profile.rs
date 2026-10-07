@@ -101,6 +101,21 @@ impl ProfileCache {
         std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
     }
 
+    /// Moves an integration's discovered profiles to a new name, rewriting
+    /// their ids (`old/...` becomes `new/...`).
+    pub fn rename_integration(&mut self, old: &str, new: &str) {
+        let Some(mut synced) = self.integrations.remove(old) else {
+            return;
+        };
+        for p in &mut synced.profiles {
+            p.integration = new.to_string();
+            if let Some(rest) = p.id.strip_prefix(&format!("{old}/")) {
+                p.id = format!("{new}/{rest}");
+            }
+        }
+        self.integrations.insert(new.to_string(), synced);
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &Profile> {
         self.integrations.values().flat_map(|s| s.profiles.iter())
     }

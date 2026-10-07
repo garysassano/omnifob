@@ -145,6 +145,16 @@ pub fn delete(key: &str) -> anyhow::Result<bool> {
     Ok(wsl::delete(key)? || in_keychain)
 }
 
+/// Moves a value to another key; returns whether there was one.
+pub fn rename(old: &str, new: &str) -> anyhow::Result<bool> {
+    let Some(value) = get::<serde_json::Value>(old)? else {
+        return Ok(false);
+    };
+    set(new, &value)?;
+    delete(old)?;
+    Ok(true)
+}
+
 /// Describes where secrets are kept, for `fob status`.
 pub fn description() -> anyhow::Result<String> {
     let store = init()?;
