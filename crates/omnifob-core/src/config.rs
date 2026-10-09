@@ -160,6 +160,10 @@ pub struct TokenConfig {
     /// URL that answers 2xx when the token is sent as a bearer token.
     #[serde(default)]
     pub verify_url: Option<String>,
+    /// Git host the token signs in to over HTTPS (`fob git-credential`);
+    /// the `github` preset sets `github.com`.
+    #[serde(default)]
+    pub git_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
