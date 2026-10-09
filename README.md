@@ -15,7 +15,7 @@ Early. What changed in each version is in the [release notes](https://github.com
 
 Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
-Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), per-directory profiles through mise.
+Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), git credentials and a GitHub sign-in, so `git` and `gh` share one per-directory account.
 
 ## Install
 
@@ -120,6 +120,24 @@ fob rename acme work      # rename an integration; keeps its sign-in and profile
 ```
 
 Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first.
+
+### Per directory
+
+Name the profiles each directory tree uses, in your own config:
+
+```toml
+[directories]
+"~/git" = ["gh-personal"]
+"~/git-acme" = ["gh-acme", "acme prod admin", "cf acme workers"]
+```
+
+Inside a listed directory, `fob exec -- <command>`, `fob use` and `fob console` with no profile use that directory's profile (or let you pick among its profiles), and a query that matches several profiles picks the one listed there: `fob exec github -- gh pr list` acts as the personal account under `~/git` and as the Acme one under `~/git-acme`. A query that matches only one profile still selects it, wherever you are. The most specific directory applies, matched by whole path components, so `~/git` does not cover `~/git-acme`. Entries are queries like any other and must each match exactly one profile; `fob status` shows the current directory's.
+
+The mapping lives only in your config, never in a repository, so a cloned project cannot choose which of your accounts it runs as. A shell function keeps the token out of the shell's environment and adds it per command:
+
+```sh
+gh() { fob exec github -- gh "$@"; }
+```
 
 ### In the current shell
 
