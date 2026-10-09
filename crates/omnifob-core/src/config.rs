@@ -17,9 +17,10 @@ pub struct Config {
 /// An identity source: something you sign in to once and that yields many
 /// profiles.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(try_from = "RawIntegration")]
 pub enum Integration {
     AwsSso(AwsSsoConfig),
+    /// Either Cloudflare type; `CloudflareConfig::sign_in` says which.
     Cloudflare(CloudflareConfig),
     Token(TokenConfig),
 }
@@ -28,9 +29,51 @@ impl Integration {
     pub fn kind(&self) -> &'static str {
         match self {
             Integration::AwsSso(_) => "aws-sso",
-            Integration::Cloudflare(_) => "cloudflare",
+            Integration::Cloudflare(c) => match c.sign_in {
+                CloudflareSignIn::Token => "cloudflare-token",
+                CloudflareSignIn::Oauth => "cloudflare-oauth",
+            },
             Integration::Token(_) => "token",
         }
+    }
+}
+
+/// The `type` values as written in the config file. Both Cloudflare types
+/// share one configuration and differ only in how omnifob signs in.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum RawIntegration {
+    AwsSso(AwsSsoConfig),
+    CloudflareToken(CloudflareConfig),
+    CloudflareOauth(CloudflareConfig),
+    Token(TokenConfig),
+}
+
+impl TryFrom<RawIntegration> for Integration {
+    type Error = String;
+
+    fn try_from(raw: RawIntegration) -> Result<Self, Self::Error> {
+        Ok(match raw {
+            RawIntegration::AwsSso(c) => Integration::AwsSso(c),
+            RawIntegration::Token(c) => Integration::Token(c),
+            RawIntegration::CloudflareToken(c) => {
+                if c.client_id.is_some() || c.scopes.is_some() {
+                    return Err(
+                        "client_id and scopes belong to type = \"cloudflare-oauth\"".to_string()
+                    );
+                }
+                Integration::Cloudflare(c)
+            }
+            RawIntegration::CloudflareOauth(mut c) => {
+                if c.token_type != CloudflareTokenType::default() {
+                    return Err("token_type only applies to type = \"cloudflare-token\"; \
+                         cloudflare-oauth mints account-owned tokens"
+                        .to_string());
+                }
+                c.sign_in = CloudflareSignIn::Oauth;
+                Integration::Cloudflare(c)
+            }
+        })
     }
 }
 
@@ -142,6 +185,45 @@ pub struct CloudflareConfig {
     /// stolen copy stops working, and a new one needs the dashboard sign-in.
     #[serde(default, with = "opt_duration")]
     pub session: Option<SignedDuration>,
+    /// `cloudflare-oauth`: the OAuth client to sign in with.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// `cloudflare-oauth`: scopes requested at sign-in; defaults to the ones
+    /// minting needs.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    /// Set from the integration's `type`.
+    #[serde(skip)]
+    pub sign_in: CloudflareSignIn,
+}
+
+/// How a Cloudflare integration signs in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CloudflareSignIn {
+    /// `cloudflare-token`: a bootstrap API token made in the dashboard.
+    #[default]
+    Token,
+    /// `cloudflare-oauth`: the browser, through an OAuth client, as wrangler
+    /// signs in. Tokens are minted as account-owned tokens in each account
+    /// approved on the consent page.
+    Oauth,
+}
+
+impl CloudflareConfig {
+    /// Whether this integration signs in through the browser (OAuth).
+    pub fn uses_oauth(&self) -> bool {
+        self.sign_in == CloudflareSignIn::Oauth
+    }
+
+    /// Who owns the tokens omnifob mints. With OAuth sign-in they are
+    /// account-owned, created in each approved account.
+    pub fn minting(&self) -> CloudflareTokenType {
+        if self.uses_oauth() {
+            CloudflareTokenType::Account
+        } else {
+            self.token_type
+        }
+    }
 }
 
 fn default_cloudflare_ttl() -> SignedDuration {
@@ -260,7 +342,11 @@ pub fn add_cloudflare_template(
         .and_then(|i| i.get_mut(integration))
         .and_then(|i| i.as_table_mut())
         .with_context(|| format!("no integration named '{integration}'"))?;
-    if table.get("type").and_then(|t| t.as_str()) != Some("cloudflare") {
+    if table
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_none_or(|t| !t.starts_with("cloudflare-"))
+    {
         bail!("'{integration}' is not a cloudflare integration");
     }
     let templates = table
@@ -348,7 +434,7 @@ mod tests {
             region = "eu-central-1"
 
             [integrations.cf]
-            type = "cloudflare"
+            type = "cloudflare-token"
             account_id = "abc"
             ttl = "8h"
 
@@ -377,13 +463,14 @@ mod tests {
 
     #[test]
     fn rejects_slash_in_integration_name() {
-        let err = Config::parse("[integrations.\"a/b\"]\ntype = \"cloudflare\"\n").unwrap_err();
+        let err =
+            Config::parse("[integrations.\"a/b\"]\ntype = \"cloudflare-token\"\n").unwrap_err();
         assert!(err.to_string().contains("no '/'"));
     }
 
     #[test]
     fn renames_keep_comments_order_and_subtables() {
-        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"1\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::2:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare\"\n";
+        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"1\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::2:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
         let renamed = rename_integration(text, "gary", "aws").unwrap();
         assert_eq!(
             renamed,
@@ -406,7 +493,7 @@ mod tests {
 
     #[test]
     fn adds_cloudflare_templates() {
-        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare\"\n\n[integrations.gary]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
+        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare-token\"\n\n[integrations.gary]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
         let template = CloudflareTemplate {
             permissions: vec!["Pages Write".into(), "Zone Read".into()],
             optional: vec![],
@@ -449,5 +536,26 @@ mod tests {
         );
         assert!(parse_duration("0s").is_err());
         assert!(parse_duration("soon").is_err());
+    }
+
+    #[test]
+    fn cloudflare_types_pick_the_sign_in() {
+        let cf = |text: &str| match Config::parse(text)?.integrations.remove("c").unwrap() {
+            Integration::Cloudflare(c) => Ok::<_, anyhow::Error>(c),
+            _ => unreachable!(),
+        };
+        let oauth =
+            cf("[integrations.c]\ntype = \"cloudflare-oauth\"\nclient_id = \"x\"\n").unwrap();
+        assert!(oauth.uses_oauth());
+        assert_eq!(oauth.minting(), CloudflareTokenType::Account);
+        let token = cf("[integrations.c]\ntype = \"cloudflare-token\"\n").unwrap();
+        assert!(!token.uses_oauth());
+        assert_eq!(token.minting(), CloudflareTokenType::User);
+        assert!(cf("[integrations.c]\ntype = \"cloudflare-token\"\nclient_id = \"x\"\n").is_err());
+        assert!(
+            cf("[integrations.c]\ntype = \"cloudflare-oauth\"\ntoken_type = \"account\"\n")
+                .is_err()
+        );
+        assert!(Config::parse("[integrations.c]\ntype = \"cloudflare\"\n").is_err());
     }
 }

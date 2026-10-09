@@ -10,7 +10,9 @@ anyhow = "1.0.104"
 aws-sdk-sso = { version = "1.114.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ssooidc = { version = "1.116.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-sts = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+base64 = "0.23.1"
 futures = "0.3.34"
+getrandom = "0.4.3"
 jiff = { version = "0.2.38", features = ["serde"] }
 keyring-core = "1.0.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
