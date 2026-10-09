@@ -1,7 +1,7 @@
 //! User configuration: the integrations to sign in to.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use jiff::SignedDuration;
@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub integrations: BTreeMap<String, Integration>,
+    /// Directory → profile queries used there: with no profile named, and to
+    /// choose between several matches. Written as an absolute path or one
+    /// starting with `~/`; the most specific directory wins.
+    #[serde(default)]
+    pub directories: BTreeMap<String, Vec<String>>,
 }
 
 /// An identity source: something you sign in to once and that yields many
@@ -283,7 +288,31 @@ impl Config {
                 bail!("integration name '{name}' must be non-empty and contain no '/'");
             }
         }
+        for (dir, queries) in &config.directories {
+            if !(dir == "~" || dir.starts_with("~/") || Path::new(dir).is_absolute()) {
+                bail!("directory '{dir}' must be an absolute path or start with '~/'");
+            }
+            if queries.is_empty() || queries.iter().any(|q| q.trim().is_empty()) {
+                bail!("directory '{dir}' needs at least one profile, and no empty ones");
+            }
+        }
         Ok(config)
+    }
+
+    /// The profile queries for `cwd`: those of the configured directory that
+    /// contains it most closely, with that directory as written. Directories
+    /// match whole path components, so `~/git` does not cover `~/git-acme`.
+    pub fn directory_profiles(&self, cwd: &Path, home: &Path) -> Option<(&str, &[String])> {
+        let cwd = canonical(cwd);
+        self.directories
+            .iter()
+            .filter_map(|(dir, queries)| {
+                let path = canonical(&expand_home(dir, home));
+                cwd.starts_with(&path)
+                    .then(|| (path.components().count(), dir.as_str(), queries.as_slice()))
+            })
+            .max_by_key(|(depth, ..)| *depth)
+            .map(|(_, dir, queries)| (dir, queries))
     }
 
     pub fn integration(&self, name: &str) -> anyhow::Result<&Integration> {
@@ -295,6 +324,19 @@ impl Config {
             )
         })
     }
+}
+
+fn expand_home(dir: &str, home: &Path) -> PathBuf {
+    match dir.strip_prefix('~') {
+        Some(rest) => home.join(rest.trim_start_matches(['/', '\\'])),
+        None => PathBuf::from(dir),
+    }
+}
+
+/// Resolves symlinks where the path exists, so a link into a configured
+/// directory counts as inside it.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Renames an integration in the text of a config file, keeping comments,
@@ -526,6 +568,49 @@ mod tests {
             err(add_cloudflare_template(text, "nope", "x", &template, false))
                 .contains("no integration")
         );
+    }
+
+    #[test]
+    fn directories_pick_the_closest_one() {
+        let home = Path::new("/nonexistent-home");
+        let config = Config::parse(
+            r#"
+            [directories]
+            "~/git" = ["gh-personal"]
+            "~/git/acme" = ["gh-acme", "acme prod admin"]
+            "/srv/work" = ["work"]
+            "#,
+        )
+        .unwrap();
+        let at = |cwd: &str| {
+            config
+                .directory_profiles(Path::new(cwd), home)
+                .map(|(dir, q)| (dir.to_string(), q.to_vec()))
+        };
+        assert_eq!(
+            at("/nonexistent-home/git/omnifob"),
+            Some(("~/git".into(), vec!["gh-personal".into()]))
+        );
+        assert_eq!(
+            at("/nonexistent-home/git/acme/api").unwrap().1,
+            ["gh-acme", "acme prod admin"]
+        );
+        assert_eq!(at("/nonexistent-home/git").unwrap().0, "~/git");
+        assert_eq!(
+            at("/nonexistent-home/git-acme"),
+            None,
+            "whole components only"
+        );
+        assert_eq!(at("/srv/work/x").unwrap().0, "/srv/work");
+        assert_eq!(at("/srv"), None);
+    }
+
+    #[test]
+    fn rejects_relative_or_empty_directories() {
+        let err = |text: &str| Config::parse(text).unwrap_err().to_string();
+        assert!(err("[directories]\n\"git\" = [\"x\"]\n").contains("absolute"));
+        assert!(err("[directories]\n\"~/git\" = []\n").contains("at least one"));
+        assert!(err("[directories]\n\"~/git\" = [\" \"]\n").contains("at least one"));
     }
 
     #[test]

@@ -69,3 +69,11 @@ Third-party OAuth clients can request "Account API Tokens Write" now (a sensitiv
 The sign-in method is the integration type, as with `aws-sso`: `cloudflare-oauth` and `cloudflare-token` (the bootstrap token, formerly `cloudflare`). Both share configuration, templates and minting, so a template gives the same token either way. A clean break from `cloudflare` while omnifob is 0.x, named in the release notes.
 
 A sign-in can only mint permissions whose scope the consent granted; Cloudflare refuses the rest. omnifob therefore requests the scopes its templates need, from a table of permission name to scope ID, since the IDs do not follow the names (`page.write` for Pages, `query-cache.write` for Hyperdrive). The OAuth client must have those scopes registered. Until omnifob ships a public client, each user registers a private one; a public client needs a verified domain for its client URL, and making a client public cannot be undone.
+
+## 2026-10-09: Per-directory profiles in the user's config, not through mise
+
+Working in one tree for a client and another for yourself means the same tool (gh, wrangler, aws) has to act as a different account per directory, and getting it wrong acts as the wrong identity. The `[directories]` table maps a directory to profile queries; the most specific directory, by whole path components, applies. Inside it, a command with no profile uses the directory's, and a query matching several profiles takes the one listed there.
+
+The plan had been mise: a repository's `mise.toml` choosing the profile. That puts the choice inside the repository, where a cloned project could pick which of your accounts it runs as, and mise's env exports secrets into the shell, where every later command and agent inherits them. The mapping therefore lives only in omnifob's config, like git's `includeIf`, and credentials are handed to each command by `fob exec`. An entry that matches no profile or several is an error rather than a guess, because a silent fallback could act as the other account.
+
+This is the first step toward replacing a hand-written gh wrapper that picks a GitHub account per directory from Git Credential Manager: next come git credentials from omnifob, so `git` and `gh` use one token, and a GitHub sign-in whose token has the scopes gh expects (`read:org` among them, which Git Credential Manager does not request).
