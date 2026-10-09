@@ -7,7 +7,6 @@
 
 pub mod config;
 pub mod credentials;
-pub mod git;
 pub mod history;
 pub mod import;
 pub mod paths;
