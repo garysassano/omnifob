@@ -154,6 +154,12 @@ enum Command {
     /// Cloudflare helpers
     #[command(subcommand, visible_alias = "cf")]
     Cloudflare(CloudflareCommand),
+    /// Git credential helper: answers git with the token of the profile that
+    /// serves the host in this directory (set as credential.helper "!fob git-credential")
+    GitCredential {
+        /// What git asks for: get, store or erase (only get does anything)
+        operation: String,
+    },
     /// Get replacement credentials for a profile (started by fob in the background)
     #[command(hide = true)]
     Renew { profile: String },
@@ -418,6 +424,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             app.ensure_synced().await?;
             export_aws_config(&app, &prefix, write, file)?;
         }
+        Command::GitCredential { operation } => return app.git_credential(&operation).await,
         Command::Renew { profile } => app.renew(&profile).await?,
     }
     Ok(ExitCode::SUCCESS)
@@ -1000,6 +1007,53 @@ impl App {
             }
         }
         status
+    }
+
+    /// Answers one request of git's credential helper protocol. Never
+    /// prompts: git owns stdin. What git hands back to store is ignored,
+    /// since the token lives in omnifob already.
+    async fn git_credential(&mut self, operation: &str) -> anyhow::Result<ExitCode> {
+        use omnifob_core::git::{self, Choice};
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        let request = git::parse_request(&input);
+        let (Some("https"), Some(host)) = (request.protocol.as_deref(), request.host.as_deref())
+        else {
+            return Ok(ExitCode::SUCCESS);
+        };
+        if operation != "get" {
+            return Ok(ExitCode::SUCCESS);
+        }
+        self.ensure_synced().await?;
+        let refuse = |why: String| {
+            eprintln!("fob: {why}");
+            println!("quit=1");
+            Ok(ExitCode::SUCCESS)
+        };
+        let here = match self.directory_profiles() {
+            Ok(here) => here,
+            Err(e) => {
+                if git::choose(&self.config, self.cache.all(), None, host) == Choice::NotOurs {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                return refuse(format!("{e:#}"));
+            }
+        };
+        let here = here.as_ref().map(|(dir, ps)| (*dir, ps.as_slice()));
+        let profile = match git::choose(&self.config, self.cache.all(), here, host) {
+            Choice::NotOurs => return Ok(ExitCode::SUCCESS),
+            Choice::Refuse(why) => return refuse(why),
+            Choice::Use(profile) => profile.clone(),
+        };
+        let creds = match providers::credentials(&self.config, &profile, true, None).await {
+            Ok(creds) => creds,
+            Err(e) => return refuse(format!("getting credentials for {}: {e:#}", profile.id)),
+        };
+        print!(
+            "{}",
+            git::response(&self.config, &profile, &creds, &request)?
+        );
+        Ok(ExitCode::SUCCESS)
     }
 
     /// Fetches new credentials for a profile, unless another renewal of the

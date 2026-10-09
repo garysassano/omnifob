@@ -15,7 +15,7 @@ Early. What changed in each version is in the [release notes](https://github.com
 
 Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
-Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), git credentials and a GitHub sign-in, so `git` and `gh` share one per-directory account.
+Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), a GitHub sign-in with the scopes gh expects.
 
 ## Install
 
@@ -138,6 +138,17 @@ The mapping lives only in your config, never in a repository, so a cloned projec
 ```sh
 gh() { fob exec github -- gh "$@"; }
 ```
+
+### Git over HTTPS
+
+`fob git-credential` is a git credential helper that answers with the token of the profile serving the host in the current directory, so `git push` and `gh` act as the same account from one stored token. The `github` preset serves `github.com`; set `git_host` on a token integration for GitHub Enterprise or another host.
+
+```sh
+git config --global credential.https://github.com.helper ""
+git config --global --add credential.https://github.com.helper "!fob git-credential"
+```
+
+The empty entry drops helpers configured earlier for every host (such as Git Credential Manager) for this host only. When omnifob has profiles for a host but cannot pick one for the directory (none listed, or several), it stops git with an error instead of letting another helper answer as a different account; hosts it has no profile for are left to other helpers. omnifob ignores what git asks it to store or erase, since it holds the token already.
 
 ### In the current shell
 
