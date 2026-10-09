@@ -154,12 +154,6 @@ enum Command {
     /// Cloudflare helpers
     #[command(subcommand, visible_alias = "cf")]
     Cloudflare(CloudflareCommand),
-    /// Git credential helper: answers git with the token of the profile that
-    /// serves the host in this directory (set as credential.helper "!fob git-credential")
-    GitCredential {
-        /// What git asks for: get, store or erase (only get does anything)
-        operation: String,
-    },
     /// Get replacement credentials for a profile (started by fob in the background)
     #[command(hide = true)]
     Renew { profile: String },
@@ -424,7 +418,6 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             app.ensure_synced().await?;
             export_aws_config(&app, &prefix, write, file)?;
         }
-        Command::GitCredential { operation } => return app.git_credential(&operation).await,
         Command::Renew { profile } => app.renew(&profile).await?,
     }
     Ok(ExitCode::SUCCESS)
@@ -686,19 +679,6 @@ impl App {
             "no sign-in to keep"
         };
         eprintln!("fob: renamed '{old}' to '{new}' ({kept}); profiles are now {new}/...");
-        let stale: Vec<&str> = self
-            .config
-            .directories
-            .iter()
-            .filter(|(_, queries)| queries.iter().any(|q| q.starts_with(&format!("{old}/"))))
-            .map(|(dir, _)| dir.as_str())
-            .collect();
-        if !stale.is_empty() {
-            eprintln!(
-                "fob: [directories] still names '{old}/...' for {}; update those entries",
-                stale.join(", ")
-            );
-        }
         let aws_config = aws_config_file(None)
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok());
@@ -760,14 +740,6 @@ impl App {
             return Ok(());
         }
         println!("Secrets: {}", omnifob_core::store::description()?);
-        match self.directory_profiles() {
-            Ok(Some((dir, profiles))) => {
-                let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
-                println!("Directory {dir}: {}", ids.join(", "));
-            }
-            Ok(None) => {}
-            Err(e) => println!("Directory: {e:#}"),
-        }
         let now = Timestamp::now();
         for (name, integration) in &self.config.integrations {
             let state = match providers::sign_in(name, integration)? {
@@ -891,46 +863,14 @@ impl App {
         Ok(())
     }
 
-    /// The profiles configured for the current directory, with the
-    /// directory as written in the config.
-    fn directory_profiles(&self) -> anyhow::Result<Option<(&str, Vec<&Profile>)>> {
-        let Ok(cwd) = std::env::current_dir() else {
-            return Ok(None);
-        };
-        let home = std::env::home_dir().unwrap_or_default();
-        let Some((dir, queries)) = self.config.directory_profiles(&cwd, &home) else {
-            return Ok(None);
-        };
-        let profiles = self
-            .cache
-            .resolve(queries)
-            .with_context(|| format!("directory '{dir}' in {}", paths::config_file().display()))?;
-        Ok(Some((dir, profiles)))
-    }
-
     /// Resolves a profile query, asking the user to pick when it is missing
-    /// or ambiguous and a terminal is available. The current directory's
-    /// profiles stand in for a missing query and win among several matches.
+    /// or ambiguous and a terminal is available.
     async fn select(&mut self, query: Option<&str>) -> anyhow::Result<Profile> {
         self.ensure_synced().await?;
-        let here = self.directory_profiles()?;
-        let mut candidates: Vec<&Profile> = match (query, &here) {
-            (Some(q), _) => self.cache.find(q),
-            (None, Some((_, profiles))) => profiles.clone(),
-            (None, None) => self.cache.all().collect(),
+        let mut candidates: Vec<&Profile> = match query {
+            Some(q) => self.cache.find(q),
+            None => self.cache.all().collect(),
         };
-        if candidates.len() > 1
-            && let Some((_, preferred)) = &here
-        {
-            let narrowed: Vec<&Profile> = candidates
-                .iter()
-                .copied()
-                .filter(|p| preferred.iter().any(|d| d.id == p.id))
-                .collect();
-            if !narrowed.is_empty() {
-                candidates = narrowed;
-            }
-        }
         // Recently used profiles first, in the picker and in error messages.
         History::load(&history::file()).sort_recent_first(&mut candidates, |p| p.id.as_str());
         match candidates.as_slice() {
@@ -944,17 +884,11 @@ impl App {
         }
         if !interactive() {
             let shown: Vec<_> = candidates.iter().take(10).map(|p| p.id.as_str()).collect();
-            match (query, &here) {
-                (None, Some((dir, _))) => bail!(
-                    "directory '{dir}' has several profiles; name one: {}",
-                    shown.join(", ")
-                ),
-                (Some(q), _) => bail!("'{q}' matches several profiles: {}", shown.join(", ")),
-                (None, None) => bail!(
-                    "no profile named and no terminal to pick one; name one of: {}",
-                    shown.join(", ")
-                ),
-            }
+            bail!(
+                "'{}' matches several profiles: {}",
+                query.unwrap_or(""),
+                shown.join(", ")
+            );
         }
         let ids: Vec<&str> = candidates.iter().map(|p| p.id.as_str()).collect();
         let picked = dialoguer::FuzzySelect::new()
@@ -1007,53 +941,6 @@ impl App {
             }
         }
         status
-    }
-
-    /// Answers one request of git's credential helper protocol. Never
-    /// prompts: git owns stdin. What git hands back to store is ignored,
-    /// since the token lives in omnifob already.
-    async fn git_credential(&mut self, operation: &str) -> anyhow::Result<ExitCode> {
-        use omnifob_core::git::{self, Choice};
-        let mut input = String::new();
-        std::io::stdin().read_to_string(&mut input)?;
-        let request = git::parse_request(&input);
-        let (Some("https"), Some(host)) = (request.protocol.as_deref(), request.host.as_deref())
-        else {
-            return Ok(ExitCode::SUCCESS);
-        };
-        if operation != "get" {
-            return Ok(ExitCode::SUCCESS);
-        }
-        self.ensure_synced().await?;
-        let refuse = |why: String| {
-            eprintln!("fob: {why}");
-            println!("quit=1");
-            Ok(ExitCode::SUCCESS)
-        };
-        let here = match self.directory_profiles() {
-            Ok(here) => here,
-            Err(e) => {
-                if git::choose(&self.config, self.cache.all(), None, host) == Choice::NotOurs {
-                    return Ok(ExitCode::SUCCESS);
-                }
-                return refuse(format!("{e:#}"));
-            }
-        };
-        let here = here.as_ref().map(|(dir, ps)| (*dir, ps.as_slice()));
-        let profile = match git::choose(&self.config, self.cache.all(), here, host) {
-            Choice::NotOurs => return Ok(ExitCode::SUCCESS),
-            Choice::Refuse(why) => return refuse(why),
-            Choice::Use(profile) => profile.clone(),
-        };
-        let creds = match providers::credentials(&self.config, &profile, true, None).await {
-            Ok(creds) => creds,
-            Err(e) => return refuse(format!("getting credentials for {}: {e:#}", profile.id)),
-        };
-        print!(
-            "{}",
-            git::response(&self.config, &profile, &creds, &request)?
-        );
-        Ok(ExitCode::SUCCESS)
     }
 
     /// Fetches new credentials for a profile, unless another renewal of the

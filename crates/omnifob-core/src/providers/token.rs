@@ -23,8 +23,6 @@ pub struct Preset {
     /// A URL that answers 2xx for a valid token sent as a bearer token.
     pub verify_url: Option<&'static str>,
     pub console: Option<&'static str>,
-    /// The git host the token signs in to over HTTPS, for `fob git-credential`.
-    pub git_host: Option<&'static str>,
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -33,7 +31,6 @@ pub const PRESETS: &[Preset] = &[
         secrets: &[("token", &["HCLOUD_TOKEN"])],
         verify_url: Some("https://api.hetzner.cloud/v1/locations"),
         console: Some("https://console.hetzner.cloud/projects"),
-        git_host: None,
     },
     Preset {
         name: "digitalocean",
@@ -44,14 +41,12 @@ pub const PRESETS: &[Preset] = &[
         )],
         verify_url: Some("https://api.digitalocean.com/v2/account"),
         console: Some("https://cloud.digitalocean.com"),
-        git_host: None,
     },
     Preset {
         name: "vultr",
         secrets: &[("api_key", &["VULTR_API_KEY"])],
         verify_url: Some("https://api.vultr.com/v2/account"),
         console: Some("https://my.vultr.com"),
-        git_host: None,
     },
     Preset {
         name: "linode",
@@ -59,7 +54,6 @@ pub const PRESETS: &[Preset] = &[
         secrets: &[("token", &["LINODE_TOKEN", "LINODE_CLI_TOKEN"])],
         verify_url: Some("https://api.linode.com/v4/profile"),
         console: Some("https://cloud.linode.com"),
-        git_host: None,
     },
     Preset {
         name: "upstash",
@@ -67,7 +61,6 @@ pub const PRESETS: &[Preset] = &[
         secrets: &[("api_key", &["UPSTASH_API_KEY"])],
         verify_url: None,
         console: Some("https://console.upstash.com"),
-        git_host: None,
     },
     Preset {
         name: "akamai-edgegrid",
@@ -78,7 +71,6 @@ pub const PRESETS: &[Preset] = &[
         ],
         verify_url: None,
         console: Some("https://control.akamai.com"),
-        git_host: None,
     },
     Preset {
         name: "scaleway",
@@ -88,42 +80,36 @@ pub const PRESETS: &[Preset] = &[
         ],
         verify_url: None,
         console: Some("https://console.scaleway.com"),
-        git_host: None,
     },
     Preset {
         name: "vercel",
         secrets: &[("token", &["VERCEL_TOKEN"])],
         verify_url: Some("https://api.vercel.com/v2/user"),
         console: Some("https://vercel.com/dashboard"),
-        git_host: None,
     },
     Preset {
         name: "netlify",
         secrets: &[("token", &["NETLIFY_AUTH_TOKEN"])],
         verify_url: Some("https://api.netlify.com/api/v1/user"),
         console: Some("https://app.netlify.com"),
-        git_host: None,
     },
     Preset {
         name: "fly",
         secrets: &[("token", &["FLY_API_TOKEN"])],
         verify_url: None,
         console: Some("https://fly.io/dashboard"),
-        git_host: None,
     },
     Preset {
         name: "neon",
         secrets: &[("api_key", &["NEON_API_KEY"])],
         verify_url: Some("https://console.neon.tech/api/v2/users/me"),
         console: Some("https://console.neon.tech"),
-        git_host: None,
     },
     Preset {
         name: "supabase",
         secrets: &[("token", &["SUPABASE_ACCESS_TOKEN"])],
         verify_url: Some("https://api.supabase.com/v1/projects"),
         console: Some("https://supabase.com/dashboard"),
-        git_host: None,
     },
     Preset {
         name: "github",
@@ -131,7 +117,6 @@ pub const PRESETS: &[Preset] = &[
         secrets: &[("token", &["GH_TOKEN", "GITHUB_TOKEN"])],
         verify_url: Some("https://api.github.com/user"),
         console: Some("https://github.com"),
-        git_host: Some("github.com"),
     },
 ];
 
@@ -278,27 +263,6 @@ pub fn credentials(integration: &str, config: &TokenConfig) -> Result<Credential
     })
 }
 
-/// The git host this integration's token signs in to, from `git_host` or
-/// the preset.
-pub fn git_host(config: &TokenConfig) -> anyhow::Result<Option<&str>> {
-    if let Some(host) = &config.git_host {
-        return Ok(Some(host.as_str()));
-    }
-    Ok(match &config.preset {
-        Some(name) => preset(name)?.git_host,
-        None => None,
-    })
-}
-
-/// The variable holding the token git should send: the integration's only
-/// secret.
-pub fn git_password_var(config: &TokenConfig) -> anyhow::Result<String> {
-    match secrets(config)?.as_slice() {
-        [(_, vars)] if !vars.is_empty() => Ok(vars[0].clone()),
-        _ => bail!("git credentials need an integration with exactly one secret"),
-    }
-}
-
 pub fn console_url(config: &TokenConfig) -> anyhow::Result<Option<String>> {
     if let Some(url) = &config.console {
         return Ok(Some(url.clone()));
@@ -368,19 +332,6 @@ mod tests {
             discover("x", &config("[integrations.t.secrets]\nk = [\"V\"]"))[0].id,
             "x/default/token"
         );
-    }
-
-    #[test]
-    fn git_hosts_come_from_the_preset_or_config() {
-        assert_eq!(
-            git_host(&config("preset = \"github\"")).unwrap(),
-            Some("github.com")
-        );
-        assert_eq!(git_host(&config("preset = \"hetzner\"")).unwrap(), None);
-        let ghe = config("preset = \"github\"\ngit_host = \"ghe.example.com\"");
-        assert_eq!(git_host(&ghe).unwrap(), Some("ghe.example.com"));
-        assert_eq!(git_password_var(&ghe).unwrap(), "GH_TOKEN");
-        assert!(git_password_var(&config("preset = \"scaleway\"")).is_err());
     }
 
     #[test]

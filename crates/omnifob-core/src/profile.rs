@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -163,27 +163,6 @@ impl ProfileCache {
             .map(|(_, p)| p)
             .collect()
     }
-
-    /// The profile each query names. Fails unless every query names exactly
-    /// one, so a stale or vague entry is reported instead of guessed at.
-    pub fn resolve(&self, queries: &[String]) -> anyhow::Result<Vec<&Profile>> {
-        let mut profiles: Vec<&Profile> = Vec::new();
-        for query in queries {
-            match self.find(query).as_slice() {
-                [one] => {
-                    if !profiles.iter().any(|p| p.id == one.id) {
-                        profiles.push(one);
-                    }
-                }
-                [] => bail!("'{query}' matches no profile; see `fob list`"),
-                several => {
-                    let ids: Vec<_> = several.iter().take(10).map(|p| p.id.as_str()).collect();
-                    bail!("'{query}' matches several profiles: {}", ids.join(", "))
-                }
-            }
-        }
-        Ok(profiles)
-    }
 }
 
 /// How well `words` match a profile: 0 when every word is a whole id
@@ -313,34 +292,6 @@ mod tests {
             "chained roles too"
         );
         assert!(ids("999999999999").is_empty());
-    }
-
-    #[test]
-    fn resolve_needs_one_profile_per_query() {
-        let mut cache = ProfileCache::default();
-        cache.integrations.insert(
-            "acme".into(),
-            SyncedProfiles {
-                synced_at: Timestamp::UNIX_EPOCH,
-                profiles: vec![
-                    aws("acme", "Prod", "AdministratorAccess"),
-                    aws("acme", "Prod", "ReadOnly"),
-                ],
-            },
-        );
-        let ids = |queries: &[&str]| {
-            let queries: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
-            cache
-                .resolve(&queries)
-                .map(|ps| ps.iter().map(|p| p.id.clone()).collect::<Vec<_>>())
-                .map_err(|e| e.to_string())
-        };
-        assert_eq!(
-            ids(&["readonly", "prod admin", "acme/prod/ReadOnly"]).unwrap(),
-            ["acme/prod/ReadOnly", "acme/prod/AdministratorAccess"]
-        );
-        assert!(ids(&["dev"]).unwrap_err().contains("matches no profile"));
-        assert!(ids(&["prod"]).unwrap_err().contains("several"));
     }
 
     #[test]
