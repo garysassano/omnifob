@@ -9,12 +9,13 @@ Early. What changed in each version is in the [release notes](https://github.com
 | Integration                     | Sign-in                                                 | Discovery                                             | Credentials                                                     | Console               |
 | ------------------------------- | ------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------- | --------------------- |
 | `aws-sso` (IAM Identity Center) | Device flow, silent refresh                             | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole          | Federated sign-in URL |
-| `cloudflare`                    | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring              | Dashboard             |
+| `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                         | Minted tokens, scoped by permission name, expiring              | Dashboard             |
+| `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring              | Dashboard             |
 | `token`                         | Paste once, checked against the provider where possible | One profile per integration                           | The stored token under every variable the provider's tools read | Known console URL     |
 
 Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
-Planned: Cloudflare browser sign-in (OAuth with PKCE), Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), per-directory profiles through mise.
+Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), per-directory profiles through mise.
 
 ## Install
 
@@ -56,7 +57,13 @@ external_id = "..."          # optional
 region = "us-east-1"         # optional, defaults to the integration's
 
 [integrations.cf]
-type = "cloudflare"
+type = "cloudflare-oauth"       # browser sign-in, like `wrangler login`
+client_id = "..."               # your OAuth client; see the Cloudflare guide
+session = "12h"                 # optional: sign in again after this long
+ttl = "1h"                      # lifetime of minted tokens
+
+[integrations.cf-token]
+type = "cloudflare-token"       # a bootstrap token instead of the browser
 account_id = "0123456789abcdef0123456789abcdef"  # required for token_type = "account"
 account_name = "personal"
 token_type = "account"   # bootstrap owned by the account; "user" (default) for a user-owned one
@@ -65,14 +72,14 @@ ips = ["current"]        # optional: tokens only work from this machine's public
 
 # Templates name permissions as the dashboard does; never IDs.
 # `fob cf add-template` writes them for you.
-[integrations.cf.templates.pages]
+[integrations.cf-token.templates.pages]
 permissions = ["Pages Write", "Account Settings Read"]
 ttl = "30m"
 ```
 
-If you know IAM Identity Center through granted, the Cloudflare integration works the same way: the bootstrap token plays the part of the sign-in, templates the part of permission sets, and each `account × template` profile the part of an `account × role`; `fob exec` mints a short-lived token the way granted fetches role credentials. Unlike permission sets, templates live in your config, not in Cloudflare, and the bootstrap token can mint any permission, so treat it like an administrator credential.
+If you know IAM Identity Center through granted, the Cloudflare integrations work the same way: the browser sign-in or bootstrap token plays the part of the sign-in, templates the part of permission sets, and each `account × template` profile the part of an `account × role`; `fob exec` mints a short-lived token the way granted fetches role credentials. Unlike permission sets, templates live in your config, not in Cloudflare. A browser sign-in can only mint the permissions you approved on the consent page; a bootstrap token can mint any permission, so treat it like an administrator credential.
 
-Creating the Cloudflare bootstrap token, account-owned or user-owned, is explained in [docs/guides/cloudflare.md](docs/guides/cloudflare.md).
+Registering the OAuth client, and creating a bootstrap token instead, account-owned or user-owned, are explained in [docs/guides/cloudflare.md](docs/guides/cloudflare.md).
 
 Providers that only have long-lived tokens use `type = "token"`, usually with a preset:
 

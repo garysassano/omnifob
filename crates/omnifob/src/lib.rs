@@ -14,7 +14,7 @@ use jiff::Timestamp;
 use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::{ProfileCache, SyncedProfiles};
-use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, token};
+use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, cloudflare_oauth, token};
 use omnifob_core::{Config, Credentials, Error, Integration, Profile, paths};
 
 use crate::shell::Shell;
@@ -510,6 +510,26 @@ impl App {
                 })
                 .await?;
             }
+            Integration::Cloudflare(config) if config.uses_oauth() => {
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' signs in through the browser; it takes no token");
+                }
+                let session = cloudflare_oauth::login(name, config, |url| {
+                    eprintln!("fob: approve the sign-in for '{name}' in your browser");
+                    eprintln!("     Pick the accounts, and turn on Account API Tokens Write under Sensitive scopes.");
+                    eprintln!("     {url}");
+                    if !no_browser && let Err(e) = open::that(url) {
+                        eprintln!("fob: could not open a browser ({e}); open the URL above");
+                    }
+                })
+                .await?;
+                if let Some(ends) = session {
+                    eprintln!(
+                        "fob: Cloudflare session for '{name}' lasts until {}",
+                        ends.strftime("%Y-%m-%d %H:%M UTC")
+                    );
+                }
+            }
             Integration::Cloudflare(config) => {
                 let token = if token_stdin {
                     let mut token = String::new();
@@ -611,6 +631,7 @@ impl App {
         }
         if let Integration::Cloudflare(config) = &integration {
             match cloudflare::end_session(name, config).await {
+                Ok(true) if config.uses_oauth() => eprintln!("fob: revoked the browser sign-in"),
                 Ok(true) => eprintln!("fob: deleted the session's bootstrap token"),
                 Ok(false) | Err(Error::NeedsLogin { .. }) => {}
                 Err(e) => eprintln!("fob: could not delete the session's bootstrap token: {e:#}"),
@@ -1024,7 +1045,7 @@ impl App {
                     "name the permissions with --permission, or run this in a terminal to pick them"
                 );
             }
-            pick_permissions(&cloudflare::services(&groups, config.token_type))?
+            pick_permissions(&cloudflare::services(&groups, config.minting()))?
         } else {
             // Check the names now rather than at the first mint, and store
             // them as Cloudflare spells them.

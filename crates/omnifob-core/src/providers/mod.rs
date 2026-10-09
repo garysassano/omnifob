@@ -3,6 +3,7 @@
 
 pub mod aws_sso;
 pub mod cloudflare;
+pub mod cloudflare_oauth;
 pub mod token;
 
 use jiff::Timestamp;
@@ -90,6 +91,15 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
                 SignIn::Token
             } else {
                 SignIn::SignedOut
+            }
+        }
+        Integration::Cloudflare(c) if c.uses_oauth() => {
+            match cloudflare_oauth::sign_in_ends(name)? {
+                None => SignIn::SignedOut,
+                Some((expires_at, refreshable)) => SignIn::Session {
+                    expires_at,
+                    refreshable,
+                },
             }
         }
         Integration::Cloudflare(_) => {
@@ -343,10 +353,11 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
         ),
         Integration::Cloudflare(_) => {
             cloudflare::rename_catalog(old, new);
-            store::rename(
+            let oauth = cloudflare_oauth::rename(old, new)?;
+            Ok(store::rename(
                 &format!("cloudflare/{old}/bootstrap"),
                 &format!("cloudflare/{new}/bootstrap"),
-            )
+            )? || oauth)
         }
         Integration::Token(_) => store::rename(
             &format!("token/{old}/secrets"),

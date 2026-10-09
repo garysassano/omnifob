@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use jiff::{Timestamp, Unit};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
@@ -118,7 +118,7 @@ pub fn builtin_templates() -> BTreeMap<String, CloudflareTemplate> {
     ])
 }
 
-fn templates(config: &CloudflareConfig) -> BTreeMap<String, CloudflareTemplate> {
+pub(crate) fn templates(config: &CloudflareConfig) -> BTreeMap<String, CloudflareTemplate> {
     let mut all = builtin_templates();
     all.extend(config.templates.clone());
     all
@@ -611,7 +611,13 @@ fn user_tag_from_policies(policies: &[Value]) -> Option<String> {
     })
 }
 
-fn bootstrap_client(integration: &str) -> Result<Client> {
+/// A client authenticated with what mints tokens: the bootstrap token, or
+/// for `cloudflare-oauth` the browser sign-in's access token.
+async fn bootstrap_client(integration: &str, config: &CloudflareConfig) -> Result<Client> {
+    if config.uses_oauth() {
+        let token = super::cloudflare_oauth::access_token(integration, config).await?;
+        return Ok(Client::new(api_base(), token));
+    }
     let token: String = store::get(&bootstrap_key(integration))?
         .ok_or_else(|| Error::not_signed_in(integration))?;
     if let Some(expires_at) = session_expiry(integration)
@@ -637,20 +643,20 @@ pub async fn login(
     config: &CloudflareConfig,
     token: &str,
 ) -> anyhow::Result<Option<Timestamp>> {
-    if config.token_type == CloudflareTokenType::Account && config.account_id.is_none() {
+    if config.minting() == CloudflareTokenType::Account && config.account_id.is_none() {
         bail!("token_type = \"account\" needs account_id in the integration config");
     }
     let account_id = config.account_id.as_deref().unwrap_or_default();
     let client = Client::new(api_base(), token.trim());
     let id = client
-        .verify(config.token_type, account_id)
+        .verify(config.minting(), account_id)
         .await
         .context("the token was rejected")?;
     let mut catalog = load_catalog(integration);
     let previous = catalog.bootstrap.take().map(|b| b.id).filter(|p| *p != id);
     let expires_at = match config.session {
         Some(session) => {
-            let tokens = Client::tokens_path(config.token_type, account_id);
+            let tokens = Client::tokens_path(config.minting(), account_id);
             Some(start_session(&client, &tokens, &id, session, previous.as_deref()).await?)
         }
         None => None,
@@ -705,6 +711,9 @@ pub async fn start_session(
 /// ends the session there too. Bootstrap tokens without a session are the
 /// user's own and are left alone. Returns whether one was deleted.
 pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result<bool> {
+    if config.uses_oauth() {
+        return Ok(super::cloudflare_oauth::revoke(integration, config).await?);
+    }
     let Some(Bootstrap {
         id,
         expires_at: Some(_),
@@ -712,9 +721,9 @@ pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result
     else {
         return Ok(false);
     };
-    let client = bootstrap_client(integration)?;
+    let client = bootstrap_client(integration, config).await?;
     let tokens = Client::tokens_path(
-        config.token_type,
+        config.minting(),
         config.account_id.as_deref().unwrap_or_default(),
     );
     delete_token(&client, &tokens, &id).await?;
@@ -723,19 +732,27 @@ pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result
 
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
     forget_catalog(integration);
-    store::delete(&bootstrap_key(integration))
+    let oauth = super::cloudflare_oauth::logout(integration)?;
+    Ok(store::delete(&bootstrap_key(integration))? || oauth)
 }
 
-/// Checks that the stored bootstrap token is active.
+/// Checks that the stored bootstrap token, or the browser sign-in, works.
 pub async fn check(integration: &str, config: &CloudflareConfig) -> Result<String> {
-    let client = bootstrap_client(integration)?;
+    let client = bootstrap_client(integration, config).await?;
+    if config.uses_oauth() {
+        let accounts = accounts(&client).await?;
+        return Ok(format!(
+            "browser sign-in active, {} account(s)",
+            accounts.len()
+        ));
+    }
     client
         .verify(
-            config.token_type,
+            config.minting(),
             config.account_id.as_deref().unwrap_or_default(),
         )
         .await?;
-    let kind = match config.token_type {
+    let kind = match config.minting() {
         CloudflareTokenType::User => "user-owned",
         CloudflareTokenType::Account => "account-owned",
     };
@@ -749,13 +766,25 @@ pub async fn check_token(
     token: &str,
 ) -> anyhow::Result<()> {
     Client::new(api_base(), token)
-        .verify(config.token_type, account_id)
+        .verify(config.minting(), account_id)
         .await
         .map(|_| ())
 }
 
 pub fn has_bootstrap_token(integration: &str) -> anyhow::Result<bool> {
     Ok(store::get::<String>(&bootstrap_key(integration))?.is_some())
+}
+
+/// The accounts the token reaches: for a browser sign-in, those approved on
+/// the consent page.
+async fn accounts(client: &Client) -> anyhow::Result<Vec<Account>> {
+    let accounts: Vec<Account> = client.get_all("/accounts").await.context(
+        "listing accounts; set account_id in the integration config if the token cannot list them",
+    )?;
+    if accounts.is_empty() {
+        bail!("the token cannot see any account; set account_id in the integration config");
+    }
+    Ok(accounts)
 }
 
 /// One profile per account and template.
@@ -765,19 +794,7 @@ pub async fn discover(integration: &str, config: &CloudflareConfig) -> Result<Ve
             id: id.clone(),
             name: config.account_name.clone().unwrap_or_else(|| id.clone()),
         }],
-        None => {
-            let client = bootstrap_client(integration)?;
-            let accounts: Vec<Account> = client.get_all("/accounts").await.context(
-                "listing accounts; set account_id in the integration config if the token cannot list them",
-            )?;
-            if accounts.is_empty() {
-                return Err(anyhow!(
-                    "the bootstrap token cannot see any account; set account_id in the integration config"
-                )
-                .into());
-            }
-            accounts
-        }
+        None => accounts(&bootstrap_client(integration, config).await?).await?,
     };
 
     let mut profiles = Vec::new();
@@ -803,12 +820,15 @@ pub async fn permission_groups(
     integration: &str,
     config: &CloudflareConfig,
 ) -> Result<Vec<PermissionGroup>> {
-    let client = bootstrap_client(integration)?;
+    let client = bootstrap_client(integration, config).await?;
+    // Account-owned tokens list the groups per account; any account will do.
+    let account_id = match (&config.account_id, config.uses_oauth()) {
+        (Some(id), _) => id.clone(),
+        (None, true) => accounts(&client).await?.remove(0).id,
+        (None, false) => String::new(),
+    };
     let mut groups = client
-        .permission_groups(
-            config.token_type,
-            config.account_id.as_deref().unwrap_or_default(),
-        )
+        .permission_groups(config.minting(), &account_id)
         .await?;
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(groups)
@@ -901,7 +921,14 @@ pub async fn credentials(
     account_id: &str,
     template_name: &str,
 ) -> Result<Credentials> {
-    let client = bootstrap_client(integration)?;
+    let client = bootstrap_client(integration, config).await?;
+    let limited;
+    let config = if config.uses_oauth() {
+        limited = within_granted_scopes(integration, config, template_name)?;
+        &limited
+    } else {
+        config
+    };
     let mut catalog = load_catalog(integration);
     let before = serde_json::to_string(&catalog).unwrap_or_default();
     let minted = mint(
@@ -922,6 +949,49 @@ pub async fn credentials(
     Ok(minted?)
 }
 
+/// A browser sign-in can only mint permissions whose scope its consent
+/// granted. Leaves out optional permissions without one, and names the
+/// required ones that lack it.
+fn within_granted_scopes(
+    integration: &str,
+    config: &CloudflareConfig,
+    template_name: &str,
+) -> Result<CloudflareConfig> {
+    use super::cloudflare_oauth::{granted_scopes, scope_for};
+    let mut config = config.clone();
+    let Some(granted) = granted_scopes(integration)?.filter(|g| !g.is_empty()) else {
+        return Ok(config);
+    };
+    let Some(mut template) = templates(&config).remove(template_name) else {
+        return Ok(config);
+    };
+    let allowed = |p: &String| scope_for(p).is_none_or(|s| granted.iter().any(|g| g == s));
+    let missing: Vec<&String> = template
+        .permissions
+        .iter()
+        .filter(|p| !allowed(p))
+        .collect();
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+        return Err(Error::needs_login(
+            integration,
+            format!(
+                "the browser sign-in was not granted the scopes for {}; add them to the OAuth client and sign in again",
+                names.join(", ")
+            ),
+        ));
+    }
+    template.optional.retain(|p| {
+        let keep = allowed(p);
+        if !keep {
+            tracing::debug!("optional permission '{p}' was not granted at sign-in; skipped");
+        }
+        keep
+    });
+    config.templates.insert(template_name.to_string(), template);
+    Ok(config)
+}
+
 /// Moves the stored catalog to a renamed integration.
 pub fn rename_catalog(old: &str, new: &str) {
     let _ = std::fs::rename(catalog_file(old), catalog_file(new));
@@ -937,7 +1007,7 @@ pub fn forget_catalog(integration: &str) {
 /// permission and the account); user-owned tokens need the dashboard's
 /// "Create Additional Tokens" template, which no URL can pre-fill.
 pub fn bootstrap_url(config: &CloudflareConfig) -> String {
-    match config.token_type {
+    match config.minting() {
         CloudflareTokenType::User => "https://dash.cloudflare.com/profile/api-tokens".to_string(),
         CloudflareTokenType::Account => {
             let account = config.account_id.as_deref().unwrap_or(":account");
@@ -1000,7 +1070,7 @@ pub async fn mint(
     let template = templates(config)
         .remove(template_name)
         .with_context(|| format!("no Cloudflare template named '{template_name}'"))?;
-    let token_type = config.token_type;
+    let token_type = config.minting();
     let tokens = Client::tokens_path(token_type, account_id);
 
     let fetch = |catalog: &mut Catalog, groups: Vec<PermissionGroup>| {
@@ -1043,6 +1113,7 @@ pub async fn mint(
     let policies = build_policies(&selected, account_id, user_tag, &template.r2_buckets)?;
     let ips = resolve_ips(template.ips.as_ref().unwrap_or(&config.ips), &client.base).await?;
     let uses_d1 = selected.iter().any(|g| g.name.starts_with("D1 "));
+    let uses_ai = selected.iter().any(|g| g.name.starts_with("Workers AI "));
 
     let ttl = template.ttl.unwrap_or(config.ttl);
     let now = now.round(Unit::Second)?;
@@ -1068,7 +1139,16 @@ pub async fn mint(
     let minted = client.with_token(&created.value);
     let wait = async {
         if uses_d1 {
-            wait_for_d1(&minted, account_id).await;
+            wait_until_accepted(
+                &minted,
+                &format!("/accounts/{account_id}/d1/database"),
+                "D1",
+            )
+            .await;
+        }
+        if uses_ai {
+            let path = format!("/accounts/{account_id}/ai/models/search");
+            wait_until_accepted(&minted, &path, "Workers AI").await;
         }
     };
     let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now, catalog, false));
@@ -1093,17 +1173,18 @@ pub async fn mint(
     })
 }
 
-/// A new token reaches D1 a few seconds after it is created, and for a while
-/// some requests accept it while others still reject it (measured on
-/// 2026-10-06: about 3 s, with rejections after the first acceptance).
-/// Workers, KV, Queues and R2 accept it at once. Waits until D1 accepts it
-/// several times in a row, so the first command run with it does not fail.
-async fn wait_for_d1(minted: &Client, account_id: &str) {
-    let path = format!("/accounts/{account_id}/d1/database");
+/// A new token reaches some products a few seconds after it is created, and
+/// for a while some requests accept it while others still reject it. D1
+/// (measured on 2026-10-06: about 3 s, with rejections after the first
+/// acceptance) and Workers AI (2026-10-09: rejected at once, accepted after
+/// 3 s) do this; Workers, KV, Queues and R2 accept it at once. Waits until
+/// `path` accepts it several times in a row, so the first command run with
+/// it does not fail.
+async fn wait_until_accepted(minted: &Client, path: &str, product: &str) {
     let query = [("per_page", "1".to_string())];
     let mut accepted_in_a_row = 0;
     for _ in 0..D1_WAIT_ATTEMPTS {
-        match minted.call::<Value>(Method::GET, &path, &query, None).await {
+        match minted.call::<Value>(Method::GET, path, &query, None).await {
             Ok(_) => {
                 accepted_in_a_row += 1;
                 if accepted_in_a_row == D1_ACCEPTANCES_NEEDED {
@@ -1112,13 +1193,13 @@ async fn wait_for_d1(minted: &Client, account_id: &str) {
             }
             Err(e) => {
                 accepted_in_a_row = 0;
-                tracing::debug!("D1 does not accept the new token yet: {e:#}");
+                tracing::debug!("{product} does not accept the new token yet: {e:#}");
             }
         }
         tokio::time::sleep(D1_WAIT_INTERVAL).await;
     }
     tracing::warn!(
-        "D1 does not reliably accept the new token yet; D1 commands may fail for a few seconds"
+        "{product} does not reliably accept the new token yet; its commands may fail for a few seconds"
     );
 }
 
@@ -1201,8 +1282,8 @@ pub async fn revoke(
     profile_id: Option<&str>,
     account_id: &str,
 ) -> Result<usize> {
-    let client = bootstrap_client(integration)?;
-    let tokens = Client::tokens_path(config.token_type, account_id);
+    let client = bootstrap_client(integration, config).await?;
+    let tokens = Client::tokens_path(config.minting(), account_id);
     let mut catalog = load_catalog(integration);
     let deleted = revoke_minted(&client, &tokens, profile_id, &mut catalog).await;
     save_catalog(integration, &catalog)?;
@@ -1217,8 +1298,8 @@ pub async fn revoke_token(
     account_id: &str,
     token_id: &str,
 ) -> Result<()> {
-    let client = bootstrap_client(integration)?;
-    let tokens = Client::tokens_path(config.token_type, account_id);
+    let client = bootstrap_client(integration, config).await?;
+    let tokens = Client::tokens_path(config.minting(), account_id);
     delete_token(&client, &tokens, token_id).await?;
     let mut catalog = load_catalog(integration);
     catalog.untrack(token_id);
@@ -1232,17 +1313,17 @@ pub async fn cleanup(
     config: &CloudflareConfig,
     account_ids: &[String],
 ) -> Result<usize> {
-    let client = bootstrap_client(integration)?;
+    let client = bootstrap_client(integration, config).await?;
     let mut catalog = load_catalog(integration);
     let mut deleted = 0;
     let mut result = Ok(());
     for account_id in account_ids {
-        let tokens = Client::tokens_path(config.token_type, account_id);
+        let tokens = Client::tokens_path(config.minting(), account_id);
         match prune_expired(&client, &tokens, Timestamp::now(), &mut catalog, true).await {
             Ok(n) => deleted += n,
             Err(e) => result = Err(e),
         }
-        if config.token_type == CloudflareTokenType::User {
+        if config.minting() == CloudflareTokenType::User {
             break; // user tokens are listed once, not per account
         }
     }
@@ -1347,7 +1428,7 @@ mod tests {
     #[test]
     fn bootstrap_urls() {
         let mut config: CloudflareConfig = match crate::Config::parse(
-            "[integrations.c]\ntype = \"cloudflare\"\naccount_id = \"abc123\"\ntoken_type = \"account\"\n",
+            "[integrations.c]\ntype = \"cloudflare-token\"\naccount_id = \"abc123\"\ntoken_type = \"account\"\n",
         )
         .unwrap()
         .integrations

@@ -18,7 +18,7 @@ From developers.cloudflare.com/fundamentals/oauth:
 - Any account can register OAuth clients (dashboard: Manage Account > OAuth clients, or `POST /accounts/{id}/oauth_clients` with "OAuth Clients Write").
 - CLI apps must use Authorization Code with PKCE (S256), `token_endpoint_auth_method = none`. **Device flow is not available to third-party clients.**
 - Scope names correspond to API token permission names; `GET /oauth/scopes` lists them.
-- Unverified: whether `account_api_tokens:create` is requestable by a third-party client.
+- A third-party client can request `account-api-tokens.write` ("Account API Tokens Write"), listed as a sensitive scope that the consent page leaves off until the user turns it on (checked 2026-10-09).
 
 ## Token API
 
@@ -30,7 +30,7 @@ From developers.cloudflare.com/fundamentals/oauth:
 
 ## How omnifob does it
 
-- Integration `type = "cloudflare"` with a stored bootstrap token (`fob login <name>` prompts for it with instructions).
+- `type = "cloudflare-token"` (until 0.5: `cloudflare`) with a stored bootstrap token (`fob login <name>` prompts for it with instructions), or `type = "cloudflare-oauth"` with a browser sign-in (below). Both share the configuration, templates and minting.
 - Templates list permission _names_; names resolve to IDs at mint time, case-insensitive, with suggestions for typos.
 - One policy per resource scope, limited to the profile's account; user-level permissions get the user tag from the bootstrap token's own policy (no extra permission needed).
 - Built-in templates: `workers` (the full developer platform: the dashboard's "Edit Cloudflare Workers" set plus D1, Queues, Workers AI, Vectorize, Hyperdrive, Containers, Pipelines, and optional Browser Run, AI Gateway, Observability, Builds, Agents, Secrets Store, CI, Cloudchamber, Images, AI Search, Email Sending), `dns-read`, `dns-edit`, `read`. Required names verified against the docs; optional names are guesses where the docs lag the dashboard, which is why they are optional.
@@ -45,7 +45,7 @@ From developers.cloudflare.com/fundamentals/oauth:
 
 ## Behaviour learned live
 
-- New tokens reach D1 about 3 s after creation and flap before settling; omnifob waits for three consecutive acceptances when the token includes a D1 permission. Workers, KV, Queues, R2, Vectorize, Hyperdrive and Workers AI accept new tokens immediately.
+- New tokens reach D1 about 3 s after creation and flap before settling; omnifob waits for three consecutive acceptances when the token includes a D1 permission. Workers AI rejected a new token at once and accepted it 3 s later (2026-10-09), so omnifob waits for it the same way. Workers, KV, Queues, R2, Vectorize and Hyperdrive accept new tokens immediately.
 - The `/user/tokens/verify` endpoint says "active" before D1 accepts the token, so it cannot be used to detect readiness.
 - A "Create Additional Tokens" bootstrap token can list permission groups (413 on 2026-10-06) and create, list and delete user tokens.
 
@@ -54,7 +54,7 @@ From developers.cloudflare.com/fundamentals/oauth:
 - User-owned and account-owned bootstraps both stay first-class. As in AWS, it is one identity for many accounts (user-owned) versus a role in one account (account-owned). No prompt to choose; the README documents both.
 - Account-owned: template URL pre-fills name, `account_api_tokens` edit and the account; tested in the browser on 2026-10-07 (the dashboard's buttons are "Review token" then "Create token"; the docs still say "Continue to summary"). Tokens are `cfat_`-prefixed. Product support: everything omnifob's `workers` template needs; not Turnstile, Registrar, Page Rules, Super Bot Fight Mode, Intel Data Platform, Zero Trust Client Platform.
 - The account token list has a "Created via" column ("Direct" for dashboard-made tokens); what it shows for API-minted tokens is still to be seen.
-- No OAuth route for third parties: none of the 392 OAuth scopes creates API tokens.
+- No OAuth route for third parties: none of the 392 OAuth scopes creates API tokens. Corrected on 2026-10-09: the catalogue now has 393, including `account-api-tokens.write`; see Browser sign-in.
 - Tokens created through the API cannot manage tokens: asking the bootstrap to mint a child with "Account API Tokens Write" fails with code 1001, "sub-token is not allowed to have permissions to manage other tokens" (2026-10-07). Only dashboard-made tokens can create, roll or delete tokens, so nothing omnifob mints can, and the bootstrap can only be retired in the dashboard or by rolling. Whether a dashboard-made token may delete itself is untested.
 
 ## Sessions (2026-10-07)
@@ -62,4 +62,17 @@ From developers.cloudflare.com/fundamentals/oauth:
 - A dashboard-made token with "Account API Tokens Edit" can edit itself: setting and removing its own `expires_on` worked live, and the token stayed active. `session` uses this right after login, keeping the token's name, policies and IP condition.
 - The same holds for anyone holding the token, so a session limits a stolen copy's lifetime but cannot stop an intruder during the session from removing the expiry or minting long-lived tokens.
 - Template URLs cannot pre-fill an expiry or IP filter (only `permissionGroupKeys`, `name`, and for user tokens `accountId` and `zoneId`), which is why fob sets the expiry itself.
-- Cloudflare has no second factor for API token creation and no OAuth scope that creates tokens for third-party clients; the dashboard sign-in is the only Cloudflare-enforced second factor, hence a new bootstrap per session.
+- Cloudflare has no second factor for API token creation and (until the 2026-10-09 finding below) no OAuth scope that creates tokens for third-party clients; the dashboard sign-in is the only Cloudflare-enforced second factor, hence a new bootstrap per session.
+
+## Browser sign-in (2026-10-09)
+
+Checked live with a private client, two to four accounts approved on one consent page.
+
+- The flow is wrangler's: Authorization Code with PKCE (S256), callback on `http://localhost:8977/callback`, `offline_access` for a refresh token. Access tokens last 3600 s. Each refresh returns a new refresh token, and the previous access token stops working (403).
+- The token endpoint sits behind Cloudflare's bot protection: a request without a user agent gets `403 error code: 1010`.
+- `GET /accounts` with the access token lists exactly the accounts approved on the consent page.
+- The access token can create, use and delete account-owned tokens (`POST /accounts/{id}/tokens`) in each approved account.
+- **Minted tokens are limited to the granted scopes.** Asking for a permission outside them fails with code 1001, "The OAuth session does not include the scopes required for the requested permission groups", listing each one. The consent page therefore caps what a sign-in can mint, unlike a bootstrap token.
+- Scope IDs do not follow permission names (`page.write` is Pages Write, `query-cache.write` Hyperdrive Write, `aig.write` AI Gateway Write), so omnifob keeps a table for the permissions its built-in templates use. The dashboard's scope picker shows "Workers" (Edit is `workers-scripts.edit`, "Workers Editor") but not `workers-scripts.read` or `.write`; the API sets them (`PATCH /accounts/{id}/oauth_clients/{client_id}` with `scopes` and `optional_scopes`, needing an API token with "OAuth Client Write", whose template URL key is `oauth_client`).
+- No OAuth scope manages OAuth clients, so a sign-in cannot register or update its own client.
+- `POST /oauth2/revoke` with `token_type_hint` revokes the refresh and access tokens; the access token then gets 403.

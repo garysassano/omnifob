@@ -1,10 +1,36 @@
 # Cloudflare
 
-The `cloudflare` integration mints short-lived API tokens, scoped by permission name, from one bootstrap token.
+omnifob mints short-lived Cloudflare API tokens, scoped by permission name, from one sign-in. There are two ways to sign in, each its own integration type; templates, profiles and minting are the same for both:
+
+- `cloudflare-oauth`: in the browser, like `wrangler login`. You pick the accounts on Cloudflare's consent page, and fob renews the sign-in by itself.
+- `cloudflare-token`: a bootstrap token you create once in the dashboard and paste. Works without a browser, and can be owned by an account rather than by you.
+
+## Browser sign-in
+
+```toml
+[integrations.cf]
+type = "cloudflare-oauth"
+client_id = "..."
+session = "12h"   # optional: sign in again after this long
+```
+
+`fob login cf` opens Cloudflare's consent page. Pick the accounts fob may use, turn on **Account API Tokens Write** under Sensitive scopes (minting needs it, and Cloudflare leaves it off by default), and authorize. fob receives the answer on `http://localhost:8977/callback`, keeps the refresh token in the keychain, and renews the sign-in in the background until `session` ends or you run `fob logout cf`, which also revokes it on Cloudflare. **My Profile > Access Management > Connected Applications** in the dashboard lists and revokes it too.
+
+Every approved account gets a profile per template. A browser sign-in can only mint the permissions it was granted, so fob asks for the scopes your templates need; optional template permissions you decline on the consent page are left out of the tokens.
+
+### The OAuth client
+
+The consent page belongs to an OAuth client, which omnifob does not ship yet, so register one in your account once:
+
+1. **Manage Account > OAuth clients > Create client**: name `omnifob`, response type Code, grant types Authorization Code and Refresh Token, token authentication method None, redirect URL `http://localhost:8977/callback`. Leave the optional fields empty.
+2. Pick at least the Account API Tokens Edit scope and create the client. Copy its client ID into `client_id`.
+3. Give the client every scope your templates need. The dashboard's picker does not offer every one (Workers Scripts Read and Write are missing), so set them through the API with a token that has **OAuth Client: Edit**: `PATCH /accounts/<account>/oauth_clients/<client_id>` with `scopes` (and `optional_scopes` for those that may be declined). The `scope` parameter of the sign-in URL `fob login` prints lists the scopes it requests.
+
+The client is private: only members of the account that owns it can sign in with it, but they can approve any account they belong to.
 
 ## The bootstrap token
 
-Cloudflare has no sign-in that lets another app create API tokens, so `fob login cf` needs one bootstrap token that can create others. You make it once in the dashboard; omnifob keeps it in the keychain and mints short-lived tokens from it. There are two kinds, set with `token_type`, and they map onto the AWS model:
+Without a browser sign-in, `fob login cf` needs one bootstrap token that can create others. You make it once in the dashboard; omnifob keeps it in the keychain and mints short-lived tokens from it. There are two kinds, set with `token_type`, and they map onto the AWS model:
 
 |             | Account-owned (`token_type = "account"`)                                                                                                                                                                                    | User-owned (`token_type = "user"`, the default)                                                                                     |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
@@ -25,7 +51,7 @@ A bootstrap token without an expiry works forever and needs no second factor, so
 
 ```toml
 [integrations.cf]
-type = "cloudflare"
+type = "cloudflare-token"
 token_type = "account"
 account_id = "..."
 session = "12h"
@@ -63,7 +89,7 @@ Three template settings narrow what a minted token can do beyond its permissions
 
 ```toml
 [integrations.cf]
-type = "cloudflare"
+type = "cloudflare-token"
 ips = ["current"]                  # every template: usable only from here
 
 [integrations.cf.templates.backups]

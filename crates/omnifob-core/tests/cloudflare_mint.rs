@@ -31,7 +31,7 @@ fn config_with_optional(token_type: &str, permissions: &str, optional: &str) -> 
     let text = format!(
         r#"
         [integrations.cf]
-        type = "cloudflare"
+        type = "cloudflare-token"
         account_id = "{ACCOUNT}"
         token_type = "{token_type}"
         ttl = "1h"
@@ -657,7 +657,7 @@ async fn narrow_tokens_carry_ip_conditions_buckets_and_s3_credentials() {
     let text = format!(
         r#"
         [integrations.cf]
-        type = "cloudflare"
+        type = "cloudflare-token"
         account_id = "{ACCOUNT}"
         token_type = "account"
         ips = ["198.51.100.0/24"]
