@@ -573,14 +573,19 @@ mod tests {
     #[test]
     fn directories_pick_the_closest_one() {
         let home = Path::new("/nonexistent-home");
-        let config = Config::parse(
+        let work = if cfg!(windows) {
+            "C:/srv/work"
+        } else {
+            "/srv/work"
+        };
+        let config = Config::parse(&format!(
             r#"
             [directories]
             "~/git" = ["gh-personal"]
             "~/git/acme" = ["gh-acme", "acme prod admin"]
-            "/srv/work" = ["work"]
-            "#,
-        )
+            "{work}" = ["work"]
+            "#
+        ))
         .unwrap();
         let at = |cwd: &str| {
             config
@@ -601,8 +606,8 @@ mod tests {
             None,
             "whole components only"
         );
-        assert_eq!(at("/srv/work/x").unwrap().0, "/srv/work");
-        assert_eq!(at("/srv"), None);
+        assert_eq!(at(&format!("{work}/x")).unwrap().0, work);
+        assert_eq!(at(work.trim_end_matches("/work")), None);
     }
 
     #[test]
