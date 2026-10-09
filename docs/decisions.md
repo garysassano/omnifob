@@ -32,7 +32,7 @@ Works on every machine including headless and WSL; PKCE needs a local callback s
 
 ## 2026-10-06: Cloudflare bootstrap token first, OAuth second
 
-Cloudflare's third-party OAuth only allows PKCE (no device flow) and it is unverified whether `account_api_tokens:create` is available to third-party clients. The bootstrap token works today and is a one-click, one-time setup. OAuth comes next, keeping the bootstrap token as fallback.
+Cloudflare's third-party OAuth only allows PKCE (no device flow) and it is unverified whether `account_api_tokens:create` is available to third-party clients. The bootstrap token works today and is a one-click, one-time setup. OAuth comes next, keeping the bootstrap token as fallback. Superseded on 2026-10-09, below.
 
 ## 2026-10-06: Permissions by name, not ID
 
@@ -61,3 +61,11 @@ Changes go through a pull request, squash-merged after CI passes, matching the r
 ## 2026-10-07: No profile aliases for now
 
 Profile ids are long (`<integration>/<account>/<role or template>`), but they are rarely typed: any words that match one profile select it, a whole-segment match wins, and shell completion fills in the rest. Aliases would add a second naming scheme to learn and keep in sync for little gain. The repeated case, the same profile in the same project, is better served by a per-directory default profile, which is planned. Revisit if real collisions keep forcing long queries; an alias would then be an exact match checked before word matching, so it never changes what existing queries select.
+
+## 2026-10-09: Cloudflare browser sign-in as its own type
+
+Third-party OAuth clients can request "Account API Tokens Write" now (a sensitive scope the consent page leaves off by default), and an access token with it creates and deletes account-owned tokens in every account approved on the consent page. So a browser sign-in replaces the bootstrap token without losing what minting gives: narrow tokens per template, IP limits, R2 bucket limits and S3 credentials, and `--revoke`.
+
+The sign-in method is the integration type, as with `aws-sso`: `cloudflare-oauth` and `cloudflare-token` (the bootstrap token, formerly `cloudflare`). Both share configuration, templates and minting, so a template gives the same token either way. A clean break from `cloudflare` while omnifob is 0.x, named in the release notes.
+
+A sign-in can only mint permissions whose scope the consent granted; Cloudflare refuses the rest. omnifob therefore requests the scopes its templates need, from a table of permission name to scope ID, since the IDs do not follow the names (`page.write` for Pages, `query-cache.write` for Hyperdrive). The OAuth client must have those scopes registered. Until omnifob ships a public client, each user registers a private one; a public client needs a verified domain for its client URL, and making a client public cannot be undone.
