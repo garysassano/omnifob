@@ -11,11 +11,12 @@ Early. What changed in each version is in the [release notes](https://github.com
 | `aws-sso` (IAM Identity Center) | Device flow, silent refresh                             | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole          | Federated sign-in URL |
 | `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                         | Minted tokens, scoped by permission name, expiring              | Dashboard             |
 | `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring              | Dashboard             |
+| `github-oauth`                  | Device flow, like `gh auth login`, with gh's scopes     | One profile per sign-in                               | The token as `GH_TOKEN` and `GITHUB_TOKEN`, and to git          | github.com            |
 | `token`                         | Paste once, checked against the provider where possible | One profile per integration                           | The stored token under every variable the provider's tools read | Known console URL     |
 
 Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
-Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), a GitHub sign-in with the scopes gh expects.
+Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`).
 
 ## Install
 
@@ -80,6 +81,15 @@ ttl = "30m"
 If you know IAM Identity Center through granted, the Cloudflare integrations work the same way: the browser sign-in or bootstrap token plays the part of the sign-in, templates the part of permission sets, and each `account × template` profile the part of an `account × role`; `fob exec` mints a short-lived token the way granted fetches role credentials. Unlike permission sets, templates live in your config, not in Cloudflare. A browser sign-in can only mint the permissions you approved on the consent page; a bootstrap token can mint any permission, so treat it like an administrator credential.
 
 Registering the OAuth client, and creating a bootstrap token instead, account-owned or user-owned, are explained in [docs/guides/cloudflare.md](docs/guides/cloudflare.md).
+
+GitHub signs in through the browser with an OAuth app you register once, explained in [docs/guides/github.md](docs/guides/github.md):
+
+```toml
+[integrations.gh-me]
+type = "github-oauth"
+client_id = "..."       # your OAuth app, with device flow enabled
+account = "me"          # profile id: gh-me/me/github
+```
 
 Providers that only have long-lived tokens use `type = "token"`, usually with a preset:
 

@@ -38,7 +38,10 @@ impl Integration {
                 CloudflareSignIn::Token => "cloudflare-token",
                 CloudflareSignIn::Oauth => "cloudflare-oauth",
             },
-            Integration::Token(_) => "token",
+            Integration::Token(c) => match c.sign_in {
+                TokenSignIn::Paste => "token",
+                TokenSignIn::GithubDevice => "github-oauth",
+            },
         }
     }
 }
@@ -52,6 +55,7 @@ enum RawIntegration {
     CloudflareToken(CloudflareConfig),
     CloudflareOauth(CloudflareConfig),
     Token(TokenConfig),
+    GithubOauth(TokenConfig),
 }
 
 impl TryFrom<RawIntegration> for Integration {
@@ -60,7 +64,31 @@ impl TryFrom<RawIntegration> for Integration {
     fn try_from(raw: RawIntegration) -> Result<Self, Self::Error> {
         Ok(match raw {
             RawIntegration::AwsSso(c) => Integration::AwsSso(c),
-            RawIntegration::Token(c) => Integration::Token(c),
+            RawIntegration::Token(c) => {
+                if c.client_id.is_some() || c.scopes.is_some() {
+                    return Err(
+                        "client_id and scopes belong to type = \"github-oauth\"".to_string()
+                    );
+                }
+                Integration::Token(c)
+            }
+            RawIntegration::GithubOauth(mut c) => {
+                if c.client_id.is_none() {
+                    return Err(
+                        "type = \"github-oauth\" needs the client_id of an OAuth app \
+                         with device flow enabled"
+                            .to_string(),
+                    );
+                }
+                if c.preset.as_deref().is_some_and(|p| p != "github") || !c.secrets.is_empty() {
+                    return Err("type = \"github-oauth\" signs in to GitHub; \
+                         it takes no other preset or secrets"
+                        .to_string());
+                }
+                c.preset = Some("github".to_string());
+                c.sign_in = TokenSignIn::GithubDevice;
+                Integration::Token(c)
+            }
             RawIntegration::CloudflareToken(c) => {
                 if c.client_id.is_some() || c.scopes.is_some() {
                     return Err(
@@ -164,6 +192,25 @@ pub struct TokenConfig {
     /// the `github` preset sets `github.com`.
     #[serde(default)]
     pub git_host: Option<String>,
+    /// `github-oauth`: the OAuth app to sign in with (device flow enabled).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// `github-oauth`: scopes requested at sign-in; defaults to gh's.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    /// Set from the integration's `type`.
+    #[serde(skip)]
+    pub sign_in: TokenSignIn,
+}
+
+/// How a token integration gets its token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenSignIn {
+    /// `token`: pasted, or read from stdin.
+    #[default]
+    Paste,
+    /// `github-oauth`: GitHub's device flow, as `gh auth login` signs in.
+    GithubDevice,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -620,6 +667,30 @@ mod tests {
         assert!(err("[directories]\n\"git\" = [\"x\"]\n").contains("absolute"));
         assert!(err("[directories]\n\"~/git\" = []\n").contains("at least one"));
         assert!(err("[directories]\n\"~/git\" = [\" \"]\n").contains("at least one"));
+    }
+
+    #[test]
+    fn github_oauth_is_a_github_token_signed_in_by_device_flow() {
+        let token = |text: &str| match Config::parse(text)?.integrations.remove("g").unwrap() {
+            Integration::Token(c) => Ok::<_, anyhow::Error>(c),
+            _ => unreachable!(),
+        };
+        let gh = token("[integrations.g]\ntype = \"github-oauth\"\nclient_id = \"x\"\n").unwrap();
+        assert_eq!(gh.sign_in, TokenSignIn::GithubDevice);
+        assert_eq!(gh.preset.as_deref(), Some("github"));
+        let config =
+            Config::parse("[integrations.g]\ntype = \"github-oauth\"\nclient_id = \"x\"\n")
+                .unwrap();
+        assert_eq!(config.integrations["g"].kind(), "github-oauth");
+        assert!(token("[integrations.g]\ntype = \"github-oauth\"\n").is_err());
+        assert!(
+            token("[integrations.g]\ntype = \"github-oauth\"\nclient_id = \"x\"\npreset = \"hetzner\"\n")
+                .is_err()
+        );
+        assert!(
+            token("[integrations.g]\ntype = \"token\"\npreset = \"github\"\nclient_id = \"x\"\n")
+                .is_err()
+        );
     }
 
     #[test]

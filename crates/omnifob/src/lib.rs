@@ -11,10 +11,10 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
 use dialoguer::console::Term;
 use jiff::Timestamp;
-use omnifob_core::config::CloudflareTokenType;
+use omnifob_core::config::{CloudflareTokenType, TokenSignIn};
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::{ProfileCache, SyncedProfiles};
-use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, cloudflare_oauth, token};
+use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, cloudflare_oauth, github, token};
 use omnifob_core::{Config, Credentials, Error, Integration, Profile, paths};
 
 use crate::shell::Shell;
@@ -573,6 +573,30 @@ impl App {
                     );
                 }
             }
+            Integration::Token(config) if config.sign_in == TokenSignIn::GithubDevice => {
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' signs in through the browser; it takes no token");
+                }
+                let granted = github::login(name, config, |prompt| {
+                    eprintln!("fob: approve the sign-in for '{name}' in your browser");
+                    eprintln!("     {}", prompt.url);
+                    eprintln!("     code: {}", prompt.user_code);
+                    if !no_browser && let Err(e) = open::that(&prompt.url) {
+                        eprintln!("fob: could not open a browser ({e}); open the URL above");
+                    }
+                })
+                .await?;
+                let missing: Vec<String> = github::scopes(config)
+                    .into_iter()
+                    .filter(|s| !granted.contains(s))
+                    .collect();
+                if !missing.is_empty() {
+                    eprintln!(
+                        "fob: GitHub did not grant {}; commands that need it will fail",
+                        missing.join(", ")
+                    );
+                }
+            }
             Integration::Token(config) => {
                 let names: Vec<String> = token::secrets(config)?
                     .into_iter()
@@ -645,6 +669,14 @@ impl App {
             }
         }
         let existed = providers::logout(name, &integration)?;
+        if existed
+            && let Integration::Token(c) = &integration
+            && c.sign_in == TokenSignIn::GithubDevice
+        {
+            eprintln!(
+                "fob: GitHub still lists the sign-in; revoke it under Settings > Applications > Authorized OAuth Apps to end the token everywhere"
+            );
+        }
         if let Some(synced) = self.cache.integrations.get(name) {
             providers::forget_credentials(&synced.profiles);
         }
@@ -774,6 +806,9 @@ impl App {
                 SignIn::SignedOut => "signed out".to_string(),
                 SignIn::Token if matches!(integration, Integration::Cloudflare(_)) => {
                     "signed in (bootstrap token)".to_string()
+                }
+                SignIn::Token if matches!(integration, Integration::Token(c) if c.sign_in == TokenSignIn::GithubDevice) => {
+                    "signed in (GitHub sign-in)".to_string()
                 }
                 SignIn::Token => "signed in (stored token)".to_string(),
                 SignIn::Session {

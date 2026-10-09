@@ -4,6 +4,7 @@
 pub mod aws_sso;
 pub mod cloudflare;
 pub mod cloudflare_oauth;
+pub mod github;
 pub mod token;
 
 use jiff::Timestamp;
