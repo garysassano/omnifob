@@ -196,6 +196,9 @@ mod wsl {
                     .is_ok_and(|v| v.to_lowercase().contains("microsoft"))
                 && Command::new("powershell.exe")
                     .arg("-?")
+                    // WSL drains an inherited stdin into the Windows process,
+                    // even unread, so input piped to `fob exec` would be lost.
+                    .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
