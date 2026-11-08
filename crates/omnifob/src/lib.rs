@@ -1014,6 +1014,9 @@ impl App {
         self.cache.save(&profiles_file())
     }
 
+    /// Discovers the profiles of integrations never synced. One that cannot
+    /// be synced (not signed in, offline) is skipped with a note rather than
+    /// failing a command that may not need it, and is tried again next time.
     async fn ensure_synced(&mut self) -> anyhow::Result<()> {
         let missing: Vec<String> = self
             .config
@@ -1022,10 +1025,29 @@ impl App {
             .filter(|name| !self.cache.integrations.contains_key(*name))
             .cloned()
             .collect();
-        if !missing.is_empty() {
-            self.sync(&missing).await?;
+        if missing.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        for name in &missing {
+            let integration = self.config.integration(name)?.clone();
+            match providers::discover(name, &integration).await {
+                Ok(profiles) => {
+                    eprintln!("fob: {name}: {} profiles", profiles.len());
+                    self.cache.integrations.insert(
+                        name.clone(),
+                        SyncedProfiles {
+                            synced_at: Timestamp::now(),
+                            profiles,
+                        },
+                    );
+                }
+                Err(Error::NeedsLogin { .. }) => {
+                    eprintln!("fob: skipping '{name}': not signed in (`fob login {name}`)");
+                }
+                Err(e) => eprintln!("fob: skipping '{name}': {e:#}"),
+            }
+        }
+        self.cache.save(&profiles_file())
     }
 
     async fn list(&mut self, query: Option<&str>, json: bool) -> anyhow::Result<()> {

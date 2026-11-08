@@ -105,3 +105,7 @@ Both follow their CLI's flows: PKCE with a `localhost` redirect by default; from
 ## 2026-11-08: Modal as a stored token
 
 The Modal CLI creates tokens through its gRPC API (`TokenFlowCreate` and `TokenFlowWait`), which can make them expire, and stores them in plain text in `~/.modal.toml`. Implementing that flow would mean hand-encoding protobuf for an internal API. The `modal` preset stores the token ID and secret in the keychain and hands them out as `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, which the Modal client reads before its config file (checked with Modal 1.6.3).
+
+## 2026-11-08: Presets carry fixed variables; Unikraft Cloud as a stored token
+
+Unikraft Cloud has two CLIs. `kraft` (KraftKit) builds unikernels and has a `kraft cloud` subcommand, deprecated with support ending 2026-11-26; `unikraft` (`unikraft-cloud/cli`) replaces it. Both sign in to the same control plane, and the token they keep is a static robot-account credential (`base64(robot$<name>.users.kraftcloud:<secret>)`) with no expiry and no API to mint narrower ones, so the `unikraft` preset stores it. `kraft` reads `UKC_TOKEN` and `UKC_METRO` whenever they are set; `unikraft` reads them only with `UNIKRAFT_PROFILE_ENV=true`, so presets gained fixed variables (`vars`, overridden by the integration's own) and this one sets that flag. Checked live with `unikraft quotas` and `kraft cloud quota`, each given only what `fob exec` exports.

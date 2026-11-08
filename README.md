@@ -16,7 +16,7 @@ Early. What changed in each version is in the [release notes](https://github.com
 | `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                   | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
 | `token`                         | Paste once, checked against the provider where possible | One profile per integration                            | The stored token under every variable the provider's tools read          | Known console URL     |
 
-Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `modal`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
+Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `modal`, `unikraft`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
 ## Install
 
@@ -124,6 +124,11 @@ account = "prod"            # profile id: hetzner-prod/prod/hetzner
 type = "token"
 preset = "upstash"
 vars = { UPSTASH_EMAIL = "me@example.com" }   # non-secret variables
+
+[integrations.unikraft]
+type = "token"
+preset = "unikraft"         # UKC_TOKEN for `unikraft` and `kraft cloud`
+vars = { UKC_METRO = "fra" }
 
 [integrations.internal]
 type = "token"
