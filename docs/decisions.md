@@ -95,3 +95,13 @@ granted and aws-vault both support IAM users, and some accounts still have them.
 ## 2026-11-08: MFA codes through a prompt the embedder registers
 
 `omnifob-core` stays usable as a library, so it never reads the terminal. The command line registers a prompt when stdin and stderr are terminals; elsewhere (background renewal, `credential_process` without a terminal) a profile that needs a code fails with a message saying to run `fob creds` in a terminal first. Fetches are serialized per profile, so parallel `credential_process` calls ask once and share the result.
+
+## 2026-11-08: Google and Azure sign in with their CLIs' own clients
+
+A sign-in needs an OAuth client. Google publishes none for third-party tools, and registering one means a Google Cloud project, a consent screen and, for the `cloud-platform` scope, either verification or a warning page. omnifob signs in with gcloud's installed-app client, as gcloud itself does, so it works wherever gcloud works and needs no setup; `client_id` and `client_secret` name a client of your own instead. Rolle reads the refresh token gcloud leaves in a plain file instead; omnifob keeps its own sign-in in the keychain and does not need gcloud installed. For Azure, the Azure CLI's public client is the default of Microsoft's own Azure Identity libraries for interactive sign-in, so using it follows Microsoft's practice.
+
+Both follow their CLI's flows: PKCE with a `localhost` redirect by default; from another device, gcloud's pasted-code page and Entra ID's device flow.
+
+## 2026-11-08: Modal as a stored token
+
+The Modal CLI creates tokens through its gRPC API (`TokenFlowCreate` and `TokenFlowWait`), which can make them expire, and stores them in plain text in `~/.modal.toml`. Implementing that flow would mean hand-encoding protobuf for an internal API. The `modal` preset stores the token ID and secret in the keychain and hands them out as `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, which the Modal client reads before its config file (checked with Modal 1.6.3).

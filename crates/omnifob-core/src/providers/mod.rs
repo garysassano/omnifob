@@ -3,8 +3,10 @@
 
 pub mod aws_iam;
 pub mod aws_sso;
+pub mod azure;
 pub mod cloudflare;
 pub mod cloudflare_oauth;
+pub mod gcp;
 pub mod token;
 
 use jiff::Timestamp;
@@ -16,6 +18,8 @@ pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profi
     match integration {
         Integration::AwsSso(config) => aws_sso::discover(name, config).await,
         Integration::AwsIam(config) => aws_iam::discover(name, config).await,
+        Integration::Gcp(config) => gcp::discover(name, config).await,
+        Integration::Azure(config) => azure::discover(name, config).await,
         Integration::Cloudflare(config) => {
             let profiles = cloudflare::discover(name, config).await?;
             // A good moment to delete expired tokens omnifob minted.
@@ -62,6 +66,8 @@ pub fn logout(name: &str, integration: &Integration) -> anyhow::Result<bool> {
     match integration {
         Integration::AwsSso(_) => aws_sso::logout(name),
         Integration::AwsIam(_) => aws_iam::logout(name),
+        Integration::Gcp(_) => gcp::logout(name),
+        Integration::Azure(_) => azure::logout(name),
         Integration::Cloudflare(_) => cloudflare::logout(name),
         Integration::Token(_) => token::logout(name),
     }
@@ -91,6 +97,18 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
         },
         Integration::AwsIam(_) => {
             if aws_iam::has_key(name)? {
+                SignIn::Token
+            } else {
+                SignIn::SignedOut
+            }
+        }
+        // A refresh token that lasts until revoked: like a stored token.
+        Integration::Gcp(_) | Integration::Azure(_) => {
+            let signed_in = match integration {
+                Integration::Gcp(_) => gcp::is_signed_in(name)?,
+                _ => azure::is_signed_in(name)?,
+            };
+            if signed_in {
                 SignIn::Token
             } else {
                 SignIn::SignedOut
@@ -130,8 +148,9 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
 /// Returns credentials for a profile, reusing cached ones while they are fresh.
 ///
 /// `ttl` asks for a lifetime other than the configured one: minted
-/// Cloudflare tokens and AWS sessions omnifob starts itself (chained roles,
-/// IAM users and their roles) honour it, and always get new credentials.
+/// Cloudflare tokens, AWS sessions omnifob starts itself (chained roles,
+/// IAM users and their roles) and Google service account tokens honour it,
+/// and always get new credentials.
 pub async fn credentials(
     config: &Config,
     profile: &Profile,
@@ -146,6 +165,11 @@ pub async fn credentials(
             .into()),
             Target::Token {} => return Err(anyhow::anyhow!(
                 "--ttl does not apply to stored tokens; they do not expire"
+            )
+            .into()),
+            Target::Gcp { .. } | Target::Azure { .. } => return Err(anyhow::anyhow!(
+                "--ttl does not apply to {}: the provider sets its tokens' lifetime",
+                profile.id
             )
             .into()),
             _ => {}
@@ -219,6 +243,20 @@ async fn fetch(
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
             aws_iam::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
         }
+        (Integration::Gcp(c), Target::Gcp { project_id, .. }) => {
+            gcp::user_credentials(&profile.integration, c, project_id).await?
+        }
+        (Integration::Gcp(c), Target::GcpServiceAccount { label, .. }) => {
+            gcp::service_account_credentials(&profile.integration, c, label, ttl).await?
+        }
+        (
+            Integration::Azure(_),
+            Target::Azure {
+                subscription_id,
+                tenant_id,
+                ..
+            },
+        ) => azure::credentials(&profile.integration, subscription_id, tenant_id).await?,
         (
             Integration::Cloudflare(c),
             Target::Cloudflare {
@@ -303,6 +341,20 @@ pub async fn console_url(
             let home = c.region.as_deref().unwrap_or("us-east-1");
             aws_sso::console_url(creds, home, region).await?
         }
+        (Integration::Gcp(_), Target::Gcp { project_id, .. }) => {
+            gcp::console_url(&profile.integration, Some(project_id))?
+        }
+        (Integration::Gcp(_), Target::GcpServiceAccount { project_id, .. }) => {
+            gcp::console_url(&profile.integration, project_id.as_deref())?
+        }
+        (
+            Integration::Azure(_),
+            Target::Azure {
+                subscription_id,
+                tenant_id,
+                ..
+            },
+        ) => azure::console_url(subscription_id, tenant_id),
         (Integration::Cloudflare(_), Target::Cloudflare { account_id, .. }) => {
             cloudflare::console_url(account_id)
         }
@@ -328,6 +380,8 @@ pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<Stri
     match integration {
         Integration::AwsSso(config) => aws_sso::check(name, config).await,
         Integration::AwsIam(config) => aws_iam::check(name, config).await,
+        Integration::Gcp(config) => gcp::check(name, config).await,
+        Integration::Azure(_) => azure::check(name).await,
         Integration::Cloudflare(config) => cloudflare::check(name, config).await,
         Integration::Token(config) => token::check(name, config).await,
     }
@@ -361,6 +415,10 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 aws_sso::caller_identity(&creds, &region).await?
             ))
         }
+        (Integration::Gcp(_), Target::Gcp { .. } | Target::GcpServiceAccount { .. }) => {
+            gcp::check_token(&creds).await
+        }
+        (Integration::Azure(_), Target::Azure { .. }) => azure::check_subscription(&creds).await,
         (Integration::Cloudflare(c), Target::Cloudflare { account_id, .. }) => {
             let token = creds
                 .env
@@ -405,10 +463,15 @@ pub async fn revoke(config: &Config, profile: &Profile) -> Result<Revoked> {
 /// Moves an integration's stored sign-in to a new integration name.
 pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow::Result<bool> {
     match integration {
-        Integration::AwsSso(_) | Integration::AwsIam(_) => {
+        Integration::AwsSso(_)
+        | Integration::AwsIam(_)
+        | Integration::Gcp(_)
+        | Integration::Azure(_) => {
             let (from, to) = match integration {
                 Integration::AwsSso(_) => (aws_sso::keys(old), aws_sso::keys(new)),
-                _ => (aws_iam::keys(old), aws_iam::keys(new)),
+                Integration::AwsIam(_) => (aws_iam::keys(old), aws_iam::keys(new)),
+                Integration::Gcp(_) => (gcp::keys(old), gcp::keys(new)),
+                _ => (azure::keys(old), azure::keys(new)),
             };
             let mut moved = false;
             for (i, (from, to)) in from.iter().zip(to).enumerate() {

@@ -50,6 +50,24 @@ pub enum Target {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
     },
+    /// The signed-in Google account, working in a project.
+    Gcp {
+        project_id: String,
+        project_name: String,
+    },
+    /// The signed-in Entra ID account, working in a subscription.
+    Azure {
+        subscription_id: String,
+        subscription_name: String,
+        tenant_id: String,
+    },
+    /// A service account the Google account impersonates; details live in
+    /// the integration's `service_accounts` table under `label`.
+    GcpServiceAccount {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+    },
 }
 
 impl Target {
@@ -63,6 +81,11 @@ impl Target {
             Target::AwsChained { account_id, .. } | Target::AwsIamRole { account_id, .. } => {
                 account_id.as_deref()
             }
+            Target::Gcp { project_id, .. } => Some(project_id),
+            Target::Azure {
+                subscription_id, ..
+            } => Some(subscription_id),
+            Target::GcpServiceAccount { project_id, .. } => project_id.as_deref(),
             Target::Token {} => None,
         }
     }

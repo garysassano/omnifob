@@ -15,7 +15,7 @@ use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::{ProfileCache, SyncedProfiles};
 use omnifob_core::providers::{
-    self, SignIn, aws_iam, aws_sso, cloudflare, cloudflare_oauth, token,
+    self, SignIn, aws_iam, aws_sso, azure, cloudflare, cloudflare_oauth, gcp, token,
 };
 use omnifob_core::{Config, Credentials, Error, Integration, Profile, paths};
 
@@ -42,9 +42,9 @@ enum Command {
         /// Print the sign-in URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
-        /// AWS: sign in with a code on any device (the device flow) instead
-        /// of the browser on this machine. Chosen on its own over SSH and in
-        /// containers.
+        /// Sign in from a browser on any device instead of this machine's:
+        /// AWS and Azure show a code to enter there (the device flow), Google
+        /// a code to paste back here. Chosen on its own over SSH and in containers.
         #[arg(long)]
         device_code: bool,
         /// Read the token (a Cloudflare bootstrap token, a token integration's
@@ -467,6 +467,9 @@ fn profile_candidates() -> Vec<CompletionCandidate> {
                 omnifob_core::Target::AwsChained { .. } => "aws (chained)",
                 omnifob_core::Target::AwsIamSession { .. } => "aws (iam user)",
                 omnifob_core::Target::AwsIamRole { .. } => "aws (iam role)",
+                omnifob_core::Target::Gcp { .. } => "gcp",
+                omnifob_core::Target::Azure { .. } => "azure",
+                omnifob_core::Target::GcpServiceAccount { .. } => "gcp (service account)",
                 omnifob_core::Target::Cloudflare { .. } => "cloudflare",
                 omnifob_core::Target::Token {} => "token",
             };
@@ -524,8 +527,15 @@ impl App {
         from_clipboard: bool,
     ) -> anyhow::Result<()> {
         let integration = self.config.integration(name)?;
-        if device_code && !matches!(integration, Integration::AwsSso(_)) {
-            bail!("--device-code only applies to AWS IAM Identity Center integrations");
+        if device_code
+            && !matches!(
+                integration,
+                Integration::AwsSso(_) | Integration::Gcp(_) | Integration::Azure(_)
+            )
+        {
+            bail!(
+                "--device-code only applies to AWS IAM Identity Center, Google and Azure integrations"
+            );
         }
         match integration {
             Integration::AwsSso(config) => {
@@ -557,6 +567,73 @@ impl App {
                     }
                 })
                 .await?;
+            }
+            Integration::Gcp(config) => {
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' signs in through Google; it takes no token");
+                }
+                let browser_here = !device_code && !omnifob_core::oauth::browser_is_elsewhere();
+                if !browser_here && !interactive() {
+                    bail!("no terminal to paste Google's code into; run `fob login {name}` in one");
+                }
+                let email = gcp::login(
+                    name,
+                    config,
+                    browser_here,
+                    |url| {
+                        if browser_here {
+                            eprintln!("fob: approve the sign-in for '{name}' in your browser");
+                            eprintln!("     {url}");
+                            eprintln!(
+                                "     The browser must run on this machine; elsewhere, use --device-code."
+                            );
+                            if !no_browser && let Err(e) = open::that(url) {
+                                eprintln!(
+                                    "fob: could not open a browser ({e}); open the URL above"
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "fob: open this on any device, approve the sign-in for '{name}', and copy the code Google shows"
+                            );
+                            eprintln!("     {url}");
+                        }
+                    },
+                    || {
+                        Ok(dialoguer::Password::new()
+                            .with_prompt("Code from Google")
+                            .interact_on(&Term::stderr())?)
+                    },
+                )
+                .await?;
+                eprintln!("fob: signed in to Google as {email}");
+            }
+            Integration::Azure(config) => {
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' signs in through Entra ID; it takes no token");
+                }
+                let browser_here = !device_code && !omnifob_core::oauth::browser_is_elsewhere();
+                let username = azure::login(name, config, browser_here, |prompt| {
+                    match prompt.user_code {
+                        Some(code) => {
+                            eprintln!("fob: approve the sign-in for '{name}' on any device");
+                            eprintln!("     {}", prompt.url);
+                            eprintln!("     code: {code}");
+                        }
+                        None => {
+                            eprintln!("fob: approve the sign-in for '{name}' in your browser");
+                            eprintln!("     {}", prompt.url);
+                            eprintln!(
+                                "     The browser must run on this machine; elsewhere, use --device-code."
+                            );
+                        }
+                    }
+                    if !no_browser && let Err(e) = open::that(prompt.url) {
+                        eprintln!("fob: could not open a browser ({e}); open the URL above");
+                    }
+                })
+                .await?;
+                eprintln!("fob: signed in to Entra ID as {username}");
             }
             Integration::Cloudflare(config) if config.uses_oauth() => {
                 if token_stdin || from_clipboard {
@@ -711,6 +788,13 @@ impl App {
                 Err(e) => eprintln!("fob: could not end the IAM Identity Center session: {e:#}"),
             }
         }
+        if let Integration::Gcp(_) = &integration {
+            match gcp::end_session(name).await {
+                Ok(true) => eprintln!("fob: revoked the Google sign-in"),
+                Ok(false) => {}
+                Err(e) => eprintln!("fob: could not revoke the Google sign-in: {e:#}"),
+            }
+        }
         if let Integration::Cloudflare(config) = &integration {
             match cloudflare::end_session(name, config).await {
                 Ok(true) if config.uses_oauth() => eprintln!("fob: revoked the browser sign-in"),
@@ -831,6 +915,18 @@ impl App {
                 }
                 SignIn::Token if matches!(integration, Integration::AwsIam(_)) => {
                     "signed in (access key)".to_string()
+                }
+                SignIn::Token
+                    if matches!(integration, Integration::Gcp(_) | Integration::Azure(_)) =>
+                {
+                    let account = match integration {
+                        Integration::Gcp(_) => gcp::account(name)?,
+                        _ => azure::account(name)?,
+                    };
+                    match account {
+                        Some(email) => format!("signed in as {email}, renews automatically"),
+                        None => "signed in".to_string(),
+                    }
                 }
                 SignIn::Token => "signed in (stored token)".to_string(),
                 SignIn::Session {

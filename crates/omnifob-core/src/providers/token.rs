@@ -82,6 +82,17 @@ pub const PRESETS: &[Preset] = &[
         console: Some("https://console.scaleway.com"),
     },
     Preset {
+        name: "modal",
+        // The Modal client reads both, overriding `~/.modal.toml`. Its API is
+        // gRPC only, so there is no plain URL to check the token against.
+        secrets: &[
+            ("token_id", &["MODAL_TOKEN_ID"]),
+            ("token_secret", &["MODAL_TOKEN_SECRET"]),
+        ],
+        verify_url: None,
+        console: Some("https://modal.com/apps"),
+    },
+    Preset {
         name: "vercel",
         secrets: &[("token", &["VERCEL_TOKEN"])],
         verify_url: Some("https://api.vercel.com/v2/user"),
