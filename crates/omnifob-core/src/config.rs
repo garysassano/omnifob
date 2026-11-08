@@ -20,6 +20,7 @@ pub struct Config {
 #[serde(try_from = "RawIntegration")]
 pub enum Integration {
     AwsSso(AwsSsoConfig),
+    AwsIam(AwsIamConfig),
     /// Either Cloudflare type; `CloudflareConfig::sign_in` says which.
     Cloudflare(CloudflareConfig),
     Token(TokenConfig),
@@ -29,6 +30,7 @@ impl Integration {
     pub fn kind(&self) -> &'static str {
         match self {
             Integration::AwsSso(_) => "aws-sso",
+            Integration::AwsIam(_) => "aws-iam",
             Integration::Cloudflare(c) => match c.sign_in {
                 CloudflareSignIn::Token => "cloudflare-token",
                 CloudflareSignIn::Oauth => "cloudflare-oauth",
@@ -44,6 +46,7 @@ impl Integration {
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum RawIntegration {
     AwsSso(AwsSsoConfig),
+    AwsIam(AwsIamConfig),
     CloudflareToken(CloudflareConfig),
     CloudflareOauth(CloudflareConfig),
     Token(TokenConfig),
@@ -55,6 +58,10 @@ impl TryFrom<RawIntegration> for Integration {
     fn try_from(raw: RawIntegration) -> Result<Self, Self::Error> {
         Ok(match raw {
             RawIntegration::AwsSso(c) => Integration::AwsSso(c),
+            RawIntegration::AwsIam(c) => {
+                c.validate()?;
+                Integration::AwsIam(c)
+            }
             RawIntegration::Token(c) => Integration::Token(c),
             RawIntegration::CloudflareToken(c) => {
                 if c.client_id.is_some() || c.scopes.is_some() {
@@ -115,9 +122,100 @@ pub struct ChainedRole {
     /// Region exported for this role; defaults to the integration's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// MFA device the role's trust policy requires (`mfa_serial` in
+    /// `~/.aws/config`); a code is asked for each new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa_serial: Option<String>,
+    /// Session length, 15 minutes to 1 hour (AWS caps role-chaining sessions
+    /// at one hour); defaults to one hour.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
+    pub duration: Option<SignedDuration>,
 }
 
 impl ChainedRole {
+    /// The role name at the end of `role_arn` (after any path).
+    pub fn role_name(&self) -> &str {
+        self.role_arn.rsplit('/').next().unwrap_or(&self.role_arn)
+    }
+
+    /// The account in `role_arn`.
+    pub fn account_id(&self) -> Option<&str> {
+        self.role_arn.split(':').nth(4).filter(|a| !a.is_empty())
+    }
+}
+
+/// An IAM user's access key, kept in the keychain (`type = "aws-iam"`), the
+/// way aws-vault keeps it. omnifob never hands the key out: it turns it into a
+/// session with STS `GetSessionToken` (with an MFA code when `mfa_serial` is
+/// set), and assumes `roles` with that session.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsIamConfig {
+    /// Middle segment of the session profile's id; defaults to the account ID.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Region exported as `AWS_REGION` and used for STS; STS defaults to
+    /// us-east-1 when unset, and no region is exported.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// The user's MFA device; sessions then carry MFA, which roles requiring
+    /// it accept.
+    #[serde(default)]
+    pub mfa_serial: Option<String>,
+    /// Length of the user's session, 15 minutes to 36 hours; defaults to
+    /// eight hours, a working day.
+    #[serde(default, with = "opt_duration")]
+    pub session_duration: Option<SignedDuration>,
+    /// Roles assumed with the user's session, keyed by a label that becomes
+    /// the middle of the profile id.
+    #[serde(default)]
+    pub roles: BTreeMap<String, IamRole>,
+}
+
+impl AwsIamConfig {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(d) = self.session_duration
+            && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(36)).contains(&d)
+        {
+            return Err("session_duration must be between 15m and 36h".to_string());
+        }
+        for (label, role) in &self.roles {
+            if let Some(d) = role.duration
+                && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(12)).contains(&d)
+            {
+                return Err(format!(
+                    "roles.{label}.duration must be between 15m and 12h"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A role assumed with an IAM user's session.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IamRole {
+    pub role_arn: String,
+    /// `RoleSessionName`; defaults to "omnifob".
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    /// Region exported for this role; defaults to the integration's.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Session length, 15 minutes to the role's maximum (at most 12 hours);
+    /// defaults to one hour.
+    #[serde(default, with = "opt_duration")]
+    pub duration: Option<SignedDuration>,
+}
+
+impl IamRole {
     /// The role name at the end of `role_arn` (after any path).
     pub fn role_name(&self) -> &str {
         self.role_arn.rsplit('/').next().unwrap_or(&self.role_arn)
@@ -409,7 +507,15 @@ mod duration {
 
 mod opt_duration {
     use jiff::SignedDuration;
-    use serde::{Deserialize, Deserializer};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Written the way it is read, as "1h" or "30m".
+    pub fn serialize<S: Serializer>(d: &Option<SignedDuration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(d) => s.serialize_str(&format!("{d:#}")),
+            None => s.serialize_none(),
+        }
+    }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,

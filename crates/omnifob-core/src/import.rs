@@ -160,13 +160,19 @@ pub fn aws_portals(text: &str) -> Vec<AwsPortal> {
                 ));
                 continue;
             };
-            if keys.contains_key("mfa_serial") {
-                f.skipped.push((
-                    name.to_string(),
-                    "it needs MFA, which omnifob does not support yet",
-                ));
-                continue;
-            }
+            let duration = match keys.get("duration_seconds").map(|s| s.parse::<i64>()) {
+                None => None,
+                Some(Ok(secs)) if (900..=3600).contains(&secs) => {
+                    Some(jiff::SignedDuration::from_secs(secs))
+                }
+                Some(_) => {
+                    f.skipped.push((
+                        name.to_string(),
+                        "its duration_seconds is not 900 to 3600, the range AWS allows for chained roles",
+                    ));
+                    continue;
+                }
+            };
             f.chained.insert(
                 crate::profile::slug(name),
                 crate::config::ChainedRole {
@@ -176,6 +182,8 @@ pub fn aws_portals(text: &str) -> Vec<AwsPortal> {
                     session_name: keys.get("role_session_name").cloned(),
                     external_id: keys.get("external_id").cloned(),
                     region: keys.get("region").cloned(),
+                    mfa_serial: keys.get("mfa_serial").cloned(),
+                    duration,
                 },
             );
         }
@@ -262,10 +270,7 @@ pub fn aws_config_block(
 ) -> String {
     let mut out = format!("{AWS_BLOCK_BEGIN}\n");
     for p in profiles {
-        if !matches!(
-            p.target,
-            crate::Target::Aws { .. } | crate::Target::AwsChained { .. }
-        ) {
+        if !p.target.is_aws() {
             continue;
         }
         let name = format!("{prefix}{}", p.id.replace('/', "-"));
@@ -371,6 +376,7 @@ external_id = xyz
 role_arn = arn:aws:iam::444444444444:role/Admin
 source_profile = gary-test
 mfa_serial = arn:aws:iam::111111111111:mfa/me
+duration_seconds = 1800
 
 [profile from-static-keys]
 role_arn = arn:aws:iam::555555555555:role/Admin
@@ -415,8 +421,14 @@ source_profile = plain-keys
         assert_eq!(deploy.region.as_deref(), Some("us-east-1"));
         assert_eq!(deploy.role_name(), "Deploy");
         let skipped: Vec<&str> = gary.skipped.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(skipped, ["half-chained", "needs-mfa"]);
-        assert_eq!(gary.chained.len(), 1, "static-key sources are ignored");
+        assert_eq!(skipped, ["half-chained"]);
+        assert_eq!(gary.chained.len(), 2, "static-key sources are ignored");
+        let mfa = &gary.chained["needs-mfa"];
+        assert_eq!(
+            mfa.mfa_serial.as_deref(),
+            Some("arn:aws:iam::111111111111:mfa/me")
+        );
+        assert_eq!(mfa.duration, Some(jiff::SignedDuration::from_mins(30)));
 
         let client = portals
             .iter()

@@ -14,7 +14,9 @@ use jiff::Timestamp;
 use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::{ProfileCache, SyncedProfiles};
-use omnifob_core::providers::{self, SignIn, aws_sso, cloudflare, cloudflare_oauth, token};
+use omnifob_core::providers::{
+    self, SignIn, aws_iam, aws_sso, cloudflare, cloudflare_oauth, token,
+};
 use omnifob_core::{Config, Credentials, Error, Integration, Profile, paths};
 
 use crate::shell::Shell;
@@ -40,8 +42,14 @@ enum Command {
         /// Print the sign-in URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
-        /// Read the token (a Cloudflare bootstrap token, or a token integration's
-        /// single secret) from stdin instead of prompting
+        /// AWS: sign in with a code on any device (the device flow) instead
+        /// of the browser on this machine. Chosen on its own over SSH and in
+        /// containers.
+        #[arg(long)]
+        device_code: bool,
+        /// Read the token (a Cloudflare bootstrap token, a token integration's
+        /// single secret, or an IAM user's access key ID and secret separated by
+        /// whitespace) from stdin instead of prompting
         #[arg(long, conflicts_with = "from_clipboard")]
         token_stdin: bool,
         /// Read the Cloudflare bootstrap token from the clipboard instead of prompting
@@ -285,6 +293,13 @@ struct App {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    if interactive() {
+        omnifob_core::prompt::set_mfa_prompt(|serial| {
+            Ok(dialoguer::Input::<String>::new()
+                .with_prompt(format!("MFA code for {serial}"))
+                .interact_text_on(&Term::stderr())?)
+        });
+    }
     let config = Config::load(&paths::config_file())?;
     let cache = ProfileCache::load(&profiles_file())?;
     let mut app = App { config, cache };
@@ -293,11 +308,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Login {
             integration,
             no_browser,
+            device_code,
             token_stdin,
             from_clipboard,
         } => {
-            app.login(&integration, no_browser, token_stdin, from_clipboard)
-                .await?;
+            app.login(
+                &integration,
+                no_browser,
+                device_code,
+                token_stdin,
+                from_clipboard,
+            )
+            .await?;
             app.sync(std::slice::from_ref(&integration)).await?;
         }
         Command::Logout { integration } => app.logout(&integration).await?,
@@ -342,11 +364,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Console { profile, print } => {
             let profile = app.select(query(&profile).as_deref()).await?;
-            // Only AWS needs credentials to sign in to its console.
-            let creds = if matches!(
-                profile.target,
-                omnifob_core::Target::Aws { .. } | omnifob_core::Target::AwsChained { .. }
-            ) {
+            // Only AWS roles need credentials to sign in to the console; an
+            // IAM user's console session comes from its access key.
+            let creds = if profile.target.is_aws()
+                && !matches!(profile.target, omnifob_core::Target::AwsIamSession { .. })
+            {
                 app.credentials(&profile, true, None).await?
             } else {
                 Credentials::default()
@@ -443,6 +465,8 @@ fn profile_candidates() -> Vec<CompletionCandidate> {
             let kind = match p.target {
                 omnifob_core::Target::Aws { .. } => "aws",
                 omnifob_core::Target::AwsChained { .. } => "aws (chained)",
+                omnifob_core::Target::AwsIamSession { .. } => "aws (iam user)",
+                omnifob_core::Target::AwsIamRole { .. } => "aws (iam role)",
                 omnifob_core::Target::Cloudflare { .. } => "cloudflare",
                 omnifob_core::Target::Token {} => "token",
             };
@@ -495,15 +519,39 @@ impl App {
         &self,
         name: &str,
         no_browser: bool,
+        device_code: bool,
         token_stdin: bool,
         from_clipboard: bool,
     ) -> anyhow::Result<()> {
-        match self.config.integration(name)? {
+        let integration = self.config.integration(name)?;
+        if device_code && !matches!(integration, Integration::AwsSso(_)) {
+            bail!("--device-code only applies to AWS IAM Identity Center integrations");
+        }
+        match integration {
             Integration::AwsSso(config) => {
-                aws_sso::login(name, config, |prompt| {
-                    eprintln!("fob: approve the sign-in for '{name}' in your browser");
-                    eprintln!("     {}", prompt.url);
-                    eprintln!("     code: {}", prompt.user_code);
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' signs in through IAM Identity Center; it takes no token");
+                }
+                let flow = if device_code {
+                    aws_sso::Flow::DeviceCode
+                } else {
+                    aws_sso::Flow::for_this_session()
+                };
+                aws_sso::login(name, config, flow, |prompt| {
+                    match &prompt.user_code {
+                        Some(code) => {
+                            eprintln!("fob: approve the sign-in for '{name}' on any device");
+                            eprintln!("     {}", prompt.url);
+                            eprintln!("     code: {code}");
+                        }
+                        None => {
+                            eprintln!("fob: approve the sign-in for '{name}' in your browser");
+                            eprintln!("     {}", prompt.url);
+                            eprintln!(
+                                "     The browser must run on this machine; elsewhere, use --device-code."
+                            );
+                        }
+                    }
                     if !no_browser && let Err(e) = open::that(&prompt.url) {
                         eprintln!("fob: could not open a browser ({e}); open the URL above");
                     }
@@ -565,6 +613,33 @@ impl App {
                         expires_at.strftime("%Y-%m-%d %H:%M UTC")
                     );
                 }
+            }
+            Integration::AwsIam(config) => {
+                let (key_id, secret) = if token_stdin {
+                    // Two words: the access key ID, then the secret.
+                    let mut text = String::new();
+                    std::io::stdin().read_to_string(&mut text)?;
+                    let mut words = text.split_whitespace();
+                    match (words.next(), words.next(), words.next()) {
+                        (Some(id), Some(secret), None) => (id.to_string(), secret.to_string()),
+                        _ => bail!(
+                            "--token-stdin for '{name}' reads the access key ID and the secret access key, separated by whitespace"
+                        ),
+                    }
+                } else {
+                    if !interactive() {
+                        bail!("no terminal to prompt for the access key; use --token-stdin");
+                    }
+                    let id: String = dialoguer::Input::new()
+                        .with_prompt(format!("{name} access key ID"))
+                        .interact_text_on(&Term::stderr())?;
+                    let secret = dialoguer::Password::new()
+                        .with_prompt(format!("{name} secret access key"))
+                        .interact_on(&Term::stderr())?;
+                    (id, secret)
+                };
+                let arn = aws_iam::login(name, config, &key_id, &secret).await?;
+                eprintln!("fob: the access key belongs to {arn}; it stays in the keychain");
             }
             Integration::Token(config) => {
                 let names: Vec<String> = token::secrets(config)?
@@ -628,6 +703,13 @@ impl App {
             Ok(0) | Err(Error::NeedsLogin { .. }) => {}
             Ok(n) => eprintln!("fob: deleted {n} token(s) omnifob had minted"),
             Err(e) => eprintln!("fob: could not delete minted tokens: {e:#}"),
+        }
+        if let Integration::AwsSso(config) = &integration {
+            match aws_sso::end_session(name, config).await {
+                Ok(true) => eprintln!("fob: ended the IAM Identity Center session"),
+                Ok(false) => {}
+                Err(e) => eprintln!("fob: could not end the IAM Identity Center session: {e:#}"),
+            }
         }
         if let Integration::Cloudflare(config) = &integration {
             match cloudflare::end_session(name, config).await {
@@ -747,6 +829,9 @@ impl App {
                 SignIn::Token if matches!(integration, Integration::Cloudflare(_)) => {
                     "signed in (bootstrap token)".to_string()
                 }
+                SignIn::Token if matches!(integration, Integration::AwsIam(_)) => {
+                    "signed in (access key)".to_string()
+                }
                 SignIn::Token => "signed in (stored token)".to_string(),
                 SignIn::Session {
                     expires_at,
@@ -792,7 +877,7 @@ impl App {
                 reason,
             }) if interactive() => {
                 eprintln!("fob: {reason}; signing in again");
-                self.login(&integration, false, false, false).await?;
+                self.login(&integration, false, false, false, false).await?;
                 Ok(f().await?)
             }
             other => Ok(other?),
@@ -1184,20 +1269,23 @@ fn export_aws_config(
     file: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use omnifob_core::import::{aws_config_block, replace_aws_block};
-    let profiles: Vec<&Profile> = app
-        .cache
-        .all()
-        .filter(|p| {
-            matches!(
-                p.target,
-                omnifob_core::Target::Aws { .. } | omnifob_core::Target::AwsChained { .. }
-            )
-        })
-        .collect();
+    let profiles: Vec<&Profile> = app.cache.all().filter(|p| p.target.is_aws()).collect();
     let regions: std::collections::BTreeMap<String, String> = profiles
         .iter()
         .filter_map(|p| {
-            let Ok(Integration::AwsSso(c)) = app.config.integration(&p.integration) else {
+            let integration = app.config.integration(&p.integration).ok()?;
+            if let Integration::AwsIam(c) = integration {
+                let region = match &p.target {
+                    omnifob_core::Target::AwsIamRole { label, .. } => c
+                        .roles
+                        .get(label)
+                        .and_then(|r| r.region.clone())
+                        .or_else(|| c.region.clone()),
+                    _ => c.region.clone(),
+                }?;
+                return Some((p.id.clone(), region));
+            }
+            let Integration::AwsSso(c) = integration else {
                 return None;
             };
             let region = match &p.target {

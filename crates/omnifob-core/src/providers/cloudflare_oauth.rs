@@ -8,16 +8,15 @@
 //! 2026-10-09: an OAuth access token can create and delete account tokens in
 //! every account approved on the consent page).
 
-use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use base64::Engine;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::config::CloudflareConfig;
+use crate::oauth::{pkce, random_string, wait_for_code};
 use crate::{Error, Result, store};
 
 const DASH: &str = "https://dash.cloudflare.com";
@@ -179,24 +178,6 @@ pub fn granted_scopes(integration: &str) -> anyhow::Result<Option<Vec<String>>> 
     Ok(store::get::<Stored>(&token_key(integration))?.map(|s| s.scopes))
 }
 
-/// A PKCE verifier and its S256 challenge.
-fn pkce() -> anyhow::Result<(String, String)> {
-    let verifier = random_string(48)?;
-    let challenge = challenge(&verifier);
-    Ok((verifier, challenge))
-}
-
-fn challenge(verifier: &str) -> String {
-    use sha2::Digest;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier))
-}
-
-fn random_string(bytes: usize) -> anyhow::Result<String> {
-    let mut buf = vec![0u8; bytes];
-    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("no system randomness: {e}"))?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
-}
-
 /// The consent page URL.
 fn authorize_url(client_id: &str, scopes: &[String], state: &str, challenge: &str) -> String {
     let mut url = reqwest::Url::parse(&format!("{}/oauth2/auth", dash())).expect("valid URL");
@@ -234,9 +215,16 @@ pub async fn login(
         &challenge,
     ));
 
-    let code =
-        tokio::task::spawn_blocking(move || wait_for_code(&listener, &state, CALLBACK_TIMEOUT))
-            .await??;
+    let code = tokio::task::spawn_blocking(move || {
+        wait_for_code(
+            &listener,
+            "/callback",
+            &state,
+            CALLBACK_TIMEOUT,
+            "Cloudflare",
+        )
+    })
+    .await??;
 
     let now = Timestamp::now();
     let response = exchange(&[
@@ -261,73 +249,6 @@ pub async fn login(
     let stored = stored(response, now, None, session_ends, &requested)?;
     store::set(&token_key(integration), &stored)?;
     Ok(session_ends)
-}
-
-/// Accepts connections until one carries the callback, answers the browser,
-/// and returns the authorization code. Gives up after `timeout`; the listener
-/// polls rather than blocks, so the process can exit then.
-fn wait_for_code(listener: &TcpListener, state: &str, timeout: Duration) -> anyhow::Result<String> {
-    listener.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    bail!(
-                        "the sign-in was not completed within {} minutes",
-                        timeout.as_secs() / 60
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line)?;
-        let Some(query) = callback_query(&line) else {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-            continue;
-        };
-        let result = parse_callback(&query, state);
-        let message = match &result {
-            Ok(_) => "Signed in to Cloudflare. You can close this tab and return to the terminal.",
-            Err(_) => "The sign-in failed. Return to the terminal for details.",
-        };
-        let _ = write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
-            message.len()
-        );
-        return result;
-    }
-}
-
-/// The query of a `GET /callback?...` request line.
-fn callback_query(request_line: &str) -> Option<String> {
-    let target = request_line.strip_prefix("GET ")?.split(' ').next()?;
-    let query = target.strip_prefix("/callback?")?;
-    Some(query.to_string())
-}
-
-fn parse_callback(query: &str, state: &str) -> anyhow::Result<String> {
-    let url = reqwest::Url::parse(&format!("http://localhost/?{query}"))?;
-    let param = |name: &str| {
-        url.query_pairs()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.into_owned())
-    };
-    if let Some(error) = param("error") {
-        let detail = param("error_description").unwrap_or_default();
-        bail!("Cloudflare refused the sign-in: {error} {detail}");
-    }
-    if param("state").as_deref() != Some(state) {
-        bail!("the callback's state does not match this sign-in");
-    }
-    param("code").context("the callback carries no code")
 }
 
 async fn exchange(form: &[(&str, &str)]) -> anyhow::Result<TokenResponse> {
@@ -512,43 +433,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pkce_challenge_is_rfc_7636_s256() {
-        // The example from RFC 7636, appendix B.
-        assert_eq!(
-            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        let (verifier, _) = pkce().unwrap();
-        assert!((43..=128).contains(&verifier.len()), "{}", verifier.len());
-    }
-
-    #[test]
-    fn waiting_for_the_callback_times_out() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let err = wait_for_code(&listener, "s", Duration::from_millis(200))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not completed"), "{err}");
-    }
-
-    #[test]
-    fn waiting_for_the_callback_returns_the_code() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let browser = std::thread::spawn(move || {
-            let mut s = std::net::TcpStream::connect(addr).unwrap();
-            s.write_all(b"GET /callback?code=c1&state=s HTTP/1.1\r\nHost: x\r\n\r\n")
-                .unwrap();
-            let mut reply = String::new();
-            std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
-            reply
-        });
-        let code = wait_for_code(&listener, "s", Duration::from_secs(5)).unwrap();
-        assert_eq!(code, "c1");
-        assert!(browser.join().unwrap().starts_with("HTTP/1.1 200"));
-    }
-
-    #[test]
     fn permissions_map_to_scopes() {
         assert_eq!(scope_for("Pages Write"), Some("page.write"));
         assert_eq!(scope_for("hyperdrive edit"), Some("query-cache.write"));
@@ -562,26 +446,6 @@ mod tests {
                 assert!(scope_for(permission).is_some(), "{permission}");
             }
         }
-    }
-
-    #[test]
-    fn callback_lines() {
-        assert_eq!(
-            callback_query("GET /callback?code=a&state=b HTTP/1.1\r\n").as_deref(),
-            Some("code=a&state=b")
-        );
-        assert_eq!(callback_query("GET /favicon.ico HTTP/1.1\r\n"), None);
-        assert_eq!(callback_query("POST /callback?code=a HTTP/1.1\r\n"), None);
-    }
-
-    #[test]
-    fn callbacks_check_state_and_errors() {
-        assert_eq!(parse_callback("code=abc&state=s1", "s1").unwrap(), "abc");
-        assert!(parse_callback("code=abc&state=other", "s1").is_err());
-        let err = parse_callback("error=access_denied&error_description=no&state=s1", "s1")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("access_denied"), "{err}");
     }
 
     #[test]

@@ -9,8 +9,10 @@ pub mod config;
 pub mod credentials;
 pub mod history;
 pub mod import;
+pub mod oauth;
 pub mod paths;
 pub mod profile;
+pub mod prompt;
 pub mod providers;
 pub mod store;
 

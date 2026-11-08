@@ -1,6 +1,7 @@
 //! Provider dispatch: each integration kind implements sign-in, discovery,
 //! credentials and a console link.
 
+pub mod aws_iam;
 pub mod aws_sso;
 pub mod cloudflare;
 pub mod cloudflare_oauth;
@@ -14,6 +15,7 @@ use crate::{Config, Credentials, Error, Integration, Profile, Result, Target, st
 pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
     match integration {
         Integration::AwsSso(config) => aws_sso::discover(name, config).await,
+        Integration::AwsIam(config) => aws_iam::discover(name, config).await,
         Integration::Cloudflare(config) => {
             let profiles = cloudflare::discover(name, config).await?;
             // A good moment to delete expired tokens omnifob minted.
@@ -59,6 +61,7 @@ pub async fn revoke_all(
 pub fn logout(name: &str, integration: &Integration) -> anyhow::Result<bool> {
     match integration {
         Integration::AwsSso(_) => aws_sso::logout(name),
+        Integration::AwsIam(_) => aws_iam::logout(name),
         Integration::Cloudflare(_) => cloudflare::logout(name),
         Integration::Token(_) => token::logout(name),
     }
@@ -86,6 +89,13 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
             },
             None => SignIn::SignedOut,
         },
+        Integration::AwsIam(_) => {
+            if aws_iam::has_key(name)? {
+                SignIn::Token
+            } else {
+                SignIn::SignedOut
+            }
+        }
         Integration::Token(_) => {
             if token::has_secrets(name)? {
                 SignIn::Token
@@ -119,21 +129,27 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
 
 /// Returns credentials for a profile, reusing cached ones while they are fresh.
 ///
-/// `ttl` asks for a lifetime other than the configured one. Only minted
-/// credentials (Cloudflare) can honour it; it always mints anew.
+/// `ttl` asks for a lifetime other than the configured one: minted
+/// Cloudflare tokens and AWS sessions omnifob starts itself (chained roles,
+/// IAM users and their roles) honour it, and always get new credentials.
 pub async fn credentials(
     config: &Config,
     profile: &Profile,
     use_cache: bool,
     ttl: Option<jiff::SignedDuration>,
 ) -> Result<Credentials> {
-    if ttl.is_some() && !matches!(profile.target, Target::Cloudflare { .. }) {
-        return Err(anyhow::anyhow!(match profile.target {
-            Target::Aws { .. } => "--ttl does not apply to AWS: the session length is set by the permission set in IAM Identity Center",
-            Target::AwsChained { .. } => "--ttl does not apply to chained AWS roles: AWS limits role-chaining sessions to one hour",
-            _ => "--ttl only applies to Cloudflare profiles; this token does not expire",
-        })
-        .into());
+    if ttl.is_some() {
+        match profile.target {
+            Target::Aws { .. } => return Err(anyhow::anyhow!(
+                "--ttl does not apply to IAM Identity Center roles: the permission set sets the session length"
+            )
+            .into()),
+            Target::Token {} => return Err(anyhow::anyhow!(
+                "--ttl does not apply to stored tokens; they do not expire"
+            )
+            .into()),
+            _ => {}
+        }
     }
     let use_cache = use_cache && ttl.is_none();
 
@@ -151,6 +167,20 @@ pub async fn credentials(
             Ok(_) => {}
             Err(e) => tracing::debug!("ignoring unreadable cached credentials: {e:#}"),
         }
+    }
+
+    // One fetch per profile at a time: parallel commands (credential_process
+    // calls from one tool) then share the result, and ask for one MFA code.
+    let _lock = store::lock(
+        &format!("credentials-{}", profile.id),
+        std::time::Duration::from_secs(120),
+    )
+    .await?;
+    if use_cache
+        && let Ok(Some(cached)) = store::get::<Credentials>(&key)
+        && cached.is_fresh(Timestamp::now())
+    {
+        return Ok(cached);
     }
 
     let fresh = fetch(config, profile, ttl).await?;
@@ -181,7 +211,13 @@ async fn fetch(
             },
         ) => aws_sso::credentials(&profile.integration, c, account_id, role_name).await?,
         (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
-            aws_sso::chained_credentials(&profile.integration, c, label).await?
+            aws_sso::chained_credentials(&profile.integration, c, label, &profile.id, ttl).await?
+        }
+        (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
+            aws_iam::session_credentials(&profile.integration, c, &profile.id, ttl).await?
+        }
+        (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
+            aws_iam::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
         }
         (
             Integration::Cloudflare(c),
@@ -253,10 +289,19 @@ pub async fn console_url(
     let integration = config.integration(&profile.integration)?;
     Ok(match (integration, &profile.target) {
         (Integration::AwsSso(c), Target::Aws { .. }) => {
-            aws_sso::console_url(creds, c.default_region.as_deref()).await?
+            aws_sso::console_url(creds, &c.region, c.default_region.as_deref()).await?
         }
-        (Integration::AwsSso(_), Target::AwsChained { .. }) => {
-            aws_sso::console_url(creds, creds.env.get("AWS_REGION").map(String::as_str)).await?
+        (Integration::AwsSso(c), Target::AwsChained { .. }) => {
+            let region = creds.env.get("AWS_REGION").map(String::as_str);
+            aws_sso::console_url(creds, &c.region, region).await?
+        }
+        (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
+            aws_iam::console_url(&profile.integration, c).await?
+        }
+        (Integration::AwsIam(c), Target::AwsIamRole { .. }) => {
+            let region = creds.env.get("AWS_REGION").map(String::as_str);
+            let home = c.region.as_deref().unwrap_or("us-east-1");
+            aws_sso::console_url(creds, home, region).await?
         }
         (Integration::Cloudflare(_), Target::Cloudflare { account_id, .. }) => {
             cloudflare::console_url(account_id)
@@ -282,6 +327,7 @@ pub async fn console_url(
 pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<String> {
     match integration {
         Integration::AwsSso(config) => aws_sso::check(name, config).await,
+        Integration::AwsIam(config) => aws_iam::check(name, config).await,
         Integration::Cloudflare(config) => cloudflare::check(name, config).await,
         Integration::Token(config) => token::check(name, config).await,
     }
@@ -298,6 +344,18 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 .get("AWS_REGION")
                 .cloned()
                 .unwrap_or_else(|| c.region.clone());
+            Ok(format!(
+                "acts as {}",
+                aws_sso::caller_identity(&creds, &region).await?
+            ))
+        }
+        (Integration::AwsIam(c), Target::AwsIamSession { .. } | Target::AwsIamRole { .. }) => {
+            let region = creds
+                .env
+                .get("AWS_REGION")
+                .cloned()
+                .or_else(|| c.region.clone())
+                .unwrap_or_else(|| "us-east-1".to_string());
             Ok(format!(
                 "acts as {}",
                 aws_sso::caller_identity(&creds, &region).await?
@@ -347,10 +405,19 @@ pub async fn revoke(config: &Config, profile: &Profile) -> Result<Revoked> {
 /// Moves an integration's stored sign-in to a new integration name.
 pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow::Result<bool> {
     match integration {
-        Integration::AwsSso(_) => store::rename(
-            &format!("aws-sso/{old}/token"),
-            &format!("aws-sso/{new}/token"),
-        ),
+        Integration::AwsSso(_) | Integration::AwsIam(_) => {
+            let (from, to) = match integration {
+                Integration::AwsSso(_) => (aws_sso::keys(old), aws_sso::keys(new)),
+                _ => (aws_iam::keys(old), aws_iam::keys(new)),
+            };
+            let mut moved = false;
+            for (i, (from, to)) in from.iter().zip(to).enumerate() {
+                // The first key is the sign-in itself: what "kept the sign-in" means.
+                let renamed = store::rename(from, &to)?;
+                moved = moved || (renamed && i == 0);
+            }
+            Ok(moved)
+        }
         Integration::Cloudflare(_) => {
             cloudflare::rename_catalog(old, new);
             let oauth = cloudflare_oauth::rename(old, new)?;

@@ -369,6 +369,72 @@ mod wsl {
     }
 }
 
+/// Puts this process on an in-memory store, so tests never touch the real
+/// keychain. Must run before anything else uses the store.
+#[doc(hidden)]
+pub fn use_memory_store() -> anyhow::Result<()> {
+    let chosen = BACKEND.get_or_init(|| {
+        keyring_core::mock::Store::new()
+            .map(|store| keyring_core::set_default_store(store))
+            .map(|()| "memory")
+            .map_err(|e| e.to_string())
+    });
+    match chosen {
+        Ok("memory") => Ok(()),
+        Ok(other) => bail!("the {other} store was already chosen"),
+        Err(e) => bail!("{e}"),
+    }
+}
+
+/// An exclusive lock shared by every omnifob process on this machine,
+/// released when dropped. It guards read-modify-write of a stored value, such
+/// as renewing a session with a refresh token that only works once.
+pub struct Lock(#[allow(dead_code)] std::fs::File);
+
+/// Takes the lock called `name`, waiting up to `timeout`. Returns `None` when
+/// another process holds it that long, so the caller can go ahead unguarded
+/// rather than hang.
+pub async fn lock(name: &str, timeout: std::time::Duration) -> anyhow::Result<Option<Lock>> {
+    let dir = crate::paths::state_dir().join("locks");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("{}.lock", lock_file_name(name)));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(Lock(file))),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tracing::debug!("{} is still locked; going ahead", path.display());
+                return Ok(None);
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
+}
+
+/// A file name for a lock: letters, digits, `-`, `_` and `.` kept, the rest `_`.
+fn lock_file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Key for the cached credentials of a profile.
 pub fn credentials_key(profile_id: &str) -> String {
     format!("credentials/{profile_id}")

@@ -38,5 +38,5 @@ linux-keyutils-keyring-store = "1.0.0"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync"] }
 wiremock = "0.6.5"

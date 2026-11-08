@@ -28,7 +28,7 @@ An integration is something you sign in to once; sync discovers its profiles. Us
 
 ## 2026-10-06: AWS device flow first
 
-Works on every machine including headless and WSL; PKCE needs a local callback server. aws-vault and granted both default to device flow.
+Works on every machine including headless and WSL; PKCE needs a local callback server. aws-vault and granted both default to device flow. Superseded on 2026-11-08, below.
 
 ## 2026-10-06: Cloudflare bootstrap token first, OAuth second
 
@@ -77,3 +77,21 @@ omnifob briefly gained per-directory profiles, a git credential helper and a Git
 git's `includeIf` already maps each directory to an account (`credential.https://github.com.username`, next to `user.name` and `user.email`), and Git Credential Manager already keeps one token per account and picks it by that username. omnifob's versions repeated the mapping in a second place, chose by directory while ignoring the username git sends, and needed an OAuth app registered and a sign-in per account. The wrapper could not go away either, since a shell function is invisible to non-interactive shells such as coding agents. The only gain was the `read:org` scope Git Credential Manager does not request, which a classic token stored in it also provides. omnifob keeps the `github` token preset for handing a token to a command; [providers/github.md](providers/github.md) has what was learned.
 
 Per-directory profiles went too: nothing used them yet, and wrangler and `cf` bind accounts to directories themselves. Revisit them when a provider without that needs it, keeping the mapping in omnifob's config rather than in repositories.
+
+## 2026-11-08: AWS browser sign-in by default, device flow as fallback
+
+The AWS CLI has signed in with the authorization code flow and PKCE by default since 2.22.0; the device flow is behind `--use-device-code`. The device flow lets anyone who tricks a user into entering a code take over the session (device code phishing), while PKCE binds the sign-in to a listener on the machine that started it. The 2026-10-06 reason for the device flow no longer holds: omnifob has had a loopback callback since the Cloudflare browser sign-in, and on WSL the Windows browser reaches `127.0.0.1` in WSL (checked 2026-11-08). `fob login` uses the device flow with `--device-code`, and on its own over SSH and in containers, where a browser cannot reach the loopback listener (granted makes the same check).
+
+Two details follow the AWS CLI rather than plain OAuth: the client is registered with the portless redirect `http://127.0.0.1/oauth/callback` and the sign-in uses any free port (RFC 8252, section 7.3), and the consent page takes the scopes as `scopes`, not `scope`.
+
+## 2026-11-08: Renew AWS sessions under a lock shared by every process
+
+Each refresh returns a new refresh token, and omnifob treats the old one as spent (as aws-vault does; whether Identity Center refuses a reused one is not verified), so two `fob` processes renewing the same session at once (parallel `credential_process` calls after a laptop wakes, or two background renewals) left the loser with a spent token and a false "session ended". Renewal now runs under a file lock per integration and reads the token again once it holds the lock. A 401 from the portal renews once and retries, and drops the session only if it still holds the refused token, so a session another process just renewed is never thrown away.
+
+## 2026-11-08: IAM users through STS sessions, like aws-vault
+
+granted and aws-vault both support IAM users, and some accounts still have them. omnifob stores the access key in the keychain and never exports it: profiles get a `GetSessionToken` session, and roles are assumed with that session rather than with the key. Roles then get sessions of up to 12 hours (role chaining would cap them at one), and one MFA code covers every role for the session's length. Long-lived keys stay discouraged; this keeps them off disk and out of environments where they exist anyway.
+
+## 2026-11-08: MFA codes through a prompt the embedder registers
+
+`omnifob-core` stays usable as a library, so it never reads the terminal. The command line registers a prompt when stdin and stderr are terminals; elsewhere (background renewal, `credential_process` without a terminal) a profile that needs a code fails with a message saying to run `fob creds` in a terminal first. Fetches are serialized per profile, so parallel `credential_process` calls ask once and share the result.
