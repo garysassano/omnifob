@@ -6,17 +6,17 @@ One sign-in for every cloud. `fob` signs you in once per identity source, discov
 
 Early. What changed in each version is in the [release notes](https://github.com/garysassano/omnifob/releases). Working today:
 
-| Integration                     | Sign-in                                                 | Discovery                                             | Credentials                                                              | Console               |
-| ------------------------------- | ------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------ | --------------------- |
-| `aws-sso` (IAM Identity Center) | Browser (PKCE) or device flow, silent refresh           | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole                   | Federated sign-in URL |
-| `aws-iam` (IAM user)            | Access key, stored once; MFA per session                | The user's session, plus configured roles             | Session from STS GetSessionToken; roles assumed with it (up to 12 hours) | Federated sign-in URL |
-| `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                         | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
-| `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
-| `token`                         | Paste once, checked against the provider where possible | One profile per integration                           | The stored token under every variable the provider's tools read          | Known console URL     |
+| Integration                     | Sign-in                                                 | Discovery                                              | Credentials                                                              | Console               |
+| ------------------------------- | ------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------ | --------------------- |
+| `aws-sso` (IAM Identity Center) | Browser (PKCE) or device flow, silent refresh           | Every account and role, plus configured chained roles  | Role credentials; chained roles through STS AssumeRole                   | Federated sign-in URL |
+| `aws-iam` (IAM user)            | Access key, stored once; MFA per session                | The user's session, plus configured roles              | Session from STS GetSessionToken; roles assumed with it (up to 12 hours) | Federated sign-in URL |
+| `gcp` (Google account)          | Browser (PKCE) or pasted code, as `gcloud auth login`   | Every active project, plus configured service accounts | Your access token per project; service account tokens by impersonation   | Cloud console         |
+| `azure` (Entra ID)              | Browser (PKCE) or device flow, as `az login`            | Every subscription in every tenant                     | A Resource Manager token, with the subscription and tenant IDs           | Azure portal          |
+| `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                          | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
+| `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                   | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
+| `token`                         | Paste once, checked against the provider where possible | One profile per integration                            | The stored token under every variable the provider's tools read          | Known console URL     |
 
-Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
-
-Planned: Google Cloud (modelled on `gcloud` impersonation), Azure (modelled on `az`), per-directory profiles through mise.
+Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `modal`, `unikraft`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
 ## Install
 
@@ -72,6 +72,21 @@ session_duration = "8h"        # optional, 15m to 36h (default 8h)
 role_arn = "arn:aws:iam::222222222222:role/Admin"
 duration = "4h"                # optional, 15m to 12h (default 1h)
 
+# A Google account, signed in like `gcloud auth login` (with gcloud's OAuth client).
+# Profile ids: google/<project>/user, and google/<label>/<name> per service account.
+[integrations.google]
+type = "gcp"
+projects = ["my-proj"]         # optional: skip listing every project
+
+[integrations.google.service_accounts.deploy]   # profile id: google/deploy/deploy
+email = "deploy@my-proj.iam.gserviceaccount.com" # needs Service Account Token Creator for you
+lifetime = "1h"                # optional, 15m to 12h (over 1h needs an org policy)
+
+# An Entra ID account, signed in like `az login`. Profile ids: work/<subscription>/user.
+[integrations.work]
+type = "azure"
+tenant = "contoso.onmicrosoft.com"   # optional: by default every tenant you belong to
+
 [integrations.cf]
 type = "cloudflare-oauth"       # browser sign-in, like `wrangler login`
 client_id = "..."               # your OAuth client; see the Cloudflare guide
@@ -109,6 +124,11 @@ account = "prod"            # profile id: hetzner-prod/prod/hetzner
 type = "token"
 preset = "upstash"
 vars = { UPSTASH_EMAIL = "me@example.com" }   # non-secret variables
+
+[integrations.unikraft]
+type = "token"
+preset = "unikraft"         # UKC_TOKEN for `unikraft` and `kraft cloud`
+vars = { UKC_METRO = "fra" }
 
 [integrations.internal]
 type = "token"

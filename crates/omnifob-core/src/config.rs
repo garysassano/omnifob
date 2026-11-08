@@ -21,6 +21,8 @@ pub struct Config {
 pub enum Integration {
     AwsSso(AwsSsoConfig),
     AwsIam(AwsIamConfig),
+    Gcp(GcpConfig),
+    Azure(AzureConfig),
     /// Either Cloudflare type; `CloudflareConfig::sign_in` says which.
     Cloudflare(CloudflareConfig),
     Token(TokenConfig),
@@ -31,6 +33,8 @@ impl Integration {
         match self {
             Integration::AwsSso(_) => "aws-sso",
             Integration::AwsIam(_) => "aws-iam",
+            Integration::Gcp(_) => "gcp",
+            Integration::Azure(_) => "azure",
             Integration::Cloudflare(c) => match c.sign_in {
                 CloudflareSignIn::Token => "cloudflare-token",
                 CloudflareSignIn::Oauth => "cloudflare-oauth",
@@ -47,6 +51,8 @@ impl Integration {
 enum RawIntegration {
     AwsSso(AwsSsoConfig),
     AwsIam(AwsIamConfig),
+    Gcp(GcpConfig),
+    Azure(AzureConfig),
     CloudflareToken(CloudflareConfig),
     CloudflareOauth(CloudflareConfig),
     Token(TokenConfig),
@@ -62,6 +68,11 @@ impl TryFrom<RawIntegration> for Integration {
                 c.validate()?;
                 Integration::AwsIam(c)
             }
+            RawIntegration::Gcp(c) => {
+                c.validate()?;
+                Integration::Gcp(c)
+            }
+            RawIntegration::Azure(c) => Integration::Azure(c),
             RawIntegration::Token(c) => Integration::Token(c),
             RawIntegration::CloudflareToken(c) => {
                 if c.client_id.is_some() || c.scopes.is_some() {
@@ -225,6 +236,108 @@ impl IamRole {
     pub fn account_id(&self) -> Option<&str> {
         self.role_arn.split(':').nth(4).filter(|a| !a.is_empty())
     }
+}
+
+/// A Google account (`type = "gcp"`), signed in the way `gcloud auth login`
+/// signs in. Profiles are the account itself in each project, and service
+/// accounts it may impersonate.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcpConfig {
+    /// The projects to offer; by default every active project the account
+    /// can see, listed at `fob sync`.
+    #[serde(default)]
+    pub projects: Option<Vec<String>>,
+    /// An OAuth client of your own (a Desktop app client) instead of the one
+    /// gcloud ships. Both or neither.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Service accounts to impersonate, keyed by a label that becomes the
+    /// middle of the profile id.
+    #[serde(default)]
+    pub service_accounts: BTreeMap<String, GcpServiceAccount>,
+}
+
+impl GcpConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.client_id.is_some() != self.client_secret.is_some() {
+            return Err("client_id and client_secret go together".to_string());
+        }
+        for (label, sa) in &self.service_accounts {
+            if !sa.email.contains('@') {
+                return Err(format!(
+                    "service_accounts.{label}.email must be a service account's email"
+                ));
+            }
+            if let Some(d) = sa.lifetime
+                && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(12)).contains(&d)
+            {
+                return Err(format!(
+                    "service_accounts.{label}.lifetime must be between 15m and 12h"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A service account the signed-in account impersonates, which needs the
+/// Service Account Token Creator role on it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcpServiceAccount {
+    pub email: String,
+    /// Exported as the project; defaults to the one in the email.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Token lifetime; defaults to one hour, the most Google allows unless the
+    /// organization policy `iam.allowServiceAccountCredentialLifetimeExtension`
+    /// lists the account (then up to 12 hours).
+    #[serde(default, with = "opt_duration")]
+    pub lifetime: Option<SignedDuration>,
+    /// Service accounts to go through, in order, when the account may only
+    /// impersonate this one by way of others.
+    #[serde(default)]
+    pub delegates: Vec<String>,
+    /// OAuth scopes for the token; defaults to cloud-platform and
+    /// userinfo.email, as gcloud asks.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+}
+
+impl GcpServiceAccount {
+    /// The part of the email before `@`.
+    pub fn name(&self) -> &str {
+        self.email.split('@').next().unwrap_or(&self.email)
+    }
+
+    /// `project`, or the project in a user-managed account's email
+    /// (`name@PROJECT.iam.gserviceaccount.com`).
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref().or_else(|| {
+            self.email
+                .split_once('@')?
+                .1
+                .strip_suffix(".iam.gserviceaccount.com")
+        })
+    }
+}
+
+/// A Microsoft Entra ID account (`type = "azure"`), signed in the way
+/// `az login` signs in. Profiles are the account in each subscription.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureConfig {
+    /// The tenant to sign in to (ID or domain); by default `organizations`,
+    /// which finds every tenant the account belongs to.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// The subscriptions to offer (IDs); by default every one the account
+    /// can see, listed at `fob sync`.
+    #[serde(default)]
+    pub subscriptions: Option<Vec<String>>,
 }
 
 fn default_sso_scopes() -> Vec<String> {

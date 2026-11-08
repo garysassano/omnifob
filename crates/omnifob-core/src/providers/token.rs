@@ -20,6 +20,9 @@ pub struct Preset {
     pub name: &'static str,
     /// Secret name → environment variables that receive it.
     pub secrets: &'static [(&'static str, &'static [&'static str])],
+    /// Fixed variables the provider's tools need alongside the secrets;
+    /// the integration's `vars` override them.
+    pub vars: &'static [(&'static str, &'static str)],
     /// A URL that answers 2xx for a valid token sent as a bearer token.
     pub verify_url: Option<&'static str>,
     pub console: Option<&'static str>,
@@ -29,6 +32,7 @@ pub const PRESETS: &[Preset] = &[
     Preset {
         name: "hetzner",
         secrets: &[("token", &["HCLOUD_TOKEN"])],
+        vars: &[],
         verify_url: Some("https://api.hetzner.cloud/v1/locations"),
         console: Some("https://console.hetzner.cloud/projects"),
     },
@@ -39,12 +43,14 @@ pub const PRESETS: &[Preset] = &[
             "token",
             &["DIGITALOCEAN_ACCESS_TOKEN", "DIGITALOCEAN_TOKEN"],
         )],
+        vars: &[],
         verify_url: Some("https://api.digitalocean.com/v2/account"),
         console: Some("https://cloud.digitalocean.com"),
     },
     Preset {
         name: "vultr",
         secrets: &[("api_key", &["VULTR_API_KEY"])],
+        vars: &[],
         verify_url: Some("https://api.vultr.com/v2/account"),
         console: Some("https://my.vultr.com"),
     },
@@ -52,6 +58,7 @@ pub const PRESETS: &[Preset] = &[
         name: "linode",
         // Akamai Cloud. linode-cli reads the second, Terraform the first.
         secrets: &[("token", &["LINODE_TOKEN", "LINODE_CLI_TOKEN"])],
+        vars: &[],
         verify_url: Some("https://api.linode.com/v4/profile"),
         console: Some("https://cloud.linode.com"),
     },
@@ -59,6 +66,7 @@ pub const PRESETS: &[Preset] = &[
         name: "upstash",
         // Set UPSTASH_EMAIL under `vars`; the API key is the secret.
         secrets: &[("api_key", &["UPSTASH_API_KEY"])],
+        vars: &[],
         verify_url: None,
         console: Some("https://console.upstash.com"),
     },
@@ -69,6 +77,7 @@ pub const PRESETS: &[Preset] = &[
             ("client_secret", &["AKAMAI_CLIENT_SECRET"]),
             ("access_token", &["AKAMAI_ACCESS_TOKEN"]),
         ],
+        vars: &[],
         verify_url: None,
         console: Some("https://control.akamai.com"),
     },
@@ -78,36 +87,64 @@ pub const PRESETS: &[Preset] = &[
             ("access_key", &["SCW_ACCESS_KEY"]),
             ("secret_key", &["SCW_SECRET_KEY"]),
         ],
+        vars: &[],
         verify_url: None,
         console: Some("https://console.scaleway.com"),
     },
     Preset {
+        name: "modal",
+        // The Modal client reads both, overriding `~/.modal.toml`. Its API is
+        // gRPC only, so there is no plain URL to check the token against.
+        secrets: &[
+            ("token_id", &["MODAL_TOKEN_ID"]),
+            ("token_secret", &["MODAL_TOKEN_SECRET"]),
+        ],
+        vars: &[],
+        verify_url: None,
+        console: Some("https://modal.com/apps"),
+    },
+    Preset {
+        name: "unikraft",
+        // Unikraft Cloud: `kraft` reads UKC_TOKEN and UKC_METRO; the newer
+        // `unikraft` CLI reads them only when UNIKRAFT_PROFILE_ENV is true.
+        // Set UKC_METRO under `vars`.
+        secrets: &[("token", &["UKC_TOKEN"])],
+        vars: &[("UNIKRAFT_PROFILE_ENV", "true")],
+        verify_url: Some("https://controlplane.unikraft.cloud/v1/auth"),
+        console: Some("https://console.unikraft.com"),
+    },
+    Preset {
         name: "vercel",
         secrets: &[("token", &["VERCEL_TOKEN"])],
+        vars: &[],
         verify_url: Some("https://api.vercel.com/v2/user"),
         console: Some("https://vercel.com/dashboard"),
     },
     Preset {
         name: "netlify",
         secrets: &[("token", &["NETLIFY_AUTH_TOKEN"])],
+        vars: &[],
         verify_url: Some("https://api.netlify.com/api/v1/user"),
         console: Some("https://app.netlify.com"),
     },
     Preset {
         name: "fly",
         secrets: &[("token", &["FLY_API_TOKEN"])],
+        vars: &[],
         verify_url: None,
         console: Some("https://fly.io/dashboard"),
     },
     Preset {
         name: "neon",
         secrets: &[("api_key", &["NEON_API_KEY"])],
+        vars: &[],
         verify_url: Some("https://console.neon.tech/api/v2/users/me"),
         console: Some("https://console.neon.tech"),
     },
     Preset {
         name: "supabase",
         secrets: &[("token", &["SUPABASE_ACCESS_TOKEN"])],
+        vars: &[],
         verify_url: Some("https://api.supabase.com/v1/projects"),
         console: Some("https://supabase.com/dashboard"),
     },
@@ -115,6 +152,7 @@ pub const PRESETS: &[Preset] = &[
         name: "github",
         // gh prefers GH_TOKEN; most other tools read GITHUB_TOKEN.
         secrets: &[("token", &["GH_TOKEN", "GITHUB_TOKEN"])],
+        vars: &[],
         verify_url: Some("https://api.github.com/user"),
         console: Some("https://github.com"),
     },
@@ -247,7 +285,15 @@ pub fn credentials(integration: &str, config: &TokenConfig) -> Result<Credential
     let Some(Stored(values)) = store::get(&secrets_key(integration))? else {
         return Err(Error::not_signed_in(integration));
     };
-    let mut env: BTreeMap<String, String> = config.vars.clone();
+    let mut env: BTreeMap<String, String> = match &config.preset {
+        Some(name) if config.secrets.is_empty() => preset(name)?
+            .vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        _ => BTreeMap::new(),
+    };
+    env.extend(config.vars.clone());
     for (name, vars) in secrets(config)? {
         let value = values
             .get(&name)
@@ -319,6 +365,27 @@ mod tests {
     fn unknown_preset_lists_known_ones() {
         let err = secrets(&config("preset = \"nope\"")).unwrap_err();
         assert!(err.to_string().contains("hetzner"), "{err}");
+    }
+
+    #[test]
+    fn preset_vars_come_with_the_secrets_and_config_vars_win() {
+        store::use_memory_store().unwrap();
+        let c = config(
+            "preset = \"unikraft\"\nvars = { UKC_METRO = \"fra\", UNIKRAFT_PROFILE_ENV = \"1\" }",
+        );
+        store::set(
+            &secrets_key("uk-vars"),
+            &Stored(BTreeMap::from([("token".to_string(), "t".to_string())])),
+        )
+        .unwrap();
+        let env = credentials("uk-vars", &c).unwrap().env;
+        assert_eq!(env["UKC_TOKEN"], "t");
+        assert_eq!(env["UKC_METRO"], "fra");
+        assert_eq!(env["UNIKRAFT_PROFILE_ENV"], "1");
+
+        let plain = config("preset = \"unikraft\"");
+        let env = credentials("uk-vars", &plain).unwrap().env;
+        assert_eq!(env["UNIKRAFT_PROFILE_ENV"], "true");
     }
 
     #[test]
