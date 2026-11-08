@@ -7,22 +7,22 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-aws-sdk-sso = { version = "1.114.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-ssooidc = { version = "1.116.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-sts = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sso = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssooidc = { version = "1.121.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 base64 = "0.23.1"
 futures = "0.3.34"
 getrandom = "0.4.3"
-jiff = { version = "0.2.38", features = ["serde"] }
-keyring-core = "1.0.0"
+jiff = { version = "0.2.40", features = ["serde"] }
+keyring-core = "1.0.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "time"] }
-toml = "1.1.6"
-toml_edit = "0.25.15"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
+toml = "1.2.1"
+toml_edit = "0.25.19"
 tracing = "0.1.44"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -38,5 +38,5 @@ linux-keyutils-keyring-store = "1.0.0"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
 [dev-dependencies]
-tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6.5"
