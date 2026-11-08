@@ -6,12 +6,13 @@ One sign-in for every cloud. `fob` signs you in once per identity source, discov
 
 Early. What changed in each version is in the [release notes](https://github.com/garysassano/omnifob/releases). Working today:
 
-| Integration                     | Sign-in                                                 | Discovery                                             | Credentials                                                     | Console               |
-| ------------------------------- | ------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------- | --------------------- |
-| `aws-sso` (IAM Identity Center) | Device flow, silent refresh                             | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole          | Federated sign-in URL |
-| `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                         | Minted tokens, scoped by permission name, expiring              | Dashboard             |
-| `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring              | Dashboard             |
-| `token`                         | Paste once, checked against the provider where possible | One profile per integration                           | The stored token under every variable the provider's tools read | Known console URL     |
+| Integration                     | Sign-in                                                 | Discovery                                             | Credentials                                                              | Console               |
+| ------------------------------- | ------------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------ | --------------------- |
+| `aws-sso` (IAM Identity Center) | Browser (PKCE) or device flow, silent refresh           | Every account and role, plus configured chained roles | Role credentials; chained roles through STS AssumeRole                   | Federated sign-in URL |
+| `aws-iam` (IAM user)            | Access key, stored once; MFA per session                | The user's session, plus configured roles             | Session from STS GetSessionToken; roles assumed with it (up to 12 hours) | Federated sign-in URL |
+| `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                         | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
+| `cloudflare-token`              | Bootstrap token, stored once                            | Accounts × templates                                  | Minted tokens, scoped by permission name, expiring                       | Dashboard             |
+| `token`                         | Paste once, checked against the provider where possible | One profile per integration                           | The stored token under every variable the provider's tools read          | Known console URL     |
 
 Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `upstash`, `akamai-edgegrid`, `scaleway`, `vercel`, `netlify`, `fly`, `neon`, `supabase`, `github`. These providers' own CLIs keep tokens in plain-text files; omnifob keeps them in the keychain. [docs/providers](docs/providers/README.md) lists every provider and how omnifob handles it.
 
@@ -35,7 +36,7 @@ This installs two names for the same binary: `fob` for daily use and `omnifob` f
 
 ## Configure
 
-Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID and region), and prints matching integrations; `--write` appends them to the config. Profiles that need MFA are reported and skipped for now.
+Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID, region, `mfa_serial` and `duration_seconds`), and prints matching integrations; `--write` appends them to the config.
 
 `~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`):
 
@@ -55,6 +56,21 @@ role_arn = "arn:aws:iam::222222222222:role/Deploy"
 session_name = "me"          # optional, like role_session_name
 external_id = "..."          # optional
 region = "us-east-1"         # optional, defaults to the integration's
+mfa_serial = "arn:aws:iam::111111111111:mfa/me"  # optional: asks for a code per session
+duration = "30m"             # optional, 15m to 1h
+
+# An IAM user's access key, kept in the keychain like aws-vault keeps it. The key
+# is never handed out: profiles get a session from STS GetSessionToken (one MFA
+# code per session), and roles assumed with that session.
+[integrations.legacy]
+type = "aws-iam"
+region = "eu-central-1"        # optional: STS region and AWS_REGION
+mfa_serial = "arn:aws:iam::111111111111:mfa/me"  # optional
+session_duration = "8h"        # optional, 15m to 36h (default 8h)
+
+[integrations.legacy.roles.prod]   # profile id: legacy/prod/Admin
+role_arn = "arn:aws:iam::222222222222:role/Admin"
+duration = "4h"                # optional, 15m to 12h (default 1h)
 
 [integrations.cf]
 type = "cloudflare-oauth"       # browser sign-in, like `wrangler login`
@@ -105,6 +121,7 @@ console = "https://console.example.com"
 
 ```sh
 fob login acme            # browser sign-in, then discovers profiles
+fob login acme --device-code   # approve with a code on another device (automatic over SSH)
 fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...
 fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare

@@ -39,6 +39,17 @@ pub enum Target {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
     },
+    /// An IAM user's own session, from STS `GetSessionToken`.
+    AwsIamSession {
+        account_id: String,
+    },
+    /// A role assumed with an IAM user's session; details live in the
+    /// integration's `roles` table under `label`.
+    AwsIamRole {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+    },
 }
 
 impl Target {
@@ -48,9 +59,23 @@ impl Target {
             Target::Aws { account_id, .. } | Target::Cloudflare { account_id, .. } => {
                 Some(account_id)
             }
-            Target::AwsChained { account_id, .. } => account_id.as_deref(),
+            Target::AwsIamSession { account_id } => Some(account_id),
+            Target::AwsChained { account_id, .. } | Target::AwsIamRole { account_id, .. } => {
+                account_id.as_deref()
+            }
             Target::Token {} => None,
         }
+    }
+
+    /// Whether these are AWS credentials (exported as `AWS_*` variables).
+    pub fn is_aws(&self) -> bool {
+        matches!(
+            self,
+            Target::Aws { .. }
+                | Target::AwsChained { .. }
+                | Target::AwsIamSession { .. }
+                | Target::AwsIamRole { .. }
+        )
     }
 }
 

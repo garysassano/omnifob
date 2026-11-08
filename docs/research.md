@@ -7,11 +7,21 @@ Each was read from a shallow clone of its repository.
 
 ### granted (fwdcloudsec/granted, Go)
 
-- Still maintained after Common Fate: five maintainers in `MAINTAINERS.md`, about 16 PRs merged after v0.39.0, but no release since March 2026 and no darwin binaries because the Apple signing certificate left with Common Fate (issue #936).
+- Still maintained after Common Fate: five maintainers in `MAINTAINERS.md`. v0.39.0 (March 2026) shipped no darwin binaries because the Apple signing certificate left with Common Fate (issue #936); v0.40.0 (2026-10-20) ships them again.
+- Second look at v0.40.0 (2026-11-08): PKCE is opt-in (device flow by default, forced on SSH, containers and CI). The SSO token is refreshed only after it has expired, a failed refresh falls back to a full browser sign-in, and a refresh response without a refresh token stores none, ending silent renewal. Tokens are stored under start URL plus `sso_session` name but cleared on a 401 under the start URL alone, so the clear misses with `sso-session` profiles. Tokens from `~/.aws/sso/cache` overwrite the keychain token, refresh token included. `GetRoleCredentials` is retried on 403 for fresh assignments (opt-in). Console sign-in handles the GovCloud, China and European Sovereign Cloud partitions through regional sign-in hosts.
 - Design: an `Assumer` interface per profile type (SSO, IAM, credential process, SAML helpers) with `AssumeTerminal` and `AssumeConsole`. Profiles come from `~/.aws/config`.
 - SSO tokens are stored per start URL in the keychain (`99designs/keyring`). Device code flow by default, PKCE opt-in, device flow forced on headless machines.
 - A shell wrapper (`assume`) exports into the current shell; `credential_process` mode for SDKs.
 - **Taken:** terminal and console as the two outputs of every profile; the shell wrapper; device flow by default.
+
+### AWS CLI v2 (aws/aws-cli, Python; read 2026-11-08)
+
+- `aws sso login` uses the authorization code flow with PKCE by default since 2.22.0; `--use-device-code` falls back to the device flow. There is no automatic headless detection.
+- Registration: `clientName` `botocore-client-<session>`, type `public`, grant types `authorization_code` and `refresh_token`, redirect `http://127.0.0.1/oauth/callback` without a port, `issuerUrl` the start URL, scopes default `sso:account:access`. The callback listens on a free port on `127.0.0.1`.
+- The consent URL is the OIDC endpoint the SDK resolves for the region plus `/authorize`, with `response_type`, `client_id`, `redirect_uri`, `state`, `code_challenge_method=S256`, `scopes` (space-separated, `%20`) and `code_challenge`.
+- Registrations are cached apart from tokens, keyed by start URL, session name and scopes, and reused until they expire (90 days); `aws sso logout` removes tokens and calls the portal's `Logout`.
+- Tokens are refreshed 15 minutes before expiry.
+- **Taken:** PKCE by default with the device flow as fallback, the portless registration, `scopes`, the separate registration cache, `Logout` on sign-out.
 
 ### aws-vault (ByteNess/aws-vault fork, Go)
 
