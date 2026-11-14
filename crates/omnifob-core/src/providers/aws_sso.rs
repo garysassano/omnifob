@@ -541,11 +541,10 @@ async fn current_token(
                 }
                 // The session at Identity Center may well be intact, so it is
                 // kept for the next try rather than sending the user to sign in.
-                return Err(e
-                    .context(format!(
-                        "could not reach IAM Identity Center to renew the sign-in for '{integration}'"
-                    ))
-                    .into());
+                return Err(anyhow!(
+                    "could not renew the sign-in for '{integration}' with IAM Identity Center: {e:#}; run `fob login {integration}` if this persists"
+                )
+                .into());
             }
             Err(RefreshError::Refused {
                 client_refused,
@@ -590,12 +589,14 @@ enum RefreshError {
     /// Identity Center refused the refresh token or the client, which
     /// `CreateToken` documents as final: only a new sign-in helps.
     Refused {
-        /// The client registration itself was refused (`InvalidClientException`).
+        /// The client registration itself was refused
+        /// (`InvalidClientException`, `UnauthorizedClientException`).
         client_refused: bool,
         source: anyhow::Error,
     },
-    /// Anything else: a network error, a timeout, throttling or a server
-    /// error. The session may be intact and a later try may succeed.
+    /// Anything else: a network error, a timeout, throttling, a server error
+    /// or a request error not documented as final. The session may be intact
+    /// and a later try may succeed.
     Transient(anyhow::Error),
 }
 
@@ -621,7 +622,10 @@ async fn refresh(token: &SsoToken) -> std::result::Result<SsoToken, RefreshError
             );
             let client_refused = matches!(
                 e.as_service_error(),
-                Some(CreateTokenError::InvalidClientException(_))
+                Some(
+                    CreateTokenError::InvalidClientException(_)
+                        | CreateTokenError::UnauthorizedClientException(_)
+                )
             );
             let source = anyhow!("{}", DisplayErrorContext(&e));
             if refused {
