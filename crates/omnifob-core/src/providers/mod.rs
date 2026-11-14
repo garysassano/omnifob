@@ -321,6 +321,27 @@ pub async fn revoke_token(config: &Config, profile: &Profile, token_id: &str) ->
     }
 }
 
+/// The partition an AWS profile's console opens in: the role ARN's for a
+/// chained or IAM user's role, else the partition of the Region its
+/// credentials come from (the portal's, or the IAM user's STS Region).
+fn aws_console_partition(integration: &Integration, target: &Target) -> anyhow::Result<Partition> {
+    match (integration, target) {
+        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => c
+            .chained
+            .get(label)
+            .with_context(|| format!("no chained role '{label}'; run `fob sync`"))?
+            .partition(),
+        (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => c
+            .roles
+            .get(label)
+            .with_context(|| format!("no role '{label}'; run `fob sync`"))?
+            .partition(),
+        (Integration::AwsSso(c), _) => Partition::of_region(&c.region),
+        (Integration::AwsIam(c), _) => Partition::of_region(aws_iam::sts_region(c)),
+        _ => anyhow::bail!("not an AWS profile"),
+    }
+}
+
 /// Returns a URL that opens the provider's web console as this profile.
 pub async fn console_url(
     config: &Config,
@@ -329,30 +350,21 @@ pub async fn console_url(
 ) -> Result<String> {
     let integration = config.integration(&profile.integration)?;
     Ok(match (integration, &profile.target) {
-        (Integration::AwsSso(c), Target::Aws { .. }) => {
-            let partition = Partition::of_region(&c.region)?;
-            let region = c.default_region.as_deref();
+        (Integration::AwsSso(c), target @ (Target::Aws { .. } | Target::AwsChained { .. })) => {
+            let partition = aws_console_partition(integration, target)?;
+            let region = match target {
+                Target::Aws { .. } => c.default_region.as_deref(),
+                _ => creds.env.get("AWS_REGION").map(String::as_str),
+            };
             aws_sso::console_url(creds, partition, Some(&c.region), region).await?
-        }
-        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
-            let role = c.chained.get(label).with_context(|| {
-                format!(
-                    "no chained role '{label}' in integration '{}'",
-                    profile.integration
-                )
-            })?;
-            let region = creds.env.get("AWS_REGION").map(String::as_str);
-            aws_sso::console_url(creds, role.partition()?, Some(&c.region), region).await?
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
             aws_iam::console_url(&profile.integration, c).await?
         }
-        (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
-            let role = c.roles.get(label).with_context(|| {
-                format!("no role '{label}' in integration '{}'", profile.integration)
-            })?;
+        (Integration::AwsIam(c), target @ Target::AwsIamRole { .. }) => {
+            let partition = aws_console_partition(integration, target)?;
             let region = creds.env.get("AWS_REGION").map(String::as_str);
-            aws_sso::console_url(creds, role.partition()?, c.region.as_deref(), region).await?
+            aws_sso::console_url(creds, partition, c.region.as_deref(), region).await?
         }
         (Integration::Gcp(_), Target::Gcp { project_id, .. }) => {
             gcp::console_url(&profile.integration, Some(project_id))?
@@ -513,5 +525,73 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
 pub fn forget_credentials<'a>(profiles: impl IntoIterator<Item = &'a Profile>) {
     for profile in profiles {
         let _ = store::delete(&store::credentials_key(&profile.id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_partition_comes_from_the_role_arn() {
+        let config = Config::parse(
+            r#"
+            [integrations.portal]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "eu-west-1"
+            [integrations.portal.chained.gov]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+
+            [integrations.user]
+            type = "aws-iam"
+            [integrations.user.roles.cn]
+            role_arn = "arn:aws-cn:iam::333333333333:role/Admin"
+            "#,
+        )
+        .unwrap();
+        let portal = config.integration("portal").unwrap();
+        let user = config.integration("user").unwrap();
+        let chained = |label: &str| Target::AwsChained {
+            label: label.into(),
+            account_id: None,
+        };
+        let cases = [
+            (
+                portal,
+                Target::Aws {
+                    account_id: "111111111111".into(),
+                    account_name: "a".into(),
+                    role_name: "Admin".into(),
+                },
+                Partition::Aws,
+            ),
+            (portal, chained("gov"), Partition::UsGov),
+            (
+                user,
+                Target::AwsIamSession {
+                    account_id: "444444444444".into(),
+                },
+                Partition::Aws,
+            ),
+            (
+                user,
+                Target::AwsIamRole {
+                    label: "cn".into(),
+                    account_id: None,
+                },
+                Partition::China,
+            ),
+        ];
+        for (integration, target, partition) in cases {
+            assert_eq!(
+                aws_console_partition(integration, &target).unwrap(),
+                partition,
+                "{target:?}"
+            );
+        }
+        assert!(aws_console_partition(portal, &chained("missing")).is_err());
     }
 }

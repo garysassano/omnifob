@@ -51,7 +51,7 @@ pub fn keys(integration: &str) -> Vec<String> {
     vec![key_key(integration), session_key(integration)]
 }
 
-fn sts_region(config: &AwsIamConfig) -> &str {
+pub(crate) fn sts_region(config: &AwsIamConfig) -> &str {
     config.region.as_deref().unwrap_or(DEFAULT_STS_REGION)
 }
 

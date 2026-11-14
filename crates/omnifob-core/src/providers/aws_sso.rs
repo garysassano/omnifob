@@ -1005,10 +1005,11 @@ pub(crate) fn from_sts(
 }
 
 /// The federation endpoint and console destination for a console sign-in to
-/// `partition`. The sign-in host is regional: `region`'s (the Region the
-/// console opens in) when set, else `home_region`'s when it is in the
-/// partition, else the partition's default. `region` must be in the
-/// partition.
+/// `partition`. With `region` (the Region the console opens in, which must be
+/// in the partition) both are regional. Without it, the console opens at the
+/// unprefixed host and so does the sign-in where the partition has one; the
+/// European Sovereign Cloud has none, so it signs in at `home_region` when
+/// that is in the partition, else at the partition's first Region.
 fn console_endpoints(
     partition: Partition,
     home_region: Option<&str>,
@@ -1018,6 +1019,7 @@ fn console_endpoints(
         partition.check_region(region)?;
     }
     let signin_region = region
+        .or(partition.unprefixed_region())
         .or(home_region.filter(|home| partition.contains(home)))
         .unwrap_or(partition.default_region());
     let endpoint = format!(
@@ -1221,12 +1223,28 @@ mod tests {
                 "https://signin.aws.amazon.com/federation",
                 "https://console.aws.amazon.com/",
             ),
+            // Without a console Region the sign-in stays on the unprefixed
+            // host, whatever the portal's Region.
             (
                 Aws,
                 Some("eu-west-1"),
                 None,
-                "https://eu-west-1.signin.aws.amazon.com/federation",
+                "https://signin.aws.amazon.com/federation",
                 "https://console.aws.amazon.com/",
+            ),
+            (
+                UsGov,
+                Some("us-gov-east-1"),
+                None,
+                "https://signin.amazonaws-us-gov.com/federation",
+                "https://console.amazonaws-us-gov.com/",
+            ),
+            (
+                China,
+                Some("cn-northwest-1"),
+                None,
+                "https://signin.amazonaws.cn/federation",
+                "https://console.amazonaws.cn/",
             ),
             (
                 Aws,
@@ -1256,15 +1274,6 @@ mod tests {
                 "https://us-gov-east-1.signin.amazonaws-us-gov.com/federation",
                 "https://us-gov-east-1.console.amazonaws-us-gov.com/console/home?region=us-gov-east-1",
             ),
-            // A home Region in another partition (an IAM user's default STS
-            // Region with a GovCloud role) does not pick the host.
-            (
-                UsGov,
-                Some("us-east-1"),
-                None,
-                "https://signin.amazonaws-us-gov.com/federation",
-                "https://console.amazonaws-us-gov.com/",
-            ),
             (
                 China,
                 Some("cn-north-1"),
@@ -1283,6 +1292,15 @@ mod tests {
             (
                 EuropeanSovereign,
                 Some("eusc-de-east-1"),
+                None,
+                "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation",
+                "https://console.amazonaws-eusc.eu/",
+            ),
+            // A home Region in another partition (a cross-partition role)
+            // does not pick the host.
+            (
+                EuropeanSovereign,
+                Some("eu-central-1"),
                 None,
                 "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation",
                 "https://console.amazonaws-eusc.eu/",

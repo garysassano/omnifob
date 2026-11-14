@@ -103,9 +103,17 @@ impl Partition {
         Ok(())
     }
 
-    /// The Region whose sign-in endpoint serves the partition when nothing
-    /// names one: the one with an unprefixed host, or the European Sovereign
-    /// Cloud's only Region.
+    /// The Region served by the partition's unprefixed sign-in and console
+    /// hosts; the European Sovereign Cloud has none.
+    pub fn unprefixed_region(self) -> Option<&'static str> {
+        match self {
+            Self::EuropeanSovereign => None,
+            _ => Some(self.default_region()),
+        }
+    }
+
+    /// The partition's first Region: the one with the unprefixed hosts, or
+    /// the European Sovereign Cloud's only Region.
     pub fn default_region(self) -> &'static str {
         match self {
             Self::Aws => "us-east-1",
@@ -206,7 +214,8 @@ mod tests {
         ] {
             let error = Partition::of_region(region).unwrap_err().to_string();
             assert!(error.contains(name), "{error}");
-            assert!(Partition::from_arn_name(name).is_err());
+            let error = Partition::from_arn_name(name).unwrap_err().to_string();
+            assert!(error.contains("isolated"), "{error}");
         }
     }
 
@@ -219,7 +228,12 @@ mod tests {
             );
             assert_eq!(partition.to_string(), partition.arn_name());
             assert!(partition.contains(partition.default_region()));
+            if let Some(region) = partition.unprefixed_region() {
+                assert_eq!(region, partition.default_region());
+                assert!(!partition.signin_host(region).starts_with(region));
+            }
         }
+        assert_eq!(Partition::EuropeanSovereign.unprefixed_region(), None);
         assert!(Partition::from_arn_name("aws-mars").is_err());
     }
 
