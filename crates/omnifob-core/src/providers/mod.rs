@@ -324,17 +324,23 @@ pub async fn revoke_token(config: &Config, profile: &Profile, token_id: &str) ->
 /// The partition an AWS profile's console opens in: the role ARN's for a
 /// chained or IAM user's role, else the partition of the Region its
 /// credentials come from (the portal's, or the IAM user's STS Region).
-fn aws_console_partition(integration: &Integration, target: &Target) -> anyhow::Result<Partition> {
+fn aws_console_partition(
+    name: &str,
+    integration: &Integration,
+    target: &Target,
+) -> anyhow::Result<Partition> {
     match (integration, target) {
         (Integration::AwsSso(c), Target::AwsChained { label, .. }) => c
             .chained
             .get(label)
-            .with_context(|| format!("no chained role '{label}'; run `fob sync`"))?
+            .with_context(|| {
+                format!("no chained role '{label}' in integration '{name}'; run `fob sync`")
+            })?
             .partition(),
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => c
             .roles
             .get(label)
-            .with_context(|| format!("no role '{label}'; run `fob sync`"))?
+            .with_context(|| format!("no role '{label}' in integration '{name}'; run `fob sync`"))?
             .partition(),
         (Integration::AwsSso(c), _) => Partition::of_region(&c.region),
         (Integration::AwsIam(c), _) => Partition::of_region(aws_iam::sts_region(c)),
@@ -351,18 +357,19 @@ pub async fn console_url(
     let integration = config.integration(&profile.integration)?;
     Ok(match (integration, &profile.target) {
         (Integration::AwsSso(c), target @ (Target::Aws { .. } | Target::AwsChained { .. })) => {
-            let partition = aws_console_partition(integration, target)?;
+            let partition = aws_console_partition(&profile.integration, integration, target)?;
             let region = match target {
                 Target::Aws { .. } => c.default_region.as_deref(),
                 _ => creds.env.get("AWS_REGION").map(String::as_str),
             };
             aws_sso::console_url(creds, partition, Some(&c.region), region).await?
         }
-        (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
-            aws_iam::console_url(&profile.integration, c).await?
+        (Integration::AwsIam(c), target @ Target::AwsIamSession { .. }) => {
+            let partition = aws_console_partition(&profile.integration, integration, target)?;
+            aws_iam::console_url(&profile.integration, c, partition).await?
         }
         (Integration::AwsIam(c), target @ Target::AwsIamRole { .. }) => {
-            let partition = aws_console_partition(integration, target)?;
+            let partition = aws_console_partition(&profile.integration, integration, target)?;
             let region = creds.env.get("AWS_REGION").map(String::as_str);
             aws_sso::console_url(creds, partition, c.region.as_deref(), region).await?
         }
@@ -587,11 +594,15 @@ mod tests {
         ];
         for (integration, target, partition) in cases {
             assert_eq!(
-                aws_console_partition(integration, &target).unwrap(),
+                aws_console_partition("i", integration, &target).unwrap(),
                 partition,
                 "{target:?}"
             );
         }
-        assert!(aws_console_partition(portal, &chained("missing")).is_err());
+        let missing = aws_console_partition("portal", portal, &chained("missing")).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "no chained role 'missing' in integration 'portal'; run `fob sync`"
+        );
     }
 }
