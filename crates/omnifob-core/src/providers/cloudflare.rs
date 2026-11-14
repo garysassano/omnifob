@@ -1262,17 +1262,26 @@ pub async fn revoke_minted(
         Some(p) => catalog.minted.get(p).cloned().unwrap_or_default(),
         None => catalog.minted.values().flatten().cloned().collect(),
     };
-    let mut deleted = 0;
+    let mut deleted = Vec::new();
     for token in &all {
         if tracked.contains(&token.id) || token.name.starts_with(&legacy) {
             delete_token(client, tokens, &token.id).await?;
-            deleted += 1;
+            deleted.push(token.id.clone());
         }
     }
-    for id in tracked {
+    // A profile's tokens all live in this listing, so its IDs can all go,
+    // gone already or not. Without a profile the listing may cover one of
+    // several accounts: forget only what it held, so the other accounts'
+    // tokens are still recognised when their listings come.
+    let forget = if profile_id.is_some() {
+        tracked
+    } else {
+        deleted.clone()
+    };
+    for id in forget {
         catalog.untrack(&id);
     }
-    Ok(deleted)
+    Ok(deleted.len())
 }
 
 /// [`revoke_minted`] with the stored bootstrap token and catalog.

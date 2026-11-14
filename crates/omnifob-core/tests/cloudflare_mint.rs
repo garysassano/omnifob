@@ -3,8 +3,9 @@
 use jiff::Timestamp;
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
 use omnifob_core::providers::cloudflare::{Catalog, Client, mint, revoke_minted, start_session};
+use omnifob_core::{paths, providers, store};
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const ACCOUNT: &str = "acct123";
@@ -766,4 +767,111 @@ async fn a_session_makes_the_bootstrap_expire_and_ends_the_previous_one() {
             .unwrap(),
         expires_at
     );
+}
+
+#[tokio::test]
+async fn logout_under_oauth_revokes_the_minted_tokens_of_every_account() {
+    // The only test here that reads the environment or the store; secrets go
+    // to an in-memory store, state to a scratch directory.
+    store::use_memory_store().unwrap();
+    let server = MockServer::start().await;
+    let state = std::env::temp_dir().join(format!("omnifob-cf-logout-test-{}", std::process::id()));
+    // SAFETY: no other test in this binary reads or writes these variables,
+    // and std serialises its own environment access.
+    unsafe {
+        std::env::set_var("OMNIFOB_CLOUDFLARE_API", server.uri());
+        std::env::set_var("XDG_STATE_HOME", &state);
+    }
+
+    let config =
+        match Config::parse("[integrations.cf]\ntype = \"cloudflare-oauth\"\nclient_id = \"x\"\n")
+            .unwrap()
+            .integrations
+            .remove("cf")
+            .unwrap()
+        {
+            Integration::Cloudflare(c) => Integration::Cloudflare(c),
+            _ => unreachable!(),
+        };
+    // A browser sign-in that is still valid, so no refresh is attempted.
+    store::set(
+        "cloudflare/cf/oauth",
+        &json!({
+            "access_token": "oauth-access",
+            "expires_at": Timestamp::now() + jiff::SignedDuration::from_hours(1),
+            "refresh_token": null,
+            "scopes": [],
+        }),
+    )
+    .unwrap();
+    let mut catalog = Catalog::default();
+    catalog
+        .minted
+        .insert("cf/acct-a/workers".into(), vec!["a1".into()]);
+    catalog
+        .minted
+        .insert("cf/acct-b/workers".into(), vec!["b1".into()]);
+    std::fs::create_dir_all(paths::state_dir()).unwrap();
+    std::fs::write(
+        paths::state_dir().join("cloudflare-cf.json"),
+        serde_json::to_string(&catalog).unwrap(),
+    )
+    .unwrap();
+
+    for (account, listed) in [
+        (
+            "acct-a",
+            json!([
+                { "id": "a1", "name": "omnifob workers", "status": "active" },
+                { "id": "a9", "name": "terraform", "status": "active" }
+            ]),
+        ),
+        (
+            "acct-b",
+            json!([
+                { "id": "b1", "name": "omnifob workers", "status": "active" },
+                { "id": "b2", "name": "omnifob:cf/acct-b/dns@2026-10-06T13:00:00Z", "status": "active" }
+            ]),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/accounts/{account}/tokens")))
+            .and(header("authorization", "Bearer oauth-access"))
+            .respond_with(ok(listed))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    for (account, id, times) in [
+        ("acct-a", "a1", 1),
+        ("acct-a", "a9", 0),
+        ("acct-b", "b1", 1),
+        ("acct-b", "b2", 1),
+    ] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/accounts/{account}/tokens/{id}")))
+            .respond_with(ok(json!({ "id": id })))
+            .expect(times)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/user/tokens"))
+        .respond_with(ok(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let deleted = providers::revoke_all("cf", &config, &["acct-a".into(), "acct-b".into()])
+        .await
+        .unwrap();
+    assert_eq!(deleted, 3);
+    let saved: Catalog = serde_json::from_str(
+        &std::fs::read_to_string(paths::state_dir().join("cloudflare-cf.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(saved.minted.is_empty(), "{:?}", saved.minted);
+
+    server.verify().await;
+    let _ = std::fs::remove_dir_all(&state);
 }

@@ -57,7 +57,9 @@ pub async fn revoke_all(
     let mut deleted = 0;
     for account_id in account_ids {
         deleted += cloudflare::revoke(name, config, None, account_id).await?;
-        if config.token_type == crate::config::CloudflareTokenType::User {
+        // `minting()`, not `token_type`: OAuth leaves `token_type` at its
+        // default (user) but mints account-owned tokens, listed per account.
+        if config.minting() == crate::config::CloudflareTokenType::User {
             break; // user tokens are listed once, not per account
         }
     }
