@@ -13,6 +13,7 @@ use anyhow::{Context, anyhow};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
+use super::aws_partition::Partition;
 use super::aws_sso::{self, RoleRequest, SESSION_MIN};
 use crate::config::AwsIamConfig;
 use crate::credentials::EXPIRY_MARGIN;
@@ -273,5 +274,7 @@ pub async fn console_url(integration: &str, config: &AwsIamConfig) -> Result<Str
         response.credentials().context("no credentials returned")?,
         None,
     )?;
-    Ok(aws_sso::console_url(&creds, sts_region(config), config.region.as_deref()).await?)
+    let home = sts_region(config);
+    let partition = Partition::of_region(home)?;
+    Ok(aws_sso::console_url(&creds, partition, Some(home), config.region.as_deref()).await?)
 }

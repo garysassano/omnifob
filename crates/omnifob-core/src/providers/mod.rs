@@ -2,6 +2,7 @@
 //! credentials and a console link.
 
 pub mod aws_iam;
+pub mod aws_partition;
 pub mod aws_sso;
 pub mod azure;
 pub mod cloudflare;
@@ -9,8 +10,10 @@ pub mod cloudflare_oauth;
 pub mod gcp;
 pub mod token;
 
+use anyhow::Context;
 use jiff::Timestamp;
 
+use self::aws_partition::Partition;
 use crate::{Config, Credentials, Error, Integration, Profile, Result, Target, store};
 
 /// Discovers every profile an integration offers.
@@ -327,19 +330,29 @@ pub async fn console_url(
     let integration = config.integration(&profile.integration)?;
     Ok(match (integration, &profile.target) {
         (Integration::AwsSso(c), Target::Aws { .. }) => {
-            aws_sso::console_url(creds, &c.region, c.default_region.as_deref()).await?
+            let partition = Partition::of_region(&c.region)?;
+            let region = c.default_region.as_deref();
+            aws_sso::console_url(creds, partition, Some(&c.region), region).await?
         }
-        (Integration::AwsSso(c), Target::AwsChained { .. }) => {
+        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
+            let role = c.chained.get(label).with_context(|| {
+                format!(
+                    "no chained role '{label}' in integration '{}'",
+                    profile.integration
+                )
+            })?;
             let region = creds.env.get("AWS_REGION").map(String::as_str);
-            aws_sso::console_url(creds, &c.region, region).await?
+            aws_sso::console_url(creds, role.partition()?, Some(&c.region), region).await?
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
             aws_iam::console_url(&profile.integration, c).await?
         }
-        (Integration::AwsIam(c), Target::AwsIamRole { .. }) => {
+        (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
+            let role = c.roles.get(label).with_context(|| {
+                format!("no role '{label}' in integration '{}'", profile.integration)
+            })?;
             let region = creds.env.get("AWS_REGION").map(String::as_str);
-            let home = c.region.as_deref().unwrap_or("us-east-1");
-            aws_sso::console_url(creds, home, region).await?
+            aws_sso::console_url(creds, role.partition()?, c.region.as_deref(), region).await?
         }
         (Integration::Gcp(_), Target::Gcp { project_id, .. }) => {
             gcp::console_url(&profile.integration, Some(project_id))?

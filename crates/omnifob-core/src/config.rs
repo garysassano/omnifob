@@ -7,6 +7,8 @@ use anyhow::{Context, bail};
 use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
+use crate::providers::aws_partition::Partition;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -157,6 +159,11 @@ impl ChainedRole {
     pub fn account_id(&self) -> Option<&str> {
         self.role_arn.split(':').nth(4).filter(|a| !a.is_empty())
     }
+
+    /// The partition in `role_arn`.
+    pub fn partition(&self) -> anyhow::Result<Partition> {
+        Partition::of_arn(&self.role_arn)
+    }
 }
 
 /// An IAM user's access key, kept in the keychain (`type = "aws-iam"`), the
@@ -235,6 +242,11 @@ impl IamRole {
     /// The account in `role_arn`.
     pub fn account_id(&self) -> Option<&str> {
         self.role_arn.split(':').nth(4).filter(|a| !a.is_empty())
+    }
+
+    /// The partition in `role_arn`.
+    pub fn partition(&self) -> anyhow::Result<Partition> {
+        Partition::of_arn(&self.role_arn)
     }
 }
 
