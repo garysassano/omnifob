@@ -51,6 +51,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// shorter, so a longer request is not one and is dropped.
 const MAX_REQUEST: usize = 16 * 1024;
 
+/// The most connections kept waiting for their request; past this the oldest
+/// is closed. Also the most connections accepted in one pass.
+const MAX_PENDING: usize = 64;
+
 /// How often the listener looks for new connections and data when idle.
 const POLL: Duration = Duration::from_millis(25);
 
@@ -101,12 +105,17 @@ pub fn wait_for_code(
             );
         }
         let mut busy = false;
-        loop {
+        // Bounded, so a flood of connections still lets this loop read the
+        // pending ones and reach the deadline.
+        for _ in 0..MAX_PENDING {
             match listener.accept() {
                 Ok((stream, _)) => {
                     busy = true;
                     // A connection that cannot be set up is dropped.
                     if stream.set_nonblocking(true).is_ok() {
+                        if pending.len() >= MAX_PENDING {
+                            drop_oldest(&mut pending);
+                        }
                         pending.push(Pending {
                             stream,
                             request: Vec::new(),
@@ -124,6 +133,11 @@ pub fn wait_for_code(
                             | ErrorKind::ConnectionAborted
                             | ErrorKind::ConnectionReset
                     ) => {}
+                // Out of file descriptors: free one and try again next pass.
+                Err(e) if out_of_descriptors(&e) => {
+                    drop_oldest(&mut pending);
+                    break;
+                }
                 Err(e) => {
                     return Err(e).context("accepting the sign-in callback on 127.0.0.1");
                 }
@@ -149,6 +163,26 @@ pub fn wait_for_code(
             std::thread::sleep(POLL);
         }
     }
+}
+
+/// Closes the pending connection that was accepted first.
+fn drop_oldest(pending: &mut Vec<Pending>) {
+    if let Some(oldest) = (0..pending.len()).min_by_key(|&i| pending[i].until) {
+        pending.swap_remove(oldest);
+    }
+}
+
+/// Whether `accept` failed because this process or the system ran out of file
+/// descriptors (`EMFILE`, `ENFILE`, `WSAEMFILE`), which passes once
+/// connections are closed.
+fn out_of_descriptors(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    const CODES: &[i32] = &[23, 24];
+    #[cfg(windows)]
+    const CODES: &[i32] = &[10024];
+    #[cfg(not(any(unix, windows)))]
+    const CODES: &[i32] = &[];
+    e.raw_os_error().is_some_and(|code| CODES.contains(&code))
 }
 
 /// Reads what has arrived on a pending connection without blocking.
@@ -285,9 +319,13 @@ mod tests {
         assert!(err.contains("not completed"), "{err}");
     }
 
-    /// Sends a request on a new connection and returns the reply.
+    /// Sends a request on a new connection and returns the reply. Times out
+    /// rather than hangs when nothing answers, as after `wait_for_code` has
+    /// returned too early.
     fn request(addr: std::net::SocketAddr, request: &str) -> String {
         let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
         s.write_all(request.as_bytes()).unwrap();
         let mut reply = String::new();
         s.read_to_string(&mut reply).unwrap();
@@ -343,8 +381,9 @@ mod tests {
         });
         let started = Instant::now();
         let code = wait_for_code(&listener, "/callback", "s", Duration::from_secs(30), "X");
-        let reply = browser.join().unwrap();
+        // Checked before joining, so a sign-in that ended early fails here.
         assert_eq!(code.unwrap(), "c1");
+        let reply = browser.join().unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
         // The callback was served while the silent connections were open,
         // not after they timed out.
@@ -375,8 +414,30 @@ mod tests {
             )
         });
         let code = wait_for_code(&listener, "/callback", "s", Duration::from_secs(30), "X");
-        let reply = browser.join().unwrap();
+        // Checked before joining, so a sign-in that ended early fails here.
         assert_eq!(code.unwrap(), "c1");
+        let reply = browser.join().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    #[test]
+    fn more_silent_connections_than_are_kept_do_not_hold_up_the_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = std::thread::spawn(move || {
+            let silent: Vec<_> = (0..MAX_PENDING * 2)
+                .map(|_| TcpStream::connect(addr).unwrap())
+                .collect();
+            let reply = request(
+                addr,
+                "GET /callback?code=c1&state=s HTTP/1.1\r\nHost: x\r\n\r\n",
+            );
+            drop(silent);
+            reply
+        });
+        let code = wait_for_code(&listener, "/callback", "s", Duration::from_secs(30), "X");
+        assert_eq!(code.unwrap(), "c1");
+        let reply = browser.join().unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     }
 
@@ -400,8 +461,9 @@ mod tests {
             request(addr, "GET /?state=s&code=c1 HTTP/1.1\r\nHost: x\r\n\r\n")
         });
         let code = wait_for_code(&listener, "/", "s", Duration::from_secs(30), "X");
-        let reply = browser.join().unwrap();
+        // Checked before joining, so a sign-in that ended early fails here.
         assert_eq!(code.unwrap(), "c1");
+        let reply = browser.join().unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     }
 
