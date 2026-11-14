@@ -314,6 +314,79 @@ async fn an_ended_session_asks_for_sign_in_and_is_forgotten() {
 }
 
 #[tokio::test]
+async fn a_server_error_during_renewal_keeps_the_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "outage", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(aws_error(401, "UnauthorizedException"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(500, "InternalServerException"))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials("outage", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Other(_)), "{err}");
+    assert!(
+        format!("{err:#}").contains("could not reach IAM Identity Center"),
+        "{err:#}"
+    );
+    assert!(aws_sso::session("outage").unwrap().unwrap().1, "kept");
+}
+
+#[tokio::test]
+async fn an_expired_token_that_cannot_be_renewed_now_does_not_ask_for_sign_in() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "offline", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(429, "SlowDownException"))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials("offline", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Other(_)), "{err}");
+    assert!(aws_sso::session("offline").unwrap().is_some(), "kept");
+}
+
+#[tokio::test]
+async fn a_refused_client_is_registered_again() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "client", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(401, "InvalidClientException"))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials("client", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
+    assert!(aws_sso::session("client").unwrap().is_none());
+
+    device_login(&server, "client", 3600).await;
+    let registers = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/client/register")
+        .count();
+    assert_eq!(registers, 2, "the refused client was reused");
+}
+
+#[tokio::test]
 async fn discovery_lists_every_account_and_role() {
     let (_guard, server) = setup().await;
     device_login(&server, "discover", 3600).await;
@@ -375,6 +448,50 @@ async fn signing_out_ends_the_portal_session() {
     assert!(aws_sso::end_session("logout", &config()).await.unwrap());
     assert!(aws_sso::logout("logout").unwrap());
     assert!(aws_sso::session("logout").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn signing_out_renews_an_expired_token_to_end_the_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "stale", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(
+            json!({ "grantType": "refresh_token", "refreshToken": "r1" }),
+        ))
+        .respond_with(token("a2", "r2", 3600))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .and(header("x-amz-sso_bearer_token", "a2"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert!(aws_sso::end_session("stale", &config()).await.unwrap());
+}
+
+#[tokio::test]
+async fn signing_out_of_an_ended_session_has_nothing_to_end() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "gone", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(400, "InvalidGrantException"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    assert!(!aws_sso::end_session("gone", &config()).await.unwrap());
 }
 
 #[tokio::test]

@@ -441,13 +441,17 @@ async fn device_sign_in(
 /// Ends the portal session at Identity Center, as `aws sso logout` does, so
 /// the stored tokens stop working everywhere. Best effort: returns whether
 /// there was a session to end.
+///
+/// An expired access token is renewed first, since its refresh token stays
+/// valid at Identity Center until the portal session ends. When it cannot be
+/// renewed, or Identity Center refuses the renewal, there is nothing left to
+/// end.
 pub async fn end_session(integration: &str, config: &AwsSsoConfig) -> anyhow::Result<bool> {
-    let Some(token) = store::get::<SsoToken>(&token_key(integration))? else {
-        return Ok(false);
+    let token = match current_token(integration, config, None).await {
+        Ok(token) => token,
+        Err(Error::NeedsLogin { .. }) => return Ok(false),
+        Err(Error::Other(e)) => return Err(e),
     };
-    if token.expires_at <= Timestamp::now() {
-        return Ok(false);
-    }
     portal_client(&config.region)
         .logout()
         .access_token(&token.access_token)
@@ -499,8 +503,14 @@ fn needs_renewal(token: &SsoToken, now: Timestamp, rejected: Option<&str>) -> bo
 ///
 /// Renewal runs under a lock shared by every omnifob process: each refresh
 /// returns a new refresh token and the old one is treated as spent, so two
-/// processes refreshing at once could leave one with a refused token. The token is read again under the lock, since another
-/// process may have renewed it while this one waited.
+/// processes refreshing at once could leave one with a refused token. The
+/// token is read again under the lock, since another process may have renewed
+/// it while this one waited.
+///
+/// The session is forgotten and a new sign-in asked for only when Identity
+/// Center refuses the refresh with an error `CreateToken` documents as final.
+/// A network error, a timeout, throttling or a server error leaves the session
+/// stored, and the call fails without asking for a sign-in.
 async fn current_token(
     integration: &str,
     config: &AwsSsoConfig,
@@ -517,48 +527,79 @@ async fn current_token(
         return Ok(token);
     }
 
-    let mut refresh_failed = false;
-    if token.can_refresh(now) {
+    let refused = if token.can_refresh(now) {
         match refresh(&token).await {
             Ok(refreshed) => {
                 store::set(&token_key(integration), &refreshed)?;
                 return Ok(refreshed);
             }
-            Err(e) => {
-                tracing::debug!("refreshing the IAM Identity Center token failed: {e:#}");
-                refresh_failed = true;
+            Err(RefreshError::Transient(e)) => {
+                if rejected.is_none() && token.expires_at > now {
+                    // Still valid for a while; renewal is tried again on the next use.
+                    tracing::debug!("renewing the IAM Identity Center token failed: {e:#}");
+                    return Ok(token);
+                }
+                // The session at Identity Center may well be intact, so it is
+                // kept for the next try rather than sending the user to sign in.
+                return Err(e
+                    .context(format!(
+                        "could not reach IAM Identity Center to renew the sign-in for '{integration}'"
+                    ))
+                    .into());
+            }
+            Err(RefreshError::Refused {
+                client_refused,
+                source,
+            }) => {
+                tracing::debug!("IAM Identity Center refused to renew the token: {source:#}");
+                if client_refused {
+                    // The next sign-in must not reuse the client just refused.
+                    forget_registrations(integration, &token.client_id);
+                }
+                true
             }
         }
+    } else {
+        false
+    };
+
+    if rejected.is_none() && token.expires_at > now {
+        // Still valid for a while; renewal is tried again on the next use.
+        return Ok(token);
     }
-    if rejected.is_some() {
+    if rejected.is_some() || refused {
         // Neither the token nor a refresh is accepted: the session is over.
         drop_if_current(integration, &token.access_token);
-        return Err(Error::needs_login(
-            integration,
-            format!(
-                "IAM Identity Center no longer accepts the sign-in for '{integration}' (revoked, or the session ended)"
-            ),
-        ));
     }
-    if token.expires_at > now {
-        // Still valid for a while; renewal is tried again on the next use.
-        Ok(token)
-    } else if refresh_failed {
-        Err(Error::needs_login(
-            integration,
-            format!(
-                "the IAM Identity Center session for '{integration}' has ended (sessions last 8 hours unless the administrator changed it)"
-            ),
-        ))
+    let reason = if rejected.is_some() {
+        format!(
+            "IAM Identity Center no longer accepts the sign-in for '{integration}' (revoked, or the session ended)"
+        )
+    } else if refused {
+        format!(
+            "the IAM Identity Center session for '{integration}' has ended (sessions last 8 hours unless the administrator changed it)"
+        )
     } else {
-        Err(Error::needs_login(
-            integration,
-            format!("the sign-in for '{integration}' has expired"),
-        ))
-    }
+        format!("the sign-in for '{integration}' has expired")
+    };
+    Err(Error::needs_login(integration, reason))
 }
 
-async fn refresh(token: &SsoToken) -> anyhow::Result<SsoToken> {
+/// How renewing a token failed.
+enum RefreshError {
+    /// Identity Center refused the refresh token or the client, which
+    /// `CreateToken` documents as final: only a new sign-in helps.
+    Refused {
+        /// The client registration itself was refused (`InvalidClientException`).
+        client_refused: bool,
+        source: anyhow::Error,
+    },
+    /// Anything else: a network error, a timeout, throttling or a server
+    /// error. The session may be intact and a later try may succeed.
+    Transient(anyhow::Error),
+}
+
+async fn refresh(token: &SsoToken) -> std::result::Result<SsoToken, RefreshError> {
     let refreshed = oidc_client(&token.region)
         .create_token()
         .client_id(&token.client_id)
@@ -567,12 +608,37 @@ async fn refresh(token: &SsoToken) -> anyhow::Result<SsoToken> {
         .refresh_token(token.refresh_token.as_deref().unwrap_or_default())
         .send()
         .await
-        .map_err(|e| anyhow!("{}", DisplayErrorContext(&e)))?;
+        .map_err(|e| {
+            let refused = matches!(
+                e.as_service_error(),
+                Some(
+                    CreateTokenError::InvalidGrantException(_)
+                        | CreateTokenError::ExpiredTokenException(_)
+                        | CreateTokenError::InvalidClientException(_)
+                        | CreateTokenError::UnauthorizedClientException(_)
+                        | CreateTokenError::AccessDeniedException(_)
+                )
+            );
+            let client_refused = matches!(
+                e.as_service_error(),
+                Some(CreateTokenError::InvalidClientException(_))
+            );
+            let source = anyhow!("{}", DisplayErrorContext(&e));
+            if refused {
+                RefreshError::Refused {
+                    client_refused,
+                    source,
+                }
+            } else {
+                RefreshError::Transient(source)
+            }
+        })?;
+    let access_token = refreshed
+        .access_token()
+        .context("no access token returned")
+        .map_err(RefreshError::Transient)?;
     Ok(SsoToken {
-        access_token: refreshed
-            .access_token()
-            .context("no access token returned")?
-            .to_string(),
+        access_token: access_token.to_string(),
         expires_at: after_secs(Timestamp::now(), refreshed.expires_in().into()),
         refresh_token: refreshed
             .refresh_token()
@@ -580,6 +646,19 @@ async fn refresh(token: &SsoToken) -> anyhow::Result<SsoToken> {
             .or_else(|| token.refresh_token.clone()),
         ..token.clone()
     })
+}
+
+/// Deletes the stored client registrations that hold `client_id`.
+fn forget_registrations(integration: &str, client_id: &str) {
+    for flow in [Flow::Browser, Flow::DeviceCode] {
+        let key = registration_key(integration, flow);
+        if let Ok(Some(stored)) = store::get::<Registration>(&key)
+            && stored.client_id == client_id
+            && let Err(e) = store::delete(&key)
+        {
+            tracing::warn!("could not forget the refused client registration: {e:#}");
+        }
+    }
 }
 
 /// How a portal call failed.
