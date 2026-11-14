@@ -6,8 +6,10 @@
 all-features = true
 
 [advisories]
-# Every RustSec advisory (vulnerable, unmaintained, unsound, yanked) fails the
-# check. Add an entry here, with the reason, only to accept a specific one.
+# Every RustSec advisory (vulnerable, unmaintained, unsound) fails the check,
+# and so does a yanked crate version. Add an entry to `ignore`, with the
+# reason, only to accept a specific advisory.
+yanked = "deny"
 ignore = [
   # zbus 6 absorbed zbus_names, zvariant and zvariant_derive, so their zbus 5
   # releases are marked unmaintained. They come only from the Linux Secret
