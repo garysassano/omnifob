@@ -3,9 +3,9 @@
 //! the provider's consent page, which redirects back to a listener on this
 //! machine with a code that only this process can redeem.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::time::Duration;
+use std::io::{ErrorKind, Read as _, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::Engine;
@@ -42,10 +42,46 @@ pub fn random_string(bytes: usize) -> anyhow::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
 
-/// Accepts connections until one carries the callback on `path`, answers the
-/// browser, and returns the authorization code. Gives up after `timeout`; the
+/// How long a connection may take to send its request. Browsers open
+/// connections speculatively and may never use them; such a connection is
+/// closed after this, without ending the sign-in.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The most a request may send before its headers end; a callback is far
+/// shorter, so a longer request is not one and is dropped.
+const MAX_REQUEST: usize = 16 * 1024;
+
+/// How often the listener looks for new connections and data when idle.
+const POLL: Duration = Duration::from_millis(25);
+
+/// A connection whose request has not fully arrived yet.
+struct Pending {
+    stream: TcpStream,
+    request: Vec<u8>,
+    until: Instant,
+}
+
+/// What reading from a pending connection gave.
+enum Progress {
+    /// The request is still arriving.
+    Waiting,
+    /// The request's headers are complete; the first line is the request line.
+    Request(String),
+    /// The connection closed, failed or sent more than a request: drop it.
+    Gone,
+}
+
+/// Accepts connections until one carries the callback on `path` with this
+/// sign-in's `state`, answers the browser, and returns the authorization code,
+/// or the provider's refusal as an error. Gives up after `timeout`; the
 /// listener polls rather than blocks, so the process can exit then.
-/// `provider` names the provider in the page the browser shows.
+///
+/// Connections are served side by side, so one that stays silent cannot hold
+/// up the callback; it is closed after [`REQUEST_TIMEOUT`]. A connection that
+/// fails, a request for another path (404), and a callback with another
+/// `state` (400) are answered or dropped, and the wait goes on: none of them
+/// can end a sign-in. `provider` names the provider in the page the browser
+/// shows.
 pub fn wait_for_code(
     listener: &TcpListener,
     path: &str,
@@ -54,44 +90,146 @@ pub fn wait_for_code(
     provider: &str,
 ) -> anyhow::Result<String> {
     listener.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
+    let mut pending: Vec<Pending> = Vec::new();
     loop {
-        let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    bail!(
-                        "the sign-in was not completed within {} minutes",
-                        timeout.as_secs() / 60
-                    );
+        let now = Instant::now();
+        if now >= deadline {
+            bail!(
+                "the sign-in was not completed within {} minutes",
+                timeout.as_secs() / 60
+            );
+        }
+        let mut busy = false;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    busy = true;
+                    // A connection that cannot be set up is dropped.
+                    if stream.set_nonblocking(true).is_ok() {
+                        pending.push(Pending {
+                            stream,
+                            request: Vec::new(),
+                            until: now + REQUEST_TIMEOUT,
+                        });
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                // Errors that belong to one connection, which a client can
+                // cause by giving up before it was accepted.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::Interrupted
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::ConnectionReset
+                    ) => {}
+                Err(e) => {
+                    return Err(e).context("accepting the sign-in callback on 127.0.0.1");
+                }
             }
-            Err(e) => return Err(e.into()),
-        };
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line)?;
-        let Some(query) = callback_query(&line, path) else {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-            continue;
-        };
-        let result = parse_callback(&query, state, provider);
-        let message = match &result {
-            Ok(_) => format!(
-                "Signed in to {provider}. You can close this tab and return to the terminal."
+        }
+        let mut i = 0;
+        while i < pending.len() {
+            match read_request(&mut pending[i]) {
+                Progress::Waiting if now < pending[i].until => i += 1,
+                Progress::Waiting | Progress::Gone => {
+                    pending.swap_remove(i);
+                }
+                Progress::Request(line) => {
+                    busy = true;
+                    let conn = pending.swap_remove(i);
+                    if let Some(result) = answer(conn.stream, &line, path, state, provider) {
+                        return result;
+                    }
+                }
+            }
+        }
+        if !busy {
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// Reads what has arrived on a pending connection without blocking.
+fn read_request(conn: &mut Pending) -> Progress {
+    let mut buf = [0u8; 4096];
+    loop {
+        match conn.stream.read(&mut buf) {
+            Ok(0) => {
+                // A client may close its side right after the request line.
+                return match request_line(&conn.request) {
+                    Some(line) => Progress::Request(line),
+                    None => Progress::Gone,
+                };
+            }
+            Ok(n) => {
+                conn.request.extend_from_slice(&buf[..n]);
+                if conn.request.len() > MAX_REQUEST {
+                    return Progress::Gone;
+                }
+                // Reading up to the end of the headers before answering, so no
+                // unread data makes closing the socket reset the connection.
+                let request = &conn.request;
+                if request.windows(4).any(|w| w == b"\r\n\r\n")
+                    || request.windows(2).any(|w| w == b"\n\n")
+                {
+                    return request_line(request).map_or(Progress::Gone, Progress::Request);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Progress::Waiting,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return Progress::Gone,
+        }
+    }
+}
+
+/// The first line of a request, once it is complete.
+fn request_line(request: &[u8]) -> Option<String> {
+    let end = request.iter().position(|&b| b == b'\n')?;
+    Some(String::from_utf8_lossy(&request[..end]).into_owned())
+}
+
+/// Answers one request, and returns the outcome of the sign-in when the
+/// request is this sign-in's callback.
+fn answer(
+    mut stream: TcpStream,
+    request_line: &str,
+    path: &str,
+    state: &str,
+    provider: &str,
+) -> Option<anyhow::Result<String>> {
+    let (status, message, result) = match callback_query(request_line, path) {
+        None => ("404 Not Found", String::new(), None),
+        Some(query) => match parse_callback(&query, state, provider) {
+            None => (
+                "400 Bad Request",
+                "This page belongs to another sign-in. The sign-in in the terminal is still waiting; finish it from the link it shows.".to_string(),
+                None,
             ),
-            Err(_) => "The sign-in failed. Return to the terminal for details.".to_string(),
-        };
+            Some(result) => {
+                let message = match &result {
+                    Ok(_) => format!(
+                        "Signed in to {provider}. You can close this tab and return to the terminal."
+                    ),
+                    Err(_) => "The sign-in failed. Return to the terminal for details.".to_string(),
+                };
+                ("200 OK", message, Some(result))
+            }
+        },
+    };
+    // The answer is best effort: the outcome stands whether or not the
+    // browser receives it.
+    if stream.set_nonblocking(false).is_ok() {
+        let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
         let _ = write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
             message.len()
         );
-        return result;
+        let _ = stream.flush();
     }
+    result
 }
 
 /// The query of a `GET <path>?...` request line.
@@ -101,21 +239,26 @@ fn callback_query(request_line: &str, path: &str) -> Option<String> {
     Some(query.to_string())
 }
 
-fn parse_callback(query: &str, state: &str, provider: &str) -> anyhow::Result<String> {
-    let url = reqwest::Url::parse(&format!("http://localhost/?{query}"))?;
+/// The outcome a callback carries: `None` when its `state` is not this
+/// sign-in's, so it is not this sign-in's callback and must not end it;
+/// otherwise the code, or the provider's refusal as an error.
+fn parse_callback(query: &str, state: &str, provider: &str) -> Option<anyhow::Result<String>> {
+    let url = reqwest::Url::parse(&format!("http://localhost/?{query}")).ok()?;
     let param = |name: &str| {
         url.query_pairs()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.into_owned())
     };
+    if param("state").as_deref() != Some(state) {
+        return None;
+    }
     if let Some(error) = param("error") {
         let detail = param("error_description").unwrap_or_default();
-        bail!("{provider} refused the sign-in: {error} {detail}");
+        return Some(Err(anyhow::anyhow!(
+            "{provider} refused the sign-in: {error} {detail}"
+        )));
     }
-    if param("state").as_deref() != Some(state) {
-        bail!("the callback's state does not match this sign-in");
-    }
-    param("code").context("the callback carries no code")
+    Some(param("code").context("the callback carries no code"))
 }
 
 #[cfg(test)]
@@ -142,25 +285,27 @@ mod tests {
         assert!(err.contains("not completed"), "{err}");
     }
 
+    /// Sends a request on a new connection and returns the reply.
+    fn request(addr: std::net::SocketAddr, request: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        reply
+    }
+
     #[test]
     fn waiting_for_the_callback_returns_the_code() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let browser = std::thread::spawn(move || {
             // A stray request first, as browsers ask for a favicon.
-            let mut s = std::net::TcpStream::connect(addr).unwrap();
-            s.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
-                .unwrap();
-            let mut reply = String::new();
-            std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
+            let reply = request(addr, "GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n");
             assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
-
-            let mut s = std::net::TcpStream::connect(addr).unwrap();
-            s.write_all(b"GET /oauth/callback?code=c1&state=s HTTP/1.1\r\nHost: x\r\n\r\n")
-                .unwrap();
-            let mut reply = String::new();
-            std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
-            reply
+            request(
+                addr,
+                "GET /oauth/callback?code=c1&state=s HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
         });
         let code = wait_for_code(
             &listener,
@@ -174,6 +319,118 @@ mod tests {
         let reply = browser.join().unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
         assert!(reply.contains("Signed in to AWS"), "{reply}");
+    }
+
+    #[test]
+    fn a_silent_connection_does_not_hold_up_the_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = std::thread::spawn(move || {
+            // Browsers open connections they may never use; these stay open
+            // and silent, or close without a request, while the callback
+            // arrives on another.
+            let silent = TcpStream::connect(addr).unwrap();
+            let mut partial = TcpStream::connect(addr).unwrap();
+            partial.write_all(b"GET /callback?co").unwrap();
+            drop(TcpStream::connect(addr).unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+            let reply = request(
+                addr,
+                "GET /callback?code=c1&state=s HTTP/1.1\r\nHost: x\r\n\r\n",
+            );
+            drop((silent, partial));
+            reply
+        });
+        let started = Instant::now();
+        let code = wait_for_code(&listener, "/callback", "s", Duration::from_secs(30), "X");
+        let reply = browser.join().unwrap();
+        assert_eq!(code.unwrap(), "c1");
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        // The callback was served while the silent connections were open,
+        // not after they timed out.
+        assert!(
+            started.elapsed() < REQUEST_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_silent_connection_is_closed_and_the_wait_goes_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = std::thread::spawn(move || {
+            let mut silent = TcpStream::connect(addr).unwrap();
+            silent.set_read_timeout(Some(REQUEST_TIMEOUT * 5)).unwrap();
+            let opened = Instant::now();
+            // The listener closes it without an answer; a reset counts too.
+            let mut reply = Vec::new();
+            let _ = silent.read_to_end(&mut reply);
+            let held = opened.elapsed();
+            assert!(reply.is_empty(), "{}", String::from_utf8_lossy(&reply));
+            assert!(held < REQUEST_TIMEOUT * 4, "held for {held:?}");
+            request(
+                addr,
+                "GET /callback?code=c1&state=s HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
+        });
+        let code = wait_for_code(&listener, "/callback", "s", Duration::from_secs(30), "X");
+        let reply = browser.join().unwrap();
+        assert_eq!(code.unwrap(), "c1");
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    #[test]
+    fn a_callback_with_another_state_is_refused_and_the_wait_goes_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = std::thread::spawn(move || {
+            let replies = [
+                // An old tab of an earlier sign-in, or any local page.
+                "GET /?code=old&state=other HTTP/1.1\r\nHost: x\r\n\r\n",
+                // A refusal is only this sign-in's when its state matches.
+                "GET /?error=access_denied&state=other HTTP/1.1\r\nHost: x\r\n\r\n",
+                "GET /?code=nostate HTTP/1.1\r\nHost: x\r\n\r\n",
+            ]
+            .map(|r| request(addr, r));
+            for reply in &replies {
+                assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+                assert!(reply.contains("still waiting"), "{reply}");
+            }
+            request(addr, "GET /?state=s&code=c1 HTTP/1.1\r\nHost: x\r\n\r\n")
+        });
+        let code = wait_for_code(&listener, "/", "s", Duration::from_secs(30), "X");
+        let reply = browser.join().unwrap();
+        assert_eq!(code.unwrap(), "c1");
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    #[test]
+    fn a_refusal_with_this_state_ends_the_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let browser = std::thread::spawn(move || {
+            request(
+                addr,
+                "GET /callback?error=access_denied&error_description=no&state=s HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
+        });
+        let err = wait_for_code(
+            &listener,
+            "/callback",
+            "s",
+            Duration::from_secs(30),
+            "Cloudflare",
+        )
+        .unwrap_err()
+        .to_string();
+        let reply = browser.join().unwrap();
+        assert!(
+            err.contains("Cloudflare refused the sign-in: access_denied"),
+            "{err}"
+        );
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(reply.contains("sign-in failed"), "{reply}");
     }
 
     #[test]
@@ -200,15 +457,20 @@ mod tests {
     #[test]
     fn callbacks_check_state_and_errors() {
         assert_eq!(
-            parse_callback("code=abc&state=s1", "s1", "X").unwrap(),
+            parse_callback("code=abc&state=s1", "s1", "X")
+                .unwrap()
+                .unwrap(),
             "abc"
         );
-        assert!(parse_callback("code=abc&state=other", "s1", "X").is_err());
+        assert!(parse_callback("code=abc&state=other", "s1", "X").is_none());
+        assert!(parse_callback("error=access_denied&state=other", "s1", "X").is_none());
+        assert!(parse_callback("state=s1", "s1", "X").unwrap().is_err());
         let err = parse_callback(
             "error=access_denied&error_description=no&state=s1",
             "s1",
             "Cloudflare",
         )
+        .unwrap()
         .unwrap_err()
         .to_string();
         assert!(err.contains("Cloudflare refused"), "{err}");
