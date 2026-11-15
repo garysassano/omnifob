@@ -9,7 +9,9 @@
 //! bootstrap tokens are also written to files encrypted with Windows DPAPI
 //! (see [`wsl`]), so they survive reboots; keyutils stays the fast cache.
 //! `OMNIFOB_KEYRING` forces a store: `keychain`, `windows`, `secret-service`
-//! or `keyutils`.
+//! or `keyutils`. For tests of the command line only,
+//! `test-plaintext-files:<absolute dir>` keeps secrets unencrypted in files
+//! (see [`test_files`]).
 
 use std::sync::OnceLock;
 
@@ -72,6 +74,15 @@ fn use_native() -> anyhow::Result<&'static str> {
 
 fn use_store(name: &str) -> anyhow::Result<()> {
     use keyring_core::set_default_store;
+    if let Some(rest) = name.strip_prefix(test_files::NAME) {
+        let dir = test_files::dir(rest)?;
+        set_default_store(test_files::Store::new(&dir)?);
+        eprintln!(
+            "fob: warning: OMNIFOB_KEYRING keeps secrets UNENCRYPTED in {}; it is for tests only",
+            dir.display()
+        );
+        return Ok(());
+    }
     match name {
         #[cfg(target_os = "macos")]
         "keychain" => set_default_store(apple_native_keyring_store::keychain::Store::new()?),
@@ -158,6 +169,12 @@ pub fn rename(old: &str, new: &str) -> anyhow::Result<bool> {
 /// Describes where secrets are kept, for `fob status`.
 pub fn description() -> anyhow::Result<String> {
     let store = init()?;
+    if let Some(rest) = store.strip_prefix(test_files::NAME) {
+        return Ok(format!(
+            "unencrypted files in {} (tests only)",
+            test_files::dir(rest)?.display()
+        ));
+    }
     Ok(if wsl::enabled() {
         format!(
             "{store}, persisted with Windows DPAPI in {}",
@@ -326,6 +343,230 @@ mod wsl {
                 assert_eq!(super::BASE64.encode(plain.as_bytes()), encoded);
                 assert_eq!(super::BASE64.decode(encoded).unwrap(), plain.as_bytes());
             }
+        }
+    }
+}
+
+/// A store of plaintext files, for end-to-end tests of the command line
+/// only: `OMNIFOB_KEYRING=test-plaintext-files:<absolute dir>`.
+///
+/// Tests run the `fob` binary, so each command is a new process and the
+/// in-memory store of [`use_memory_store`] would forget everything between
+/// commands; this store keeps secrets where the next command finds them,
+/// without touching the real keychain. It does not protect them at all:
+/// every secret is written unencrypted, one file per key, named after the
+/// key with every byte outside `[A-Za-z0-9._-]` written as `%XX` (so
+/// `aws-sso/acme/token` is `aws-sso%2Facme%2Ftoken`). To keep it from being
+/// chosen by accident, it needs an absolute directory, says so on stderr
+/// whenever it is used, and on Unix creates the directory `0700` and the
+/// files `0600`. Never use it for real credentials.
+pub mod test_files {
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use anyhow::{Context, bail};
+    use keyring_core::api::{CredentialApi, CredentialStoreApi};
+    use keyring_core::{Credential, Entry, Error, Result};
+
+    /// What `OMNIFOB_KEYRING` starts with to choose this store.
+    pub const NAME: &str = "test-plaintext-files";
+
+    /// The directory from what follows [`NAME`] in `OMNIFOB_KEYRING`, which
+    /// must be `:<absolute dir>`.
+    pub fn dir(rest: &str) -> anyhow::Result<PathBuf> {
+        let Some(dir) = rest.strip_prefix(':').filter(|d| !d.is_empty()) else {
+            bail!(
+                "OMNIFOB_KEYRING={NAME}{rest} needs a directory: {NAME}:<absolute dir> (for tests only; it stores secrets unencrypted)"
+            );
+        };
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            bail!(
+                "OMNIFOB_KEYRING={NAME}:{} needs an absolute directory",
+                dir.display()
+            );
+        }
+        Ok(dir)
+    }
+
+    /// A file name for `key`.
+    pub fn file_name(key: &str) -> String {
+        let mut name = String::new();
+        for b in key.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+                name.push(b as char);
+            } else {
+                name.push_str(&format!("%{b:02X}"));
+            }
+        }
+        name
+    }
+
+    #[derive(Debug)]
+    pub struct Store {
+        dir: PathBuf,
+    }
+
+    impl Store {
+        pub fn new(dir: &Path) -> anyhow::Result<Arc<Self>> {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            Ok(Arc::new(Self {
+                dir: dir.to_path_buf(),
+            }))
+        }
+    }
+
+    impl CredentialStoreApi for Store {
+        fn vendor(&self) -> String {
+            "omnifob test-plaintext-files".to_string()
+        }
+
+        fn id(&self) -> String {
+            self.dir.display().to_string()
+        }
+
+        fn build(
+            &self,
+            service: &str,
+            user: &str,
+            _modifiers: Option<&HashMap<&str, &str>>,
+        ) -> Result<Entry> {
+            Ok(Entry::new_with_credential(Arc::new(File {
+                service: service.to_string(),
+                user: user.to_string(),
+                path: self.dir.join(file_name(user)),
+            })))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct File {
+        service: String,
+        user: String,
+        path: PathBuf,
+    }
+
+    fn platform(e: std::io::Error) -> Error {
+        Error::PlatformFailure(Box::new(e))
+    }
+
+    impl CredentialApi for File {
+        /// Writes a temporary file and renames it over the old one, so a
+        /// command reading at the same time never sees half a secret.
+        fn set_secret(&self, secret: &[u8]) -> Result<()> {
+            let dir = self.path.parent().unwrap_or(Path::new("."));
+            // Unique within this process, and the process id across them.
+            static WRITES: AtomicU64 = AtomicU64::new(0);
+            let n = WRITES.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!(".{}-{n}.tmp", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let written = options.open(&tmp).and_then(|mut file| {
+                file.write_all(secret)?;
+                drop(file);
+                std::fs::rename(&tmp, &self.path)
+            });
+            if written.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            written.map_err(platform)
+        }
+
+        fn get_secret(&self) -> Result<Vec<u8>> {
+            match std::fs::read(&self.path) {
+                Ok(secret) => Ok(secret),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NoEntry),
+                Err(e) => Err(platform(e)),
+            }
+        }
+
+        fn delete_credential(&self) -> Result<()> {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NoEntry),
+                Err(e) => Err(platform(e)),
+            }
+        }
+
+        fn get_credential(&self) -> Result<Option<Arc<Credential>>> {
+            self.get_secret().map(|_| None)
+        }
+
+        fn get_specifiers(&self) -> Option<(String, String)> {
+            Some((self.service.clone(), self.user.clone()))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_directory_must_be_given_and_absolute() {
+            for rest in ["", ":", "x", ":relative/dir"] {
+                assert!(dir(rest).is_err(), "{rest:?}");
+            }
+            let absolute = std::env::temp_dir().join("omnifob-test-files");
+            let rest = format!(":{}", absolute.display());
+            assert_eq!(dir(&rest).unwrap(), absolute);
+        }
+
+        #[test]
+        fn secrets_are_kept_in_private_files() {
+            let root =
+                std::env::temp_dir().join(format!("omnifob-test-files-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let dir = root.join("keyring");
+            let store = Store::new(&dir).unwrap();
+            let entry = store.build("omnifob", "aws-sso/acme/token", None).unwrap();
+            assert!(matches!(entry.get_password(), Err(Error::NoEntry)));
+            entry.set_password("{\"a\":1}").unwrap();
+            entry.set_password("{\"a\":2}").unwrap();
+            assert_eq!(entry.get_password().unwrap(), "{\"a\":2}");
+            let path = dir.join("aws-sso%2Facme%2Ftoken");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
+            let names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["aws-sso%2Facme%2Ftoken"], "no temporary files");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode(&dir), 0o700);
+                assert_eq!(mode(&path), 0o600);
+            }
+            entry.delete_credential().unwrap();
+            assert!(matches!(entry.delete_credential(), Err(Error::NoEntry)));
+            assert!(!path.exists());
+            std::fs::remove_dir_all(&root).unwrap();
         }
     }
 }

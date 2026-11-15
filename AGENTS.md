@@ -21,7 +21,7 @@ Before pushing, run `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 
 ## Live tests
 
-Mocks cover the API calls (`wiremock` in `crates/omnifob-core/tests`); confirm provider behaviour live when it matters.
+Mocks cover the API calls (`wiremock` in `crates/omnifob-core/tests`), and `crates/omnifob/tests` runs the `fob` binary end to end against mocks and a plaintext test store; confirm provider behaviour live when it matters.
 
 - Point `OMNIFOB_CONFIG` and `XDG_STATE_HOME` at a scratch directory, so the maintainer's config and profiles stay untouched. The keychain is shared, so integration names must match the signed-in ones.
 - Use `fob exec --revoke` for Cloudflare tokens a test needs, so none outlive it.
