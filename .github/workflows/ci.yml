@@ -43,8 +43,6 @@ jobs:
         run: cargo clippy --locked --all-targets
       - name: Test
         run: cargo test --locked
-      - name: Build release binaries
-        run: cargo build --locked --release --bins
 
   msrv:
     name: MSRV (${{ matrix.os }})
@@ -69,6 +67,18 @@ jobs:
           rustup toolchain install "$msrv" --profile minimal && rustup default "$msrv"
       - name: Check
         run: cargo check --locked --all-targets
+
+  # Every release target, built and packaged as a tag would build it, so a
+  # new target or a release-profile change fails here rather than at release.
+  release-build:
+    name: Release build
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.stack == null ||
+      github.event.pull_request.stack.position == github.event.pull_request.stack.size
+    uses: ./.github/workflows/build.yml
+    with:
+      version: dev
 
   deny:
     name: cargo deny

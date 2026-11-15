@@ -1,67 +1,27 @@
 name: Release
 
-# Pushing a tag like v0.1.0 builds fob and omnifob for each platform and
-# publishes them as a GitHub release with checksums and build provenance.
-# Asset names carry the Rust target triple, which mise's github: backend
-# understands: `mise use github:garysassano/omnifob`.
+# Pushing a tag like v0.1.0 builds fob and omnifob for each platform (see
+# build.yml) and publishes them as a GitHub release with checksums and build
+# provenance: `mise use github:garysassano/omnifob`. Running it by hand
+# (workflow_dispatch) builds every target without publishing anything.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   build:
-    name: ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
-      - name: Build
-        run: cargo build --locked --release --bins --target ${{ matrix.target }}
-      - name: Package
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          name="omnifob-${TAG}-${TARGET}"
-          mkdir -p "dist/$name"
-          ext=""
-          [[ "$TARGET" == *windows* ]] && ext=".exe"
-          cp "target/$TARGET/release/fob$ext" "target/$TARGET/release/omnifob$ext" README.md LICENSE "dist/$name/"
-          cd dist
-          if [[ "$TARGET" == *windows* ]]; then
-            7z a -bd "$name.zip" "$name" >/dev/null
-          else
-            tar -czf "$name.tar.gz" "$name"
-          fi
-          rm -r "$name"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: error
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
 
   release:
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write

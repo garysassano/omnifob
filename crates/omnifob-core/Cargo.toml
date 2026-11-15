@@ -2,7 +2,12 @@
 name = "omnifob-core"
 version.workspace = true
 edition.workspace = true
+description = "Providers, configuration and keychain storage behind the omnifob command line"
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["authentication"]
 rust-version.workspace = true
 
 [dependencies]

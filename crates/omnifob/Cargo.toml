@@ -2,7 +2,12 @@
 name = "omnifob"
 version.workspace = true
 edition.workspace = true
+description.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "authentication"]
 rust-version.workspace = true
 
 [dependencies]
@@ -28,3 +33,15 @@ path = "src/bin/omnifob.rs"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.191"
+
+# cargo binstall: the archives the release workflow publishes.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/omnifob-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "omnifob-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
