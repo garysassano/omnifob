@@ -61,13 +61,6 @@ fn authority(tenant: &str) -> String {
     format!("{}/{tenant}/oauth2/v2.0", login_host())
 }
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(concat!("omnifob/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("HTTP client")
-}
-
 fn token_key(integration: &str) -> String {
     format!("azure/{integration}/oauth")
 }
@@ -124,7 +117,7 @@ enum Exchange {
 }
 
 async fn exchange(tenant: &str, form: &[(&str, &str)]) -> anyhow::Result<Exchange> {
-    let response = http()
+    let response = crate::http::client()
         .post(format!("{}/token", authority(tenant)))
         .form(form)
         .send()
@@ -262,7 +255,7 @@ async fn device_sign_in(
         #[serde(default)]
         interval: Option<u64>,
     }
-    let response = http()
+    let response = crate::http::client()
         .post(format!("{}/devicecode", authority(tenant)))
         .form(&[("client_id", CLIENT_ID), ("scope", SCOPE)])
         .send()
@@ -395,7 +388,11 @@ async fn arm_list<T: serde::de::DeserializeOwned>(
         arm_host()
     ));
     while let Some(url) = next {
-        let response = http().get(&url).bearer_auth(token).send().await?;
+        let response = crate::http::client()
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await?;
         let status = response.status();
         if !status.is_success() {
             bail!(
@@ -515,7 +512,7 @@ pub async fn check_subscription(creds: &Credentials) -> Result<String> {
         .env
         .get("AZURE_SUBSCRIPTION_ID")
         .context("no subscription in the credentials")?;
-    let response = http()
+    let response = crate::http::client()
         .get(format!(
             "{}/subscriptions/{id}?api-version={ARM_API_VERSION}",
             arm_host()
