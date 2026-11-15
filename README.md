@@ -54,7 +54,8 @@ type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
 region = "eu-central-1"          # where IAM Identity Center runs
 default_region = "eu-central-1"  # exported as AWS_REGION (optional)
-console_duration = "4h"          # optional: `fob console` session length, 15m to 12h
+# console_duration = "4h"        # optional: `fob console` session length, 15m to 12h; must fit the
+                                 # permission set's session duration, 1h unless an administrator raised it
 
 # Roles assumed from an Identity Center role (role_arn + source_profile in ~/.aws/config).
 # Profile id: acme/prod-deploy/Deploy. AWS limits these sessions to one hour.
