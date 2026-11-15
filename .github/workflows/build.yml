@@ -5,8 +5,8 @@ name: Build
 # it so every target is built before a tag is pushed.
 #
 # Asset names carry the Rust target triple, which mise's github: backend
-# matches on. Linux has a glibc and a static musl build for each architecture;
-# mise picks the one matching the host's C library. The musl builds use
+# matches on. Linux gets only static musl builds, which start on any
+# distribution; a glibc build would need the runner's glibc. They use
 # cargo-zigbuild, because aws-lc-sys compiles C and Zig ships the musl and
 # Linux kernel headers it needs (Ubuntu's musl-gcc lacks the kernel headers).
 
@@ -31,10 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pinned, so the glibc floor (2.39) cannot rise with ubuntu-latest.
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest, target: aarch64-apple-darwin }
           # Cross-compiled on Apple Silicon, so it is not run here.

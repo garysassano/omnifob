@@ -26,7 +26,7 @@ From source:
 cargo install --locked --git https://github.com/garysassano/omnifob omnifob
 ```
 
-Every [release](https://github.com/garysassano/omnifob/releases) has prebuilt binaries, with checksums and build provenance, for Linux (x86_64 and ARM64, each built against glibc and as a static musl binary), macOS (Apple Silicon and Intel) and Windows (x86_64 and ARM64). The musl, Intel macOS and Windows ARM64 builds start with the first release after 0.6.1. With mise:
+Every [release](https://github.com/garysassano/omnifob/releases) has prebuilt binaries, with checksums and build provenance, for Linux (x86_64 and ARM64, static musl binaries that run on any distribution), macOS (Apple Silicon and Intel) and Windows (x86_64 and ARM64). Up to 0.6.1 the Linux builds were linked against glibc, and there were no Intel macOS or Windows ARM64 builds. With mise:
 
 ```sh
 mise use -g github:garysassano/omnifob
@@ -37,8 +37,6 @@ Or with [cargo binstall](https://github.com/cargo-bins/cargo-binstall), which do
 ```sh
 cargo binstall --git https://github.com/garysassano/omnifob omnifob
 ```
-
-On Linux, mise picks the build that matches the system's C library: glibc on most distributions, musl on Alpine. The glibc build needs at least the glibc of the Ubuntu LTS it is built on; the static musl build runs on any Linux, and `MISE_LIBC=musl` makes mise pick it on glibc systems too.
 
 This installs two names for the same binary: `fob` for daily use and `omnifob` for scripts.
 
