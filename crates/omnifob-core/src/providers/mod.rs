@@ -170,10 +170,10 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
 /// Returns credentials for a profile, reusing cached ones while they are fresh.
 ///
 /// `ttl` asks for a lifetime other than the configured one: minted
-/// Cloudflare tokens, AWS sessions omnifob starts itself (chained roles,
-/// IAM users and their roles) and Google service account tokens honour it,
-/// and always get new credentials. These are not cached, so the next call
-/// without `ttl` gets the configured lifetime again.
+/// Cloudflare tokens, AWS sessions omnifob starts itself (chained and
+/// cross-partition roles, IAM users and their roles) and Google service
+/// account tokens honour it, and always get new credentials. These are not
+/// cached, so the next call without `ttl` gets the configured lifetime again.
 ///
 /// AWS credentials carry `AWS_ACCOUNT_ID`, which the SDKs use for
 /// account-based endpoints.
@@ -315,8 +315,8 @@ async fn fetch(
         (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
             aws_sso::chained_credentials(&profile.integration, c, label, &profile.id, ttl).await?
         }
-        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => {
-            return Err(cross_partition_not_implemented(profile).into());
+        (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
+            aws_sso::cross_partition_credentials(&profile.integration, c, label, ttl).await?
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
             aws_iam::session_credentials(&profile.integration, c, &profile.id, ttl).await?
@@ -368,16 +368,6 @@ async fn fetch(
         }
     };
     Ok(fresh)
-}
-
-// TODO(layer 11): replace with the GetWebIdentityToken and
-// AssumeRoleWithWebIdentity flow in `fetch`, `console_url` and
-// `check_profile`.
-fn cross_partition_not_implemented(profile: &Profile) -> anyhow::Error {
-    anyhow::anyhow!(
-        "{} is a cross-partition profile, and cross-partition profiles are not implemented yet",
-        profile.id
-    )
 }
 
 /// Mints credentials for one command and does not cache them, so they can be
@@ -494,15 +484,19 @@ fn console_session_duration(
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => options
             .duration
             .or(c.roles.get(label).and_then(|role| role.console_duration)),
-        // AssumeRoleWithWebIdentity credentials take SessionDuration like
-        // other AssumeRole* ones, unless STS counts the exchange as role
-        // chaining because the token was requested with role credentials.
-        // The integration's `console_duration` is for its Identity Center
-        // roles, so only the flag applies.
-        // TODO(layer 11): confirm whether the federation endpoint accepts
-        // SessionDuration for these credentials; if it does not, refuse it
-        // here as for chained roles.
-        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => options.duration,
+        // The federation endpoint takes SessionDuration for AssumeRole*
+        // credentials unless they come from role chaining. Whether it counts
+        // AssumeRoleWithWebIdentity with a token that role credentials
+        // requested as chaining is not documented and not tried, so the
+        // length is refused until it is; `duration` (up to 12 hours) sets
+        // the console session's length instead. The integration's
+        // `console_duration` is for its Identity Center roles.
+        (_, Target::AwsCrossPartition { .. }) if options.duration.is_some() => anyhow::bail!(
+            "a cross-partition role's console session cannot be given a length yet: whether the \
+             AWS federation endpoint accepts SessionDuration for credentials from a web identity \
+             token that a role requested has not been confirmed, so it lasts as long as the \
+             role's credentials (its `duration`, up to 12 hours)"
+        ),
         // `console_duration` on an aws-sso integration is for its Identity
         // Center roles only.
         (_, Target::AwsChained { .. }) if options.duration.is_some() => anyhow::bail!(
@@ -579,8 +573,18 @@ pub async fn console_url(
             };
             aws_sso::console_url(creds, &request).await?
         }
-        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => {
-            return Err(cross_partition_not_implemented(profile).into());
+        (Integration::AwsSso(c), target @ Target::AwsCrossPartition { label, .. }) => {
+            let request = cross_partition_console_request(
+                &profile.integration,
+                integration,
+                c,
+                label,
+                target,
+                creds,
+                options,
+                session_duration,
+            )?;
+            aws_sso::console_url(creds, &request).await?
         }
         (Integration::AwsIam(c), target @ Target::AwsIamSession { .. }) => {
             let partition = aws_console_partition(&profile.integration, integration, target)?;
@@ -631,6 +635,37 @@ pub async fn console_url(
     })
 }
 
+/// The console sign-in for a cross-partition role: the destination
+/// partition's federation endpoint, with the console in `--region` or else
+/// the exported destination Region, so the sign-in host is the destination
+/// partition's too.
+#[allow(clippy::too_many_arguments)]
+fn cross_partition_console_request<'a>(
+    name: &str,
+    integration: &Integration,
+    config: &'a crate::config::AwsSsoConfig,
+    label: &str,
+    target: &Target,
+    creds: &'a Credentials,
+    options: &'a ConsoleOptions,
+    session_duration: Option<jiff::SignedDuration>,
+) -> anyhow::Result<aws_sso::ConsoleRequest<'a>> {
+    let role = config.cross_partition.get(label).with_context(|| {
+        format!("no cross-partition role '{label}' in integration '{name}'; run `fob sync`")
+    })?;
+    Ok(aws_sso::ConsoleRequest {
+        partition: aws_console_partition(name, integration, target)?,
+        home_region: Some(&role.region),
+        region: options
+            .region
+            .as_deref()
+            .or(creds.env.get("AWS_REGION").map(String::as_str))
+            .or(Some(&role.region)),
+        service: options.service.as_deref(),
+        session_duration,
+    })
+}
+
 /// Checks that an integration's stored sign-in works, without signing in.
 pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<String> {
     match integration {
@@ -659,8 +694,19 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 aws_sso::caller_identity(&creds, &region).await?.arn
             ))
         }
-        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => {
-            Err(cross_partition_not_implemented(profile).into())
+        (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
+            // The destination partition's STS: the credentials work nowhere
+            // else.
+            let role = c.cross_partition.get(label).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no cross-partition role '{label}' in integration '{}'; run `fob sync`",
+                    profile.integration
+                )
+            })?;
+            Ok(format!(
+                "acts as {}",
+                aws_sso::caller_identity(&creds, &role.region).await?.arn
+            ))
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. } | Target::AwsIamRole { .. }) => {
             let region = creds
@@ -970,9 +1016,12 @@ mod tests {
             console_session_duration(portal, &profile, &ConsoleOptions::default()).unwrap(),
             None
         );
-        assert_eq!(
-            console_session_duration(portal, &profile, &hours(2)).unwrap(),
-            Some(jiff::SignedDuration::from_hours(2))
+        // Whether the federation endpoint takes SessionDuration for these
+        // credentials is unconfirmed, so a length is refused.
+        let error = check_console_options(&config, &profile, &hours(2)).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot be given a length yet"),
+            "{error}"
         );
         // A console Region must be in the destination partition.
         let region = |r: &str| ConsoleOptions {
@@ -981,10 +1030,107 @@ mod tests {
         };
         assert!(check_console_options(&config, &profile, &region("us-gov-east-1")).is_ok());
         assert!(check_console_options(&config, &profile, &region("us-east-1")).is_err());
+    }
 
-        // Until the STS flow lands, getting credentials says so.
-        let error = fetch(&config, &profile, None).await.unwrap_err();
-        assert!(error.to_string().contains("not implemented yet"), "{error}");
+    /// The sign-in host and console for a commercial portal's role in each
+    /// other partition: the destination partition's, in the destination
+    /// Region unless `--region` names another one there.
+    #[test]
+    fn cross_partition_consoles_open_in_the_destination_partition() {
+        let config = Config::parse(
+            r#"
+            [integrations.portal]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "us-east-1"
+            [integrations.portal.cross_partition.gov]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+            audience = "omnifob"
+            region = "us-gov-east-1"
+            [integrations.portal.cross_partition.cn]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws-cn:iam::333333333333:role/Audit"
+            audience = "omnifob"
+            region = "cn-northwest-1"
+            [integrations.portal.cross_partition.eusc]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws-eusc:iam::444444444444:role/Audit"
+            audience = "omnifob"
+            region = "eusc-de-east-1"
+            "#,
+        )
+        .unwrap();
+        let integration = config.integration("portal").unwrap();
+        let Integration::AwsSso(c) = integration else {
+            unreachable!()
+        };
+        let endpoints = |label: &str, options: &ConsoleOptions, exported: bool| {
+            let target = Target::AwsCrossPartition {
+                label: label.into(),
+                account_id: c.cross_partition[label].account_id().into(),
+            };
+            let mut creds = Credentials::default();
+            if exported {
+                creds
+                    .env
+                    .insert("AWS_REGION".into(), c.cross_partition[label].region.clone());
+            }
+            let request = cross_partition_console_request(
+                "portal",
+                integration,
+                c,
+                label,
+                &target,
+                &creds,
+                options,
+                None,
+            )
+            .unwrap();
+            aws_sso::console_endpoints(&request).unwrap()
+        };
+        let none = ConsoleOptions::default();
+        for exported in [true, false] {
+            assert_eq!(
+                endpoints("gov", &none, exported),
+                (
+                    "https://us-gov-east-1.signin.amazonaws-us-gov.com/federation".to_string(),
+                    "https://us-gov-east-1.console.amazonaws-us-gov.com/console/home?region=us-gov-east-1"
+                        .to_string()
+                ),
+            );
+            assert_eq!(
+                endpoints("cn", &none, exported),
+                (
+                    "https://cn-northwest-1.signin.amazonaws.cn/federation".to_string(),
+                    "https://cn-northwest-1.console.amazonaws.cn/console/home?region=cn-northwest-1"
+                        .to_string()
+                ),
+            );
+            assert_eq!(
+                endpoints("eusc", &none, exported),
+                (
+                    "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation".to_string(),
+                    "https://eusc-de-east-1.console.amazonaws-eusc.eu/console/home?region=eusc-de-east-1"
+                        .to_string()
+                ),
+            );
+        }
+        // --region picks another Region of the destination partition.
+        let west = ConsoleOptions {
+            region: Some("us-gov-west-1".into()),
+            service: Some("s3".into()),
+            ..Default::default()
+        };
+        let (signin, destination) = endpoints("gov", &west, true);
+        assert_eq!(signin, "https://signin.amazonaws-us-gov.com/federation");
+        assert_eq!(
+            destination,
+            "https://console.amazonaws-us-gov.com/s3/home?region=us-gov-west-1"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 ## Guides
 
 - [Cloudflare](guides/cloudflare.md): the bootstrap token, account-owned or user-owned, and the built-in templates.
+- [AWS roles in another partition](guides/aws-cross-partition.md): reaching a GovCloud, China or European Sovereign Cloud role from an IAM Identity Center role, and the setup in both accounts.
 
 ## Design
 

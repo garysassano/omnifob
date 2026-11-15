@@ -266,6 +266,12 @@ pub fn main() -> ExitCode {
     // Answers the shell's completion requests (COMPLETE=<shell>) and exits.
     clap_complete::CompleteEnv::with_factory(command).complete();
 
+    // The AWS SDK logs whole HTTP requests and responses at trace level,
+    // bodies included: role credentials, Identity Center tokens and web
+    // identity tokens. Those events are dropped whatever OMNIFOB_LOG asks
+    // for, so no secret reaches the log.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -273,6 +279,10 @@ pub fn main() -> ExitCode {
                 .unwrap_or_else(|_| "warn".into()),
         )
         .without_time()
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(|meta| {
+            !logs_http_bodies(meta)
+        }))
         .init();
 
     let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
@@ -1932,11 +1942,38 @@ fn exec(profile: &Profile, creds: &Credentials, command: &[String]) -> anyhow::R
     }
 }
 
+/// Whether a log event may hold whole HTTP requests or responses: the AWS
+/// SDK's orchestrator logs them, bodies and headers included, at trace
+/// level.
+fn logs_http_bodies(meta: &tracing::Metadata<'_>) -> bool {
+    sdk_logs_http_bodies(meta.target(), *meta.level())
+}
+
+fn sdk_logs_http_bodies(target: &str, level: tracing::Level) -> bool {
+    level == tracing::Level::TRACE && target.starts_with("aws_smithy_runtime::client::orchestrator")
+}
+
 #[cfg(test)]
 mod tests {
     use omnifob_core::Target;
 
     use super::*;
+
+    #[test]
+    fn the_sdks_request_and_response_dumps_are_never_logged() {
+        use tracing::Level;
+        for target in [
+            "aws_smithy_runtime::client::orchestrator",
+            "aws_smithy_runtime::client::orchestrator::http",
+        ] {
+            assert!(sdk_logs_http_bodies(target, Level::TRACE), "{target}");
+            assert!(!sdk_logs_http_bodies(target, Level::DEBUG), "{target}");
+        }
+        assert!(!sdk_logs_http_bodies(
+            "omnifob_core::providers::aws_sso",
+            Level::TRACE
+        ));
+    }
 
     fn aws_creds(account: Option<&str>) -> Credentials {
         let mut creds = Credentials {

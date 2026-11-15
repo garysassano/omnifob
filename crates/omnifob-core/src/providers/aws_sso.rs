@@ -26,7 +26,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use super::aws_partition::Partition;
-use crate::config::AwsSsoConfig;
+use crate::config::{AwsSsoConfig, CrossPartitionRole};
 use crate::{Credentials, Error, Profile, Result, Target, oauth, store};
 
 /// A token expiring within this window is refreshed before use. Matches the
@@ -1049,6 +1049,268 @@ pub async fn chained_credentials(
     Ok(assume_role(&source, &request, region.unwrap_or(&config.region), region).await?)
 }
 
+/// How long a web identity token lives, in seconds: the least STS allows.
+/// It is exchanged at once, so a minute is plenty; it stays within any
+/// `sts:DurationSeconds` limit an administrator sets, and it never outlives
+/// the Identity Center role's credentials, which are new for each request.
+pub const WEB_IDENTITY_TOKEN_SECONDS: i32 = 60;
+
+/// A JWT from `GetWebIdentityToken`. It is a bearer credential for its
+/// lifetime, so it is never logged, cached or written anywhere, and `Debug`
+/// does not show it.
+struct WebIdentityToken(String);
+
+impl std::fmt::Debug for WebIdentityToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WebIdentityToken(<redacted>)")
+    }
+}
+
+/// The claims of a web identity token that an administrator needs for the
+/// destination's OIDC provider and trust policy. Nothing else is read from
+/// the token, and these are only ever displayed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct TokenClaims {
+    /// The source account's issuer URL.
+    #[serde(default)]
+    pub iss: Option<String>,
+    /// The principal that requested the token; for an Identity Center role,
+    /// the reserved role's ARN.
+    #[serde(default)]
+    pub sub: Option<String>,
+    /// The audience, a string or a list.
+    #[serde(default)]
+    pub aud: Option<serde_json::Value>,
+}
+
+impl TokenClaims {
+    /// Reads `iss`, `sub` and `aud` from a JWT's payload. The signature is
+    /// not checked: the claims are for display only.
+    pub fn of(token: &str) -> Option<Self> {
+        use base64::Engine;
+        let payload = token.split('.').nth(1)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload.trim_end_matches('='))
+            .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+impl std::fmt::Display for TokenClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let aud = match &self.aud {
+            None => "(none)".to_string(),
+            Some(serde_json::Value::String(aud)) => aud.clone(),
+            Some(serde_json::Value::Array(auds)) => auds
+                .iter()
+                .map(|a| a.as_str().map_or_else(|| a.to_string(), str::to_string))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(other) => other.to_string(),
+        };
+        write!(
+            f,
+            "iss {}, sub {}, aud {aud}",
+            self.iss.as_deref().unwrap_or("(none)"),
+            self.sub.as_deref().unwrap_or("(none)")
+        )
+    }
+}
+
+/// An STS error code without the `Exception` suffix that some codes carry
+/// on the wire and in the SDK model and others do not.
+fn sts_code(code: Option<&str>) -> Option<&str> {
+    code.map(|c| c.strip_suffix("Exception").unwrap_or(c))
+}
+
+/// Credentials for a role in another partition: the Identity Center role's
+/// credentials, then STS `GetWebIdentityToken` with them in the source
+/// Region for a token with one audience that lasts a minute, then STS
+/// `AssumeRoleWithWebIdentity` in the destination Region, unsigned, with
+/// that token. The destination Region is exported.
+///
+/// `ttl` overrides the role's `duration`. A `SessionDurationEscalation`
+/// from the token request is retried once with new source credentials, and
+/// an `ExpiredToken` from the exchange once with a new token. The SDK
+/// itself retries an `IDPCommunicationError`, which it models as a server
+/// error, with the same token. Errors name who has to act; those from the exchange show the
+/// token's `iss`, `sub` and `aud`.
+pub async fn cross_partition_credentials(
+    integration: &str,
+    config: &AwsSsoConfig,
+    label: &str,
+    ttl: Option<SignedDuration>,
+) -> Result<Credentials> {
+    let role = config.cross_partition.get(label).with_context(|| {
+        format!("no cross-partition role '{label}' in integration '{integration}'; run `fob sync`")
+    })?;
+    let duration = ttl.unwrap_or_else(|| role.duration_or_default());
+    if !CrossPartitionRole::DURATION.contains(&duration) {
+        return Err(anyhow!(
+            "a cross-partition role's session lasts 15 minutes to 12 hours, and at most the \
+             role's maximum session duration"
+        )
+        .into());
+    }
+    let duration_seconds = whole_seconds(duration)?;
+    let source_region = role.source_region(config);
+    let destination = unsigned_sts_client(&role.region);
+
+    let source = credentials(integration, config, &role.via_account_id, &role.via_role).await?;
+    let mut sts = sts_client(&source, source_region)?;
+    let mut renewed_source = false;
+    let mut retried_exchange = false;
+    loop {
+        // Signed with the Identity Center role's credentials. The SDK
+        // resolves the Regional endpoint (`sts.<region>.<domain>`), which
+        // the call needs: the global endpoint does not serve it.
+        let requested = sts
+            .get_web_identity_token()
+            .audience(&role.audience)
+            .signing_algorithm(role.signing_algorithm.as_str())
+            .duration_seconds(WEB_IDENTITY_TOKEN_SECONDS)
+            .send()
+            .await;
+        let token = match requested {
+            Ok(response) => WebIdentityToken(
+                response
+                    .web_identity_token()
+                    .context("no web identity token returned")?
+                    .to_string(),
+            ),
+            Err(e)
+                if !renewed_source && sts_code(e.code()) == Some("SessionDurationEscalation") =>
+            {
+                renewed_source = true;
+                let source =
+                    credentials(integration, config, &role.via_account_id, &role.via_role).await?;
+                sts = sts_client(&source, source_region)?;
+                continue;
+            }
+            Err(e) => return Err(token_error(&e, role, source_region).into()),
+        };
+        let claims = TokenClaims::of(&token.0);
+        if let Some(claims) = &claims {
+            tracing::debug!("web identity token for {}: {claims}", role.role_arn);
+        }
+        let exchanged = destination
+            .assume_role_with_web_identity()
+            .role_arn(&role.role_arn)
+            .role_session_name(role.session_name())
+            .web_identity_token(&token.0)
+            .duration_seconds(duration_seconds)
+            .send()
+            .await;
+        drop(token);
+        match exchanged {
+            Ok(assumed) => {
+                return Ok(from_sts(
+                    assumed.credentials().context("no credentials returned")?,
+                    Some(&role.region),
+                )?);
+            }
+            Err(e) if !retried_exchange && sts_code(e.code()) == Some("ExpiredToken") => {
+                retried_exchange = true;
+            }
+            Err(e) => {
+                return Err(exchange_error(&e, role, duration_seconds, claims.as_ref()).into());
+            }
+        }
+    }
+}
+
+/// What a refused token request means, and who has to act.
+fn token_error(
+    e: &aws_sdk_sts::error::SdkError<
+        aws_sdk_sts::operation::get_web_identity_token::GetWebIdentityTokenError,
+    >,
+    role: &CrossPartitionRole,
+    region: &str,
+) -> anyhow::Error {
+    let (account, via_role) = (&role.via_account_id, &role.via_role);
+    let detail = aws_sdk_sts::error::DisplayErrorContext(e);
+    match sts_code(e.code()) {
+        Some("OutboundWebIdentityFederationDisabled") => anyhow!(
+            "outbound identity federation is not enabled in the source account {account}: an \
+             administrator of that account must enable it (IAM account settings, or `aws iam \
+             enable-outbound-web-identity-federation`) before {via_role} can request a web \
+             identity token"
+        ),
+        Some("AccessDenied") => anyhow!(
+            "{via_role} in {account} may not request a web identity token for the audience \
+             '{}', signed with {}, lasting {WEB_IDENTITY_TOKEN_SECONDS} seconds: an \
+             administrator of the source account must allow sts:GetWebIdentityToken in the \
+             permission set {via_role}, with conditions that admit these values \
+             (sts:IdentityTokenAudience, sts:SigningAlgorithm, sts:DurationSeconds) ({detail})",
+            role.audience,
+            role.signing_algorithm.as_str()
+        ),
+        Some("SessionDurationEscalation") => anyhow!(
+            "STS refused a {WEB_IDENTITY_TOKEN_SECONDS}-second web identity token because the \
+             credentials of {via_role} in {account} expire sooner, even new ones; an \
+             administrator of the source account should check the permission set's session \
+             duration ({detail})"
+        ),
+        _ => anyhow!(
+            "requesting a web identity token in {region} as {via_role} in {account}: {detail}"
+        ),
+    }
+}
+
+/// What a refused exchange means, and who has to act. A refused token is
+/// described by its `iss`, `sub` and `aud`, the values the destination's
+/// OIDC provider and trust policy must match.
+fn exchange_error(
+    e: &aws_sdk_sts::error::SdkError<
+        aws_sdk_sts::operation::assume_role_with_web_identity::AssumeRoleWithWebIdentityError,
+    >,
+    role: &CrossPartitionRole,
+    duration_seconds: i32,
+    claims: Option<&TokenClaims>,
+) -> anyhow::Error {
+    let (arn, region) = (&role.role_arn, &role.region);
+    let detail = aws_sdk_sts::error::DisplayErrorContext(e);
+    let token = match claims {
+        Some(claims) => format!("the token has {claims}"),
+        None => "the token's claims could not be read".to_string(),
+    };
+    match sts_code(e.code()) {
+        Some("AccessDenied" | "InvalidIdentityToken" | "IDPRejectedClaim") => anyhow!(
+            "{arn} does not accept the web identity token from {} in {}: an administrator of \
+             the destination account must check that its IAM OIDC provider has the source \
+             account's issuer URL and '{}' as a client ID, and that the role's trust policy \
+             allows sts:AssumeRoleWithWebIdentity for this token; {token} ({detail})",
+            role.via_role,
+            role.via_account_id,
+            role.audience
+        ),
+        Some("IDPCommunicationError") => anyhow!(
+            "STS in {region} could not reach the source account's issuer to check the web \
+             identity token, even after retrying; try again later ({detail})"
+        ),
+        Some("ExpiredToken") => anyhow!(
+            "the web identity token had expired when STS in {region} checked it, twice; check \
+             that this computer's clock is right ({detail})"
+        ),
+        Some("ValidationError") if e.message().is_some_and(|m| m.contains("DurationSeconds")) => {
+            anyhow!(
+                "{arn} does not allow sessions of {duration_seconds} seconds: lower its \
+                 `duration` (or --ttl), or ask an administrator of the destination account to \
+                 raise the role's maximum session duration ({detail})"
+            )
+        }
+        _ => anyhow!("assuming {arn} with a web identity token in {region}: {detail}"),
+    }
+}
+
+/// `duration` in whole seconds, as STS takes `DurationSeconds`. A fraction
+/// of a second rounds up, so a length checked against a minimum never falls
+/// below it.
+pub(crate) fn whole_seconds(duration: SignedDuration) -> anyhow::Result<i32> {
+    let secs = duration.as_secs() + i64::from(duration.subsec_nanos() > 0);
+    Ok(secs.try_into()?)
+}
+
 /// The shortest session STS hands out.
 pub(crate) const SESSION_MIN: SignedDuration = SignedDuration::from_mins(15);
 
@@ -1092,6 +1354,19 @@ pub(crate) fn sts_client(creds: &Credentials, region: &str) -> anyhow::Result<aw
         config = config.endpoint_url(url);
     }
     Ok(aws_sdk_sts::Client::from_conf(config.build()))
+}
+
+/// An STS client with no credentials provider, for calls that carry their
+/// own proof of identity (`AssumeRoleWithWebIdentity`), so the request is
+/// not signed and no AWS credentials leave this machine with it.
+fn unsigned_sts_client(region: &str) -> aws_sdk_sts::Client {
+    let mut config = aws_sdk_sts::Config::builder()
+        .region(aws_sdk_sts::config::Region::new(region.to_string()))
+        .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest());
+    if let Some(url) = endpoint_override() {
+        config = config.endpoint_url(url);
+    }
+    aws_sdk_sts::Client::from_conf(config.build())
 }
 
 /// Whom credentials act as, from STS `GetCallerIdentity`.
@@ -1151,7 +1426,7 @@ pub(crate) async fn assume_role(
         .role_arn(request.role_arn)
         .role_session_name(request.session_name.unwrap_or("omnifob"))
         .set_external_id(request.external_id.map(str::to_string))
-        .duration_seconds(request.duration.as_secs().try_into()?);
+        .duration_seconds(whole_seconds(request.duration)?);
     if let Some(serial) = request.mfa_serial {
         call = call
             .serial_number(serial)
@@ -1262,7 +1537,7 @@ pub struct ConsoleRequest<'a> {
 /// The destination is `https://<console host>/<service>/home?region=<region>`,
 /// as granted builds it, with `console` as the service when only a Region is
 /// given and the bare console host when neither is.
-fn console_endpoints(request: &ConsoleRequest) -> anyhow::Result<(String, String)> {
+pub(crate) fn console_endpoints(request: &ConsoleRequest) -> anyhow::Result<(String, String)> {
     let ConsoleRequest {
         partition,
         home_region,
@@ -1342,7 +1617,7 @@ pub async fn console_url(
 
     let mut form = vec![("Action", "getSigninToken".to_string())];
     if let Some(duration) = request.session_duration {
-        form.push(("SessionDuration", duration.as_secs().to_string()));
+        form.push(("SessionDuration", whole_seconds(duration)?.to_string()));
     }
     form.push(("Session", session));
 
@@ -1389,6 +1664,125 @@ pub async fn console_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records the URL a request would go to, and stops it there.
+    #[derive(Debug, Default, Clone)]
+    struct StopBeforeSending(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+    impl aws_sdk_sts::config::Intercept for StopBeforeSending {
+        fn name(&self) -> &'static str {
+            "StopBeforeSending"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &aws_sdk_sts::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+            _: &aws_sdk_sts::config::RuntimeComponents,
+            _: &mut aws_sdk_sts::config::ConfigBag,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            *self.0.lock().unwrap() = Some(context.request().uri().to_string());
+            Err("stopped before sending".into())
+        }
+    }
+
+    /// `GetWebIdentityToken` is not served by the global STS endpoint, so
+    /// the client must resolve the Regional one, in us-east-1 too.
+    #[tokio::test]
+    async fn web_identity_tokens_are_requested_from_the_regional_endpoint() {
+        assert!(
+            endpoint_override().is_none(),
+            "OMNIFOB_AWS_ENDPOINT must be unset for this test"
+        );
+        let mut creds = Credentials::default();
+        for (k, v) in [
+            ("AWS_ACCESS_KEY_ID", "ASIAEXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "token"),
+        ] {
+            creds.env.insert(k.into(), v.into());
+        }
+        for (region, host) in [
+            ("us-east-1", "https://sts.us-east-1.amazonaws.com"),
+            ("eu-west-1", "https://sts.eu-west-1.amazonaws.com"),
+            ("us-gov-west-1", "https://sts.us-gov-west-1.amazonaws.com"),
+            ("cn-north-1", "https://sts.cn-north-1.amazonaws.com.cn"),
+        ] {
+            let stop = StopBeforeSending::default();
+            let result = sts_client(&creds, region)
+                .unwrap()
+                .get_web_identity_token()
+                .audience("omnifob")
+                .signing_algorithm("ES384")
+                .duration_seconds(WEB_IDENTITY_TOKEN_SECONDS)
+                .customize()
+                .interceptor(stop.clone())
+                .send()
+                .await;
+            assert!(result.is_err());
+            let url = stop.0.lock().unwrap().clone().unwrap();
+            assert_eq!(url.trim_end_matches('/'), host, "{region}");
+        }
+        // The exchange's client resolves the destination's Regional endpoint.
+        let stop = StopBeforeSending::default();
+        let _ = unsigned_sts_client("us-gov-east-1")
+            .assume_role_with_web_identity()
+            .role_arn("arn:aws-us-gov:iam::222222222222:role/Audit")
+            .role_session_name("omnifob")
+            .web_identity_token("a.b.c")
+            .customize()
+            .interceptor(stop.clone())
+            .send()
+            .await;
+        let url = stop.0.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            url.trim_end_matches('/'),
+            "https://sts.us-gov-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn token_claims_are_read_for_display() {
+        use base64::Engine;
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let token = format!(
+            "{}.{}.signature",
+            encode(r#"{"alg":"ES384"}"#),
+            encode(
+                r#"{"iss":"https://abc.tokens.sts.global.api.aws","sub":"arn:aws:iam::111111111111:role/Admin","aud":"omnifob","https://sts.amazonaws.com/":{"identity_store_user_id":"u"}}"#
+            )
+        );
+        let claims = TokenClaims::of(&token).unwrap();
+        assert_eq!(
+            claims.to_string(),
+            "iss https://abc.tokens.sts.global.api.aws, sub arn:aws:iam::111111111111:role/Admin, aud omnifob"
+        );
+        // A list of audiences, and padding some encoders add.
+        let token = format!("h.{}==.s", encode(r#"{"aud":["a","b"]}"#));
+        assert_eq!(
+            TokenClaims::of(&token).unwrap().to_string(),
+            "iss (none), sub (none), aud a, b"
+        );
+        for broken in [
+            "",
+            "only-one-part",
+            "h.!!!.s",
+            &format!("h.{}.s", encode("[1]")),
+        ] {
+            assert_eq!(TokenClaims::of(broken), None, "{broken}");
+        }
+        // The token itself never shows in Debug output.
+        let secret = WebIdentityToken(token.clone());
+        assert!(!format!("{secret:?}").contains(&token));
+    }
+
+    #[test]
+    fn session_lengths_round_up_to_whole_seconds() {
+        let d = |s: i64, n: i32| SignedDuration::new(s, n);
+        assert_eq!(whole_seconds(d(900, 0)).unwrap(), 900);
+        assert_eq!(whole_seconds(d(900, 1)).unwrap(), 901);
+        assert_eq!(whole_seconds(d(43_199, 500_000_000)).unwrap(), 43_200);
+        assert!(whole_seconds(SignedDuration::from_secs(i64::from(i32::MAX) + 1)).is_err());
+    }
 
     fn role(account_name: &str, account_id: &str) -> Profile {
         Profile::new(
