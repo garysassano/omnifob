@@ -247,13 +247,18 @@ async fn user_token_is_scoped_named_and_old_tokens_are_pruned() {
 async fn account_tokens_use_account_endpoints() {
     let server = MockServer::start().await;
     let base = format!("/accounts/{ACCOUNT}/tokens");
+    // Cloudflare's bot protection refuses requests without a user agent
+    // (error 1010), so the API client must send the one `http::client` sets.
+    let user_agent = concat!("omnifob/", env!("CARGO_PKG_VERSION"));
     Mock::given(method("GET"))
         .and(path(format!("{base}/permission_groups")))
+        .and(header("user-agent", user_agent))
         .respond_with(ok(permission_groups()))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path(base.clone()))
+        .and(header("user-agent", user_agent))
         .respond_with(ok(json!({ "value": "acct-secret" })))
         .expect(1)
         .mount(&server)
