@@ -399,7 +399,9 @@ impl CrossPartitionRole {
         };
         let source =
             Partition::of_region(source_region).map_err(|e| format!("{source_key}: {e:#}"))?;
-        let portal_partition = portal.partition().map_err(|e| format!("region: {e:#}"))?;
+        let portal_partition = portal
+            .partition()
+            .map_err(|e| format!("the portal's region: {e:#}"))?;
         if source != portal_partition {
             return Err(format!(
                 "{source_key} {source_region} is in the {source} partition, but the Identity \
@@ -414,10 +416,14 @@ impl CrossPartitionRole {
             ));
         }
 
+        // The audience must equal a client ID of the destination's IAM OIDC
+        // provider, which IAM's CreateOpenIDConnectProvider takes at 1 to 255
+        // characters (ClientIDList); GetWebIdentityToken would take 1000.
         let audience = self.audience.chars().count();
-        if !(1..=1000).contains(&audience) {
+        if !(1..=255).contains(&audience) {
             return Err(format!(
-                "audience must be 1 to 1000 characters, not {audience}"
+                "audience must be 1 to 255 characters (an IAM OIDC provider's client ID), \
+                 not {audience}"
             ));
         }
         if let Some(name) = &self.session_name {
@@ -463,8 +469,18 @@ fn check_role_arn(arn: &str) -> Result<(), String> {
     {
         return bad("the role name must be 1 to 64 letters, digits or +=,.@_-");
     }
-    if !path_and_name.bytes().all(|b| b.is_ascii_graphic()) {
+    // IAM role paths (CreateRole `Path`) are `/`, or `/` + printable ASCII
+    // + `/`, at most 512 characters. Empty segments (`role//Audit`) are
+    // refused as the typo they almost always are.
+    let inner = &path_and_name[..path_and_name.len() - name.len()];
+    if !inner.bytes().all(|b| b.is_ascii_graphic()) {
         return bad("the role path may contain only printable ASCII");
+    }
+    if inner.split('/').rev().skip(1).any(str::is_empty) {
+        return bad("the role path has an empty segment");
+    }
+    if 1 + inner.len() > 512 {
+        return bad("the role path is longer than IAM's 512 characters");
     }
     Ok(())
 }
@@ -1369,6 +1385,19 @@ mod tests {
             "{error}"
         );
 
+        // An isolated portal Region is blamed on the portal's key.
+        for role in [
+            GOV_ROLE.to_string(),
+            format!("{GOV_ROLE}\nsource_region = \"us-east-1\""),
+        ] {
+            let error = cross_partition_error("us-isob-east-1", "", &role);
+            assert!(
+                error.contains("cross_partition.gov-audit: the portal's region")
+                    && error.contains("isolated"),
+                "{error}"
+            );
+        }
+
         // Isolated partitions have no cross-partition access.
         let error = cross_partition_error(
             "us-east-1",
@@ -1391,10 +1420,10 @@ mod tests {
         };
         let error = |key: &str, value: &str| format!("{:#}", with(key, value).unwrap_err());
 
-        // The audience: 1 to 1000 characters.
-        assert!(with("audience", &format!("\"{}\"", "a".repeat(1000))).is_ok());
-        assert!(error("audience", "\"\"").contains("audience must be 1 to 1000 characters"));
-        assert!(error("audience", &format!("\"{}\"", "é".repeat(1001))).contains("not 1001"));
+        // The audience: 1 to 255 characters, an IAM OIDC provider's client ID.
+        assert!(with("audience", &format!("\"{}\"", "é".repeat(255))).is_ok());
+        assert!(error("audience", "\"\"").contains("audience must be 1 to 255 characters"));
+        assert!(error("audience", &format!("\"{}\"", "é".repeat(256))).contains("not 256"));
         // The session: 15 minutes to 12 hours.
         assert!(with("duration", "\"15m\"").is_ok());
         assert!(with("duration", "\"12h\"").is_ok());
@@ -1426,6 +1455,8 @@ mod tests {
             "\"arn:aws-us-gov:iam::222222222222:role/\"",
             "\"arn:aws-us-gov:iam::222222222222:role/Au dit\"",
             "\"arn:aws-us-gov:iam::222222222222:role/Au/dit/\"",
+            "\"arn:aws-us-gov:iam::222222222222:role//Audit\"",
+            "\"arn:aws-us-gov:iam::222222222222:role/a//b/Audit\"",
         ] {
             assert!(
                 error("role_arn", bad).contains("not an IAM role ARN"),
@@ -1435,6 +1466,15 @@ mod tests {
         assert!(
             error("role_arn", "\"arn:aws-mars:iam::222222222222:role/R\"").contains("aws-mars")
         );
+        // A role path is at most 512 characters, its slashes included.
+        let path = |len: usize| {
+            format!(
+                "\"arn:aws-us-gov:iam::222222222222:role/{}/Audit\"",
+                "p".repeat(len - 2)
+            )
+        };
+        assert!(with("role_arn", &path(512)).is_ok());
+        assert!(error("role_arn", &path(513)).contains("512"));
         assert!(error("session_name", "\"a\"").contains("session_name"));
         assert!(error("session_name", "\"a b\"").contains("session_name"));
         assert!(error("signing_algorithm", "\"HS256\"").contains("ES384"));
@@ -1483,6 +1523,24 @@ mod tests {
                 "{error}"
             );
         }
+        // So are two cross-partition labels that differ only in case.
+        let error = format!(
+            "{:#}",
+            Config::parse(&format!(
+                "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+                 region = \"us-east-1\"\n\
+                 [integrations.acme.cross_partition.Gov]\n{GOV_ROLE}\n\
+                 [integrations.acme.cross_partition.gov]\n{GOV_ROLE}\n"
+            ))
+            .unwrap_err()
+        );
+        assert!(
+            error.contains(
+                "cross_partition.Gov and cross_partition.gov would both be the profile \
+                 <integration>/gov/Audit"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
