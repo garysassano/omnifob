@@ -15,7 +15,7 @@
 9. Console: `portal.azure.com/#@<tenant>/resource/subscriptions/<id>/overview`.
 10. `fob logout` deletes the refresh token. Entra ID gives public clients no revocation endpoint; `az logout` does the same.
 
-`OMNIFOB_AZURE_ENDPOINT` sends every Entra ID and Resource Manager call to one URL; the tests in `crates/omnifob-core/tests/azure.rs` point it at a mock. Not yet tried against a live tenant.
+`OMNIFOB_AZURE_ENDPOINT` sends every Entra ID and Resource Manager call to one URL; the tests in `crates/omnifob-core/tests/azure.rs` point it at a mock. Not yet tried on a live tenant: none is available to test with.
 
 ## Variables
 

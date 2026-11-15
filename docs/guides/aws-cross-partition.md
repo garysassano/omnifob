@@ -140,7 +140,7 @@ The user ID is shown in IAM Identity Center > Users > the user (User ID). Keep t
 
 ## Using the profile
 
-`fob sync` adds the profile; then use it like any other: `fob exec acme/gov-audit/Audit -- aws sts get-caller-identity`, `fob use`, `fob creds`, `fob status`, `fob console`.
+`fob sync` adds the profile; then use it like any other: `fob exec acme/gov-audit/Audit -- aws sts get-caller-identity`, `fob use`, `fob creds`, `fob console`. `fob check acme/gov-audit/Audit` checks the credentials with `GetCallerIdentity` in the destination Region.
 
 - Each new set of credentials gets the Identity Center role's credentials, requests a token for the one audience that lasts one minute, and exchanges it at once; the token is never stored. The credentials are cached like any other profile's.
 - `--ttl` asks for another session length, from 15 minutes to 12 hours, and at most the destination role's maximum session duration; such credentials are not cached.
