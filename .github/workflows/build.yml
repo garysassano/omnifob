@@ -31,7 +31,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          # Pinned, so the glibc floor (2.39) cannot rise with ubuntu-latest.
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
@@ -57,6 +58,7 @@ jobs:
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-zigbuild@0.24.1
+          fallback: none
       - name: Build
         shell: bash
         env:
@@ -73,12 +75,17 @@ jobs:
           dir="target/$TARGET/release"
           ext=""
           [[ "$TARGET" == *windows* ]] && ext=".exe"
-          "$dir/fob$ext" --version
-          "$dir/omnifob$ext" --version
-          if [[ "$TARGET" == *musl* ]] && readelf -l "$dir/fob" | grep -q INTERP; then
-            echo "::error::$TARGET build is dynamically linked"
-            exit 1
-          fi
+          for bin in fob omnifob; do
+            "$dir/$bin$ext" --version
+            if [[ "$TARGET" == *musl* ]]; then
+              # Captured first, so a readelf failure stops the step.
+              headers=$(readelf -l "$dir/$bin")
+              if [[ "$headers" == *INTERP* ]]; then
+                echo "::error::$TARGET $bin is dynamically linked"
+                exit 1
+              fi
+            fi
+          done
       - name: Package
         shell: bash
         env:

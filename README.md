@@ -32,6 +32,12 @@ Every [release](https://github.com/garysassano/omnifob/releases) has prebuilt bi
 mise use -g github:garysassano/omnifob
 ```
 
+Or with [cargo binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same release archive for your platform:
+
+```sh
+cargo binstall --git https://github.com/garysassano/omnifob omnifob
+```
+
 On Linux, mise picks the build that matches the system's C library: glibc on most distributions, musl on Alpine. The glibc build needs at least the glibc of the Ubuntu LTS it is built on; the static musl build runs on any Linux, and `MISE_LIBC=musl` makes mise pick it on glibc systems too.
 
 This installs two names for the same binary: `fob` for daily use and `omnifob` for scripts.
