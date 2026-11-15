@@ -858,17 +858,24 @@ mod tests {
 
     #[test]
     fn console_partition_comes_from_the_role_arn() {
+        // The config check refuses a chained role outside the portal's
+        // partition (it needs `cross_partition`), so this one is built
+        // without it: the console still follows the ARN.
+        let portal = &Integration::AwsSso(
+            toml::from_str(
+                r#"
+                start_url = "https://acme.awsapps.com/start"
+                region = "eu-west-1"
+                [chained.gov]
+                via_account_id = "111111111111"
+                via_role = "Admin"
+                role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+                "#,
+            )
+            .unwrap(),
+        );
         let config = Config::parse(
             r#"
-            [integrations.portal]
-            type = "aws-sso"
-            start_url = "https://acme.awsapps.com/start"
-            region = "eu-west-1"
-            [integrations.portal.chained.gov]
-            via_account_id = "111111111111"
-            via_role = "Admin"
-            role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
-
             [integrations.user]
             type = "aws-iam"
             [integrations.user.roles.cn]
@@ -876,7 +883,6 @@ mod tests {
             "#,
         )
         .unwrap();
-        let portal = config.integration("portal").unwrap();
         let user = config.integration("user").unwrap();
         let chained = |label: &str| Target::AwsChained {
             label: label.into(),

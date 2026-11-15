@@ -143,6 +143,8 @@ impl AwsSsoConfig {
             if let Some(region) = &role.region {
                 check_region(&format!("chained.{label}.region"), region)?;
             }
+            self.check_chained_arn(role)
+                .map_err(|e| format!("chained.{label}: {e}"))?;
         }
         for (label, role) in &self.cross_partition {
             role.validate(label, self)
@@ -150,6 +152,10 @@ impl AwsSsoConfig {
         }
         self.check_profile_ids()?;
         check_console_duration("console_duration", self.console_duration)
+    }
+
+    fn check_chained_arn(&self, role: &ChainedRole) -> Result<(), String> {
+        check_chained_role_arn(&role.role_arn, &self.region)
     }
 
     /// Fails when a cross-partition role would get the same profile id as a
@@ -189,6 +195,27 @@ impl AwsSsoConfig {
     pub fn partition(&self) -> anyhow::Result<Partition> {
         Partition::of_region(&self.region)
     }
+}
+
+/// Fails unless a chained role's `role_arn` is an IAM role ARN in the
+/// partition of the portal in `portal_region`: `AssumeRole` stays within a
+/// partition, so a role in another one needs `cross_partition`. A portal in
+/// an isolated partition, which `Partition` does not model, gets the ARN
+/// shape check only. `fob import aws` skips such roles with this reason.
+pub(crate) fn check_chained_role_arn(role_arn: &str, portal_region: &str) -> Result<(), String> {
+    check_role_arn(role_arn)?;
+    let Ok(portal) = Partition::of_region(portal_region) else {
+        return Ok(());
+    };
+    let partition = Partition::of_arn(role_arn).map_err(|e| format!("role_arn: {e:#}"))?;
+    if partition != portal {
+        return Err(format!(
+            "role_arn is in the {partition} partition, but the portal and its roles are in \
+             {portal}; AssumeRole cannot cross partitions, so configure this role under \
+             `cross_partition` instead"
+        ));
+    }
+    Ok(())
 }
 
 /// Fails unless `region` is shaped like an AWS Region, naming the key.
@@ -1121,7 +1148,7 @@ mod tests {
 
     #[test]
     fn renames_keep_comments_order_and_subtables() {
-        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"1\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::2:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
+        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"1\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
         let renamed = rename_integration(text, "gary", "aws").unwrap();
         assert_eq!(
             renamed,
@@ -1242,7 +1269,7 @@ mod tests {
         );
         // Chained roles cannot take it: role chaining refuses SessionDuration.
         let chained = sso(
-            "[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::2:role/R\"\nconsole_duration = \"1h\"",
+            "[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nconsole_duration = \"1h\"",
         );
         assert!(chained.is_err());
     }
@@ -1544,6 +1571,61 @@ mod tests {
     }
 
     #[test]
+    fn chained_roles_stay_in_the_portal_partition() {
+        let parse = |portal_region: &str, role_arn: &str| {
+            Config::parse(&format!(
+                "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+                 region = \"{portal_region}\"\n\
+                 [integrations.acme.chained.audit]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
+                 role_arn = \"{role_arn}\"\n"
+            ))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+        };
+        assert!(parse("eu-west-1", "arn:aws:iam::222222222222:role/path/Audit").is_ok());
+        assert!(
+            parse(
+                "us-gov-west-1",
+                "arn:aws-us-gov:iam::222222222222:role/Audit"
+            )
+            .is_ok()
+        );
+        let error = parse("eu-west-1", "arn:aws-us-gov:iam::222222222222:role/Audit").unwrap_err();
+        assert!(
+            error.contains(
+                "chained.audit: role_arn is in the aws-us-gov partition, but the portal and its \
+                 roles are in aws"
+            ) && error.contains("under `cross_partition` instead"),
+            "{error}"
+        );
+        for bad in [
+            "Audit",
+            "arn:aws:iam::222222222222:user/Audit",
+            "arn:aws:iam::2222:role/Audit",
+        ] {
+            let error = parse("eu-west-1", bad).unwrap_err();
+            assert!(
+                error.contains("chained.audit: role_arn") && error.contains("not an IAM role ARN"),
+                "{bad}: {error}"
+            );
+        }
+        assert!(
+            parse("eu-west-1", "arn:aws-mars:iam::222222222222:role/Audit")
+                .unwrap_err()
+                .contains("aws-mars")
+        );
+        // An isolated portal, which `Partition` does not model, gets the
+        // shape check only.
+        assert!(
+            parse(
+                "us-isob-east-1",
+                "arn:aws-iso-b:iam::222222222222:role/Audit"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn aws_regions_are_checked_when_the_config_loads() {
         let sso = |extra: &str| {
             Config::parse(&format!(
@@ -1571,7 +1653,7 @@ mod tests {
                 "chained.c.region",
                 sso(&format!(
                     "region = \"eu-west-1\"\n[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"A\"\n\
-                     role_arn = \"arn:aws:iam::2:role/R\"\nregion = \"{bad}\""
+                     role_arn = \"arn:aws:iam::222222222222:role/R\"\nregion = \"{bad}\""
                 )),
             ),
             (
