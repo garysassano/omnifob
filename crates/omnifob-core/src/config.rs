@@ -246,26 +246,34 @@ impl AwsIamConfig {
 }
 
 /// A role assumed with an IAM user's session.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IamRole {
     pub role_arn: String,
     /// `RoleSessionName`; defaults to "omnifob".
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
     /// Region exported for this role; defaults to the integration's.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// Session length, 15 minutes to the role's maximum (at most 12 hours);
     /// defaults to one hour.
-    #[serde(default, with = "opt_duration")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
     pub duration: Option<SignedDuration>,
     /// How long `fob console` sessions last (`SessionDuration`), 15 minutes
     /// to 12 hours and shorter than the role's maximum session duration.
     /// Unset, a console session lasts as long as the role's credentials.
-    #[serde(default, with = "opt_duration")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
     pub console_duration: Option<SignedDuration>,
 }
 
@@ -530,22 +538,41 @@ pub struct CloudflareTemplate {
 impl Config {
     /// Loads the config file; a missing file is an empty config.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with(path, Self::parse)
+    }
+
+    /// Loads the config file without checking integration names, for
+    /// `fob rename`, which has to open a config with a name that breaks the
+    /// rule in order to fix it.
+    pub fn load_allowing_any_names(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with(path, Self::parse_allowing_any_names)
+    }
+
+    fn load_with(path: &Path, parse: fn(&str) -> anyhow::Result<Self>) -> anyhow::Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+        parse(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// Parses a config. Integration names may contain only letters, digits,
+    /// `.`, `_` and `-` (see [`check_name`]); the error for another name says
+    /// how to rename it.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let config: Self = toml::from_str(text)?;
+        let config = Self::parse_allowing_any_names(text)?;
         for name in config.integrations.keys() {
-            if name.is_empty() || name.contains('/') {
-                bail!("integration name '{name}' must be non-empty and contain no '/'");
+            if let Err(e) = check_name("integration name", name) {
+                bail!("{e}; rename it with `fob rename \"{name}\" <new-name>`");
             }
         }
         Ok(config)
+    }
+
+    /// Parses a config without checking integration names.
+    pub fn parse_allowing_any_names(text: &str) -> anyhow::Result<Self> {
+        Ok(toml::from_str(text)?)
     }
 
     pub fn integration(&self, name: &str) -> anyhow::Result<&Integration> {
@@ -562,9 +589,7 @@ impl Config {
 /// Renames an integration in the text of a config file, keeping comments,
 /// layout and its sub-tables (chained roles, templates).
 pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<String> {
-    if new.is_empty() || new.contains('/') {
-        bail!("integration name '{new}' must be non-empty and contain no '/'");
-    }
+    check_name("integration name", new)?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the config")?;
     let integrations = doc
         .get_mut("integrations")
@@ -581,8 +606,26 @@ pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<St
         .with_dotted_decor(key.dotted_decor().clone());
     integrations.insert_formatted(&renamed, item);
     let text = doc.to_string();
-    Config::parse(&text).context("the renamed config is not valid")?;
+    // Other integrations may still have names to fix, one rename at a time.
+    Config::parse_allowing_any_names(&text).context("the renamed config is not valid")?;
     Ok(text)
+}
+
+/// Fails unless `name` is non-empty and made of ASCII letters, digits, `.`,
+/// `_` and `-`. Integration names go into profile ids, the AWS config's
+/// `credential_process` lines, keychain keys, lock files and the WSL vault's
+/// file names; template names into profile ids.
+pub fn check_name(what: &str, name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        bail!("{what} must not be empty");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("{what} '{name}' may contain only letters, digits, '.', '_' and '-'");
+    }
+    Ok(())
 }
 
 /// Adds a template to a Cloudflare integration in the config text, keeping
@@ -595,9 +638,7 @@ pub fn add_cloudflare_template(
     template: &CloudflareTemplate,
     replace: bool,
 ) -> anyhow::Result<String> {
-    if name.is_empty() || name.contains('/') {
-        bail!("template name '{name}' must be non-empty and contain no '/'");
-    }
+    check_name("template name", name)?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the config")?;
     let table = doc
         .get_mut("integrations")
@@ -732,10 +773,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_slash_in_integration_name() {
-        let err =
-            Config::parse("[integrations.\"a/b\"]\ntype = \"cloudflare-token\"\n").unwrap_err();
-        assert!(err.to_string().contains("no '/'"));
+    fn integration_names_are_letters_digits_dots_underscores_and_hyphens() {
+        let parse = |name: &str| {
+            Config::parse(&format!(
+                "[integrations.\"{name}\"]\ntype = \"cloudflare-token\"\n"
+            ))
+        };
+        assert!(parse("Acme_prod-2.eu").is_ok());
+        for bad in ["a/b", "a b", "a\"b", "é", "a:b", ""] {
+            let err = parse(&bad.replace('"', "\\\"")).unwrap_err().to_string();
+            assert!(err.contains("fob rename"), "{bad}: {err}");
+        }
+        let err = parse("my portal").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "integration name 'my portal' may contain only letters, digits, '.', '_' and '-'; \
+             rename it with `fob rename \"my portal\" <new-name>`"
+        );
+        // `fob rename` reads such a config to fix it.
+        let text = "[integrations.\"my portal\"]\ntype = \"cloudflare-token\"\n\n[integrations.\"b c\"]\ntype = \"cloudflare-token\"\n";
+        assert!(Config::parse_allowing_any_names(text).is_ok());
+        let renamed = rename_integration(text, "my portal", "portal").unwrap();
+        assert!(renamed.contains("[integrations.portal]"), "{renamed}");
+        assert!(Config::parse(&renamed).is_err(), "'b c' is still to fix");
+        let renamed = rename_integration(&renamed, "b c", "b-c").unwrap();
+        assert!(Config::parse(&renamed).is_ok());
     }
 
     #[test]
@@ -758,7 +820,12 @@ mod tests {
                 .to_string()
                 .contains("no integration")
         );
-        assert!(rename_integration(text, "gary", "a/b").is_err());
+        for bad in ["a/b", "a b", "", "a\"b"] {
+            assert!(
+                rename_integration(text, "gary", bad).is_err(),
+                "{bad:?} is refused"
+            );
+        }
     }
 
     #[test]
@@ -796,6 +863,12 @@ mod tests {
             err(add_cloudflare_template(text, "nope", "x", &template, false))
                 .contains("no integration")
         );
+        for bad in ["a/b", "my pages", ""] {
+            assert!(
+                add_cloudflare_template(text, "cf", bad, &template, false).is_err(),
+                "{bad:?} is refused"
+            );
+        }
     }
 
     #[test]
