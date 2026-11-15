@@ -1,8 +1,9 @@
 name: Release
 
 # Pushing a tag like v0.1.0 builds fob and omnifob for each platform (see
-# build.yml) and publishes them as a GitHub release with checksums and build
-# provenance: `mise use github:garysassano/omnifob`. Running it by hand
+# build.yml) and publishes them as a GitHub release with build provenance
+# (GitHub records each file's SHA-256 digest itself):
+# `mise use github:garysassano/omnifob`. Running it by hand
 # (workflow_dispatch) builds every target without publishing anything.
 
 on:
@@ -35,9 +36,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum -- * > SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
