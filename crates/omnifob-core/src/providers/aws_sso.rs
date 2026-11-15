@@ -447,10 +447,15 @@ async fn device_sign_in(
 /// renewed, or Identity Center refuses the renewal, there is nothing left to
 /// end.
 pub async fn end_session(integration: &str, config: &AwsSsoConfig) -> anyhow::Result<bool> {
-    let token = match current_token(integration, config, None).await {
+    let token = match renewed_token(integration, config, None).await {
         Ok(token) => token,
-        Err(Error::NeedsLogin { .. }) => return Ok(false),
-        Err(Error::Other(e)) => return Err(e),
+        Err(TokenError::Session(Error::NeedsLogin { .. })) => return Ok(false),
+        Err(TokenError::Session(Error::Other(e))) => return Err(e),
+        Err(TokenError::NotRenewed(cause)) => {
+            return Err(anyhow!(
+                "renewing the expired sign-in failed: {cause:#}; the portal session ends on its own when it expires"
+            ));
+        }
     };
     portal_client(&config.region)
         .logout()
@@ -516,6 +521,44 @@ async fn current_token(
     config: &AwsSsoConfig,
     rejected: Option<&str>,
 ) -> Result<SsoToken> {
+    renewed_token(integration, config, rejected)
+        .await
+        .map_err(|e| match e {
+            TokenError::Session(e) => e,
+            TokenError::NotRenewed(cause) => anyhow!(
+                "could not renew the sign-in for '{integration}' with IAM Identity Center: {cause:#}; run `fob login {integration}` if this persists"
+            )
+            .into(),
+        })
+}
+
+/// Why [`renewed_token`] has no token to give.
+enum TokenError {
+    /// No usable session, or another error unrelated to the renewal.
+    Session(Error),
+    /// The token is no longer usable and renewing it failed for a reason
+    /// that may pass; the session is kept for the next try.
+    NotRenewed(anyhow::Error),
+}
+
+impl From<Error> for TokenError {
+    fn from(e: Error) -> Self {
+        Self::Session(e)
+    }
+}
+
+impl From<anyhow::Error> for TokenError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Session(e.into())
+    }
+}
+
+/// [`current_token`], leaving the caller to word a renewal that failed for now.
+async fn renewed_token(
+    integration: &str,
+    config: &AwsSsoConfig,
+    rejected: Option<&str>,
+) -> std::result::Result<SsoToken, TokenError> {
     let token = load(integration, config)?;
     if !needs_renewal(&token, Timestamp::now(), rejected) {
         return Ok(token);
@@ -541,10 +584,7 @@ async fn current_token(
                 }
                 // The session at Identity Center may well be intact, so it is
                 // kept for the next try rather than sending the user to sign in.
-                return Err(anyhow!(
-                    "could not renew the sign-in for '{integration}' with IAM Identity Center: {e:#}; run `fob login {integration}` if this persists"
-                )
-                .into());
+                return Err(TokenError::NotRenewed(e));
             }
             Err(RefreshError::Refused {
                 client_refused,
@@ -581,7 +621,7 @@ async fn current_token(
     } else {
         format!("the sign-in for '{integration}' has expired")
     };
-    Err(Error::needs_login(integration, reason))
+    Err(Error::needs_login(integration, reason).into())
 }
 
 /// How renewing a token failed.

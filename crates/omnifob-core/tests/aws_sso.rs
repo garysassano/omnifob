@@ -554,7 +554,13 @@ async fn signing_out_reports_a_renewal_that_fails_for_now() {
         .await;
 
     let err = aws_sso::end_session("later", &config()).await.unwrap_err();
-    assert!(format!("{err:#}").contains("could not renew"), "{err:#}");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("renewing the expired sign-in failed")
+            && message.contains("ends on its own")
+            && !message.contains("fob login"),
+        "{message}"
+    );
     assert!(aws_sso::session("later").unwrap().is_some(), "kept");
 }
 
