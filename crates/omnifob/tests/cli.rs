@@ -93,10 +93,20 @@ impl Fob {
         // Nothing from the developer's or the CI runner's setup leaks in.
         for (name, _) in std::env::vars_os() {
             let name = name.to_string_lossy();
-            if name.starts_with("AWS_") || name.starts_with("OMNIFOB_") || name == "COMPLETE" {
+            let proxy = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]
+                .iter()
+                .any(|p| name.eq_ignore_ascii_case(p));
+            if name.starts_with("AWS_")
+                || name.starts_with("OMNIFOB_")
+                || name == "COMPLETE"
+                || proxy
+            {
                 cmd.env_remove(&*name);
             }
         }
+        // A proxy must not get between fob and the local mock.
+        cmd.env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost");
         cmd.env("OMNIFOB_CONFIG", self.config_file())
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env(
@@ -346,10 +356,20 @@ async fn login_signs_in_and_syncs() {
         .await;
     mount_portal(&server, &[("111111111111", "Dev")]).await;
 
+    // fob creates the store's directory itself.
+    assert!(!fob.keyring().exists());
     let (_, stderr) = fob.ok(&["login", "acme", "--device-code", "--no-browser"]);
     assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
     assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
-    assert!(fob.secret("aws-sso/acme/token").exists());
+    let token = fob.secret("aws-sso/acme/token");
+    assert!(token.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&fob.keyring()), 0o700);
+        assert_eq!(mode(&token), 0o600);
+    }
     let (stdout, _) = fob.ok(&["list"]);
     assert_eq!(lines(&stdout), ["acme/dev/Admin"]);
 }
@@ -388,9 +408,10 @@ async fn credential_process_output_names_the_account() {
 }
 
 /// Not a test of its own: `fob exec` runs this test binary with
-/// `OMNIFOB_E2E_CHILD` set, as a child that works on every platform, and it
-/// prints the variables it got.
+/// `--ignored --exact` and `OMNIFOB_E2E_CHILD` set, as a child that works on
+/// every platform, and it prints the variables it got.
 #[test]
+#[ignore = "run by exec_hands_the_account_and_region_to_the_command"]
 fn child_prints_its_environment() {
     if std::env::var_os("OMNIFOB_E2E_CHILD").is_none() {
         return;
@@ -417,6 +438,7 @@ async fn exec_hands_the_account_and_region_to_the_command() {
             me.to_str().unwrap(),
             "child_prints_its_environment",
             "--exact",
+            "--ignored",
             "--nocapture",
             "--test-threads=1",
         ])

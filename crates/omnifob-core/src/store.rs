@@ -366,6 +366,7 @@ pub mod test_files {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use anyhow::{Context, bail};
     use keyring_core::api::{CredentialApi, CredentialStoreApi};
@@ -471,10 +472,10 @@ pub mod test_files {
         /// command reading at the same time never sees half a secret.
         fn set_secret(&self, secret: &[u8]) -> Result<()> {
             let dir = self.path.parent().unwrap_or(Path::new("."));
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos());
-            let tmp = dir.join(format!(".{}-{nonce}.tmp", std::process::id()));
+            // Unique within this process, and the process id across them.
+            static WRITES: AtomicU64 = AtomicU64::new(0);
+            let n = WRITES.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!(".{}-{n}.tmp", std::process::id()));
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
