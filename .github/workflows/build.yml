@@ -1,0 +1,110 @@
+name: Build
+
+# Builds fob and omnifob for every release target and uploads one archive per
+# target. release.yml calls it to publish a tagged release, and ci.yml calls
+# it so every target is built before a tag is pushed.
+#
+# Asset names carry the Rust target triple, which mise's github: backend
+# matches on. Linux gets only static musl builds, which start on any
+# distribution; a glibc build would need the runner's glibc. They use
+# cargo-zigbuild, because aws-lc-sys compiles C and Zig ships the musl and
+# Linux kernel headers it needs (Ubuntu's musl-gcc lacks the kernel headers).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version in the archive names, such as v0.7.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          # Cross-compiled on Apple Silicon, so it is not run here.
+          - { os: macos-latest, target: x86_64-apple-darwin, cross: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
+      - if: contains(matrix.target, 'musl')
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          # No Actions cache in a workflow that builds release binaries.
+          use-cache: false
+      - if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-zigbuild@0.24.1
+          fallback: none
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD: ${{ contains(matrix.target, 'musl') && 'zigbuild' || 'build' }}
+        run: cargo "$BUILD" --locked --release --bins --target "$TARGET"
+      - name: Check the binaries
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          dir="target/$TARGET/release"
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          for bin in fob omnifob; do
+            "$dir/$bin$ext" --version
+            if [[ "$TARGET" == *musl* ]]; then
+              # Captured first, so a readelf failure stops the step.
+              headers=$(readelf -l "$dir/$bin")
+              if [[ "$headers" == *INTERP* ]]; then
+                echo "::error::$TARGET $bin is dynamically linked"
+                exit 1
+              fi
+            fi
+          done
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          name="omnifob-${VERSION}-${TARGET}"
+          mkdir -p "dist/$name"
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          cp "target/$TARGET/release/fob$ext" "target/$TARGET/release/omnifob$ext" README.md LICENSE "dist/$name/"
+          cd dist
+          if [[ "$TARGET" == *windows* ]]; then
+            7z a -bd "$name.zip" "$name" >/dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7

@@ -2,7 +2,12 @@
 name = "omnifob"
 version.workspace = true
 edition.workspace = true
+description.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "authentication"]
 rust-version.workspace = true
 
 [dependencies]
@@ -28,3 +33,25 @@ path = "src/bin/omnifob.rs"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.191"
+
+# cargo binstall: the archives the release workflow publishes.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/omnifob-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "omnifob-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+# Linux releases are static musl builds only; binstall asks for the gnu target
+# on a glibc system, so point it at the musl archive.
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/omnifob-v{ version }-x86_64-unknown-linux-musl{ archive-suffix }"
+bin-dir = "omnifob-v{ version }-x86_64-unknown-linux-musl/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/omnifob-v{ version }-aarch64-unknown-linux-musl{ archive-suffix }"
+bin-dir = "omnifob-v{ version }-aarch64-unknown-linux-musl/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"

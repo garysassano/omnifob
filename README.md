@@ -26,10 +26,16 @@ From source:
 cargo install --locked --git https://github.com/garysassano/omnifob omnifob
 ```
 
-Once releases are published (built for Linux x86_64 and ARM, macOS Apple Silicon and Windows, with checksums and build provenance), with mise:
+Every [release](https://github.com/garysassano/omnifob/releases) has prebuilt binaries, with checksums and build provenance, for Linux (x86_64 and ARM64, static musl binaries that run on any distribution), macOS (Apple Silicon and Intel) and Windows (x86_64 and ARM64). Up to 0.6.1 the Linux builds were linked against glibc, and there were no Intel macOS or Windows ARM64 builds. With mise:
 
 ```sh
 mise use -g github:garysassano/omnifob
+```
+
+Or with [cargo binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same release archive for your platform:
+
+```sh
+cargo binstall --git https://github.com/garysassano/omnifob omnifob
 ```
 
 This installs two names for the same binary: `fob` for daily use and `omnifob` for scripts.
