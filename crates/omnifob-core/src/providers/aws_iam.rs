@@ -13,6 +13,7 @@ use anyhow::{Context, anyhow};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
+use super::aws_partition::Partition;
 use super::aws_sso::{self, RoleRequest, SESSION_MIN};
 use crate::config::AwsIamConfig;
 use crate::credentials::EXPIRY_MARGIN;
@@ -50,7 +51,7 @@ pub fn keys(integration: &str) -> Vec<String> {
     vec![key_key(integration), session_key(integration)]
 }
 
-fn sts_region(config: &AwsIamConfig) -> &str {
+pub(crate) fn sts_region(config: &AwsIamConfig) -> &str {
     config.region.as_deref().unwrap_or(DEFAULT_STS_REGION)
 }
 
@@ -250,8 +251,12 @@ pub async fn role_credentials(
 /// the console, so this asks STS `GetFederationToken` with the access key for
 /// a federated session limited to the user's own permissions, as aws-vault
 /// does. A user whose policies require MFA cannot sign in this way: use a
-/// role instead.
-pub async fn console_url(integration: &str, config: &AwsIamConfig) -> Result<String> {
+/// role instead. `partition` is the user's, from the STS Region.
+pub async fn console_url(
+    integration: &str,
+    config: &AwsIamConfig,
+    partition: Partition,
+) -> Result<String> {
     let key = stored_key(integration)?;
     let duration = config
         .session_duration
@@ -273,5 +278,6 @@ pub async fn console_url(integration: &str, config: &AwsIamConfig) -> Result<Str
         response.credentials().context("no credentials returned")?,
         None,
     )?;
-    Ok(aws_sso::console_url(&creds, sts_region(config), config.region.as_deref()).await?)
+    let home = Some(sts_region(config));
+    Ok(aws_sso::console_url(&creds, partition, home, config.region.as_deref()).await?)
 }

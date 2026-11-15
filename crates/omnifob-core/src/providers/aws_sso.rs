@@ -25,6 +25,7 @@ use futures::StreamExt;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
+use super::aws_partition::Partition;
 use crate::config::AwsSsoConfig;
 use crate::{Credentials, Error, Profile, Result, Target, oauth, store};
 
@@ -1003,65 +1004,28 @@ pub(crate) fn from_sts(
     })
 }
 
-/// The AWS partitions with a public console.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Partition {
-    Aws,
-    UsGov,
-    China,
-    EuropeanSovereign,
-}
-
-impl Partition {
-    fn of(region: &str) -> anyhow::Result<Self> {
-        Ok(if region.starts_with("cn-") {
-            Self::China
-        } else if region.starts_with("us-gov-") {
-            Self::UsGov
-        } else if region.starts_with("eusc-") {
-            Self::EuropeanSovereign
-        } else if region.starts_with("us-iso") {
-            bail!("{region} has no public AWS console");
-        } else {
-            Self::Aws
-        })
+/// The federation endpoint and console destination for a console sign-in to
+/// `partition`. With `region` (the Region the console opens in, which must be
+/// in the partition) both are regional. Without it, the console opens at the
+/// unprefixed host and so does the sign-in where the partition has one; the
+/// European Sovereign Cloud has none, so it signs in at `home_region` when
+/// that is in the partition, else at the partition's first Region.
+fn console_endpoints(
+    partition: Partition,
+    home_region: Option<&str>,
+    region: Option<&str>,
+) -> anyhow::Result<(String, String)> {
+    if let Some(region) = region {
+        partition.check_region(region)?;
     }
-
-    /// The sign-in host, regional where AWS runs one, as AWS recommends for
-    /// federation; the partition's first region uses the unprefixed host.
-    fn signin_host(self, region: Option<&str>) -> String {
-        let domain = match self {
-            Self::Aws => "signin.aws.amazon.com",
-            Self::UsGov => "signin.amazonaws-us-gov.com",
-            Self::China => "signin.amazonaws.cn",
-            Self::EuropeanSovereign => "signin.amazonaws-eusc.eu",
-        };
-        format!("{}{domain}", self.region_prefix(region))
-    }
-
-    fn console_host(self, region: Option<&str>) -> String {
-        let domain = match self {
-            Self::Aws => "console.aws.amazon.com",
-            Self::UsGov => "console.amazonaws-us-gov.com",
-            Self::China => "console.amazonaws.cn",
-            Self::EuropeanSovereign => "console.amazonaws-eusc.eu",
-        };
-        format!("{}{domain}", self.region_prefix(region))
-    }
-
-    fn region_prefix(self, region: Option<&str>) -> String {
-        match region {
-            None | Some("us-east-1" | "us-gov-west-1" | "cn-north-1") => String::new(),
-            Some(region) => format!("{region}."),
-        }
-    }
-}
-
-/// The federation endpoint and console destination for a console sign-in.
-/// `home_region` (the portal's) picks the partition when `region` is unset.
-fn console_endpoints(home_region: &str, region: Option<&str>) -> anyhow::Result<(String, String)> {
-    let partition = Partition::of(region.unwrap_or(home_region))?;
-    let endpoint = format!("https://{}/federation", partition.signin_host(region));
+    let signin_region = region
+        .or(partition.unprefixed_region())
+        .or(home_region.filter(|home| partition.contains(home)))
+        .unwrap_or(partition.default_region());
+    let endpoint = format!(
+        "https://{}/federation",
+        partition.signin_host(signin_region)
+    );
     let destination = match region {
         Some(r) => format!(
             "https://{}/console/home?region={r}",
@@ -1083,10 +1047,13 @@ struct FederationSession<'a> {
 }
 
 /// Builds a sign-in URL for the AWS console using the federation endpoint of
-/// the credentials' partition.
+/// the credentials' partition. `home_region` (where the credentials came
+/// from) picks the sign-in host when `region` (where the console opens) is
+/// unset; see [`console_endpoints`].
 pub async fn console_url(
     creds: &Credentials,
-    home_region: &str,
+    partition: Partition,
+    home_region: Option<&str>,
     region: Option<&str>,
 ) -> anyhow::Result<String> {
     let get = |k: &str| {
@@ -1101,7 +1068,7 @@ pub async fn console_url(
         session_key: get("AWS_SECRET_ACCESS_KEY")?,
         session_token: get("AWS_SESSION_TOKEN")?,
     })?;
-    let (endpoint, destination) = console_endpoints(home_region, region)?;
+    let (endpoint, destination) = console_endpoints(partition, home_region, region)?;
 
     #[derive(Deserialize)]
     struct SigninToken {
@@ -1247,46 +1214,122 @@ mod tests {
 
     #[test]
     fn console_sign_in_follows_partition_and_region() {
+        use Partition::*;
         let cases = [
             (
-                "us-east-1",
+                Aws,
+                Some("us-east-1"),
+                None,
+                "https://signin.aws.amazon.com/federation",
+                "https://console.aws.amazon.com/",
+            ),
+            // Without a console Region the sign-in stays on the unprefixed
+            // host, whatever the portal's Region.
+            (
+                Aws,
+                Some("eu-west-1"),
                 None,
                 "https://signin.aws.amazon.com/federation",
                 "https://console.aws.amazon.com/",
             ),
             (
-                "us-east-1",
-                Some("eu-west-1"),
-                "https://eu-west-1.signin.aws.amazon.com/federation",
-                "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1",
-            ),
-            (
-                "us-gov-west-1",
+                UsGov,
+                Some("us-gov-east-1"),
                 None,
                 "https://signin.amazonaws-us-gov.com/federation",
                 "https://console.amazonaws-us-gov.com/",
             ),
             (
-                "us-gov-west-1",
+                China,
+                Some("cn-northwest-1"),
+                None,
+                "https://signin.amazonaws.cn/federation",
+                "https://console.amazonaws.cn/",
+            ),
+            (
+                Aws,
+                Some("us-east-1"),
+                Some("eu-west-1"),
+                "https://eu-west-1.signin.aws.amazon.com/federation",
+                "https://eu-west-1.console.aws.amazon.com/console/home?region=eu-west-1",
+            ),
+            (
+                Aws,
+                None,
+                None,
+                "https://signin.aws.amazon.com/federation",
+                "https://console.aws.amazon.com/",
+            ),
+            (
+                UsGov,
+                Some("us-gov-west-1"),
+                None,
+                "https://signin.amazonaws-us-gov.com/federation",
+                "https://console.amazonaws-us-gov.com/",
+            ),
+            (
+                UsGov,
+                Some("us-gov-west-1"),
                 Some("us-gov-east-1"),
                 "https://us-gov-east-1.signin.amazonaws-us-gov.com/federation",
                 "https://us-gov-east-1.console.amazonaws-us-gov.com/console/home?region=us-gov-east-1",
             ),
             (
-                "cn-north-1",
+                China,
+                Some("cn-north-1"),
                 Some("cn-north-1"),
                 "https://signin.amazonaws.cn/federation",
                 "https://console.amazonaws.cn/console/home?region=cn-north-1",
             ),
+            (
+                China,
+                Some("cn-north-1"),
+                Some("cn-northwest-1"),
+                "https://cn-northwest-1.signin.amazonaws.cn/federation",
+                "https://cn-northwest-1.console.amazonaws.cn/console/home?region=cn-northwest-1",
+            ),
+            // The European Sovereign Cloud has no unprefixed sign-in host.
+            (
+                EuropeanSovereign,
+                Some("eusc-de-east-1"),
+                None,
+                "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation",
+                "https://console.amazonaws-eusc.eu/",
+            ),
+            // A home Region in another partition (a cross-partition role)
+            // does not pick the host.
+            (
+                EuropeanSovereign,
+                Some("eu-central-1"),
+                None,
+                "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation",
+                "https://console.amazonaws-eusc.eu/",
+            ),
+            (
+                EuropeanSovereign,
+                None,
+                None,
+                "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation",
+                "https://console.amazonaws-eusc.eu/",
+            ),
+            (
+                EuropeanSovereign,
+                Some("eusc-de-east-1"),
+                Some("eusc-de-east-1"),
+                "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation",
+                "https://eusc-de-east-1.console.amazonaws-eusc.eu/console/home?region=eusc-de-east-1",
+            ),
         ];
-        for (home, region, endpoint, destination) in cases {
+        for (partition, home, region, endpoint, destination) in cases {
             assert_eq!(
-                console_endpoints(home, region).unwrap(),
+                console_endpoints(partition, home, region).unwrap(),
                 (endpoint.to_string(), destination.to_string()),
-                "{home} {region:?}"
+                "{partition} {home:?} {region:?}"
             );
         }
-        assert!(console_endpoints("us-iso-east-1", None).is_err());
+        // The console opens in the credentials' partition only.
+        assert!(console_endpoints(UsGov, None, Some("eu-west-1")).is_err());
+        assert!(console_endpoints(Aws, None, Some("us-isob-east-1")).is_err());
     }
 
     #[test]
