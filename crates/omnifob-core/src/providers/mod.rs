@@ -713,17 +713,22 @@ pub fn forget_credentials<'a>(profiles: impl IntoIterator<Item = &'a Profile>) {
 }
 
 /// Drops cached credentials of the profiles in `before` that are not in
-/// `after`, so a sync that loses a profile (an assignment removed, a role
-/// taken out of the config, an integration deleted) leaves no credentials
-/// behind in the keychain. Returns how many profiles went away.
+/// `after` unchanged, so a sync that loses a profile (an assignment removed,
+/// a role taken out of the config, an integration deleted) leaves no
+/// credentials behind in the keychain. A profile whose id stays but whose
+/// target changed (a chained or IAM user's role moved to another account)
+/// loses them too: they belong to the old target, and would otherwise be
+/// handed out labelled with the new one's account. Returns how many
+/// profiles' credentials were dropped.
 pub fn forget_removed_credentials<'a>(
     before: impl IntoIterator<Item = &'a Profile>,
     after: impl IntoIterator<Item = &'a Profile>,
 ) -> usize {
-    let kept: std::collections::BTreeSet<&str> = after.into_iter().map(|p| p.id.as_str()).collect();
+    let kept: std::collections::BTreeMap<&str, &Profile> =
+        after.into_iter().map(|p| (p.id.as_str(), p)).collect();
     let mut removed = 0;
     for profile in before {
-        if !kept.contains(profile.id.as_str()) {
+        if kept.get(profile.id.as_str()) != Some(&profile) {
             removed += 1;
             if let Err(e) = store::delete(&store::credentials_key(&profile.id)) {
                 tracing::warn!(
@@ -778,6 +783,27 @@ mod tests {
         // Nothing to drop when nothing went away.
         assert_eq!(forget_removed_credentials(&after, &after), 0);
         assert!(cached(&kept));
+
+        // A role whose ARN moved to another account keeps its id, but its
+        // credentials are the old account's.
+        let role = |account: &str| {
+            Profile::new(
+                "prune",
+                "ops",
+                "Deploy",
+                Target::AwsChained {
+                    label: "ops".into(),
+                    account_id: Some(account.into()),
+                },
+            )
+        };
+        let (old, moved) = (role("222222222222"), role("333333333333"));
+        assert_eq!(old.id, moved.id);
+        store::set(&store::credentials_key(&old.id), &Credentials::default()).unwrap();
+        assert_eq!(forget_removed_credentials([&old], [&old]), 0);
+        assert!(cached(&old));
+        assert_eq!(forget_removed_credentials([&old], [&moved]), 1);
+        assert!(!cached(&moved));
     }
 
     #[test]

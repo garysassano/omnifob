@@ -191,7 +191,7 @@ fob creds acme/prod/ReadOnly --format credential-process  # for ~/.aws/config
 fob creds cf/personal/workers --format fnox               # for a fnox command lease
 ```
 
-AWS profiles export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CREDENTIAL_EXPIRATION` and `AWS_ACCOUNT_ID`, which the AWS SDKs use for account-based endpoints, plus `AWS_REGION` and `AWS_DEFAULT_REGION` when a Region is configured. The `credential-process` format carries the account as `AccountId`.
+AWS profiles export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CREDENTIAL_EXPIRATION` and `AWS_ACCOUNT_ID`, which the AWS SDKs use for account-based endpoints, plus `AWS_REGION` and `AWS_DEFAULT_REGION` when a Region is configured. The `credential-process` format carries the account as `AccountId`. These replace any you set yourself: an `AWS_ACCOUNT_ID` in your shell is overwritten by `fob exec` and `fob use`. With the account known, the SDKs send requests to account-based endpoints (DynamoDB, S3) on other hosts than the regional ones, which matters for firewall and VPC endpoint allowlists; `AWS_ACCOUNT_ID_ENDPOINT_MODE=disabled` turns that off.
 
 AWS profiles for tools that want `--profile` or `AWS_PROFILE`: `fob export aws-config` prints one `[profile fob-<integration>-<account>-<role>]` per discovered role, each using `credential_process = fob creds ... --format credential-process`. `--write` keeps them in a marked block of `~/.aws/config` (backing up the previous file) and never touches anything outside it.
 
