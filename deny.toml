@@ -1,0 +1,52 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+# The graph covers every target, so a crate pulled in only for one platform
+# (the macOS or Windows keyring stores, for example) is checked too.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory (vulnerable, unmaintained, unsound) fails the check,
+# and so does a yanked crate version. Add an entry to `ignore`, with the
+# reason, only to accept a specific advisory.
+yanked = "deny"
+ignore = [
+  # zbus 6 absorbed zbus_names, zvariant and zvariant_derive, so their zbus 5
+  # releases are marked unmaintained. They come only from the Linux Secret
+  # Service keyring store (zbus-secret-service-keyring-store -> secret-service
+  # -> zbus 5), and no stable release of those moves to zbus 6 yet. Drop these
+  # entries once one does.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6; only reachable through secret-service on zbus 5" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6; only reachable through secret-service on zbus 5" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6; only reachable through secret-service on zbus 5" },
+]
+
+[licenses]
+# Licences found in the dependency tree that are compatible with shipping
+# MIT-licensed binaries. A new licence fails the check until it is reviewed
+# and added here.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Duplicate versions are common while the ecosystem moves (syn 2 and 3, for
+# example); report them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

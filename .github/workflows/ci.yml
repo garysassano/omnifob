@@ -19,6 +19,13 @@ env:
 jobs:
   check:
     name: ${{ matrix.os }}
+    # Stacked PRs run the expensive jobs only on the top of the stack, whose
+    # tree contains every layer below it; the push to main after a merge runs
+    # them in full.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.stack == null ||
+      github.event.pull_request.stack.position == github.event.pull_request.stack.size
     strategy:
       fail-fast: false
       matrix:
@@ -38,3 +45,39 @@ jobs:
         run: cargo test --locked
       - name: Build release binaries
         run: cargo build --locked --release --bins
+
+  msrv:
+    name: MSRV (${{ matrix.os }})
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.stack == null ||
+      github.event.pull_request.stack.position == github.event.pull_request.stack.size
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the declared minimum Rust
+        shell: bash
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$msrv" || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
+          rustup toolchain install "$msrv" --profile minimal && rustup default "$msrv"
+      - name: Check
+        run: cargo check --locked --all-targets
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # deny.toml sets all-features for the graph.
+          arguments: --locked
