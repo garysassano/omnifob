@@ -731,7 +731,23 @@ pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result
 }
 
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
-    forget_catalog(integration);
+    // Keep the IDs of minted tokens that could not be deleted, so a later
+    // sign-in still recognises them (and deletes them once expired); drop
+    // the rest, including the bootstrap's record.
+    let minted = load_catalog(integration).minted;
+    let kept = !minted.is_empty()
+        && save_catalog(
+            integration,
+            &Catalog {
+                minted,
+                ..Catalog::default()
+            },
+        )
+        .inspect_err(|e| tracing::warn!("could not keep the IDs of undeleted tokens: {e:#}"))
+        .is_ok();
+    if !kept {
+        forget_catalog(integration);
+    }
     let oauth = super::cloudflare_oauth::logout(integration)?;
     Ok(store::delete(&bootstrap_key(integration))? || oauth)
 }
@@ -1002,6 +1018,17 @@ pub fn forget_catalog(integration: &str) {
     let _ = std::fs::remove_file(catalog_file(integration));
 }
 
+/// Forgets every tracked token ID, once all the accounts' minted tokens are
+/// deleted: the IDs left belong to tokens no listing showed.
+pub fn forget_minted(integration: &str) -> anyhow::Result<()> {
+    let mut catalog = load_catalog(integration);
+    if catalog.minted.is_empty() {
+        return Ok(());
+    }
+    catalog.minted.clear();
+    save_catalog(integration, &catalog)
+}
+
 /// Where to create the bootstrap token. For account-owned tokens this is a
 /// template URL that pre-fills the form (name, the "Account API Tokens Edit"
 /// permission and the account); user-owned tokens need the dashboard's
@@ -1247,7 +1274,9 @@ async fn delete_token(client: &Client, tokens: &str, id: &str) -> anyhow::Result
 }
 
 /// Deletes the tokens omnifob minted for `profile_id` (or for every profile
-/// when `None`), live or not; returns how many.
+/// when `None`), live or not; returns how many. A failed delete does not stop
+/// the others; the first error is returned at the end, and the IDs of the
+/// tokens that could not be deleted stay tracked.
 pub async fn revoke_minted(
     client: &Client,
     tokens: &str,
@@ -1263,10 +1292,19 @@ pub async fn revoke_minted(
         None => catalog.minted.values().flatten().cloned().collect(),
     };
     let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+    let mut result = Ok(());
     for token in &all {
         if tracked.contains(&token.id) || token.name.starts_with(&legacy) {
-            delete_token(client, tokens, &token.id).await?;
-            deleted.push(token.id.clone());
+            match delete_token(client, tokens, &token.id).await {
+                Ok(()) => deleted.push(token.id.clone()),
+                Err(e) => {
+                    failed.push(token.id.clone());
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
         }
     }
     // A profile's tokens all live in this listing, so its IDs can all go,
@@ -1278,9 +1316,10 @@ pub async fn revoke_minted(
     } else {
         deleted.clone()
     };
-    for id in forget {
-        catalog.untrack(&id);
+    for id in forget.iter().filter(|id| !failed.contains(id)) {
+        catalog.untrack(id);
     }
+    result?;
     Ok(deleted.len())
 }
 

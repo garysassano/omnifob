@@ -45,7 +45,9 @@ pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profi
 }
 
 /// Deletes every token omnifob minted through a Cloudflare integration, in
-/// the given accounts; returns how many. Called before signing out.
+/// the given accounts; returns how many. Called before signing out. An
+/// account that fails does not stop the others; the first error is returned
+/// once every account has been tried.
 pub async fn revoke_all(
     name: &str,
     integration: &Integration,
@@ -55,14 +57,29 @@ pub async fn revoke_all(
         return Ok(0);
     };
     let mut deleted = 0;
+    let mut result = Ok(());
     for account_id in account_ids {
-        deleted += cloudflare::revoke(name, config, None, account_id).await?;
+        match cloudflare::revoke(name, config, None, account_id).await {
+            Ok(n) => deleted += n,
+            Err(e) => {
+                // Without a sign-in no other account can be reached either.
+                let stop = matches!(e, Error::NeedsLogin { .. });
+                if result.is_ok() {
+                    result = Err(e);
+                }
+                if stop {
+                    break;
+                }
+            }
+        }
         // `minting()`, not `token_type`: OAuth leaves `token_type` at its
         // default (user) but mints account-owned tokens, listed per account.
         if config.minting() == crate::config::CloudflareTokenType::User {
             break; // user tokens are listed once, not per account
         }
     }
+    result?;
+    cloudflare::forget_minted(name)?;
     Ok(deleted)
 }
 
