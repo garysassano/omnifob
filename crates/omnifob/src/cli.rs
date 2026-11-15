@@ -85,7 +85,9 @@ pub(crate) enum Command {
         /// Get new credentials even if cached ones are still valid
         #[arg(long)]
         no_cache: bool,
-        /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
+        /// Lifetime of new credentials instead of the configured one, e.g. "4h";
+        /// not cached (Cloudflare tokens, assumed AWS roles, IAM users, Google
+        /// service accounts)
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<jiff::SignedDuration>,
     },
@@ -95,7 +97,9 @@ pub(crate) enum Command {
         profile: Vec<String>,
         #[arg(long)]
         no_cache: bool,
-        /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
+        /// Lifetime of new credentials instead of the configured one, e.g. "4h";
+        /// not cached (Cloudflare tokens, assumed AWS roles, IAM users, Google
+        /// service accounts)
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<jiff::SignedDuration>,
         /// Mint a token for this command only and revoke it when the command
@@ -133,7 +137,9 @@ pub(crate) enum Command {
         format: CredsFormat,
         #[arg(long)]
         no_cache: bool,
-        /// Lifetime of minted credentials, overriding the template (Cloudflare), e.g. "4h"
+        /// Lifetime of new credentials instead of the configured one, e.g. "4h";
+        /// not cached (Cloudflare tokens, assumed AWS roles, IAM users, Google
+        /// service accounts)
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<jiff::SignedDuration>,
     },
