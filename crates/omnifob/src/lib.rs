@@ -196,11 +196,15 @@ enum ImportCommand {
 #[derive(Subcommand)]
 enum ExportCommand {
     /// AWS CLI profiles that get credentials from `fob creds`, for tools that
-    /// want --profile or AWS_PROFILE (needs `fob` on PATH)
+    /// want --profile or AWS_PROFILE (needs `fob` on PATH, or --absolute)
     AwsConfig {
         /// Prefix for the generated profile names
         #[arg(long, default_value = "fob-")]
         prefix: String,
+        /// Write the full path of this fob binary instead of `fob`, for editors
+        /// and GUI tools that run without your shell's PATH
+        #[arg(long)]
+        absolute: bool,
         /// Replace omnifob's marked block in the AWS config file instead of printing it
         #[arg(long)]
         write: bool,
@@ -312,7 +316,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 .interact_text_on(&Term::stderr())?)
         });
     }
-    let config = Config::load(&paths::config_file())?;
+    // `fob rename` has to open a config with a name the rule refuses, to fix it.
+    let config = if matches!(cli.command, Command::Rename { .. }) {
+        Config::load_allowing_any_names(&paths::config_file())?
+    } else {
+        Config::load(&paths::config_file())?
+    };
     let cache = ProfileCache::load(&profiles_file())?;
     let mut app = App { config, cache };
 
@@ -456,11 +465,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Export(ExportCommand::AwsConfig {
             prefix,
+            absolute,
             write,
             file,
         }) => {
             app.ensure_synced().await?;
-            export_aws_config(&app, &prefix, write, file)?;
+            export_aws_config(&app, &prefix, absolute, write, file)?;
         }
         Command::Renew { profile } => app.renew(&profile).await?,
     }
@@ -502,7 +512,7 @@ fn profile_candidates() -> Vec<CompletionCandidate> {
 
 /// Integration names for shell completion.
 fn integration_candidates() -> Vec<CompletionCandidate> {
-    let Ok(config) = Config::load(&paths::config_file()) else {
+    let Ok(config) = Config::load_allowing_any_names(&paths::config_file()) else {
         return Vec::new();
     };
     config
@@ -851,12 +861,10 @@ impl App {
             providers::forget_credentials(&synced.profiles);
         }
         let moved = providers::rename_sign_in(old, new, &integration)?;
-        let tmp = path.with_extension("toml.tmp");
-        let written = std::fs::write(&tmp, &renamed).and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(e) = written {
+        if let Err(e) = write_atomically(&path, &renamed) {
             // Put the sign-in back so nothing is left half renamed.
             let _ = providers::rename_sign_in(new, old, &integration);
-            return Err(e).with_context(|| format!("writing {}", path.display()));
+            return Err(e);
         }
         self.cache.rename_integration(old, new);
         self.cache.save(&profiles_file())?;
@@ -870,7 +878,7 @@ impl App {
         let aws_config = aws_config_file(None)
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok());
-        if aws_config.is_some_and(|t| t.contains(&format!("fob creds {old}/"))) {
+        if aws_config.is_some_and(|t| t.contains(&format!(" creds {old}/"))) {
             eprintln!(
                 "fob: ~/.aws/config still has profiles for '{old}'; run `fob export aws-config --write` to update them"
             );
@@ -1261,6 +1269,8 @@ impl App {
         ttl: Option<jiff::SignedDuration>,
         replace: bool,
     ) -> anyhow::Result<()> {
+        // Before signing in or picking permissions, which the name would waste.
+        omnifob_core::config::check_name("template name", name)?;
         let config = match self.config.integration(integration)? {
             Integration::Cloudflare(c) => c.clone(),
             other => bail!(
@@ -1315,10 +1325,7 @@ impl App {
             &template,
             replace,
         )?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &text)
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .with_context(|| format!("writing {}", path.display()))?;
+        write_atomically(&path, &text)?;
         self.config = Config::parse(&text)?;
         eprintln!(
             "fob: added template '{name}' to '{integration}' ({}):",
@@ -1414,13 +1421,86 @@ fn aws_config_file(file: Option<std::path::PathBuf>) -> anyhow::Result<std::path
         .context("cannot find the AWS config file; pass --file")
 }
 
+/// Replaces `path` with `contents` through a temporary file in the same
+/// directory and a rename, so a reader never sees half a file and a failed
+/// write leaves the old one. An existing file keeps its permissions, a new
+/// one is readable by its owner only on Unix (as botocore creates the AWS
+/// config), and a symbolic link (a dotfiles manager's) stays a link: its
+/// target is replaced. The temporary file is created anew, never opened
+/// through a link left in its place.
+fn write_atomically(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} is not a file", path.display()))?
+        .to_string_lossy();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!(
+        ".{name}.omnifob-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let written = (|| {
+        // Before the contents on Unix, so they are never readable more widely
+        // than the file they replace.
+        #[cfg(unix)]
+        if let Some(permissions) = &permissions {
+            file.set_permissions(permissions.clone())?;
+        }
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(not(unix))]
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&tmp, permissions)?;
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", path.display()))
+}
+
 fn export_aws_config(
     app: &App,
     prefix: &str,
+    absolute: bool,
     write: bool,
     file: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    use omnifob_core::import::{aws_config_block, replace_aws_block};
+    use omnifob_core::import::{aws_config_block, credential_process_program, replace_aws_block};
+    let program = if absolute {
+        let exe = std::env::current_exe().context("finding the path of this fob binary")?;
+        let exe = exe
+            .to_str()
+            .with_context(|| format!("the path {} is not valid Unicode", exe.display()))?;
+        credential_process_program(exe, cfg!(windows))?
+    } else {
+        "fob".to_string()
+    };
     let profiles: Vec<&Profile> = app.cache.all().filter(|p| p.target.is_aws()).collect();
     let regions: std::collections::BTreeMap<String, String> = profiles
         .iter()
@@ -1451,7 +1531,7 @@ fn export_aws_config(
             Some((p.id.clone(), region))
         })
         .collect();
-    let block = aws_config_block(&profiles, prefix, &regions);
+    let block = aws_config_block(&profiles, prefix, &regions, &program);
     if !write {
         print!("{block}");
         return Ok(());
@@ -1468,15 +1548,23 @@ fn export_aws_config(
         return Ok(());
     }
     if !existing.is_empty() {
+        // A new file with the config's permissions, so a config holding keys
+        // is not copied somewhere more readable.
         let backup = path.with_extension("omnifob-backup");
-        std::fs::write(&backup, &existing)
-            .with_context(|| format!("writing {}", backup.display()))?;
+        match std::fs::remove_file(&backup) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("replacing {}", backup.display()));
+            }
+            _ => {}
+        }
+        write_atomically(&backup, &existing)?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            std::fs::set_permissions(&backup, meta.permissions())
+                .with_context(|| format!("writing {}", backup.display()))?;
+        }
         eprintln!("fob: backed up the previous file to {}", backup.display());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
+    write_atomically(&path, &updated)?;
     eprintln!(
         "fob: wrote {} profile(s) to omnifob's block in {}; use them with --profile {prefix}<integration>-<account>-<role>",
         profiles.len(),
@@ -1490,7 +1578,10 @@ fn import_aws(
     file: Option<std::path::PathBuf>,
     write: bool,
 ) -> anyhow::Result<()> {
-    use omnifob_core::import::{aws_portal_toml, aws_portals, chained_toml, normalize_start_url};
+    use omnifob_core::import::{
+        aws_iam_user_toml, aws_import, aws_portal_toml, chained_toml, iam_roles_toml,
+        normalize_start_url,
+    };
     let file = aws_config_file(file)?;
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
@@ -1508,12 +1599,26 @@ fn import_aws(
         })
         .collect();
     let mut taken: Vec<String> = config.integrations.keys().cloned().collect();
+    let mut unique = |name: &mut String| {
+        let base = name.clone();
+        let mut n = 1;
+        while taken.contains(name) {
+            n += 1;
+            *name = format!("{base}-{n}");
+        }
+        taken.push(name.clone());
+    };
     let mut sections = Vec::new();
     let (mut new_portals, mut new_chained) = (0, 0);
-    for mut portal in aws_portals(&text) {
-        for (profile, reason) in &portal.skipped {
-            eprintln!("fob: skipped chained profile '{profile}': {reason}");
-        }
+    let mut new_users = Vec::new();
+    let import = aws_import(&text);
+    for skipped in &import.skipped {
+        eprintln!(
+            "fob: skipped profile '{}': {}",
+            skipped.profile, skipped.reason
+        );
+    }
+    for mut portal in import.portals {
         if let Some((name, existing)) = configured.get(&portal.start_url) {
             portal
                 .chained
@@ -1534,13 +1639,7 @@ fn import_aws(
             }
             continue;
         }
-        let base = portal.name.clone();
-        let mut n = 1;
-        while taken.contains(&portal.name) {
-            n += 1;
-            portal.name = format!("{base}-{n}");
-        }
-        taken.push(portal.name.clone());
+        unique(&mut portal.name);
         eprintln!(
             "fob: {} as '{}': {} profile(s), {} chained role(s)",
             portal.start_url,
@@ -1552,24 +1651,75 @@ fn import_aws(
         new_chained += portal.chained.len();
         sections.push(aws_portal_toml(&portal));
     }
+    for mut user in import.iam_users {
+        // An aws-iam integration named after the profile is taken to be the
+        // same user, so importing again adds only new roles.
+        if let Some(Integration::AwsIam(existing)) = config.integrations.get(&user.name) {
+            user.roles
+                .retain(|label, _| !existing.roles.contains_key(label));
+            if user.roles.is_empty() {
+                eprintln!(
+                    "fob: profile '{}' (an access key) is already configured as '{}'",
+                    user.profile, user.name
+                );
+            } else {
+                eprintln!(
+                    "fob: profile '{}' (an access key) is configured as '{}'; {} role(s) to add",
+                    user.profile,
+                    user.name,
+                    user.roles.len()
+                );
+                new_chained += user.roles.len();
+                sections.push(
+                    iam_roles_toml(&user.name, &user.roles)
+                        .trim_start()
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        unique(&mut user.name);
+        eprintln!(
+            "fob: profile '{}' (an access key) as aws-iam '{}': {} role(s)",
+            user.profile,
+            user.name,
+            user.roles.len()
+        );
+        new_chained += user.roles.len();
+        sections.push(aws_iam_user_toml(&user));
+        new_users.push(user.name);
+    }
     if sections.is_empty() {
         eprintln!("fob: nothing new to import");
         return Ok(());
     }
+    let key_hint = if new_users.is_empty() {
+        String::new()
+    } else {
+        let logins: Vec<String> = new_users
+            .iter()
+            .map(|n| format!("`fob login {n}`"))
+            .collect();
+        format!(
+            "; the access keys were not imported: run {} to store each one in the keychain",
+            logins.join(", ")
+        )
+    };
     let toml = sections.join("\n");
     if !write {
         print!("{toml}");
         eprintln!(
-            "fob: review the names, then run again with --write to append them to {}",
+            "fob: review the names, then run again with --write to append them to {}{key_hint}",
             paths::config_file().display()
         );
         return Ok(());
     }
     let path = paths::config_file();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     let separator = if existing.is_empty() || existing.ends_with("\n\n") {
         ""
     } else if existing.ends_with('\n') {
@@ -1579,9 +1729,10 @@ fn import_aws(
     };
     let updated = format!("{existing}{separator}{toml}");
     Config::parse(&updated).context("the result would not be a valid config; nothing written")?;
-    std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
+    write_atomically(&path, &updated)?;
     eprintln!(
-        "fob: added {new_portals} integration(s) and {new_chained} chained role(s) to {}; run `fob sync`, or `fob login <name>` for new portals",
+        "fob: added {} integration(s) and {new_chained} role(s) to {}; run `fob sync`, or `fob login <name>` for new integrations{key_hint}",
+        new_portals + new_users.len(),
         path.display()
     );
     Ok(())
@@ -1823,5 +1974,65 @@ mod tests {
         // Optional in the format: left out rather than null.
         let value = output(aws_creds(None));
         assert!(value.get("AccountId").is_none(), "{value}");
+    }
+
+    /// A fresh directory under the system's temporary directory.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("omnifob-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn atomic_writes_replace_the_file_and_leave_nothing_behind() {
+        let dir = scratch("atomic");
+        let path = dir.join("aws").join("config");
+        write_atomically(&path, "first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+        write_atomically(&path, "second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+        assert_eq!(entries(&dir.join("aws")), ["config"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_keep_permissions_and_symbolic_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("atomic-unix");
+        let real = dir.join("dotfiles-config");
+        std::fs::write(&real, "old\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("config");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomically(&link, "new\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(entries(&dir), ["config", "dotfiles-config"]);
+
+        // A new file is the owner's only.
+        let fresh = dir.join("fresh");
+        write_atomically(&fresh, "x\n").unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

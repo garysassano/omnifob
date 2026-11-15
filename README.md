@@ -36,7 +36,9 @@ This installs two names for the same binary: `fob` for daily use and `omnifob` f
 
 ## Configure
 
-Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID, region, `mfa_serial` and `duration_seconds`), and prints matching integrations; `--write` appends them to the config.
+Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections with their `sso_registration_scopes`, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID, region, `mfa_serial` and `duration_seconds`), and prints matching integrations; `--write` appends them to the config. Roles assumed from a profile with an IAM user's access key become an `aws-iam` integration with those roles; the key itself is never read, so run `fob login <name>` afterwards to store it. Profiles it cannot import (a role assumed from another assumed role, a `credential_process` source, a `duration_seconds` AWS would refuse) are listed with the reason.
+
+Integration names may contain only letters, digits, `.`, `_` and `-`, and may not start with `-`. A config with another name is refused with a pointer to `fob rename "<old name>" <new-name>`, which still works on it.
 
 `~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`):
 
@@ -59,6 +61,14 @@ external_id = "..."          # optional
 region = "us-east-1"         # optional, defaults to the integration's
 mfa_serial = "arn:aws:iam::111111111111:mfa/me"  # optional: asks for a code per session
 duration = "30m"             # optional, 15m to 1h
+
+# An additional Region of a multi-Region Identity Center instance: a second
+# integration with that Region's portal URL (no /start), signed in on its own,
+# since CLI sign-ins are not replicated across Regions.
+[integrations.acme-eu]
+type = "aws-sso"
+start_url = "https://ssoins-1111111111111111.eu-west-1.portal.amazonaws.com"
+region = "eu-west-1"
 
 # An IAM user's access key, kept in the keychain like aws-vault keeps it. The key
 # is never handed out: profiles get a session from STS GetSessionToken (one MFA
@@ -193,7 +203,7 @@ fob creds cf/personal/workers --format fnox               # for a fnox command l
 
 AWS profiles export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CREDENTIAL_EXPIRATION` and `AWS_ACCOUNT_ID`, which the AWS SDKs use for account-based endpoints, plus `AWS_REGION` and `AWS_DEFAULT_REGION` when a Region is configured. The `credential-process` format carries the account as `AccountId`. These replace any you set yourself: an `AWS_ACCOUNT_ID` in your shell is overwritten by `fob exec` and `fob use`. With the account known, the SDKs send requests to account-based endpoints (DynamoDB, S3) on other hosts than the regional ones, which matters for firewall and VPC endpoint allowlists; `AWS_ACCOUNT_ID_ENDPOINT_MODE=disabled` turns that off.
 
-AWS profiles for tools that want `--profile` or `AWS_PROFILE`: `fob export aws-config` prints one `[profile fob-<integration>-<account>-<role>]` per discovered role, each using `credential_process = fob creds ... --format credential-process`. `--write` keeps them in a marked block of `~/.aws/config` (backing up the previous file) and never touches anything outside it.
+AWS profiles for tools that want `--profile` or `AWS_PROFILE`: `fob export aws-config` prints one `[profile fob-<integration>-<account>-<role>]` per discovered role, each using `credential_process = fob creds ... --format credential-process`. `--write` keeps them in a marked block of `~/.aws/config` (backing up the previous file) and never touches anything outside it; the file is replaced in one step, keeping its permissions, and a symbolic link to it stays a link. Editors and GUI tools often run without your shell's `PATH`: `--absolute` writes the full path of the `fob` binary you ran instead, with symbolic links resolved, so run the export again after upgrading fob. On Linux and macOS a path with a space is written in double quotes; on Windows a path that needs quotes is refused, so put `fob` on `PATH` there instead.
 
 ```sh
 fob export aws-config --write
