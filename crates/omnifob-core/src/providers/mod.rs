@@ -367,30 +367,139 @@ fn aws_console_partition(
     }
 }
 
+/// What `fob console` asks of an AWS console beyond the profile. Other
+/// providers take none of it.
+#[derive(Debug, Clone, Default)]
+pub struct ConsoleOptions {
+    /// How long the console session lasts (`SessionDuration`, 15 minutes to
+    /// 12 hours), overriding `console_duration`. Identity Center roles and
+    /// an IAM user's roles only: the federation endpoint refuses it for
+    /// chained roles and for the IAM user's own (`GetFederationToken`)
+    /// session.
+    pub duration: Option<jiff::SignedDuration>,
+    /// The console page to open, as the path after the console host (`ec2`,
+    /// `s3`, `cloudformation`).
+    pub service: Option<String>,
+    /// The Region the console opens in, overriding the profile's; it must
+    /// be in the profile's partition.
+    pub region: Option<String>,
+}
+
+/// Whether `fob console` needs credentials for this profile: AWS roles sign
+/// in with them, an IAM user's own console session comes from its access key
+/// and other providers' consoles need none.
+///
+/// Pass new credentials, not cached ones (`credentials` with `use_cache`
+/// off): without a `SessionDuration` the console session ends when they
+/// expire, and cached credentials are handed out until five minutes before.
+pub fn console_needs_credentials(profile: &Profile) -> bool {
+    profile.target.is_aws() && !matches!(profile.target, Target::AwsIamSession { .. })
+}
+
+/// The console session length to ask for: `--duration`, else the
+/// configured `console_duration` (Identity Center roles and an IAM user's
+/// roles), else none. Fails where the federation endpoint would refuse one.
+fn console_session_duration(
+    integration: &Integration,
+    profile: &Profile,
+    options: &ConsoleOptions,
+) -> anyhow::Result<Option<jiff::SignedDuration>> {
+    let duration = match (integration, &profile.target) {
+        (Integration::AwsSso(c), Target::Aws { .. }) => options.duration.or(c.console_duration),
+        (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => options
+            .duration
+            .or(c.roles.get(label).and_then(|role| role.console_duration)),
+        // `console_duration` on an aws-sso integration is for its Identity
+        // Center roles only.
+        (_, Target::AwsChained { .. }) if options.duration.is_some() => anyhow::bail!(
+            "a chained role's console session cannot be given a length: the AWS federation \
+             endpoint refuses SessionDuration for credentials from role chaining, so it lasts \
+             as long as the role's credentials (`duration`, at most an hour)"
+        ),
+        (_, Target::AwsIamSession { .. }) if options.duration.is_some() => anyhow::bail!(
+            "an IAM user's own console session cannot be given a length: the AWS federation \
+             endpoint refuses SessionDuration for GetFederationToken credentials, so it lasts \
+             the integration's `session_duration`; use one of its roles for another length"
+        ),
+        _ => None,
+    };
+    if let Some(duration) = duration {
+        aws_sso::check_console_duration(duration)?;
+    }
+    Ok(duration)
+}
+
+/// Checks `options` against the profile, so `fob console` can refuse them
+/// before it gets any credentials. [`console_url`] checks them too.
+pub fn check_console_options(
+    config: &Config,
+    profile: &Profile,
+    options: &ConsoleOptions,
+) -> Result<()> {
+    let integration = config.integration(&profile.integration)?;
+    if !profile.target.is_aws() {
+        if options.duration.is_some() || options.service.is_some() || options.region.is_some() {
+            return Err(anyhow::anyhow!(
+                "a console session length, service and Region apply only to AWS profiles, not {}",
+                profile.id
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    console_session_duration(integration, profile, options)?;
+    if let Some(service) = &options.service {
+        aws_sso::check_service(service)?;
+    }
+    if let Some(region) = &options.region {
+        aws_console_partition(&profile.integration, integration, &profile.target)?
+            .check_region(region)?;
+    }
+    Ok(())
+}
+
 /// Returns a URL that opens the provider's web console as this profile.
+/// `creds` are the profile's credentials where
+/// [`console_needs_credentials`] says so, and are otherwise ignored.
 pub async fn console_url(
     config: &Config,
     profile: &Profile,
     creds: &Credentials,
+    options: &ConsoleOptions,
 ) -> Result<String> {
+    check_console_options(config, profile, options)?;
     let integration = config.integration(&profile.integration)?;
+    let session_duration = console_session_duration(integration, profile, options)?;
+    let service = options.service.as_deref();
+    let region = options.region.as_deref();
     Ok(match (integration, &profile.target) {
         (Integration::AwsSso(c), target @ (Target::Aws { .. } | Target::AwsChained { .. })) => {
-            let partition = aws_console_partition(&profile.integration, integration, target)?;
-            let region = match target {
-                Target::Aws { .. } => c.default_region.as_deref(),
-                _ => creds.env.get("AWS_REGION").map(String::as_str),
+            let request = aws_sso::ConsoleRequest {
+                partition: aws_console_partition(&profile.integration, integration, target)?,
+                home_region: Some(&c.region),
+                region: region.or(match target {
+                    Target::Aws { .. } => c.default_region.as_deref(),
+                    _ => creds.env.get("AWS_REGION").map(String::as_str),
+                }),
+                service,
+                session_duration,
             };
-            aws_sso::console_url(creds, partition, Some(&c.region), region).await?
+            aws_sso::console_url(creds, &request).await?
         }
         (Integration::AwsIam(c), target @ Target::AwsIamSession { .. }) => {
             let partition = aws_console_partition(&profile.integration, integration, target)?;
-            aws_iam::console_url(&profile.integration, c, partition).await?
+            let region = region.or(c.region.as_deref());
+            aws_iam::console_url(&profile.integration, c, partition, region, service).await?
         }
         (Integration::AwsIam(c), target @ Target::AwsIamRole { .. }) => {
-            let partition = aws_console_partition(&profile.integration, integration, target)?;
-            let region = creds.env.get("AWS_REGION").map(String::as_str);
-            aws_sso::console_url(creds, partition, c.region.as_deref(), region).await?
+            let request = aws_sso::ConsoleRequest {
+                partition: aws_console_partition(&profile.integration, integration, target)?,
+                home_region: c.region.as_deref(),
+                region: region.or(creds.env.get("AWS_REGION").map(String::as_str)),
+                service,
+                session_duration,
+            };
+            aws_sso::console_url(creds, &request).await?
         }
         (Integration::Gcp(_), Target::Gcp { project_id, .. }) => {
             gcp::console_url(&profile.integration, Some(project_id))?
@@ -623,5 +732,140 @@ mod tests {
             missing.to_string(),
             "no chained role 'missing' in integration 'portal'; run `fob sync`"
         );
+    }
+
+    #[test]
+    fn console_options_follow_what_the_federation_endpoint_accepts() {
+        let config = Config::parse(
+            r#"
+            [integrations.portal]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "eu-west-1"
+            console_duration = "4h"
+            [integrations.portal.chained.ops]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws:iam::222222222222:role/Ops"
+
+            [integrations.user]
+            type = "aws-iam"
+            [integrations.user.roles.prod]
+            role_arn = "arn:aws:iam::333333333333:role/Admin"
+            console_duration = "2h"
+            [integrations.user.roles.plain]
+            role_arn = "arn:aws:iam::333333333333:role/Plain"
+
+            [integrations.cf]
+            type = "cloudflare-token"
+            account_id = "abc"
+            "#,
+        )
+        .unwrap();
+        let sso_role = Profile::new(
+            "portal",
+            "a",
+            "Admin",
+            Target::Aws {
+                account_id: "111111111111".into(),
+                account_name: "a".into(),
+                role_name: "Admin".into(),
+            },
+        );
+        let chained = Profile::new(
+            "portal",
+            "ops",
+            "Ops",
+            Target::AwsChained {
+                label: "ops".into(),
+                account_id: None,
+            },
+        );
+        let session = Profile::new(
+            "user",
+            "333333333333",
+            "session",
+            Target::AwsIamSession {
+                account_id: "333333333333".into(),
+            },
+        );
+        let iam_role = |label: &str| {
+            Profile::new(
+                "user",
+                label,
+                "Admin",
+                Target::AwsIamRole {
+                    label: label.into(),
+                    account_id: None,
+                },
+            )
+        };
+        let cloudflare = Profile::new(
+            "cf",
+            "abc",
+            "default",
+            Target::Cloudflare {
+                account_id: "abc".into(),
+                account_name: "abc".into(),
+                template: "default".into(),
+            },
+        );
+        let hours = jiff::SignedDuration::from_hours;
+        let with = |duration: Option<i64>| ConsoleOptions {
+            duration: duration.map(hours),
+            ..Default::default()
+        };
+        let duration = |profile: &Profile, options: &ConsoleOptions| {
+            let integration = config.integration(&profile.integration).unwrap();
+            console_session_duration(integration, profile, options)
+        };
+
+        // The flag overrides the configured length; unset, there is none.
+        assert_eq!(duration(&sso_role, &with(None)).unwrap(), Some(hours(4)));
+        assert_eq!(duration(&sso_role, &with(Some(8))).unwrap(), Some(hours(8)));
+        assert_eq!(
+            duration(&iam_role("prod"), &with(None)).unwrap(),
+            Some(hours(2))
+        );
+        assert_eq!(duration(&iam_role("plain"), &with(None)).unwrap(), None);
+        assert_eq!(
+            duration(&iam_role("plain"), &with(Some(1))).unwrap(),
+            Some(hours(1))
+        );
+        // The integration's length is not sent for its chained roles.
+        assert_eq!(duration(&chained, &with(None)).unwrap(), None);
+        assert_eq!(duration(&session, &with(None)).unwrap(), None);
+
+        // Role chaining and GetFederationToken refuse SessionDuration.
+        let error = check_console_options(&config, &chained, &with(Some(1))).unwrap_err();
+        assert!(error.to_string().contains("role chaining"), "{error}");
+        let error = check_console_options(&config, &session, &with(Some(1))).unwrap_err();
+        assert!(error.to_string().contains("GetFederationToken"), "{error}");
+        let error = check_console_options(&config, &sso_role, &with(Some(13))).unwrap_err();
+        assert!(error.to_string().contains("12 hours"), "{error}");
+
+        // The Region must be in the profile's partition, the service a path.
+        let region = |r: &str| ConsoleOptions {
+            region: Some(r.into()),
+            service: Some("ec2".into()),
+            ..Default::default()
+        };
+        assert!(check_console_options(&config, &chained, &region("eu-west-1")).is_ok());
+        let error = check_console_options(&config, &session, &region("us-gov-west-1")).unwrap_err();
+        assert!(error.to_string().contains("not aws"), "{error}");
+        let service = ConsoleOptions {
+            service: Some("ec2?x=1".into()),
+            ..Default::default()
+        };
+        assert!(check_console_options(&config, &sso_role, &service).is_err());
+
+        // Other providers take none of them.
+        assert!(check_console_options(&config, &cloudflare, &ConsoleOptions::default()).is_ok());
+        let error = check_console_options(&config, &cloudflare, &region("eu-west-1")).unwrap_err();
+        assert!(error.to_string().contains("only to AWS"), "{error}");
+        assert!(!console_needs_credentials(&cloudflare));
+        assert!(!console_needs_credentials(&session));
+        assert!(console_needs_credentials(&chained));
+        assert!(console_needs_credentials(&iam_role("prod")));
     }
 }

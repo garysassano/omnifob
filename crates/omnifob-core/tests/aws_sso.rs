@@ -698,3 +698,123 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
     .to_string();
     assert!(err.contains("1 hour"), "{err}");
 }
+
+fn role_creds() -> omnifob_core::Credentials {
+    let mut creds = omnifob_core::Credentials::default();
+    for (k, v) in [
+        ("AWS_ACCESS_KEY_ID", "ASIACONSOLE"),
+        ("AWS_SECRET_ACCESS_KEY", "console-secret"),
+        ("AWS_SESSION_TOKEN", "console-token"),
+    ] {
+        creds.env.insert(k.into(), v.into());
+    }
+    creds
+}
+
+fn console_request(
+    session_duration: Option<jiff::SignedDuration>,
+) -> aws_sso::ConsoleRequest<'static> {
+    aws_sso::ConsoleRequest {
+        partition: omnifob_core::providers::aws_partition::Partition::Aws,
+        home_region: Some("eu-west-1"),
+        region: Some("eu-west-1"),
+        service: Some("ec2"),
+        session_duration,
+    }
+}
+
+/// The form fields of a request body.
+fn form(request: &Request) -> HashMap<String, String> {
+    let body = std::str::from_utf8(&request.body).unwrap();
+    reqwest::Url::parse(&format!("http://form/?{body}"))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+#[tokio::test]
+async fn console_sign_in_posts_the_credentials_in_a_form() {
+    let (_guard, server) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/federation"))
+        .and(header("content-type", "application/x-www-form-urlencoded"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "SigninToken": "signin-token" })),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let url = aws_sso::console_url(&role_creds(), &console_request(None))
+        .await
+        .unwrap();
+    let eight_hours = jiff::SignedDuration::from_hours(8);
+    aws_sso::console_url(&role_creds(), &console_request(Some(eight_hours)))
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        // Nothing travels in the query string.
+        assert_eq!(request.url.query(), None);
+        let fields = form(request);
+        assert_eq!(fields["Action"], "getSigninToken");
+        let session: Value = serde_json::from_str(&fields["Session"]).unwrap();
+        assert_eq!(
+            session,
+            json!({
+                "sessionId": "ASIACONSOLE",
+                "sessionKey": "console-secret",
+                "sessionToken": "console-token",
+            })
+        );
+    }
+    // SessionDuration only when a length is asked for, in seconds.
+    assert!(!form(&requests[0]).contains_key("SessionDuration"));
+    assert_eq!(form(&requests[1])["SessionDuration"], "28800");
+
+    // The sign-in URL keeps the real, regional sign-in host and opens the
+    // service in the Region.
+    let url = reqwest::Url::parse(&url).unwrap();
+    assert_eq!(url.host_str(), Some("eu-west-1.signin.aws.amazon.com"));
+    assert_eq!(url.path(), "/federation");
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(query["Action"], "login");
+    assert_eq!(query["SigninToken"], "signin-token");
+    assert_eq!(
+        query["Destination"],
+        "https://eu-west-1.console.aws.amazon.com/ec2/home?region=eu-west-1"
+    );
+    assert!(!url.as_str().contains("console-secret"));
+}
+
+#[tokio::test]
+async fn a_refused_console_session_length_says_why_without_the_credentials() {
+    let (_guard, server) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/federation"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("<html>Bad Request</html>"))
+        .mount(&server)
+        .await;
+
+    let twelve_hours = jiff::SignedDuration::from_hours(12);
+    let error = aws_sso::console_url(&role_creds(), &console_request(Some(twelve_hours)))
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("HTTP 400"), "{error}");
+    assert!(error.contains("maximum session duration"), "{error}");
+    for secret in ["ASIACONSOLE", "console-secret", "console-token"] {
+        assert!(!error.contains(secret), "{error}");
+    }
+
+    // A length the endpoint never accepts is refused before any request.
+    let thirteen_hours = jiff::SignedDuration::from_hours(13);
+    let error = aws_sso::console_url(&role_creds(), &console_request(Some(thirteen_hours)))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("12 hours"), "{error}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
