@@ -323,6 +323,10 @@ pub fn aws_import(text: &str) -> AwsImport {
                 );
                 continue;
             };
+            if let Err(why) = crate::config::check_chained_role_arn(role_arn, &sso.sso_region) {
+                skip(name, why);
+                continue;
+            }
             f.chained.insert(
                 crate::profile::slug(name),
                 crate::config::ChainedRole {
@@ -852,6 +856,21 @@ credential_process = /usr/bin/creds
     }
 
     #[test]
+    fn skips_chained_roles_outside_the_portal_partition() {
+        let import = aws_import(
+            "[profile p]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = us-east-1\n\
+             sso_account_id = 111111111111\nsso_role_name = Admin\n\
+             [profile gov]\nrole_arn = arn:aws-us-gov:iam::222222222222:role/Audit\nsource_profile = p\n\
+             [profile typo]\nrole_arn = arn:aws:iam::22222222222:role/Audit\nsource_profile = p\n\
+             [profile ok]\nrole_arn = arn:aws:iam::222222222222:role/Audit\nsource_profile = p\n",
+        );
+        let skipped = skipped(&import);
+        assert!(skipped["gov"].contains("`cross_partition`"), "{skipped:?}");
+        assert!(skipped["typo"].contains("12 digits"), "{skipped:?}");
+        assert_eq!(import.portals[0].chained.keys().collect::<Vec<_>>(), ["ok"]);
+    }
+
+    #[test]
     fn reports_roles_from_other_credential_sources() {
         let import = aws_import(
             "[profile on-ec2]\nrole_arn = arn:aws:iam::1:role/A\ncredential_source = Ec2InstanceMetadata\n\
@@ -1035,7 +1054,7 @@ credential_process = /usr/bin/creds
             "[profile john.doe]\nregion = eu-west-1\n\
              [profile john.doe-admin]\nrole_arn = arn:aws:iam::1:role/Admin\nsource_profile = john.doe\n\
              [profile p]\nsso_session = acme.prod\nsso_account_id = 1\nsso_role_name = Admin\n\
-             [profile p.deploy]\nrole_arn = arn:aws:iam::2:role/Deploy\nsource_profile = p\n\
+             [profile p.deploy]\nrole_arn = arn:aws:iam::222222222222:role/Deploy\nsource_profile = p\n\
              [sso-session acme.prod]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = eu-west-1\n",
         );
         assert_eq!(import.iam_users[0].name, "john.doe");

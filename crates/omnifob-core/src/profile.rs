@@ -39,6 +39,14 @@ pub enum Target {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
     },
+    /// A role in another AWS partition, reached with a web identity token
+    /// from an Identity Center role; details live in the integration's
+    /// `cross_partition` table under `label`.
+    AwsCrossPartition {
+        label: String,
+        /// The account of the destination role, from its ARN.
+        account_id: String,
+    },
     /// An IAM user's own session, from STS `GetSessionToken`.
     AwsIamSession {
         account_id: String,
@@ -77,7 +85,9 @@ impl Target {
             Target::Aws { account_id, .. } | Target::Cloudflare { account_id, .. } => {
                 Some(account_id)
             }
-            Target::AwsIamSession { account_id } => Some(account_id),
+            Target::AwsIamSession { account_id } | Target::AwsCrossPartition { account_id, .. } => {
+                Some(account_id)
+            }
             Target::AwsChained { account_id, .. } | Target::AwsIamRole { account_id, .. } => {
                 account_id.as_deref()
             }
@@ -96,6 +106,7 @@ impl Target {
             self,
             Target::Aws { .. }
                 | Target::AwsChained { .. }
+                | Target::AwsCrossPartition { .. }
                 | Target::AwsIamSession { .. }
                 | Target::AwsIamRole { .. }
         )

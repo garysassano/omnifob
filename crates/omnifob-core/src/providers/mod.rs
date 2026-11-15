@@ -253,14 +253,17 @@ pub async fn credentials(
 
 /// The account an AWS profile's credentials belong to, as the profile states
 /// it: the account of an Identity Center role and an IAM user's session, and
-/// the role ARN's account, recorded at discovery, for chained and IAM user
-/// roles. The profile's, not the current config's: credentials cached before
-/// a `role_arn` edit belong to the account the profile was synced with, and
-/// `fob sync` drops them along with the old profile. Only a role profile
-/// synced before omnifob recorded the account falls back to the config.
+/// the role ARN's account, recorded at discovery, for chained,
+/// cross-partition and IAM user roles. The profile's, not the current
+/// config's: credentials cached before a `role_arn` edit belong to the
+/// account the profile was synced with, and `fob sync` drops them along with
+/// the old profile. Only a chained or IAM user's role profile synced before
+/// omnifob recorded the account falls back to the config.
 fn aws_account_id<'a>(config: &'a Config, profile: &'a Profile) -> Option<&'a str> {
     match &profile.target {
-        Target::Aws { account_id, .. } | Target::AwsIamSession { account_id } => Some(account_id),
+        Target::Aws { account_id, .. }
+        | Target::AwsIamSession { account_id }
+        | Target::AwsCrossPartition { account_id, .. } => Some(account_id),
         Target::AwsChained {
             account_id: Some(account_id),
             ..
@@ -311,6 +314,9 @@ async fn fetch(
         ) => aws_sso::credentials(&profile.integration, c, account_id, role_name).await?,
         (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
             aws_sso::chained_credentials(&profile.integration, c, label, &profile.id, ttl).await?
+        }
+        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => {
+            return Err(cross_partition_not_implemented(profile).into());
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
             aws_iam::session_credentials(&profile.integration, c, &profile.id, ttl).await?
@@ -363,6 +369,17 @@ async fn fetch(
     };
     Ok(fresh)
 }
+
+// TODO(layer 11): replace with the GetWebIdentityToken and
+// AssumeRoleWithWebIdentity flow in `fetch`, `console_url` and
+// `check_profile`.
+fn cross_partition_not_implemented(profile: &Profile) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is a cross-partition profile, and cross-partition profiles are not implemented yet",
+        profile.id
+    )
+}
+
 /// Mints credentials for one command and does not cache them, so they can be
 /// revoked with [`revoke_token`] when the command ends. Only Cloudflare
 /// tokens can be revoked early.
@@ -394,7 +411,7 @@ pub async fn revoke_token(config: &Config, profile: &Profile, token_id: &str) ->
 }
 
 /// The partition an AWS profile's console opens in: the role ARN's for a
-/// chained or IAM user's role, else the partition of the Region its
+/// chained, cross-partition or IAM user's role, else the partition of the Region its
 /// credentials come from (the portal's, or the IAM user's STS Region).
 fn aws_console_partition(
     name: &str,
@@ -407,6 +424,13 @@ fn aws_console_partition(
             .get(label)
             .with_context(|| {
                 format!("no chained role '{label}' in integration '{name}'; run `fob sync`")
+            })?
+            .partition(),
+        (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => c
+            .cross_partition
+            .get(label)
+            .with_context(|| {
+                format!("no cross-partition role '{label}' in integration '{name}'; run `fob sync`")
             })?
             .partition(),
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => c
@@ -470,6 +494,15 @@ fn console_session_duration(
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => options
             .duration
             .or(c.roles.get(label).and_then(|role| role.console_duration)),
+        // AssumeRoleWithWebIdentity credentials take SessionDuration like
+        // other AssumeRole* ones, unless STS counts the exchange as role
+        // chaining because the token was requested with role credentials.
+        // The integration's `console_duration` is for its Identity Center
+        // roles, so only the flag applies.
+        // TODO(layer 11): confirm whether the federation endpoint accepts
+        // SessionDuration for these credentials; if it does not, refuse it
+        // here as for chained roles.
+        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => options.duration,
         // `console_duration` on an aws-sso integration is for its Identity
         // Center roles only.
         (_, Target::AwsChained { .. }) if options.duration.is_some() => anyhow::bail!(
@@ -545,6 +578,9 @@ pub async fn console_url(
                 session_duration,
             };
             aws_sso::console_url(creds, &request).await?
+        }
+        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => {
+            return Err(cross_partition_not_implemented(profile).into());
         }
         (Integration::AwsIam(c), target @ Target::AwsIamSession { .. }) => {
             let partition = aws_console_partition(&profile.integration, integration, target)?;
@@ -622,6 +658,9 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 "acts as {}",
                 aws_sso::caller_identity(&creds, &region).await?.arn
             ))
+        }
+        (Integration::AwsSso(_), Target::AwsCrossPartition { .. }) => {
+            Err(cross_partition_not_implemented(profile).into())
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. } | Target::AwsIamRole { .. }) => {
             let region = creds
@@ -819,17 +858,24 @@ mod tests {
 
     #[test]
     fn console_partition_comes_from_the_role_arn() {
+        // The config check refuses a chained role outside the portal's
+        // partition (it needs `cross_partition`), so this one is built
+        // without it: the console still follows the ARN.
+        let portal = &Integration::AwsSso(
+            toml::from_str(
+                r#"
+                start_url = "https://acme.awsapps.com/start"
+                region = "eu-west-1"
+                [chained.gov]
+                via_account_id = "111111111111"
+                via_role = "Admin"
+                role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+                "#,
+            )
+            .unwrap(),
+        );
         let config = Config::parse(
             r#"
-            [integrations.portal]
-            type = "aws-sso"
-            start_url = "https://acme.awsapps.com/start"
-            region = "eu-west-1"
-            [integrations.portal.chained.gov]
-            via_account_id = "111111111111"
-            via_role = "Admin"
-            role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
-
             [integrations.user]
             type = "aws-iam"
             [integrations.user.roles.cn]
@@ -837,7 +883,6 @@ mod tests {
             "#,
         )
         .unwrap();
-        let portal = config.integration("portal").unwrap();
         let user = config.integration("user").unwrap();
         let chained = |label: &str| Target::AwsChained {
             label: label.into(),
@@ -882,6 +927,64 @@ mod tests {
             missing.to_string(),
             "no chained role 'missing' in integration 'portal'; run `fob sync`"
         );
+    }
+
+    #[tokio::test]
+    async fn cross_partition_profiles_are_aws_profiles_in_the_destination_partition() {
+        let config = Config::parse(
+            r#"
+            [integrations.portal]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "us-east-1"
+            console_duration = "4h"
+            [integrations.portal.cross_partition.gov-audit]
+            via_account_id = "111111111111"
+            via_role = "AdministratorAccess"
+            role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+            audience = "omnifob"
+            region = "us-gov-west-1"
+            "#,
+        )
+        .unwrap();
+        let target = Target::AwsCrossPartition {
+            label: "gov-audit".into(),
+            account_id: "222222222222".into(),
+        };
+        let profile = Profile::new("portal", "gov-audit", "Audit", target.clone());
+        let portal = config.integration("portal").unwrap();
+
+        assert_eq!(aws_account_id(&config, &profile), Some("222222222222"));
+        assert_eq!(
+            aws_console_partition("portal", portal, &target).unwrap(),
+            Partition::UsGov
+        );
+        assert!(console_needs_credentials(&profile));
+        // The integration's console_duration is for Identity Center roles;
+        // the flag applies.
+        let hours = |h| ConsoleOptions {
+            duration: Some(jiff::SignedDuration::from_hours(h)),
+            ..Default::default()
+        };
+        assert_eq!(
+            console_session_duration(portal, &profile, &ConsoleOptions::default()).unwrap(),
+            None
+        );
+        assert_eq!(
+            console_session_duration(portal, &profile, &hours(2)).unwrap(),
+            Some(jiff::SignedDuration::from_hours(2))
+        );
+        // A console Region must be in the destination partition.
+        let region = |r: &str| ConsoleOptions {
+            region: Some(r.into()),
+            ..Default::default()
+        };
+        assert!(check_console_options(&config, &profile, &region("us-gov-east-1")).is_ok());
+        assert!(check_console_options(&config, &profile, &region("us-east-1")).is_err());
+
+        // Until the STS flow lands, getting credentials says so.
+        let error = fetch(&config, &profile, None).await.unwrap_err();
+        assert!(error.to_string().contains("not implemented yet"), "{error}");
     }
 
     #[test]
