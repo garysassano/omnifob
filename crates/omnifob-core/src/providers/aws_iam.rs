@@ -173,7 +173,7 @@ pub async fn session_credentials(
     let key = stored_key(integration)?;
     let mut call = aws_sso::sts_client(&key_credentials(&key), sts_region(config))?
         .get_session_token()
-        .duration_seconds(duration.as_secs().try_into().map_err(anyhow::Error::from)?);
+        .duration_seconds(aws_sso::whole_seconds(duration)?);
     if let Some(serial) = &config.mfa_serial {
         call = call
             .serial_number(serial)
@@ -278,7 +278,7 @@ pub async fn console_url(
         .get_federation_token()
         .name("omnifob")
         .policy(allow_all)
-        .duration_seconds(duration.as_secs().try_into().map_err(anyhow::Error::from)?)
+        .duration_seconds(aws_sso::whole_seconds(duration)?)
         .send()
         .await
         .map_err(|e| anyhow!("{}", aws_sdk_sts::error::DisplayErrorContext(&e)))

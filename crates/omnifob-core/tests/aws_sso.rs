@@ -959,3 +959,536 @@ async fn the_console_gets_new_credentials_and_caches_them() {
         .unwrap();
     assert_eq!(reused.issued_at, console.issued_at);
 }
+
+/// A token as `GetWebIdentityToken` returns one, with the claims an
+/// Identity Center role's token carries. The signature is not checked.
+fn web_identity_jwt() -> String {
+    use base64::Engine;
+    let encode =
+        |json: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string());
+    format!(
+        "{}.{}.c2lnbmF0dXJl",
+        encode(json!({ "alg": "ES384", "kid": "k1" })),
+        encode(json!({
+            "iss": "https://abc123.tokens.sts.global.api.aws",
+            "sub": XP_SUB,
+            "aud": "omnifob",
+            "https://sts.amazonaws.com/": { "identity_store_user_id": "user-1" },
+        }))
+    )
+}
+
+const XP_SUB: &str = "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/eu-west-1/AWSReservedSSO_Admin_0123456789abcdef";
+
+fn web_identity_token() -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/xml")
+        .set_body_string(format!(
+            r#"<GetWebIdentityTokenResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><GetWebIdentityTokenResult><WebIdentityToken>{}</WebIdentityToken><Expiration>2100-01-01T00:00:00Z</Expiration></GetWebIdentityTokenResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></GetWebIdentityTokenResponse>"#,
+            web_identity_jwt()
+        ))
+}
+
+fn sts_error(status: u16, code: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .insert_header("content-type", "text/xml")
+        .set_body_string(format!(
+            r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>{code}</Code><Message>{code} from STS</Message></Error><RequestId>1</RequestId></ErrorResponse>"#
+        ))
+}
+
+/// A commercial portal with a GovCloud role, its token requested in
+/// us-east-1 rather than the portal's Region.
+fn cross_partition_config(integration: &str) -> Config {
+    Config::parse(&format!(
+        r#"
+        [integrations.{integration}]
+        type = "aws-sso"
+        start_url = "{START_URL}"
+        region = "eu-west-1"
+        [integrations.{integration}.cross_partition.gov]
+        via_account_id = "111111111111"
+        via_role = "Admin"
+        role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+        audience = "omnifob"
+        region = "us-gov-west-1"
+        source_region = "us-east-1"
+        duration = "2h"
+        "#
+    ))
+    .unwrap()
+}
+
+fn sso_config(config: &Config, integration: &str) -> AwsSsoConfig {
+    match config.integration(integration).unwrap() {
+        Integration::AwsSso(c) => c.clone(),
+        _ => unreachable!(),
+    }
+}
+
+fn cross_partition_profile(integration: &str) -> omnifob_core::Profile {
+    omnifob_core::Profile::new(
+        integration,
+        "gov",
+        "Audit",
+        omnifob_core::Target::AwsCrossPartition {
+            label: "gov".into(),
+            account_id: "222222222222".into(),
+        },
+    )
+}
+
+/// Mounts the Identity Center role's credentials for a signed-in portal.
+async fn mount_source_credentials(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .and(query_param("account_id", "111111111111"))
+        .and(query_param("role_name", "Admin"))
+        .respond_with(role_credentials())
+        .mount(server)
+        .await;
+}
+
+fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request.headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+#[tokio::test]
+async fn cross_partition_roles_exchange_a_web_identity_token() {
+    use omnifob_core::providers;
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "xp", 3600).await;
+    mount_source_credentials(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetWebIdentityToken"))
+        .respond_with(web_identity_token())
+        .expect(2)
+        .mount(&server)
+        .await;
+    for (seconds, access_key) in [("7200", "ASIAGOV"), ("1800", "ASIAGOVTTL")] {
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+            .and(body_string_contains(format!("DurationSeconds={seconds}")))
+            .respond_with(sts_credentials("AssumeRoleWithWebIdentity", access_key))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let config = cross_partition_config("xp");
+    let profile = cross_partition_profile("xp");
+
+    let creds = providers::credentials(&config, &profile, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+    assert_eq!(creds.env["AWS_REGION"], "us-gov-west-1");
+    assert_eq!(creds.env["AWS_DEFAULT_REGION"], "us-gov-west-1");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "222222222222");
+
+    let requests = server.received_requests().await.unwrap();
+    let action = |name: &str| {
+        requests
+            .iter()
+            .find(|r| form(r).get("Action").map(String::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("no {name} request"))
+    };
+    // One audience, the algorithm and a one-minute token, signed in the
+    // source Region with the Identity Center role's key and session.
+    let request = action("GetWebIdentityToken");
+    let fields = form(request);
+    assert_eq!(fields["Audience.member.1"], "omnifob");
+    assert!(!fields.contains_key("Audience.member.2"), "{fields:?}");
+    assert_eq!(fields["SigningAlgorithm"], "ES384");
+    assert_eq!(fields["DurationSeconds"], "60");
+    let authorization = header_value(request, "authorization").unwrap();
+    assert!(
+        authorization.contains("Credential=AKIAEXAMPLE/")
+            && authorization.contains("/us-east-1/sts/aws4_request"),
+        "{authorization}"
+    );
+    assert_eq!(
+        header_value(request, "x-amz-security-token"),
+        Some("session")
+    );
+    // The exchange carries the token, the role and the length, unsigned.
+    let request = action("AssumeRoleWithWebIdentity");
+    let fields = form(request);
+    assert_eq!(fields["WebIdentityToken"], web_identity_jwt());
+    assert_eq!(
+        fields["RoleArn"],
+        "arn:aws-us-gov:iam::222222222222:role/Audit"
+    );
+    assert_eq!(fields["RoleSessionName"], "omnifob");
+    assert_eq!(fields["DurationSeconds"], "7200");
+    assert_eq!(header_value(request, "authorization"), None);
+    assert_eq!(header_value(request, "x-amz-security-token"), None);
+
+    // Cached under the profile, like any other.
+    let cached = store::get::<omnifob_core::Credentials>(&store::credentials_key(&profile.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+    assert!(
+        !serde_json::to_string(&cached)
+            .unwrap()
+            .contains(&web_identity_jwt()),
+        "the token is never cached"
+    );
+    let again = providers::credentials(&config, &profile, true, None)
+        .await
+        .unwrap();
+    assert_eq!(again.issued_at, creds.issued_at);
+
+    // --ttl asks for another length and leaves the cache alone.
+    let ttl = providers::credentials(
+        &config,
+        &profile,
+        true,
+        Some(jiff::SignedDuration::from_mins(30)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ttl.env["AWS_ACCESS_KEY_ID"], "ASIAGOVTTL");
+    let again = providers::credentials(&config, &profile, true, None)
+        .await
+        .unwrap();
+    assert_eq!(again.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+    // A length STS never accepts is refused before any call.
+    for hours in [0, 13] {
+        let error = providers::credentials(
+            &config,
+            &profile,
+            true,
+            Some(jiff::SignedDuration::from_hours(hours)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("15 minutes to 12 hours"),
+            "{error}"
+        );
+    }
+}
+
+/// Runs the flow once against what is mounted, and returns the error.
+async fn cross_partition_error(config: &AwsSsoConfig, integration: &str) -> String {
+    let error = aws_sso::cross_partition_credentials(integration, config, "gov", None)
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(!error.contains(&web_identity_jwt()), "{error}");
+    error
+}
+
+fn count(requests: &[Request], needle: &str) -> usize {
+    requests
+        .iter()
+        .filter(|r| {
+            r.url.path() == needle || std::str::from_utf8(&r.body).is_ok_and(|b| b.contains(needle))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn refused_token_requests_say_who_has_to_act() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "xp-token", 3600).await;
+    let config = sso_config(&cross_partition_config("xp-token"), "xp-token");
+
+    // The documented code, without the SDK model's `Exception` suffix.
+    let cases = [
+        (
+            "OutboundWebIdentityFederationDisabled",
+            "outbound identity federation is not enabled in the source account 111111111111",
+        ),
+        (
+            "OutboundWebIdentityFederationDisabledException",
+            "an administrator of that account must enable it",
+        ),
+        (
+            "AccessDenied",
+            "Admin in 111111111111 may not request a web identity token for the audience 'omnifob', signed with ES384, lasting 60 seconds",
+        ),
+    ];
+    for (code, expected) in cases {
+        server.reset().await;
+        mount_source_credentials(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=GetWebIdentityToken"))
+            .respond_with(sts_error(403, code))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = cross_partition_error(&config, "xp-token").await;
+        assert!(error.contains(expected), "{code}: {error}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(count(&requests, "AssumeRoleWithWebIdentity"), 0, "{code}");
+    }
+    let error = {
+        server.reset().await;
+        mount_source_credentials(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=GetWebIdentityToken"))
+            .respond_with(sts_error(403, "AccessDenied"))
+            .mount(&server)
+            .await;
+        cross_partition_error(&config, "xp-token").await
+    };
+    assert!(error.contains("sts:IdentityTokenAudience"), "{error}");
+
+    // SessionDurationEscalation: retried once with new source credentials.
+    server.reset().await;
+    mount_source_credentials(&server).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=GetWebIdentityToken"))
+        .respond_with(sts_error(403, "SessionDurationEscalationException"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=GetWebIdentityToken"))
+        .respond_with(web_identity_token())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+        .respond_with(sts_credentials("AssumeRoleWithWebIdentity", "ASIAGOV"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let creds = aws_sso::cross_partition_credentials("xp-token", &config, "gov", None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(count(&requests, "/federation/credentials"), 2);
+    assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 2);
+
+    // Only once.
+    server.reset().await;
+    mount_source_credentials(&server).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=GetWebIdentityToken"))
+        .respond_with(sts_error(403, "SessionDurationEscalation"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let error = cross_partition_error(&config, "xp-token").await;
+    assert!(error.contains("expire sooner, even new ones"), "{error}");
+}
+
+#[tokio::test]
+async fn refused_exchanges_show_the_tokens_claims() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "xp-exchange", 3600).await;
+    let config = sso_config(&cross_partition_config("xp-exchange"), "xp-exchange");
+    let mount = |code: &'static str, times: Option<u64>| {
+        let server = &server;
+        async move {
+            server.reset().await;
+            mount_source_credentials(server).await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("Action=GetWebIdentityToken"))
+                .respond_with(web_identity_token())
+                .mount(server)
+                .await;
+            let mut refused = Mock::given(method("POST"))
+                .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+                .respond_with(sts_error(400, code))
+                .with_priority(1);
+            if let Some(times) = times {
+                refused = refused.up_to_n_times(times);
+            }
+            refused.mount(server).await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+                .respond_with(sts_credentials("AssumeRoleWithWebIdentity", "ASIAGOV"))
+                .mount(server)
+                .await;
+        }
+    };
+
+    // Refused by the destination: the values its administrator must match.
+    for code in ["AccessDenied", "InvalidIdentityToken", "IDPRejectedClaim"] {
+        mount(code, None).await;
+        let error = cross_partition_error(&config, "xp-exchange").await;
+        for expected in [
+            "arn:aws-us-gov:iam::222222222222:role/Audit does not accept the web identity token from Admin in 111111111111",
+            "an administrator of the destination account",
+            "'omnifob' as a client ID",
+            "iss https://abc123.tokens.sts.global.api.aws",
+            &format!("sub {XP_SUB}"),
+            "aud omnifob",
+        ] {
+            assert!(error.contains(expected), "{code}: {error}");
+        }
+        assert!(!error.contains("user-1"), "only iss, sub and aud: {error}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            count(&requests, "Action=AssumeRoleWithWebIdentity"),
+            1,
+            "{code}"
+        );
+    }
+
+    // The SDK retries an unreachable issuer with the same token, up to
+    // three attempts in all.
+    mount("IDPCommunicationError", Some(1)).await;
+    let creds = aws_sso::cross_partition_credentials("xp-exchange", &config, "gov", None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 1);
+    assert_eq!(count(&requests, "Action=AssumeRoleWithWebIdentity"), 2);
+    mount("IDPCommunicationError", None).await;
+    let error = cross_partition_error(&config, "xp-exchange").await;
+    assert!(
+        error.contains("could not reach the source account's issuer"),
+        "{error}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 1);
+    assert_eq!(count(&requests, "Action=AssumeRoleWithWebIdentity"), 3);
+
+    // An expired token needs a new one: retried once, then given up. The
+    // API reference spells the code `ExpiredToken`, the SDK model
+    // `ExpiredTokenException`.
+    for code in ["ExpiredToken", "ExpiredTokenException"] {
+        mount(code, Some(1)).await;
+        let creds = aws_sso::cross_partition_credentials("xp-exchange", &config, "gov", None)
+            .await
+            .unwrap();
+        assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 2, "{code}");
+        assert_eq!(
+            count(&requests, "Action=AssumeRoleWithWebIdentity"),
+            2,
+            "{code}"
+        );
+        mount(code, None).await;
+        let error = cross_partition_error(&config, "xp-exchange").await;
+        assert!(
+            error.contains("expired or not valid, twice")
+                && error.contains("expire 60 seconds after issuing it"),
+            "{code}: {error}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            count(&requests, "Action=AssumeRoleWithWebIdentity"),
+            2,
+            "{code}"
+        );
+    }
+
+    // A length above the role's maximum.
+    server.reset().await;
+    mount_source_credentials(&server).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=GetWebIdentityToken"))
+        .respond_with(web_identity_token())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>ValidationError</Code><Message>The requested DurationSeconds exceeds the MaxSessionDuration set for this role.</Message></Error><RequestId>1</RequestId></ErrorResponse>"#),
+        )
+        .mount(&server)
+        .await;
+    let error = cross_partition_error(&config, "xp-exchange").await;
+    assert!(
+        error.contains("does not allow sessions of 7200 seconds"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn cross_partition_profiles_check_in_the_destination_and_open_its_console() {
+    use omnifob_core::providers;
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "xp-check", 3600).await;
+    mount_source_credentials(&server).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=GetWebIdentityToken"))
+        .respond_with(web_identity_token())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=AssumeRoleWithWebIdentity"))
+        .respond_with(sts_credentials("AssumeRoleWithWebIdentity", "ASIAGOV"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=GetCallerIdentity"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(r#"<GetCallerIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><GetCallerIdentityResult><Arn>arn:aws-us-gov:sts::222222222222:assumed-role/Audit/omnifob</Arn><UserId>AROA:omnifob</UserId><Account>222222222222</Account></GetCallerIdentityResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></GetCallerIdentityResponse>"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/federation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "SigninToken": "signin-token" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = cross_partition_config("xp-check");
+    let profile = cross_partition_profile("xp-check");
+
+    let checked = providers::check_profile(&config, &profile).await.unwrap();
+    assert_eq!(
+        checked,
+        "acts as arn:aws-us-gov:sts::222222222222:assumed-role/Audit/omnifob"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let identity = requests
+        .iter()
+        .find(|r| {
+            std::str::from_utf8(&r.body)
+                .unwrap()
+                .contains("GetCallerIdentity")
+        })
+        .unwrap();
+    let authorization = header_value(identity, "authorization").unwrap();
+    assert!(
+        authorization.contains("Credential=ASIAGOV/")
+            && authorization.contains("/us-gov-west-1/sts/aws4_request"),
+        "{authorization}"
+    );
+
+    let options = providers::ConsoleOptions::default();
+    let creds = providers::console_credentials(&config, &profile)
+        .await
+        .unwrap();
+    let url = providers::console_url(&config, &profile, &creds, &options)
+        .await
+        .unwrap();
+    let url = reqwest::Url::parse(&url).unwrap();
+    assert_eq!(url.host_str(), Some("signin.amazonaws-us-gov.com"));
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query["Destination"],
+        "https://console.amazonaws-us-gov.com/console/home?region=us-gov-west-1"
+    );
+    let federation = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/federation")
+        .unwrap();
+    assert!(!form(&federation).contains_key("SessionDuration"));
+}
