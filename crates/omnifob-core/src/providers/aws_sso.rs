@@ -1215,9 +1215,9 @@ fn console_endpoints(request: &ConsoleRequest) -> anyhow::Result<(String, String
         .unwrap_or(partition.default_region());
     let endpoint = format!(
         "https://{}/federation",
-        partition.signin_host(signin_region)
+        partition.signin_host(signin_region)?
     );
-    let host = partition.console_host(region);
+    let host = partition.console_host(region)?;
     let destination = match (service, region) {
         (None, None) => format!("https://{host}/"),
         (Some(service), None) => format!("https://{host}/{service}/home"),
@@ -1629,6 +1629,34 @@ mod tests {
                 "{service}: {error}"
             );
         }
+        // A Region becomes part of the sign-in host, so one that is not
+        // shaped like a Region could send the credentials elsewhere.
+        for region in [
+            "attacker.example#",
+            "attacker.example/",
+            "eu-west-1.attacker.example",
+            "eu-west-1@attacker.example",
+            "EU-WEST-1",
+        ] {
+            let error =
+                console_endpoints(&console(Aws, None, Some(region), Some("ec2"))).unwrap_err();
+            assert!(
+                error.to_string().contains("not an AWS Region name"),
+                "{region}: {error}"
+            );
+        }
+        // A malformed home Region never picks the sign-in host either.
+        let (endpoint, _) = console_endpoints(&console(
+            EuropeanSovereign,
+            Some("attacker.example#"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            endpoint,
+            "https://eusc-de-east-1.signin.amazonaws-eusc.eu/federation"
+        );
         // The service does not lift the partition check on the Region.
         assert!(console_endpoints(&console(UsGov, None, Some("eu-west-1"), Some("ec2"))).is_err());
     }

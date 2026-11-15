@@ -57,8 +57,10 @@ impl Partition {
 
     /// The partition a Region belongs to, from its prefix. A Region with an
     /// unknown prefix is taken to be commercial, as new commercial
-    /// geographies keep appearing.
+    /// geographies keep appearing. A name not shaped like a Region is
+    /// refused, since Regions become part of host names.
     pub fn of_region(region: &str) -> anyhow::Result<Self> {
+        check_region_name(region)?;
         if let Some(isolated) = isolated_partition(region) {
             bail!(
                 "{region} is in {isolated}, an isolated AWS partition with no public console or cross-partition access"
@@ -124,27 +126,33 @@ impl Partition {
     }
 
     /// The sign-in host for federation in `region`, regional as AWS
-    /// recommends; a few Regions use the unprefixed host.
-    pub fn signin_host(self, region: &str) -> String {
+    /// recommends; a few Regions use the unprefixed host. Fails for a name
+    /// not shaped like a Region, which could otherwise name another host.
+    pub fn signin_host(self, region: &str) -> anyhow::Result<String> {
         let domain = match self {
             Self::Aws => "signin.aws.amazon.com",
             Self::China => "signin.amazonaws.cn",
             Self::UsGov => "signin.amazonaws-us-gov.com",
             Self::EuropeanSovereign => "signin.amazonaws-eusc.eu",
         };
-        format!("{}{domain}", region_prefix(region))
+        Ok(format!("{}{domain}", region_prefix(region)?))
     }
 
     /// The console host, for `region` or (with none) the partition's
-    /// unprefixed one, which every partition has.
-    pub fn console_host(self, region: Option<&str>) -> String {
+    /// unprefixed one, which every partition has. Fails for a name not
+    /// shaped like a Region.
+    pub fn console_host(self, region: Option<&str>) -> anyhow::Result<String> {
         let domain = match self {
             Self::Aws => "console.aws.amazon.com",
             Self::China => "console.amazonaws.cn",
             Self::UsGov => "console.amazonaws-us-gov.com",
             Self::EuropeanSovereign => "console.amazonaws-eusc.eu",
         };
-        format!("{}{domain}", region.map(region_prefix).unwrap_or_default())
+        let prefix = match region {
+            Some(region) => region_prefix(region)?,
+            None => String::new(),
+        };
+        Ok(format!("{prefix}{domain}"))
     }
 }
 
@@ -162,12 +170,40 @@ impl FromStr for Partition {
     }
 }
 
-fn region_prefix(region: &str) -> String {
-    if UNPREFIXED_REGIONS.contains(&region) {
+fn region_prefix(region: &str) -> anyhow::Result<String> {
+    check_region_name(region)?;
+    Ok(if UNPREFIXED_REGIONS.contains(&region) {
         String::new()
     } else {
         format!("{region}.")
+    })
+}
+
+/// Whether `name` is shaped like an AWS Region: lowercase words joined by
+/// hyphens and ending in a number (`eu-west-1`, `us-gov-west-1`,
+/// `eusc-de-east-1`, `us-isob-east-1`).
+fn is_region_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('-').collect();
+    let Some((number, words)) = parts.split_last() else {
+        return false;
+    };
+    name.len() <= 32
+        && words.len() >= 2
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && words
+            .iter()
+            .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
+/// Fails unless `name` is shaped like an AWS Region. Regions become part of
+/// sign-in and console host names, so anything else could send credentials
+/// to another host.
+fn check_region_name(name: &str) -> anyhow::Result<()> {
+    if !is_region_name(name) {
+        bail!("'{name}' is not an AWS Region name (such as eu-west-1)");
     }
+    Ok(())
 }
 
 /// The isolated partition a Region is in, if any: `us-iso-east-1` is in
@@ -230,7 +266,7 @@ mod tests {
             assert!(partition.contains(partition.default_region()));
             if let Some(region) = partition.unprefixed_region() {
                 assert_eq!(region, partition.default_region());
-                assert!(!partition.signin_host(region).starts_with(region));
+                assert!(!partition.signin_host(region).unwrap().starts_with(region));
             }
         }
         assert_eq!(Partition::EuropeanSovereign.unprefixed_region(), None);
@@ -259,6 +295,54 @@ mod tests {
         assert!(format!("{isolated:#}").contains("isolated"), "{isolated:#}");
         assert!(Partition::of_arn("Deploy").is_err());
         assert!(Partition::of_arn("arn:aws").is_err());
+    }
+
+    #[test]
+    fn region_names_must_look_like_regions() {
+        for region in [
+            "us-east-1",
+            "us-gov-west-1",
+            "cn-northwest-1",
+            "eusc-de-east-1",
+            "eu-isoe-west-1",
+            "us-isob-east-1",
+            "ap-southeast-7",
+            "mx-central-1",
+            "il-central-1",
+            "ca-west-1",
+        ] {
+            assert!(is_region_name(region), "{region}");
+            assert!(Partition::ALL.iter().any(|p| p.signin_host(region).is_ok()));
+        }
+        for region in [
+            "",
+            "attacker.example#",
+            "attacker.example/x",
+            "evil.com#eu-west-1",
+            "eu-west-1.attacker.example",
+            "eu-west-1#",
+            "eu-west-1/",
+            "EU-WEST-1",
+            "eu-west",
+            "west-1",
+            "eu--west-1",
+            "eu-west-1a",
+            "eu-west-",
+            "-eu-west-1",
+            "eu_west_1",
+            "eu-west-1 ",
+            "eu-wést-1",
+        ] {
+            assert!(!is_region_name(region), "{region:?}");
+            assert!(Partition::of_region(region).is_err(), "{region:?}");
+            assert!(Partition::Aws.check_region(region).is_err(), "{region:?}");
+            assert!(!Partition::Aws.contains(region), "{region:?}");
+            assert!(Partition::Aws.signin_host(region).is_err(), "{region:?}");
+            assert!(
+                Partition::Aws.console_host(Some(region)).is_err(),
+                "{region:?}"
+            );
+        }
     }
 
     #[test]

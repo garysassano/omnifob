@@ -391,11 +391,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             // New credentials, not cached ones: without a session length the
             // console signs out when they expire, and cached ones are handed
             // out until minutes before that.
-            let creds = if providers::console_needs_credentials(&profile) {
-                app.credentials(&profile, false, None).await?
-            } else {
-                Credentials::default()
-            };
+            let creds = app
+                .with_login(|| providers::console_credentials(&app.config, &profile))
+                .await
+                .with_context(|| format!("getting credentials for {}", profile.id))?;
             let url = providers::console_url(&app.config, &profile, &creds, &options).await?;
             record_use(&profile.id);
             if print {

@@ -388,12 +388,20 @@ pub struct ConsoleOptions {
 /// Whether `fob console` needs credentials for this profile: AWS roles sign
 /// in with them, an IAM user's own console session comes from its access key
 /// and other providers' consoles need none.
-///
-/// Pass new credentials, not cached ones (`credentials` with `use_cache`
-/// off): without a `SessionDuration` the console session ends when they
-/// expire, and cached credentials are handed out until five minutes before.
 pub fn console_needs_credentials(profile: &Profile) -> bool {
     profile.target.is_aws() && !matches!(profile.target, Target::AwsIamSession { .. })
+}
+
+/// The credentials to pass to [`console_url`]: always new ones, never cached,
+/// where [`console_needs_credentials`] says the profile needs any, and none
+/// otherwise. Without a `SessionDuration` the console session ends when they
+/// expire, and cached credentials are handed out until five minutes before.
+/// The new credentials also replace the cached ones.
+pub async fn console_credentials(config: &Config, profile: &Profile) -> Result<Credentials> {
+    if !console_needs_credentials(profile) {
+        return Ok(Credentials::default());
+    }
+    credentials(config, profile, false, None).await
 }
 
 /// The console session length to ask for: `--duration`, else the
@@ -459,8 +467,7 @@ pub fn check_console_options(
 }
 
 /// Returns a URL that opens the provider's web console as this profile.
-/// `creds` are the profile's credentials where
-/// [`console_needs_credentials`] says so, and are otherwise ignored.
+/// `creds` come from [`console_credentials`].
 pub async fn console_url(
     config: &Config,
     profile: &Profile,

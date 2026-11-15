@@ -818,3 +818,47 @@ async fn a_refused_console_session_length_says_why_without_the_credentials() {
     assert!(error.to_string().contains("12 hours"), "{error}");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn the_console_gets_new_credentials_and_caches_them() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "fresh", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let text = format!(
+        "[integrations.fresh]\ntype = \"aws-sso\"\nstart_url = \"{START_URL}\"\nregion = \"eu-west-1\"\n"
+    );
+    let config = Config::parse(&text).unwrap();
+    let profile = omnifob_core::Profile::new(
+        "fresh",
+        "prod",
+        "Admin",
+        omnifob_core::Target::Aws {
+            account_id: "111111111111".into(),
+            account_name: "prod".into(),
+            role_name: "Admin".into(),
+        },
+    );
+    use omnifob_core::providers;
+    // The first call caches the credentials, the second reuses them.
+    let cached = providers::credentials(&config, &profile, true, None)
+        .await
+        .unwrap();
+    providers::credentials(&config, &profile, true, None)
+        .await
+        .unwrap();
+    // The console bypasses the cache, and its credentials replace the cached.
+    let console = providers::console_credentials(&config, &profile)
+        .await
+        .unwrap();
+    assert!(console.issued_at > cached.issued_at);
+    let reused = providers::credentials(&config, &profile, true, None)
+        .await
+        .unwrap();
+    assert_eq!(reused.issued_at, console.issued_at);
+}
