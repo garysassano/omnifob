@@ -669,7 +669,7 @@ impl App {
                         );
                     }
                     let url = cloudflare::bootstrap_url(config);
-                    eprintln!("{}", cloudflare_bootstrap_help(config.token_type));
+                    eprintln!("{}", cloudflare_bootstrap_help(config.minting()));
                     eprintln!("     {url}");
                     if !no_browser && let Err(e) = open::that(&url) {
                         eprintln!("fob: could not open a browser ({e}); open the URL above");

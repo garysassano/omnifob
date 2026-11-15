@@ -390,6 +390,9 @@ pub struct CloudflareConfig {
     /// Display name for `account_id`; defaults to the ID.
     #[serde(default)]
     pub account_name: Option<String>,
+    /// The configured owner of minted tokens (`cloudflare-token` only). OAuth
+    /// leaves it at the default yet mints account-owned tokens, so code that
+    /// acts on the owner reads [`CloudflareConfig::minting`] instead.
     #[serde(default)]
     pub token_type: CloudflareTokenType,
     /// Lifetime of minted tokens unless a template overrides it.

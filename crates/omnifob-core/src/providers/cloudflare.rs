@@ -731,7 +731,23 @@ pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result
 }
 
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
-    forget_catalog(integration);
+    // Keep the IDs of minted tokens that could not be deleted, so a later
+    // sign-in still recognises them (and deletes them once expired); drop
+    // the rest, including the bootstrap's record.
+    let minted = load_catalog(integration).minted;
+    let kept = !minted.is_empty()
+        && save_catalog(
+            integration,
+            &Catalog {
+                minted,
+                ..Catalog::default()
+            },
+        )
+        .inspect_err(|e| tracing::warn!("could not keep the IDs of undeleted tokens: {e:#}"))
+        .is_ok();
+    if !kept {
+        forget_catalog(integration);
+    }
     let oauth = super::cloudflare_oauth::logout(integration)?;
     Ok(store::delete(&bootstrap_key(integration))? || oauth)
 }
@@ -874,6 +890,15 @@ impl Catalog {
         self.minted.retain(|_, ids| !ids.is_empty());
     }
 
+    /// Forgets the tracked IDs that `listed` (every account's tokens) lacks:
+    /// those tokens were deleted outside omnifob.
+    pub fn forget_missing(&mut self, listed: &[String]) {
+        for ids in self.minted.values_mut() {
+            ids.retain(|id| listed.contains(id));
+        }
+        self.minted.retain(|_, ids| !ids.is_empty());
+    }
+
     fn is_tracked(&self, token_id: &str) -> bool {
         self.minted
             .values()
@@ -1000,6 +1025,17 @@ pub fn rename_catalog(old: &str, new: &str) {
 /// Removes the stored catalog, for example after signing out.
 pub fn forget_catalog(integration: &str) {
     let _ = std::fs::remove_file(catalog_file(integration));
+}
+
+/// Forgets every tracked token ID, once all the accounts' minted tokens are
+/// deleted: the IDs left belong to tokens no listing showed.
+pub fn forget_minted(integration: &str) -> anyhow::Result<()> {
+    let mut catalog = load_catalog(integration);
+    if catalog.minted.is_empty() {
+        return Ok(());
+    }
+    catalog.minted.clear();
+    save_catalog(integration, &catalog)
 }
 
 /// Where to create the bootstrap token. For account-owned tokens this is a
@@ -1151,7 +1187,9 @@ pub async fn mint(
             wait_until_accepted(&minted, &path, "Workers AI").await;
         }
     };
-    let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now, catalog, false));
+    // Tracked IDs missing from this listing are kept: a new token may not be
+    // listed yet, and other accounts' tokens are listed elsewhere.
+    let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now, catalog));
     if let Err(e) = pruned {
         tracing::warn!("could not clean up expired omnifob tokens: {e:#}");
     }
@@ -1208,16 +1246,14 @@ const D1_WAIT_ATTEMPTS: u32 = 60;
 const D1_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Deletes tokens omnifob minted that have expired, so they do not pile up
-/// in the dashboard: tracked ones, and legacy-named ones. With
-/// `forget_missing`, tracked IDs absent from the list are forgotten; not
-/// right after minting, when a new token may not be listed yet.
+/// in the dashboard: tracked ones, and legacy-named ones. Returns how many,
+/// and the IDs of every token listed, for [`Catalog::forget_missing`].
 pub async fn prune_expired(
     client: &Client,
     tokens: &str,
     now: Timestamp,
     catalog: &mut Catalog,
-    forget_missing: bool,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, Vec<String>)> {
     let all: Vec<Token> = client.get_all(tokens).await?;
     let mut deleted = 0;
     for token in &all {
@@ -1229,14 +1265,7 @@ pub async fn prune_expired(
             deleted += 1;
         }
     }
-    if forget_missing {
-        let existing: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
-        for ids in catalog.minted.values_mut() {
-            ids.retain(|id| existing.contains(&id.as_str()));
-        }
-        catalog.minted.retain(|_, ids| !ids.is_empty());
-    }
-    Ok(deleted)
+    Ok((deleted, all.into_iter().map(|t| t.id).collect()))
 }
 
 async fn delete_token(client: &Client, tokens: &str, id: &str) -> anyhow::Result<()> {
@@ -1247,7 +1276,9 @@ async fn delete_token(client: &Client, tokens: &str, id: &str) -> anyhow::Result
 }
 
 /// Deletes the tokens omnifob minted for `profile_id` (or for every profile
-/// when `None`), live or not; returns how many.
+/// when `None`), live or not; returns how many. A failed delete does not stop
+/// the others; the first error is returned at the end, and the IDs of the
+/// tokens that could not be deleted stay tracked.
 pub async fn revoke_minted(
     client: &Client,
     tokens: &str,
@@ -1262,17 +1293,36 @@ pub async fn revoke_minted(
         Some(p) => catalog.minted.get(p).cloned().unwrap_or_default(),
         None => catalog.minted.values().flatten().cloned().collect(),
     };
-    let mut deleted = 0;
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+    let mut result = Ok(());
     for token in &all {
         if tracked.contains(&token.id) || token.name.starts_with(&legacy) {
-            delete_token(client, tokens, &token.id).await?;
-            deleted += 1;
+            match delete_token(client, tokens, &token.id).await {
+                Ok(()) => deleted.push(token.id.clone()),
+                Err(e) => {
+                    failed.push(token.id.clone());
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
+            }
         }
     }
-    for id in tracked {
-        catalog.untrack(&id);
+    // A profile's tokens all live in this listing, so its IDs can all go,
+    // gone already or not. Without a profile the listing may cover one of
+    // several accounts: forget only what it held, so the other accounts'
+    // tokens are still recognised when their listings come.
+    let forget = if profile_id.is_some() {
+        tracked
+    } else {
+        deleted.clone()
+    };
+    for id in forget.iter().filter(|id| !failed.contains(id)) {
+        catalog.untrack(id);
     }
-    Ok(deleted)
+    result?;
+    Ok(deleted.len())
 }
 
 /// [`revoke_minted`] with the stored bootstrap token and catalog.
@@ -1316,16 +1366,25 @@ pub async fn cleanup(
     let client = bootstrap_client(integration, config).await?;
     let mut catalog = load_catalog(integration);
     let mut deleted = 0;
+    let mut listed = Vec::new();
     let mut result = Ok(());
     for account_id in account_ids {
         let tokens = Client::tokens_path(config.minting(), account_id);
-        match prune_expired(&client, &tokens, Timestamp::now(), &mut catalog, true).await {
-            Ok(n) => deleted += n,
+        match prune_expired(&client, &tokens, Timestamp::now(), &mut catalog).await {
+            Ok((n, ids)) => {
+                deleted += n;
+                listed.extend(ids);
+            }
             Err(e) => result = Err(e),
         }
         if config.minting() == CloudflareTokenType::User {
             break; // user tokens are listed once, not per account
         }
+    }
+    // Only once every account was listed: an ID missing from one account's
+    // listing may belong to another account.
+    if result.is_ok() {
+        catalog.forget_missing(&listed);
     }
     save_catalog(integration, &catalog)?;
     result?;

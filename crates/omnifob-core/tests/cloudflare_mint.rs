@@ -1,10 +1,16 @@
 //! Cloudflare minting against a mock of the v4 API.
 
+use std::path::PathBuf;
+
 use jiff::Timestamp;
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
-use omnifob_core::providers::cloudflare::{Catalog, Client, mint, revoke_minted, start_session};
+use omnifob_core::providers::cloudflare::{
+    self, Catalog, Client, mint, revoke_minted, start_session,
+};
+use omnifob_core::{paths, providers, store};
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param};
+use tokio::sync::{Mutex, MutexGuard};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const ACCOUNT: &str = "acct123";
@@ -765,5 +771,273 @@ async fn a_session_makes_the_bootstrap_expire_and_ends_the_previous_one() {
             .parse::<Timestamp>()
             .unwrap(),
         expires_at
+    );
+}
+
+/// The tests that sign in share environment variables and the in-memory
+/// store, so they run one at a time.
+static SERIAL: Mutex<()> = Mutex::const_new(());
+
+/// A signed-in OAuth integration `cf` against a mock, with state in a scratch
+/// directory that is removed when this is dropped, even after a failure.
+struct SignedIn {
+    _guard: MutexGuard<'static, ()>,
+    server: MockServer,
+    state: PathBuf,
+    integration: Integration,
+}
+
+impl Drop for SignedIn {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.state);
+    }
+}
+
+impl SignedIn {
+    async fn new(test: &str) -> Self {
+        let guard = SERIAL.lock().await;
+        store::use_memory_store().unwrap();
+        let server = MockServer::start().await;
+        let state = std::env::temp_dir().join(format!("omnifob-cf-{test}-{}", std::process::id()));
+        // SAFETY: the tests that touch the environment run one at a time
+        // under SERIAL, and nothing else in this process reads it meanwhile.
+        unsafe {
+            std::env::set_var("OMNIFOB_CLOUDFLARE_API", server.uri());
+            std::env::set_var("XDG_STATE_HOME", &state);
+        }
+        let integration =
+            Config::parse("[integrations.cf]\ntype = \"cloudflare-oauth\"\nclient_id = \"x\"\n")
+                .unwrap()
+                .integrations
+                .remove("cf")
+                .unwrap();
+        // A browser sign-in that is still valid, so no refresh is attempted.
+        store::set(
+            "cloudflare/cf/oauth",
+            &json!({
+                "access_token": "oauth-access",
+                "expires_at": Timestamp::now() + jiff::SignedDuration::from_hours(1),
+                "refresh_token": null,
+                "scopes": [],
+            }),
+        )
+        .unwrap();
+        Self {
+            _guard: guard,
+            server,
+            state,
+            integration,
+        }
+    }
+
+    fn catalog_file() -> PathBuf {
+        paths::state_dir().join("cloudflare-cf.json")
+    }
+
+    fn save_catalog(catalog: &Catalog) {
+        std::fs::create_dir_all(paths::state_dir()).unwrap();
+        std::fs::write(
+            Self::catalog_file(),
+            serde_json::to_string(catalog).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn load_catalog() -> Option<Catalog> {
+        let text = std::fs::read_to_string(Self::catalog_file()).ok()?;
+        Some(serde_json::from_str(&text).unwrap())
+    }
+
+    /// Lists `tokens` in `account`, answering only to the OAuth access token.
+    async fn lists(&self, account: &str, tokens: Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/accounts/{account}/tokens")))
+            .and(header("authorization", "Bearer oauth-access"))
+            .respond_with(ok(tokens))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+    }
+
+    async fn deletes(&self, account: &str, id: &str, response: ResponseTemplate, times: u64) {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/accounts/{account}/tokens/{id}")))
+            .respond_with(response)
+            .expect(times)
+            .mount(&self.server)
+            .await;
+    }
+
+    async fn no_user_tokens(&self) {
+        Mock::given(method("GET"))
+            .and(path("/user/tokens"))
+            .respond_with(ok(json!([])))
+            .expect(0)
+            .mount(&self.server)
+            .await;
+    }
+}
+
+fn tracked(entries: &[(&str, &str)]) -> Catalog {
+    let mut catalog = Catalog::default();
+    for (profile, id) in entries {
+        catalog
+            .minted
+            .entry((*profile).into())
+            .or_default()
+            .push((*id).into());
+    }
+    catalog
+}
+
+#[tokio::test]
+async fn logout_under_oauth_revokes_the_minted_tokens_of_every_account() {
+    let cf = SignedIn::new("logout-all").await;
+    SignedIn::save_catalog(&tracked(&[
+        ("cf/acct-a/workers", "a1"),
+        ("cf/acct-b/workers", "b1"),
+        // Tracked, but no listing shows it any more.
+        ("cf/acct-b/dns-edit", "gone"),
+    ]));
+    cf.lists(
+        "acct-a",
+        json!([
+            { "id": "a1", "name": "omnifob workers", "status": "active" },
+            { "id": "a9", "name": "terraform", "status": "active" }
+        ]),
+    )
+    .await;
+    cf.lists(
+        "acct-b",
+        json!([
+            { "id": "b1", "name": "omnifob workers", "status": "active" },
+            { "id": "b2", "name": "omnifob:cf/acct-b/dns@2026-10-06T13:00:00Z", "status": "active" }
+        ]),
+    )
+    .await;
+    for (account, id, times) in [
+        ("acct-a", "a1", 1),
+        ("acct-a", "a9", 0),
+        ("acct-b", "b1", 1),
+        ("acct-b", "b2", 1),
+    ] {
+        cf.deletes(account, id, ok(json!({ "id": id })), times)
+            .await;
+    }
+    cf.no_user_tokens().await;
+
+    let accounts = ["acct-a".to_string(), "acct-b".to_string()];
+    let deleted = providers::revoke_all("cf", &cf.integration, &accounts)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 3);
+    let saved = SignedIn::load_catalog().unwrap();
+    assert!(saved.minted.is_empty(), "{:?}", saved.minted);
+
+    assert!(cloudflare::logout("cf").unwrap());
+    assert!(
+        SignedIn::load_catalog().is_none(),
+        "nothing left to remember"
+    );
+    cf.server.verify().await;
+}
+
+#[tokio::test]
+async fn logout_goes_on_past_an_account_that_fails_and_remembers_what_is_left() {
+    let cf = SignedIn::new("logout-partial").await;
+    let mut catalog = tracked(&[
+        ("cf/acct-a/workers", "a1"),
+        ("cf/acct-a/dns-edit", "a2"),
+        ("cf/acct-b/workers", "b1"),
+    ]);
+    catalog.user_tag = Some("tag".into());
+    SignedIn::save_catalog(&catalog);
+    cf.lists(
+        "acct-a",
+        json!([
+            { "id": "a1", "name": "omnifob workers", "status": "active" },
+            { "id": "a2", "name": "omnifob dns-edit", "status": "active" }
+        ]),
+    )
+    .await;
+    cf.lists(
+        "acct-b",
+        json!([{ "id": "b1", "name": "omnifob workers", "status": "active" }]),
+    )
+    .await;
+    let refused = ResponseTemplate::new(500).set_body_json(json!({
+        "success": false,
+        "errors": [{ "code": 1000, "message": "try again later" }],
+        "messages": [],
+        "result": null
+    }));
+    cf.deletes("acct-a", "a1", refused, 1).await;
+    cf.deletes("acct-a", "a2", ok(json!({ "id": "a2" })), 1)
+        .await;
+    cf.deletes("acct-b", "b1", ok(json!({ "id": "b1" })), 1)
+        .await;
+    cf.no_user_tokens().await;
+
+    let accounts = ["acct-a".to_string(), "acct-b".to_string()];
+    let err = providers::revoke_all("cf", &cf.integration, &accounts)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("try again later"), "{err:#}");
+    cf.server.verify().await;
+
+    // Only the token that could not be deleted is still tracked, and signing
+    // out keeps that, so a later sign-in still recognises it.
+    assert!(cloudflare::logout("cf").unwrap());
+    let kept = SignedIn::load_catalog().unwrap();
+    assert_eq!(
+        kept.minted.into_iter().collect::<Vec<_>>(),
+        [("cf/acct-a/workers".to_string(), vec!["a1".to_string()])]
+    );
+    assert_eq!(kept.user_tag, None, "the rest of the catalog is dropped");
+}
+
+#[tokio::test]
+async fn sync_under_oauth_prunes_expired_tokens_of_every_account() {
+    let cf = SignedIn::new("cleanup-all").await;
+    SignedIn::save_catalog(&tracked(&[
+        ("cf/acct-a/workers", "a1"),
+        ("cf/acct-b/workers", "b1"),
+        // Tracked, but deleted outside omnifob: no listing shows it.
+        ("cf/acct-b/dns-edit", "gone"),
+    ]));
+    cf.lists(
+        "acct-a",
+        json!([{ "id": "a1", "name": "omnifob workers", "status": "active" }]),
+    )
+    .await;
+    cf.lists(
+        "acct-b",
+        json!([{
+            "id": "b1", "name": "omnifob workers", "status": "active",
+            "expires_on": "2026-01-01T00:00:00Z"
+        }]),
+    )
+    .await;
+    cf.deletes("acct-a", "a1", ok(json!({ "id": "a1" })), 0)
+        .await;
+    cf.deletes("acct-b", "b1", ok(json!({ "id": "b1" })), 1)
+        .await;
+    cf.no_user_tokens().await;
+
+    let Integration::Cloudflare(config) = &cf.integration else {
+        unreachable!()
+    };
+    let accounts = ["acct-a".to_string(), "acct-b".to_string()];
+    let deleted = cloudflare::cleanup("cf", config, &accounts).await.unwrap();
+    assert_eq!(
+        deleted, 1,
+        "the second account's expired token is recognised"
+    );
+    cf.server.verify().await;
+    let saved = SignedIn::load_catalog().unwrap();
+    assert_eq!(
+        saved.minted.into_iter().collect::<Vec<_>>(),
+        [("cf/acct-a/workers".to_string(), vec!["a1".to_string()])],
+        "the live token stays tracked; the pruned and the missing ones are forgotten"
     );
 }
