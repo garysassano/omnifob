@@ -76,31 +76,37 @@ pub fn normalize_start_url(url: &str) -> String {
 
 /// Keys whose values are secrets; [`parse_ini`] keeps that they are set, not
 /// their values.
-const SECRET_KEYS: [&str; 3] = [
+const SECRET_KEYS: [&str; 4] = [
     "aws_access_key_id",
     "aws_secret_access_key",
     "aws_session_token",
+    // botocore's older name for the session token.
+    "aws_security_token",
 ];
 
 /// Parses an AWS config file into `section → key → value`, the way the AWS
 /// SDKs read it: lines starting with `#` or `;` are comments, and so is the
 /// rest of a line from a `#` or `;` that follows whitespace (`region =
 /// eu-west-1 # home`); in a section header, from any `#` or `;` after the
-/// `]`. Indented lines continue the property above them (`s3 =` and its
-/// sub-settings) and are skipped. Secret values are dropped.
+/// `]`. A line indented more deeply than the property line above it
+/// continues that property (`s3 =` and its sub-settings) and is skipped, as
+/// botocore's `configparser` decides; a section whose keys are all indented
+/// alike keeps every key. Secret values are dropped.
 fn parse_ini(text: &str) -> Vec<(String, BTreeMap<String, String>)> {
     let mut sections: Vec<(String, BTreeMap<String, String>)> = Vec::new();
-    let mut in_property = false;
+    // Indentation of the line that opened the current property.
+    let mut property_indent: Option<usize> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if raw.starts_with([' ', '\t']) && in_property {
+        let indent = raw.len() - raw.trim_start().len();
+        if property_indent.is_some_and(|opened| indent > opened) {
             continue;
         }
         if let Some(rest) = line.strip_prefix('[') {
-            in_property = false;
+            property_indent = None;
             let Some((name, _comment)) = rest.split_once(']') else {
                 continue;
             };
@@ -108,7 +114,7 @@ fn parse_ini(text: &str) -> Vec<(String, BTreeMap<String, String>)> {
         } else if let Some((key, value)) = strip_comment(line).split_once('=')
             && let Some((_, keys)) = sections.last_mut()
         {
-            in_property = true;
+            property_indent = Some(indent);
             let key = key.trim().to_string();
             let value = if SECRET_KEYS.contains(&key.as_str()) {
                 String::new()
@@ -189,6 +195,14 @@ const OTHER_SOURCES: [&str; 4] = [
     "web_identity_token_file",
     "login_session",
 ];
+
+/// The first of [`OTHER_SOURCES`] a profile sets.
+fn other_source(keys: &BTreeMap<String, String>) -> Option<&'static str> {
+    OTHER_SOURCES
+        .iter()
+        .copied()
+        .find(|s| keys.contains_key(*s))
+}
 
 /// How long AWS lets a role session last when it is chained from an
 /// Identity Center role, and when it is assumed with an IAM user's session.
@@ -280,8 +294,18 @@ pub fn aws_import(text: &str) -> AwsImport {
             }
             continue;
         }
-        let (Some(role_arn), Some(source)) = (keys.get("role_arn"), keys.get("source_profile"))
-        else {
+        let Some(role_arn) = keys.get("role_arn") else {
+            continue;
+        };
+        let Some(source) = keys.get("source_profile") else {
+            if let Some(other) = other_source(keys) {
+                skip(
+                    name,
+                    format!(
+                        "it gets its source credentials through {other}, which omnifob cannot import"
+                    ),
+                );
+            }
             continue;
         };
         let source_keys = profiles.get(source.as_str());
@@ -314,6 +338,15 @@ pub fn aws_import(text: &str) -> AwsImport {
             );
             continue;
         }
+        if let Some(other) = source_keys.and_then(|k| other_source(k)) {
+            skip(
+                name,
+                format!(
+                    "its source profile '{source}' gets credentials through {other}, which omnifob cannot import"
+                ),
+            );
+            continue;
+        }
         // A profile that names itself as its source assumes the role with its
         // own access key, as the AWS CLI allows.
         let source_is_self = source == name;
@@ -336,17 +369,6 @@ pub fn aws_import(text: &str) -> AwsImport {
             skip(
                 name,
                 format!("its source profile '{source}' has incomplete Identity Center settings"),
-            );
-            continue;
-        }
-        if let Some(other) =
-            source_keys.and_then(|k| OTHER_SOURCES.iter().find(|s| k.contains_key(**s)))
-        {
-            skip(
-                name,
-                format!(
-                    "its source profile '{source}' gets credentials through {other}, which omnifob cannot import"
-                ),
             );
             continue;
         }
@@ -464,12 +486,18 @@ fn toml_str(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
 }
 
+/// A TOML key: bare when it can be, else quoted, so `john.doe` stays one key
+/// rather than a nested table.
+fn toml_key(s: &str) -> String {
+    toml_edit::Key::new(s).display_repr().into_owned()
+}
+
 /// TOML for an `aws-sso` integration and its chained roles, ready to append
 /// to the config file.
 pub fn aws_portal_toml(portal: &AwsPortal) -> String {
     let mut out = format!(
         "[integrations.{}]\ntype = \"aws-sso\"\nstart_url = {}\nregion = {}\n",
-        portal.name,
+        toml_key(&portal.name),
         toml_str(&portal.start_url),
         toml_str(&portal.region)
     );
@@ -489,7 +517,10 @@ pub fn aws_portal_toml(portal: &AwsPortal) -> String {
 /// TOML for an `aws-iam` integration and its roles, ready to append to the
 /// config file. It has no key: `fob login` asks for it.
 pub fn aws_iam_user_toml(user: &AwsIamUser) -> String {
-    let mut out = format!("[integrations.{}]\ntype = \"aws-iam\"\n", user.name);
+    let mut out = format!(
+        "[integrations.{}]\ntype = \"aws-iam\"\n",
+        toml_key(&user.name)
+    );
     if let Some(region) = &user.region {
         out.push_str(&format!("region = {}\n", toml_str(region)));
     }
@@ -509,7 +540,9 @@ pub fn iam_roles_toml(
     for (label, role) in roles {
         let table = toml::to_string(role).expect("a role serializes");
         out.push_str(&format!(
-            "\n[integrations.{integration}.roles.\"{label}\"]\n{table}"
+            "\n[integrations.{}.roles.{}]\n{table}",
+            toml_key(integration),
+            toml_str(label)
         ));
     }
     out
@@ -524,7 +557,9 @@ pub fn chained_toml(
     for (label, role) in chained {
         let table = toml::to_string(role).expect("a chained role serializes");
         out.push_str(&format!(
-            "\n[integrations.{integration}.chained.\"{label}\"]\n{table}"
+            "\n[integrations.{}.chained.{}]\n{table}",
+            toml_key(integration),
+            toml_str(label)
         ));
     }
     out
@@ -536,33 +571,32 @@ pub const AWS_BLOCK_BEGIN: &str =
 pub const AWS_BLOCK_END: &str = "# END omnifob";
 
 /// The program in a `credential_process` line: `path` as is when it is made
-/// of letters, digits, `.`, `_`, `-`, `/`, `:` (and `\` on Windows), else in
-/// double quotes, as the AWS guide asks for a path with a space. Some SDKs
-/// run the line through `sh -c`, or `cmd.exe /C` on Windows, and others split
+/// of letters, digits, `.`, `_`, `-`, `/` and `:` (and `\` on Windows).
+///
+/// Outside Windows any other path goes in double quotes, as the AWS guide
+/// asks for a path with a space; the SDKs run the line with `sh -c` or split
 /// it like a shell, so a path with a character that stays special inside
-/// double quotes is refused rather than written: `"`, `$`, `` ` ``, `%` and
-/// control characters, a backslash outside Windows, and on Windows the
-/// characters that make `cmd.exe /C` drop the quotes (`&<>()@^|`).
+/// double quotes (`"`, `$`, `` ` ``, `\`, `%`, control characters) is
+/// refused. On Windows a path that would need quotes is refused: the Rust
+/// and Go SDKs hand the line to `cmd.exe /C` through an API that escapes
+/// inner quotes as `\"`, which `cmd.exe` does not undo, so a quoted path is
+/// not known to work there.
 pub fn credential_process_program(path: &str, windows: bool) -> anyhow::Result<String> {
-    let refused = |c: char| {
-        matches!(c, '"' | '$' | '`' | '%')
-            || c.is_control()
-            || (!windows && c == '\\')
-            || (windows && matches!(c, '&' | '<' | '>' | '(' | ')' | '@' | '^' | '|'))
+    let plain = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '_' | '-' | '/' | ':')
+            || (windows && c == '\\')
     };
-    if path.is_empty() || path.chars().any(refused) {
+    if !path.is_empty() && path.chars().all(plain) {
+        return Ok(path.to_string());
+    }
+    let quotable = |c: char| !matches!(c, '"' | '$' | '`' | '\\' | '%') && !c.is_control();
+    if windows || path.is_empty() || !path.chars().all(quotable) {
         anyhow::bail!(
             "the path {path:?} cannot be written in a credential_process line; leave out --absolute and put fob on PATH"
         );
     }
-    let plain = |c: char| {
-        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':') || c == '\\'
-    };
-    Ok(if path.chars().all(plain) {
-        path.to_string()
-    } else {
-        format!("\"{path}\"")
-    })
+    Ok(format!("\"{path}\""))
 }
 
 /// `[profile ...]` sections that get credentials from `<program> creds`, one
@@ -818,6 +852,28 @@ credential_process = /usr/bin/creds
     }
 
     #[test]
+    fn reports_roles_from_other_credential_sources() {
+        let import = aws_import(
+            "[profile on-ec2]\nrole_arn = arn:aws:iam::1:role/A\ncredential_source = Ec2InstanceMetadata\n\
+             [profile web]\nrole_arn = arn:aws:iam::1:role/B\nweb_identity_token_file = /t\n\
+             [profile from-on-ec2]\nrole_arn = arn:aws:iam::1:role/C\nsource_profile = on-ec2\n",
+        );
+        let skipped = skipped(&import);
+        assert!(
+            skipped["on-ec2"].contains("credential_source"),
+            "{skipped:?}"
+        );
+        assert!(skipped["web"].contains("web_identity_token_file"));
+        // Its source has a role_arn too, but the reason is the credential source.
+        assert!(
+            skipped["from-on-ec2"].contains("'on-ec2' gets credentials through credential_source"),
+            "{}",
+            skipped["from-on-ec2"]
+        );
+        assert!(import.iam_users.is_empty());
+    }
+
+    #[test]
     fn roles_from_access_keys_become_iam_users() {
         let import = aws_import(CONFIG);
         let names: Vec<&str> = import.iam_users.iter().map(|u| u.name.as_str()).collect();
@@ -876,6 +932,8 @@ credential_process = /usr/bin/creds
             .unwrap();
         assert_eq!(keys["aws_access_key_id"], "");
         assert_eq!(keys["aws_secret_access_key"], "");
+        let legacy = parse_ini("[default]\naws_security_token = legacy-token-value\n");
+        assert_eq!(legacy[0].1["aws_security_token"], "");
     }
 
     #[test]
@@ -972,6 +1030,75 @@ credential_process = /usr/bin/creds
     }
 
     #[test]
+    fn dotted_names_stay_one_key() {
+        let import = aws_import(
+            "[profile john.doe]\nregion = eu-west-1\n\
+             [profile john.doe-admin]\nrole_arn = arn:aws:iam::1:role/Admin\nsource_profile = john.doe\n\
+             [profile p]\nsso_session = acme.prod\nsso_account_id = 1\nsso_role_name = Admin\n\
+             [profile p.deploy]\nrole_arn = arn:aws:iam::2:role/Deploy\nsource_profile = p\n\
+             [sso-session acme.prod]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = eu-west-1\n",
+        );
+        assert_eq!(import.iam_users[0].name, "john.doe");
+        assert_eq!(import.portals[0].name, "acme.prod");
+        let toml: String = import
+            .portals
+            .iter()
+            .map(aws_portal_toml)
+            .chain(import.iam_users.iter().map(aws_iam_user_toml))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            toml.contains("[integrations.\"john.doe\".roles.\"john.doe-admin\"]"),
+            "{toml}"
+        );
+        let config = crate::Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.integrations.keys().collect::<Vec<_>>(),
+            ["acme.prod", "john.doe"]
+        );
+        let crate::Integration::AwsSso(sso) = &config.integrations["acme.prod"] else {
+            panic!()
+        };
+        assert_eq!(sso.chained["p.deploy"].via_role, "Admin");
+
+        // Appending roles to an integration whose name is quoted in the config.
+        let existing = "[integrations.\"acme.prod\"]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.\"john.doe\"]\ntype = \"aws-iam\"\n";
+        let appended = format!(
+            "{existing}{}{}",
+            chained_toml("acme.prod", &import.portals[0].chained),
+            iam_roles_toml("john.doe", &import.iam_users[0].roles)
+        );
+        let config = crate::Config::parse(&appended).unwrap();
+        let crate::Integration::AwsIam(user) = &config.integrations["john.doe"] else {
+            panic!()
+        };
+        assert_eq!(
+            user.roles["john.doe-admin"].role_arn,
+            "arn:aws:iam::1:role/Admin"
+        );
+    }
+
+    #[test]
+    fn indented_keys_are_continuations_only_below_a_shallower_property() {
+        // Every key indented alike: all are kept.
+        let sections = parse_ini(
+            "[profile a]\n  sso_start_url = https://a.awsapps.com/start\n  sso_region = eu-west-1\n  region = eu-west-2\n",
+        );
+        assert_eq!(sections[0].1.len(), 3, "{sections:?}");
+        assert_eq!(sections[0].1["region"], "eu-west-2");
+        // Deeper than the property above: a sub-setting, skipped.
+        let sections = parse_ini(
+            "[profile a]\n  s3 =\n      region = us-east-1\n  region = eu-west-1\n[profile b]\n    region = eu-north-1\n",
+        );
+        assert_eq!(sections[0].1["region"], "eu-west-1");
+        assert_eq!(sections[0].1.len(), 2);
+        assert_eq!(
+            sections[1].1["region"], "eu-north-1",
+            "a header resets the depth"
+        );
+    }
+
+    #[test]
     fn regional_portal_urls_of_a_multi_region_instance() {
         let regional = "https://SSOINS-1111aaaa2222bbbb.eu-west-1.portal.amazonaws.com/";
         let dual = "https://ssoins-1111aaaa2222bbbb.portal.eu-west-1.app.aws";
@@ -1039,10 +1166,7 @@ credential_process = /usr/bin/creds
             windows(r"C:\Users\me\bin\fob.exe").unwrap(),
             r"C:\Users\me\bin\fob.exe"
         );
-        assert_eq!(
-            windows(r"C:\Users\First Last\bin\fob.exe").unwrap(),
-            r#""C:\Users\First Last\bin\fob.exe""#
-        );
+        assert_eq!(unix("/opt/(tools)/fob").unwrap(), "\"/opt/(tools)/fob\"");
         for bad in [
             r#"/a"b/fob"#,
             "/a$b/fob",
@@ -1057,6 +1181,9 @@ credential_process = /usr/bin/creds
             r"C:\Program Files (x86)\fob.exe",
             r"C:\%USERPROFILE%\fob.exe",
             r"C:\a&b\fob.exe",
+            // Needs quotes, which cmd.exe /C is not known to keep.
+            r"C:\Users\First Last\bin\fob.exe",
+            "",
         ] {
             assert!(windows(bad).is_err(), "{bad:?}");
         }

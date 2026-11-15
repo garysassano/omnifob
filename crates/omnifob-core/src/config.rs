@@ -611,13 +611,17 @@ pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<St
     Ok(text)
 }
 
-/// Fails unless `name` is non-empty and made of ASCII letters, digits, `.`,
-/// `_` and `-`. Integration names go into profile ids, the AWS config's
+/// Fails unless `name` is non-empty, made of ASCII letters, digits, `.`, `_`
+/// and `-`, and does not start with `-` (the command line would read it as
+/// an option). Integration names go into profile ids, the AWS config's
 /// `credential_process` lines, keychain keys, lock files and the WSL vault's
 /// file names; template names into profile ids.
 pub fn check_name(what: &str, name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         bail!("{what} must not be empty");
+    }
+    if name.starts_with('-') {
+        bail!("{what} '{name}' must not start with '-'");
     }
     if !name
         .chars()
@@ -780,7 +784,7 @@ mod tests {
             ))
         };
         assert!(parse("Acme_prod-2.eu").is_ok());
-        for bad in ["a/b", "a b", "a\"b", "é", "a:b", ""] {
+        for bad in ["a/b", "a b", "a\"b", "é", "a:b", "", "-a"] {
             let err = parse(&bad.replace('"', "\\\"")).unwrap_err().to_string();
             assert!(err.contains("fob rename"), "{bad}: {err}");
         }

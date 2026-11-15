@@ -878,7 +878,7 @@ impl App {
         let aws_config = aws_config_file(None)
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok());
-        if aws_config.is_some_and(|t| t.contains(&format!("fob creds {old}/"))) {
+        if aws_config.is_some_and(|t| t.contains(&format!(" creds {old}/"))) {
             eprintln!(
                 "fob: ~/.aws/config still has profiles for '{old}'; run `fob export aws-config --write` to update them"
             );
@@ -1423,9 +1423,11 @@ fn aws_config_file(file: Option<std::path::PathBuf>) -> anyhow::Result<std::path
 
 /// Replaces `path` with `contents` through a temporary file in the same
 /// directory and a rename, so a reader never sees half a file and a failed
-/// write leaves the old one. An existing file keeps its permissions, and a
-/// symbolic link (a dotfiles manager's) stays a link: its target is
-/// replaced.
+/// write leaves the old one. An existing file keeps its permissions, a new
+/// one is readable by its owner only on Unix (as botocore creates the AWS
+/// config), and a symbolic link (a dotfiles manager's) stays a link: its
+/// target is replaced. The temporary file is created anew, never opened
+/// through a link left in its place.
 fn write_atomically(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     let target = match std::fs::canonicalize(path) {
@@ -1442,10 +1444,25 @@ fn write_atomically(path: &std::path::Path, contents: &str) -> anyhow::Result<()
         .file_name()
         .with_context(|| format!("{} is not a file", path.display()))?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.omnifob-{}.tmp", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!(
+        ".{name}.omnifob-{}-{nonce}.tmp",
+        std::process::id()
+    ));
     let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     let written = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
         // Before the contents on Unix, so they are never readable more widely
         // than the file they replace.
         #[cfg(unix)]
@@ -1531,9 +1548,20 @@ fn export_aws_config(
         return Ok(());
     }
     if !existing.is_empty() {
+        // A new file with the config's permissions, so a config holding keys
+        // is not copied somewhere more readable.
         let backup = path.with_extension("omnifob-backup");
-        std::fs::write(&backup, &existing)
-            .with_context(|| format!("writing {}", backup.display()))?;
+        match std::fs::remove_file(&backup) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("replacing {}", backup.display()));
+            }
+            _ => {}
+        }
+        write_atomically(&backup, &existing)?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            std::fs::set_permissions(&backup, meta.permissions())
+                .with_context(|| format!("writing {}", backup.display()))?;
+        }
         eprintln!("fob: backed up the previous file to {}", backup.display());
     }
     write_atomically(&path, &updated)?;
@@ -1999,6 +2027,12 @@ mod tests {
         let mode = std::fs::metadata(&real).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(entries(&dir), ["config", "dotfiles-config"]);
+
+        // A new file is the owner's only.
+        let fresh = dir.join("fresh");
+        write_atomically(&fresh, "x\n").unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
