@@ -42,7 +42,7 @@ Release notes live only in GitHub releases; there is no CHANGELOG.md. They are w
    git push origin vX.Y.Z
    ```
 
-5. The release workflow builds the binaries, publishes them with SHA256SUMS and provenance, and uses the tag message after its first line as the release text. A tag without notes falls back to GitHub's generated notes, with a warning.
-6. Check the release page, `sha256sum -c`, `gh attestation verify`, and `mise use github:garysassano/omnifob@X.Y.Z`.
+5. The release workflow builds the binaries, publishes them with build provenance (GitHub records each asset's SHA-256 digest, so there is no checksum file), and uses the tag message after its first line as the release text. A tag without notes falls back to GitHub's generated notes, with a warning.
+6. Check the release page, the downloads against each asset's `digest` in the API, `gh attestation verify`, and `mise use github:garysassano/omnifob@X.Y.Z` (the `github-releases` skill has the commands).
 
 To fix the notes of a published release, edit the release on GitHub (`gh release edit vX.Y.Z --notes-file ...`); tags are not rewritten.
