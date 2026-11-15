@@ -25,7 +25,7 @@ use crate::shell::Shell;
 #[command(
     name = "fob",
     version,
-    about = "One sign-in for every cloud: short-lived credentials for AWS IAM Identity Center, Cloudflare and more",
+    about = "One sign-in for every cloud: short-lived credentials for AWS (Identity Center and IAM users), Google Cloud, Azure and Cloudflare, and stored tokens for the rest",
     after_help = "Config: $OMNIFOB_CONFIG or ~/.config/omnifob/config.toml"
 )]
 struct Cli {
