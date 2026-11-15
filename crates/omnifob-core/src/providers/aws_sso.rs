@@ -1198,7 +1198,7 @@ pub async fn console_url(
         #[serde(rename = "SigninToken")]
         signin_token: String,
     }
-    let token: SigninToken = reqwest::Client::new()
+    let token: SigninToken = crate::http::client()
         .get(&endpoint)
         .query(&[("Action", "getSigninToken"), ("Session", session.as_str())])
         .send()

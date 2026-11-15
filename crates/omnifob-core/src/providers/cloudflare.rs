@@ -208,7 +208,7 @@ impl Client {
 
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::client(),
             base: base.into(),
             token: token.into(),
         }
@@ -548,7 +548,7 @@ async fn current_ips(api_base: &str) -> Vec<std::net::IpAddr> {
     let lookup = |local: IpAddr| {
         let trace = trace.clone();
         async move {
-            let client = reqwest::Client::builder()
+            let client = crate::http::builder()
                 .local_address(local)
                 .timeout(std::time::Duration::from_secs(5))
                 .build()

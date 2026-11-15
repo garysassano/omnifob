@@ -225,10 +225,9 @@ pub async fn login(
 }
 
 async fn verify(url: &str, token: &str) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let response = crate::http::client()
         .get(url)
         .bearer_auth(token)
-        .header("user-agent", "omnifob")
         .send()
         .await
         .with_context(|| format!("checking the token against {url}"))?;

@@ -92,13 +92,6 @@ fn url(endpoint: Endpoint) -> String {
     format!("{}{path}", base.as_deref().unwrap_or(host))
 }
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(concat!("omnifob/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("HTTP client")
-}
-
 fn token_key(integration: &str) -> String {
     format!("gcp/{integration}/oauth")
 }
@@ -288,7 +281,7 @@ fn id_token_email(id_token: &str) -> Option<String> {
 }
 
 async fn exchange(form: &[(&str, &str)]) -> std::result::Result<TokenResponse, ExchangeError> {
-    let response = http()
+    let response = crate::http::client()
         .post(url(Endpoint::Token))
         .form(form)
         .send()
@@ -407,7 +400,7 @@ pub async fn end_session(integration: &str) -> anyhow::Result<bool> {
     let Some(stored) = store::get::<Stored>(&token_key(integration))? else {
         return Ok(false);
     };
-    let response = http()
+    let response = crate::http::client()
         .post(url(Endpoint::Revoke))
         .form(&[("token", stored.refresh_token.as_str())])
         .send()
@@ -428,7 +421,7 @@ struct TokenInfo {
 }
 
 async fn token_info(access_token: &str) -> anyhow::Result<TokenInfo> {
-    let response = http()
+    let response = crate::http::client()
         .get(url(Endpoint::TokenInfo))
         .query(&[("access_token", access_token)])
         .send()
@@ -480,7 +473,7 @@ async fn list_projects(integration: &str, config: &GcpConfig) -> Result<Vec<Proj
     let mut projects = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
-        let mut request = http()
+        let mut request = crate::http::client()
             .get(url(Endpoint::Projects))
             .bearer_auth(&token)
             .query(&[("filter", "lifecycleState:ACTIVE")]);
@@ -632,7 +625,7 @@ async fn impersonate(
             .map(|d| format!("projects/-/serviceAccounts/{d}"))
             .collect(),
     };
-    let response = http()
+    let response = crate::http::client()
         .post(format!(
             "{}{}:generateAccessToken",
             url(Endpoint::GenerateAccessToken),

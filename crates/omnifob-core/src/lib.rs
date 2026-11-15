@@ -8,6 +8,7 @@
 pub mod config;
 pub mod credentials;
 pub mod history;
+pub(crate) mod http;
 pub mod import;
 pub mod oauth;
 pub mod paths;

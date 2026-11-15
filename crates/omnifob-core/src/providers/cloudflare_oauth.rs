@@ -132,15 +132,6 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-fn http() -> reqwest::Client {
-    // Cloudflare's bot protection rejects requests without a user agent
-    // (error 1010), and the token endpoint sits behind it.
-    reqwest::Client::builder()
-        .user_agent(concat!("omnifob/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("HTTP client")
-}
-
 fn client_id(integration: &str, config: &CloudflareConfig) -> anyhow::Result<String> {
     config.client_id.clone().with_context(|| {
         format!(
@@ -254,7 +245,7 @@ pub async fn login(
 async fn exchange(form: &[(&str, &str)]) -> anyhow::Result<TokenResponse> {
     let mut body = reqwest::Url::parse("http://localhost/").expect("valid URL");
     body.query_pairs_mut().extend_pairs(form);
-    let response = http()
+    let response = crate::http::client()
         .post(format!("{}/oauth2/token", dash()))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
@@ -407,7 +398,7 @@ pub async fn revoke(integration: &str, config: &CloudflareConfig) -> anyhow::Res
             .append_pair("token", &token)
             .append_pair("token_type_hint", hint)
             .append_pair("client_id", &client_id);
-        let response = http()
+        let response = crate::http::client()
             .post(format!("{}/oauth2/revoke", dash()))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body.query().unwrap_or_default().to_string())
