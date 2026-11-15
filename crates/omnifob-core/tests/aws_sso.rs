@@ -314,6 +314,140 @@ async fn an_ended_session_asks_for_sign_in_and_is_forgotten() {
 }
 
 #[tokio::test]
+async fn a_server_error_during_renewal_keeps_the_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "outage", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(aws_error(401, "UnauthorizedException"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(500, "InternalServerException"))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials("outage", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Other(_)), "{err}");
+    assert!(
+        format!("{err:#}").contains("could not renew the sign-in for 'outage'"),
+        "{err:#}"
+    );
+    assert!(aws_sso::session("outage").unwrap().unwrap().1, "kept");
+}
+
+#[tokio::test]
+async fn an_expired_token_that_cannot_be_renewed_now_does_not_ask_for_sign_in() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "offline", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(429, "SlowDownException"))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials("offline", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Other(_)), "{err}");
+    assert!(aws_sso::session("offline").unwrap().is_some(), "kept");
+}
+
+#[tokio::test]
+async fn an_unreachable_identity_center_keeps_the_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "unreachable", 0).await;
+    // Nothing listens on this port once the listener is dropped.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    // SAFETY: the tests run one at a time under SERIAL.
+    unsafe { std::env::set_var("OMNIFOB_AWS_ENDPOINT", url) };
+
+    let err = aws_sso::credentials("unreachable", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Other(_)), "{err}");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("could not renew the sign-in for 'unreachable'")
+            && message.contains("run `fob login unreachable` if this persists"),
+        "{message}"
+    );
+    assert!(aws_sso::session("unreachable").unwrap().is_some(), "kept");
+}
+
+#[tokio::test]
+async fn a_refused_renewal_keeps_using_a_token_still_valid() {
+    let (_guard, server) = setup().await;
+    // Inside the 15-minute window: the next use tries to renew.
+    device_login(&server, "valid", 300).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(400, "InvalidGrantException"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .and(header("x-amz-sso_bearer_token", "a1"))
+        .respond_with(role_credentials())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    aws_sso::credentials("valid", &config(), "111111111111", "Admin")
+        .await
+        .unwrap();
+    assert!(aws_sso::session("valid").unwrap().is_some(), "kept");
+}
+
+/// Identity Center refuses the client with `kind`: the session ends and the
+/// next sign-in registers a new client instead of reusing the refused one.
+async fn refused_client_is_registered_again(integration: &str, kind: &str) {
+    let (_guard, server) = setup().await;
+    device_login(&server, integration, 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(400, kind))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials(integration, &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
+    assert!(aws_sso::session(integration).unwrap().is_none());
+
+    device_login(&server, integration, 3600).await;
+    let registers = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/client/register")
+        .count();
+    assert_eq!(registers, 2, "the refused client was reused");
+}
+
+#[tokio::test]
+async fn an_invalid_client_is_registered_again() {
+    refused_client_is_registered_again("invalid-client", "InvalidClientException").await;
+}
+
+#[tokio::test]
+async fn an_unauthorized_client_is_registered_again() {
+    refused_client_is_registered_again("unauthorized-client", "UnauthorizedClientException").await;
+}
+
+#[tokio::test]
 async fn discovery_lists_every_account_and_role() {
     let (_guard, server) = setup().await;
     device_login(&server, "discover", 3600).await;
@@ -375,6 +509,79 @@ async fn signing_out_ends_the_portal_session() {
     assert!(aws_sso::end_session("logout", &config()).await.unwrap());
     assert!(aws_sso::logout("logout").unwrap());
     assert!(aws_sso::session("logout").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn signing_out_renews_an_expired_token_to_end_the_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "stale", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(
+            json!({ "grantType": "refresh_token", "refreshToken": "r1" }),
+        ))
+        .respond_with(token("a2", "r2", 3600))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .and(header("x-amz-sso_bearer_token", "a2"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert!(aws_sso::end_session("stale", &config()).await.unwrap());
+}
+
+#[tokio::test]
+async fn signing_out_reports_a_renewal_that_fails_for_now() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "later", 0).await;
+    // A request error not documented as final, which the SDK does not retry.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(400, "InvalidRequestException"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::end_session("later", &config()).await.unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("renewing the expired sign-in failed")
+            && message.contains("ends on its own")
+            && !message.contains("fob login"),
+        "{message}"
+    );
+    assert!(aws_sso::session("later").unwrap().is_some(), "kept");
+}
+
+#[tokio::test]
+async fn signing_out_of_an_ended_session_has_nothing_to_end() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "gone", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(aws_error(400, "InvalidGrantException"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    assert!(!aws_sso::end_session("gone", &config()).await.unwrap());
 }
 
 #[tokio::test]
