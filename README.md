@@ -65,7 +65,7 @@ duration = "30m"             # optional, 15m to 1h
 # A role in another AWS partition (GovCloud, China, European Sovereign Cloud),
 # reached from an Identity Center role with a web identity token.
 # Profile id: acme/gov-audit/Audit. Setup in both accounts: docs/guides/aws-cross-partition.md.
-# Not yet tried live across partitions.
+# The token request is tried live; the exchange in the other partition is not yet.
 [integrations.acme.cross_partition.gov-audit]
 via_account_id = "111111111111"      # the Identity Center role that requests the token
 via_role = "AdministratorAccess"

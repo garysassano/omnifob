@@ -1154,7 +1154,7 @@ pub async fn cross_partition_credentials(
     }
     let duration_seconds = whole_seconds(duration)?;
     let source_region = role.source_region(config);
-    let destination = unsigned_sts_client(&role.region);
+    let destination = exchange_client(role);
 
     let source = credentials(integration, config, &role.via_account_id, &role.via_role).await?;
     let mut sts = sts_client(&source, source_region)?;
@@ -1289,8 +1289,11 @@ fn exchange_error(
              identity token, even after retrying; try again later ({detail})"
         ),
         Some("ExpiredToken") => anyhow!(
-            "the web identity token had expired when STS in {region} checked it, twice; check \
-             that this computer's clock is right ({detail})"
+            "STS in {region} found the web identity token expired or not valid, twice, although \
+             each one was exchanged as soon as it was issued: the source STS makes it expire \
+             {WEB_IDENTITY_TOKEN_SECONDS} seconds after issuing it, so either more time than \
+             that passed between the two calls (a slow network, or the SDK's retries with \
+             backoff) or the token is not valid; try again later ({detail})"
         ),
         Some("ValidationError") if e.message().is_some_and(|m| m.contains("DurationSeconds")) => {
             anyhow!(
@@ -1367,6 +1370,12 @@ fn unsigned_sts_client(region: &str) -> aws_sdk_sts::Client {
         config = config.endpoint_url(url);
     }
     aws_sdk_sts::Client::from_conf(config.build())
+}
+
+/// The STS client a cross-partition role's token is exchanged through: the
+/// destination Region's, where the role's partition is, and unsigned.
+fn exchange_client(role: &CrossPartitionRole) -> aws_sdk_sts::Client {
+    unsigned_sts_client(&role.region)
 }
 
 /// Whom credentials act as, from STS `GetCallerIdentity`.
@@ -1667,7 +1676,7 @@ mod tests {
 
     /// Records the URL a request would go to, and stops it there.
     #[derive(Debug, Default, Clone)]
-    struct StopBeforeSending(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+    struct StopBeforeSending(std::sync::Arc<std::sync::Mutex<Option<(String, bool)>>>);
 
     impl aws_sdk_sts::config::Intercept for StopBeforeSending {
         fn name(&self) -> &'static str {
@@ -1680,7 +1689,9 @@ mod tests {
             _: &aws_sdk_sts::config::RuntimeComponents,
             _: &mut aws_sdk_sts::config::ConfigBag,
         ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            *self.0.lock().unwrap() = Some(context.request().uri().to_string());
+            let request = context.request();
+            let signed = request.headers().contains_key("authorization");
+            *self.0.lock().unwrap() = Some((request.uri().to_string(), signed));
             Err("stopped before sending".into())
         }
     }
@@ -1719,25 +1730,64 @@ mod tests {
                 .send()
                 .await;
             assert!(result.is_err());
-            let url = stop.0.lock().unwrap().clone().unwrap();
+            let (url, signed) = stop.0.lock().unwrap().clone().unwrap();
             assert_eq!(url.trim_end_matches('/'), host, "{region}");
+            assert!(signed, "{region}");
         }
-        // The exchange's client resolves the destination's Regional endpoint.
-        let stop = StopBeforeSending::default();
-        let _ = unsigned_sts_client("us-gov-east-1")
-            .assume_role_with_web_identity()
-            .role_arn("arn:aws-us-gov:iam::222222222222:role/Audit")
-            .role_session_name("omnifob")
-            .web_identity_token("a.b.c")
-            .customize()
-            .interceptor(stop.clone())
-            .send()
-            .await;
-        let url = stop.0.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            url.trim_end_matches('/'),
-            "https://sts.us-gov-east-1.amazonaws.com"
+    }
+
+    /// The exchange goes to STS in the destination Region, never the
+    /// source's, and is not signed.
+    #[tokio::test]
+    async fn the_exchange_goes_to_the_destination_region_unsigned() {
+        assert!(
+            endpoint_override().is_none(),
+            "OMNIFOB_AWS_ENDPOINT must be unset for this test"
         );
+        let config = crate::Config::parse(
+            r#"
+            [integrations.portal]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "us-east-1"
+            [integrations.portal.cross_partition.gov]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+            audience = "omnifob"
+            region = "us-gov-east-1"
+            source_region = "us-east-1"
+            [integrations.portal.cross_partition.eusc]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws-eusc:iam::333333333333:role/Audit"
+            audience = "omnifob"
+            region = "eusc-de-east-1"
+            "#,
+        )
+        .unwrap();
+        let crate::Integration::AwsSso(portal) = config.integration("portal").unwrap() else {
+            unreachable!()
+        };
+        for (label, host) in [
+            ("gov", "https://sts.us-gov-east-1.amazonaws.com"),
+            ("eusc", "https://sts.eusc-de-east-1.amazonaws.eu"),
+        ] {
+            let role = &portal.cross_partition[label];
+            let stop = StopBeforeSending::default();
+            let _ = exchange_client(role)
+                .assume_role_with_web_identity()
+                .role_arn(&role.role_arn)
+                .role_session_name("omnifob")
+                .web_identity_token("a.b.c")
+                .customize()
+                .interceptor(stop.clone())
+                .send()
+                .await;
+            let (url, signed) = stop.0.lock().unwrap().clone().unwrap();
+            assert_eq!(url.trim_end_matches('/'), host, "{label}");
+            assert!(!signed, "{label}");
+        }
     }
 
     #[test]

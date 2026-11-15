@@ -1355,23 +1355,36 @@ async fn refused_exchanges_show_the_tokens_claims() {
     assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 1);
     assert_eq!(count(&requests, "Action=AssumeRoleWithWebIdentity"), 3);
 
-    // An expired token needs a new one: retried once, then given up.
-    mount("ExpiredTokenException", Some(1)).await;
-    let creds = aws_sso::cross_partition_credentials("xp-exchange", &config, "gov", None)
-        .await
-        .unwrap();
-    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 2);
-    assert_eq!(count(&requests, "Action=AssumeRoleWithWebIdentity"), 2);
-    mount("ExpiredTokenException", None).await;
-    let error = cross_partition_error(&config, "xp-exchange").await;
-    assert!(
-        error.contains("check that this computer's clock is right"),
-        "{error}"
-    );
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(count(&requests, "Action=AssumeRoleWithWebIdentity"), 2);
+    // An expired token needs a new one: retried once, then given up. The
+    // API reference spells the code `ExpiredToken`, the SDK model
+    // `ExpiredTokenException`.
+    for code in ["ExpiredToken", "ExpiredTokenException"] {
+        mount(code, Some(1)).await;
+        let creds = aws_sso::cross_partition_credentials("xp-exchange", &config, "gov", None)
+            .await
+            .unwrap();
+        assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 2, "{code}");
+        assert_eq!(
+            count(&requests, "Action=AssumeRoleWithWebIdentity"),
+            2,
+            "{code}"
+        );
+        mount(code, None).await;
+        let error = cross_partition_error(&config, "xp-exchange").await;
+        assert!(
+            error.contains("expired or not valid, twice")
+                && error.contains("expire 60 seconds after issuing it"),
+            "{code}: {error}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            count(&requests, "Action=AssumeRoleWithWebIdentity"),
+            2,
+            "{code}"
+        );
+    }
 
     // A length above the role's maximum.
     server.reset().await;

@@ -442,7 +442,8 @@ pub struct ConsoleOptions {
     /// 12 hours), overriding `console_duration`. Identity Center roles and
     /// an IAM user's roles only: the federation endpoint refuses it for
     /// chained roles and for the IAM user's own (`GetFederationToken`)
-    /// session.
+    /// session, and cross-partition roles refuse it until it is confirmed
+    /// that the endpoint accepts it for their credentials.
     pub duration: Option<jiff::SignedDuration>,
     /// The console page to open, as the path after the console host (`ec2`,
     /// `s3`, `cloudformation`).

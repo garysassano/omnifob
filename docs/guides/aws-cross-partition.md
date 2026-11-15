@@ -18,7 +18,7 @@ session_name = "me"                  # optional, defaults to "omnifob"
 duration = "1h"                      # optional, 15m to the role's maximum (at most 12h)
 ```
 
-> **Not yet tried live.** The exchange has been tested against a mock of STS only: no account in a second partition was available. The source half (the token request) is checked against a real commercial account before release; the results go in the places marked "Live check" below. If you use this across partitions, please report what worked and what did not.
+> **The exchange is not yet tried live.** It has been tested against a mock of STS only: no account in a second partition was available. The source half was tried on 2026-11-15 in one commercial account with an IAM Identity Center role session: enabling outbound federation, requesting a one-minute ES384 token from the Regional endpoint, and reading its claims. What that showed is marked "Tried live" below; what it could not show is marked "Not yet tried". If you use this across partitions, please report what worked and what did not.
 
 ## Before you start
 
@@ -34,6 +34,8 @@ This is an account-wide setting. It creates the account's issuer URL, which the 
 aws iam enable-outbound-web-identity-federation
 aws iam get-outbound-web-identity-federation-info   # shows the issuer URL again later
 ```
+
+Both commands return it as `IssuerIdentifier`. Until federation is enabled, `get-outbound-web-identity-federation-info` fails with `FeatureDisabled` and a token request with `OutboundWebIdentityFederationDisabledException`. Disabling it again (`aws iam disable-outbound-web-identity-federation`) took a moment to apply: a token request made right after it still succeeded, and the next one, a few minutes later, was refused.
 
 The issuer URL looks like `https://<id>.tokens.sts.global.api.aws` for a commercial account (`tokens.sts.us-gov.api.aws` in GovCloud, `tokens.sts.global.api.amazonwebservices.com.cn` in China, `tokens.sts.global.api.amazonwebservices.eu` in the European Sovereign Cloud). The part after `https://` is the issuer host, used in the policies below.
 
@@ -60,7 +62,7 @@ Add an inline policy to the permission set that `via_role` names (IAM Identity C
 }
 ```
 
-> **Live check:** that a permission set's inline policy can grant `sts:GetWebIdentityToken`, and that the Identity Center role's credentials get a token from the Regional endpoint with these conditions.
+> **Tried live:** an Identity Center role whose permission set already allowed all actions got a token from the Regional endpoint (`sts.us-east-1.amazonaws.com`) with one audience, ES384 and `DurationSeconds` 60, and the token's `exp` was 60 seconds after its `iat`. The global endpoint (`sts.amazonaws.com`) refused the same request with `InvalidAction` ("Operation not supported on STS global endpoint"). **Not yet tried:** the inline policy above with its conditions, and how a request outside them (such as 300 seconds) is refused.
 
 ## 3. Create an OIDC provider in the destination account
 
@@ -104,9 +106,9 @@ The destination role's trust policy allows `sts:AssumeRoleWithWebIdentity` throu
 
 ### What `sub` is
 
-The token's `sub` is the ARN of the IAM principal that requested it. For an assumed role that is the role, not the session, and an Identity Center role is the reserved role IAM Identity Center creates for the permission set in each account: `arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/<region>/AWSReservedSSO_<permission set>_<suffix>`, with a random suffix (whether the path has the `<region>/` part depends on the Identity Center instance's Region). The `StringLike` pattern above matches it without the suffix; once you know the exact value, `StringEquals` on it is tighter.
+The token's `sub` is the ARN of the IAM principal that requested it. For an assumed role that is the role, not the session, and an Identity Center role is the reserved role IAM Identity Center creates for the permission set in each account: `arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/<region>/AWSReservedSSO_<permission set>_<suffix>`, with a random suffix. The `StringLike` pattern above matches it without the suffix; once you know the exact value, `StringEquals` on it is tighter.
 
-> **Live check:** the exact `sub` (with or without the role's path) and `iss` of a token requested with Identity Center role credentials, to be shown here.
+> **Tried live:** `sub` was the reserved role's full ARN, path included: `arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/<Identity Center Region>/AWSReservedSSO_<permission set>_<suffix>`, where the Region is the Identity Center instance's (not the Region the token was requested in). `iss` was `https://<id>.tokens.sts.global.api.aws`, the `IssuerIdentifier` from step 1. The namespaced claims also held `aws_account`, `source_region` (where the token was requested), `principal_id` (the same ARN as `sub`), `original_session_exp`, `org_id`, `ou_path` and `identity_store_user_id`; the header named `ES384` and a key ID. **Not yet tried:** an instance in `us-east-1`, whose path may differ.
 
 To see the claims of your own token, run the profile with debug logging; omnifob shows `iss`, `sub` and `aud` and nothing else from the token, and never the token itself:
 
@@ -118,7 +120,7 @@ A refused exchange shows the same three values in the error.
 
 ### Pinning the role to one person
 
-`sub` matches every session of the permission set's role, that is everyone assigned that permission set in the source account. To let only one person in, also match the Identity Center user, which a token from an Identity Center session carries as `identity_store_user_id` (with `identity_store_arn` for the identity store it belongs to):
+`sub` matches every session of the permission set's role, that is everyone assigned that permission set in the source account. To let only one person in, also match the Identity Center user, which a token from an Identity Center session carries as `identity_store_user_id`:
 
 ```json
 "Condition": {
@@ -126,18 +128,15 @@ A refused exchange shows the same three values in the error.
     "<issuer host>:aud": "omnifob",
     "<issuer host>:identity_store_user_id": "<user id>"
   },
-  "ArnEquals": {
-    "<issuer host>:identity_store_arn": "arn:aws:identitystore::<account>:identitystore/d-<id>"
-  },
   "StringLike": {
     "<issuer host>:sub": "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_AdministratorAccess_*"
   }
 }
 ```
 
-The user ID is shown in IAM Identity Center > Users > the user (User ID), and the identity store ARN under Settings. `<issuer host>:mfa_present` is `"true"` when the session used MFA (it is never `"false"`; it is left out without MFA), so `"StringEquals": { "<issuer host>:mfa_present": "true" }` requires it. These keys are checked when the role is assumed only; they are not kept in the role's session.
+The user ID is shown in IAM Identity Center > Users > the user (User ID). Keep the `sub` condition too, so the trust names the permission set as well as the person. These keys are checked when the role is assumed only; they are not kept in the role's session.
 
-> **Live check:** that tokens from Identity Center role sessions carry `identity_store_user_id`, `identity_store_arn` and `mfa_present`, as AWS's claims table says.
+> **Tried live:** the token carried `identity_store_user_id`, a UUID-shaped user ID. It did **not** carry `identity_store_arn`, which AWS's table lists, so do not put `<issuer host>:identity_store_arn` in a trust policy: an absent key fails `ArnEquals` and the role refuses every token. It did not carry `mfa_present` either. AWS documents that claim as `"true"` when the principal authenticated with MFA and left out otherwise; whether an Identity Center sign-in with MFA sets it is **not yet tried**, so do not require `<issuer host>:mfa_present` until you have seen it in your own token.
 
 ## Using the profile
 
