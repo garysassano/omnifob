@@ -46,6 +46,7 @@ type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
 region = "eu-central-1"          # where IAM Identity Center runs
 default_region = "eu-central-1"  # exported as AWS_REGION (optional)
+console_duration = "4h"          # optional: `fob console` session length, 15m to 12h
 
 # Roles assumed from an Identity Center role (role_arn + source_profile in ~/.aws/config).
 # Profile id: acme/prod-deploy/Deploy. AWS limits these sessions to one hour.
@@ -71,6 +72,7 @@ session_duration = "8h"        # optional, 15m to 36h (default 8h)
 [integrations.legacy.roles.prod]   # profile id: legacy/prod/Admin
 role_arn = "arn:aws:iam::222222222222:role/Admin"
 duration = "4h"                # optional, 15m to 12h (default 1h)
+console_duration = "8h"        # optional: `fob console` session length, 15m to 12h
 
 # A Google account, signed in like `gcloud auth login` (with gcloud's OAuth client).
 # Profile ids: google/<project>/user, and google/<label>/<name> per service account.
@@ -150,11 +152,20 @@ fob exec cf workers --ttl 4h -- claude   # longer-lived token for a long session
 fob exec cf workers --revoke -- claude   # token for this command only, deleted when it ends
 fob cf add-template cf pages             # pick services and access levels, save a template
 fob console prod admin    # opens the AWS console as that role
+fob console prod admin --service ec2 --region eu-west-1 --duration 8h
 fob status
 fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts)
 fob check prod admin      # do this profile's credentials work, and what do they act as?
 fob rename acme work      # rename an integration; keeps its sign-in and profiles
 ```
+
+### The AWS console
+
+`fob console` signs in with new credentials each time, never cached ones, so the console session gets their whole lifetime: without a session length, the console signs you out when the credentials it was opened with expire. For an IAM user's roles that is also never past the end of the user's session.
+
+`--duration` (or `console_duration` on an `aws-sso` integration or an `aws-iam` role) makes the console session last that long, 15 minutes to 12 hours, independently of the credentials. For an IAM user's roles, AWS does not state whether the console session can outlast the user's `GetSessionToken` session, and that has not been tried live. It has no default: it must be shorter than the role's maximum session duration (for an Identity Center role, the permission set's session duration, one hour unless your administrator raised it), which omnifob cannot see, and AWS refuses the sign-in otherwise. Chained roles and an IAM user's own session cannot take one: AWS refuses a session length for credentials from role chaining (at most an hour) and from `GetFederationToken` (which lasts the integration's `session_duration`).
+
+`--service` opens a console page, given as the path after the console host (`ec2`, `s3`, `lambda`, `cloudformation`, `route53/v2`), and `--region` the Region it opens in, which must be in the profile's partition; without it the profile's exported Region is used, if any.
 
 Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first.
 

@@ -125,6 +125,18 @@ enum Command {
         /// Print the URL instead of opening it
         #[arg(long)]
         print: bool,
+        /// How long the console session lasts, 15m to 12h, e.g. "8h"
+        /// (Identity Center roles and IAM users' roles; overrides
+        /// `console_duration`)
+        #[arg(long, value_parser = parse_ttl)]
+        duration: Option<jiff::SignedDuration>,
+        /// The console page to open, e.g. "ec2", "s3" or "cloudformation"
+        /// (AWS)
+        #[arg(long)]
+        service: Option<String>,
+        /// The Region the console opens in (AWS)
+        #[arg(long)]
+        region: Option<String>,
     },
     /// Print credentials for other tools (fnox, AWS credential_process, scripts)
     Creds {
@@ -362,18 +374,28 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let creds = app.credentials(&profile, !no_cache, ttl).await?;
             return exec(&profile, &creds, &command);
         }
-        Command::Console { profile, print } => {
+        Command::Console {
+            profile,
+            print,
+            duration,
+            service,
+            region,
+        } => {
             let profile = app.select(query(&profile).as_deref()).await?;
-            // Only AWS roles need credentials to sign in to the console; an
-            // IAM user's console session comes from its access key.
-            let creds = if profile.target.is_aws()
-                && !matches!(profile.target, omnifob_core::Target::AwsIamSession { .. })
-            {
-                app.credentials(&profile, true, None).await?
-            } else {
-                Credentials::default()
+            let options = providers::ConsoleOptions {
+                duration,
+                service,
+                region,
             };
-            let url = providers::console_url(&app.config, &profile, &creds).await?;
+            providers::check_console_options(&app.config, &profile, &options)?;
+            // New credentials, not cached ones: without a session length the
+            // console signs out when they expire, and cached ones are handed
+            // out until minutes before that.
+            let creds = app
+                .with_login(|| providers::console_credentials(&app.config, &profile))
+                .await
+                .with_context(|| format!("getting credentials for {}", profile.id))?;
+            let url = providers::console_url(&app.config, &profile, &creds, &options).await?;
             record_use(&profile.id);
             if print {
                 println!("{url}");

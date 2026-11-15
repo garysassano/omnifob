@@ -65,7 +65,10 @@ impl TryFrom<RawIntegration> for Integration {
 
     fn try_from(raw: RawIntegration) -> Result<Self, Self::Error> {
         Ok(match raw {
-            RawIntegration::AwsSso(c) => Integration::AwsSso(c),
+            RawIntegration::AwsSso(c) => {
+                c.validate()?;
+                Integration::AwsSso(c)
+            }
             RawIntegration::AwsIam(c) => {
                 c.validate()?;
                 Integration::AwsIam(c)
@@ -116,6 +119,30 @@ pub struct AwsSsoConfig {
     /// that becomes the middle of the profile id.
     #[serde(default)]
     pub chained: BTreeMap<String, ChainedRole>,
+    /// How long `fob console` sessions of this portal's roles last
+    /// (`SessionDuration`), 15 minutes to 12 hours, and shorter than the
+    /// permission set's session duration, which omnifob cannot see. Unset,
+    /// a console session lasts as long as the role's credentials. Chained
+    /// roles cannot take it.
+    #[serde(default, with = "opt_duration")]
+    pub console_duration: Option<SignedDuration>,
+}
+
+impl AwsSsoConfig {
+    fn validate(&self) -> Result<(), String> {
+        check_console_duration("console_duration", self.console_duration)
+    }
+}
+
+/// Fails unless a configured console session length is one the federation
+/// endpoint accepts.
+fn check_console_duration(key: &str, duration: Option<SignedDuration>) -> Result<(), String> {
+    match duration {
+        Some(d) if !crate::providers::aws_sso::CONSOLE_SESSION.contains(&d) => {
+            Err(format!("{key} must be between 15m and 12h"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A role assumed with the credentials of an Identity Center role.
@@ -209,6 +236,10 @@ impl AwsIamConfig {
                     "roles.{label}.duration must be between 15m and 12h"
                 ));
             }
+            check_console_duration(
+                &format!("roles.{label}.console_duration"),
+                role.console_duration,
+            )?;
         }
         Ok(())
     }
@@ -231,6 +262,11 @@ pub struct IamRole {
     /// defaults to one hour.
     #[serde(default, with = "opt_duration")]
     pub duration: Option<SignedDuration>,
+    /// How long `fob console` sessions last (`SessionDuration`), 15 minutes
+    /// to 12 hours and shorter than the role's maximum session duration.
+    /// Unset, a console session lasts as long as the role's credentials.
+    #[serde(default, with = "opt_duration")]
+    pub console_duration: Option<SignedDuration>,
 }
 
 impl IamRole {
@@ -770,6 +806,53 @@ mod tests {
         );
         assert!(parse_duration("0s").is_err());
         assert!(parse_duration("soon").is_err());
+    }
+
+    #[test]
+    fn console_durations_are_checked_and_have_no_default() {
+        let sso = |extra: &str| {
+            Config::parse(&format!(
+                "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n{extra}"
+            ))
+        };
+        let Integration::AwsSso(c) = &sso("").unwrap().integrations["a"] else {
+            panic!()
+        };
+        assert_eq!(c.console_duration, None);
+        let Integration::AwsSso(c) = &sso("console_duration = \"8h\"").unwrap().integrations["a"]
+        else {
+            panic!()
+        };
+        assert_eq!(c.console_duration, Some(SignedDuration::from_hours(8)));
+        let error = format!("{:#}", sso("console_duration = \"13h\"").unwrap_err());
+        assert!(
+            error.contains("console_duration must be between 15m and 12h"),
+            "{error}"
+        );
+
+        let iam = |extra: &str| {
+            Config::parse(&format!(
+                "[integrations.u]\ntype = \"aws-iam\"\n[integrations.u.roles.prod]\nrole_arn = \"arn:aws:iam::2:role/R\"\n{extra}"
+            ))
+        };
+        let Integration::AwsIam(c) = &iam("console_duration = \"4h\"").unwrap().integrations["u"]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            c.roles["prod"].console_duration,
+            Some(SignedDuration::from_hours(4))
+        );
+        let error = format!("{:#}", iam("console_duration = \"10m\"").unwrap_err());
+        assert!(
+            error.contains("roles.prod.console_duration must be between 15m and 12h"),
+            "{error}"
+        );
+        // Chained roles cannot take it: role chaining refuses SessionDuration.
+        let chained = sso(
+            "[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::2:role/R\"\nconsole_duration = \"1h\"",
+        );
+        assert!(chained.is_err());
     }
 
     #[test]

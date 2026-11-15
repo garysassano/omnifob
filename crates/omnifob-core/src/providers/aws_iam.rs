@@ -251,11 +251,18 @@ pub async fn role_credentials(
 /// the console, so this asks STS `GetFederationToken` with the access key for
 /// a federated session limited to the user's own permissions, as aws-vault
 /// does. A user whose policies require MFA cannot sign in this way: use a
-/// role instead. `partition` is the user's, from the STS Region.
+/// role instead. `partition` is the user's, from the STS Region; the console
+/// opens `service` in `region` when given.
+///
+/// The federated session is always new and lasts `session_duration`, which
+/// is also how long the console session lasts: the federation endpoint
+/// refuses `SessionDuration` for `GetFederationToken` credentials.
 pub async fn console_url(
     integration: &str,
     config: &AwsIamConfig,
     partition: Partition,
+    region: Option<&str>,
+    service: Option<&str>,
 ) -> Result<String> {
     let key = stored_key(integration)?;
     let duration = config
@@ -278,6 +285,12 @@ pub async fn console_url(
         response.credentials().context("no credentials returned")?,
         None,
     )?;
-    let home = Some(sts_region(config));
-    Ok(aws_sso::console_url(&creds, partition, home, config.region.as_deref()).await?)
+    let request = aws_sso::ConsoleRequest {
+        partition,
+        home_region: Some(sts_region(config)),
+        region,
+        service,
+        session_duration: None,
+    };
+    Ok(aws_sso::console_url(&creds, &request).await?)
 }
