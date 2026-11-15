@@ -890,6 +890,15 @@ impl Catalog {
         self.minted.retain(|_, ids| !ids.is_empty());
     }
 
+    /// Forgets the tracked IDs that `listed` (every account's tokens) lacks:
+    /// those tokens were deleted outside omnifob.
+    pub fn forget_missing(&mut self, listed: &[String]) {
+        for ids in self.minted.values_mut() {
+            ids.retain(|id| listed.contains(id));
+        }
+        self.minted.retain(|_, ids| !ids.is_empty());
+    }
+
     fn is_tracked(&self, token_id: &str) -> bool {
         self.minted
             .values()
@@ -1178,7 +1187,9 @@ pub async fn mint(
             wait_until_accepted(&minted, &path, "Workers AI").await;
         }
     };
-    let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now, catalog, false));
+    // Tracked IDs missing from this listing are kept: a new token may not be
+    // listed yet, and other accounts' tokens are listed elsewhere.
+    let (_, pruned) = tokio::join!(wait, prune_expired(client, &tokens, now, catalog));
     if let Err(e) = pruned {
         tracing::warn!("could not clean up expired omnifob tokens: {e:#}");
     }
@@ -1235,16 +1246,14 @@ const D1_WAIT_ATTEMPTS: u32 = 60;
 const D1_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Deletes tokens omnifob minted that have expired, so they do not pile up
-/// in the dashboard: tracked ones, and legacy-named ones. With
-/// `forget_missing`, tracked IDs absent from the list are forgotten; not
-/// right after minting, when a new token may not be listed yet.
+/// in the dashboard: tracked ones, and legacy-named ones. Returns how many,
+/// and the IDs of every token listed, for [`Catalog::forget_missing`].
 pub async fn prune_expired(
     client: &Client,
     tokens: &str,
     now: Timestamp,
     catalog: &mut Catalog,
-    forget_missing: bool,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, Vec<String>)> {
     let all: Vec<Token> = client.get_all(tokens).await?;
     let mut deleted = 0;
     for token in &all {
@@ -1256,14 +1265,7 @@ pub async fn prune_expired(
             deleted += 1;
         }
     }
-    if forget_missing {
-        let existing: Vec<&str> = all.iter().map(|t| t.id.as_str()).collect();
-        for ids in catalog.minted.values_mut() {
-            ids.retain(|id| existing.contains(&id.as_str()));
-        }
-        catalog.minted.retain(|_, ids| !ids.is_empty());
-    }
-    Ok(deleted)
+    Ok((deleted, all.into_iter().map(|t| t.id).collect()))
 }
 
 async fn delete_token(client: &Client, tokens: &str, id: &str) -> anyhow::Result<()> {
@@ -1364,16 +1366,25 @@ pub async fn cleanup(
     let client = bootstrap_client(integration, config).await?;
     let mut catalog = load_catalog(integration);
     let mut deleted = 0;
+    let mut listed = Vec::new();
     let mut result = Ok(());
     for account_id in account_ids {
         let tokens = Client::tokens_path(config.minting(), account_id);
-        match prune_expired(&client, &tokens, Timestamp::now(), &mut catalog, true).await {
-            Ok(n) => deleted += n,
+        match prune_expired(&client, &tokens, Timestamp::now(), &mut catalog).await {
+            Ok((n, ids)) => {
+                deleted += n;
+                listed.extend(ids);
+            }
             Err(e) => result = Err(e),
         }
         if config.minting() == CloudflareTokenType::User {
             break; // user tokens are listed once, not per account
         }
+    }
+    // Only once every account was listed: an ID missing from one account's
+    // listing may belong to another account.
+    if result.is_ok() {
+        catalog.forget_missing(&listed);
     }
     save_catalog(integration, &catalog)?;
     result?;

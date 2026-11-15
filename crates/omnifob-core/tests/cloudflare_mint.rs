@@ -995,3 +995,49 @@ async fn logout_goes_on_past_an_account_that_fails_and_remembers_what_is_left() 
     );
     assert_eq!(kept.user_tag, None, "the rest of the catalog is dropped");
 }
+
+#[tokio::test]
+async fn sync_under_oauth_prunes_expired_tokens_of_every_account() {
+    let cf = SignedIn::new("cleanup-all").await;
+    SignedIn::save_catalog(&tracked(&[
+        ("cf/acct-a/workers", "a1"),
+        ("cf/acct-b/workers", "b1"),
+        // Tracked, but deleted outside omnifob: no listing shows it.
+        ("cf/acct-b/dns-edit", "gone"),
+    ]));
+    cf.lists(
+        "acct-a",
+        json!([{ "id": "a1", "name": "omnifob workers", "status": "active" }]),
+    )
+    .await;
+    cf.lists(
+        "acct-b",
+        json!([{
+            "id": "b1", "name": "omnifob workers", "status": "active",
+            "expires_on": "2026-01-01T00:00:00Z"
+        }]),
+    )
+    .await;
+    cf.deletes("acct-a", "a1", ok(json!({ "id": "a1" })), 0)
+        .await;
+    cf.deletes("acct-b", "b1", ok(json!({ "id": "b1" })), 1)
+        .await;
+    cf.no_user_tokens().await;
+
+    let Integration::Cloudflare(config) = &cf.integration else {
+        unreachable!()
+    };
+    let accounts = ["acct-a".to_string(), "acct-b".to_string()];
+    let deleted = cloudflare::cleanup("cf", config, &accounts).await.unwrap();
+    assert_eq!(
+        deleted, 1,
+        "the second account's expired token is recognised"
+    );
+    cf.server.verify().await;
+    let saved = SignedIn::load_catalog().unwrap();
+    assert_eq!(
+        saved.minted.into_iter().collect::<Vec<_>>(),
+        [("cf/acct-a/workers".to_string(), vec!["a1".to_string()])],
+        "the live token stays tracked; the pruned and the missing ones are forgotten"
+    );
+}
