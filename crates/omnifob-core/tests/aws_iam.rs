@@ -4,8 +4,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use omnifob_core::config::{AwsIamConfig, Config, Integration};
-use omnifob_core::providers::aws_iam;
-use omnifob_core::{Target, store};
+use omnifob_core::providers::{self, aws_iam};
+use omnifob_core::{Profile, Target, store};
 use tokio::sync::{Mutex, MutexGuard};
 use wiremock::matchers::{body_string_contains, header_regex, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -202,4 +202,151 @@ async fn durations_outside_what_sts_allows_are_refused() {
     )
     .unwrap_err();
     assert!(format!("{bad:#}").contains("36h"), "{bad:#}");
+}
+
+#[tokio::test]
+async fn discovery_takes_the_account_from_sts() {
+    let (_guard, server) = setup().await;
+    let config = config("");
+    login(&server, "acct-sts", &config).await;
+    server.reset().await;
+    // An ARN without the account shows where the account comes from.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetCallerIdentity"))
+        .respond_with(sts(
+            "GetCallerIdentity",
+            "<Arn>arn:aws:iam:::user/me</Arn><UserId>AIDAEXAMPLE</UserId><Account>123456789012</Account>",
+        ))
+        .mount(&server)
+        .await;
+    let profiles = aws_iam::discover("acct-sts", &config).await.unwrap();
+    assert_eq!(
+        profiles[0].target,
+        Target::AwsIamSession {
+            account_id: "123456789012".into()
+        }
+    );
+
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetCallerIdentity"))
+        .respond_with(sts(
+            "GetCallerIdentity",
+            "<Arn>arn:aws:iam::123456789012:user/me</Arn><UserId>AIDAEXAMPLE</UserId>",
+        ))
+        .mount(&server)
+        .await;
+    let err = aws_iam::discover("acct-sts", &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no account"), "{err}");
+}
+
+/// The `legacy` integration of [`config`] under another name, as a whole
+/// config, with its session and role profiles.
+fn whole_config(name: &str) -> (Config, Profile, Profile) {
+    let config = Config::parse(&format!(
+        r#"
+        [integrations.{name}]
+        type = "aws-iam"
+        region = "eu-west-1"
+        [integrations.{name}.roles.prod]
+        role_arn = "arn:aws:iam::222222222222:role/Deploy"
+        duration = "2h"
+        "#
+    ))
+    .unwrap();
+    let session = Profile::new(
+        name,
+        "123456789012",
+        "session",
+        Target::AwsIamSession {
+            account_id: "123456789012".into(),
+        },
+    );
+    let role = Profile::new(
+        name,
+        "prod",
+        "Deploy",
+        Target::AwsIamRole {
+            label: "prod".into(),
+            account_id: None,
+        },
+    );
+    (config, session, role)
+}
+
+fn integration(config: &Config, name: &str) -> AwsIamConfig {
+    match config.integration(name).unwrap() {
+        Integration::AwsIam(c) => c.clone(),
+        _ => unreachable!(),
+    }
+}
+
+async fn mock_sts(server: &MockServer, action: &str, seconds: u32, access_key: &str) {
+    let result = match action {
+        "AssumeRole" => format!(
+            "{}<AssumedRoleUser><AssumedRoleId>AROA:omnifob</AssumedRoleId><Arn>arn:aws:sts::222222222222:assumed-role/Deploy/omnifob</Arn></AssumedRoleUser>",
+            temporary(access_key)
+        ),
+        _ => temporary(access_key),
+    };
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains(format!("Action={action}")))
+        .and(body_string_contains(format!("DurationSeconds={seconds}")))
+        .respond_with(sts(action, &result))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn credentials_carry_the_account_id() {
+    let (_guard, server) = setup().await;
+    let (config, session, role) = whole_config("acct-id");
+    login(&server, "acct-id", &integration(&config, "acct-id")).await;
+    mock_sts(&server, "GetSessionToken", 28_800, "ASIASESSION").await;
+    mock_sts(&server, "AssumeRole", 7_200, "ASIAROLE").await;
+
+    let creds = providers::credentials(&config, &session, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "123456789012");
+    let creds = providers::credentials(&config, &role, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "222222222222");
+}
+
+#[tokio::test]
+async fn a_ttl_request_leaves_the_cache_alone() {
+    let (_guard, server) = setup().await;
+    let (config, session, role) = whole_config("ttl");
+    login(&server, "ttl", &integration(&config, "ttl")).await;
+    let short = Some(jiff::SignedDuration::from_mins(15));
+    // Each is asked for once: the plain calls after a `ttl` one get the
+    // configured lifetime, and the second plain call comes from the cache.
+    mock_sts(&server, "GetSessionToken", 900, "ASIASHORTSESSION").await;
+    mock_sts(&server, "GetSessionToken", 28_800, "ASIASESSION").await;
+    mock_sts(&server, "AssumeRole", 900, "ASIASHORTROLE").await;
+    mock_sts(&server, "AssumeRole", 7_200, "ASIAROLE").await;
+
+    assert_eq!(key(&config, &session, short).await, "ASIASHORTSESSION");
+    assert_eq!(key(&config, &session, None).await, "ASIASESSION");
+    assert_eq!(key(&config, &role, short).await, "ASIASHORTROLE");
+    assert_eq!(key(&config, &role, None).await, "ASIAROLE");
+    assert_eq!(key(&config, &role, None).await, "ASIAROLE");
+    assert_eq!(key(&config, &session, None).await, "ASIASESSION");
+}
+
+/// The access key ID of a profile's credentials, from the cache if fresh.
+async fn key(config: &Config, profile: &Profile, ttl: Option<jiff::SignedDuration>) -> String {
+    let creds = providers::credentials(config, profile, true, ttl)
+        .await
+        .unwrap();
+    creds.env["AWS_ACCESS_KEY_ID"].clone()
 }

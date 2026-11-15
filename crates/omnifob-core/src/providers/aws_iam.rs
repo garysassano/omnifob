@@ -90,7 +90,8 @@ pub async fn login(
     }
     let arn = aws_sso::caller_identity(&key_credentials(&key), sts_region(config))
         .await
-        .context("checking the access key")?;
+        .context("checking the access key")?
+        .arn;
     store::set(&key_key(integration), &key)?;
     // A session from an earlier key must not outlive it.
     store::delete(&session_key(integration))?;
@@ -109,20 +110,17 @@ pub fn has_key(integration: &str) -> anyhow::Result<bool> {
 /// Checks that the stored key works; says whom it belongs to.
 pub async fn check(integration: &str, config: &AwsIamConfig) -> Result<String> {
     let key = stored_key(integration)?;
-    let arn = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
-    Ok(format!("access key valid for {arn}"))
+    let identity = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
+    Ok(format!("access key valid for {}", identity.arn))
 }
 
 /// The user's session profile and one profile per configured role.
 pub async fn discover(integration: &str, config: &AwsIamConfig) -> Result<Vec<Profile>> {
     let key = stored_key(integration)?;
-    let arn = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
-    let account_id = arn
-        .split(':')
-        .nth(4)
-        .filter(|a| !a.is_empty())
-        .with_context(|| format!("no account in {arn}"))?
-        .to_string();
+    let identity = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
+    let account_id = identity
+        .account
+        .with_context(|| format!("STS named no account for {}", identity.arn))?;
     let account = config.account.clone().unwrap_or_else(|| account_id.clone());
     let mut profiles = vec![Profile::new(
         integration,
@@ -146,7 +144,7 @@ pub async fn discover(integration: &str, config: &AwsIamConfig) -> Result<Vec<Pr
 
 /// The user's session: from the keychain while it lasts, else a new one from
 /// `GetSessionToken`, asking for an MFA code when `mfa_serial` is set. `ttl`
-/// asks for a new session of that length.
+/// asks for a new session of that length, which is not kept.
 ///
 /// A new session is started under a lock shared by every omnifob process, so
 /// parallel commands ask for one MFA code, not one each.
@@ -194,7 +192,11 @@ pub async fn session_credentials(
         issued_at: Some(Timestamp::now()),
         ..session
     };
-    store::set(&session_key(integration), &session)?;
+    // A `ttl` session is for this call only: kept, it would become the
+    // session every role is assumed with until it ends.
+    if ttl.is_none() {
+        store::set(&session_key(integration), &session)?;
+    }
     Ok(session)
 }
 

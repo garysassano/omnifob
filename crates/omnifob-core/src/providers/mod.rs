@@ -172,7 +172,11 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
 /// `ttl` asks for a lifetime other than the configured one: minted
 /// Cloudflare tokens, AWS sessions omnifob starts itself (chained roles,
 /// IAM users and their roles) and Google service account tokens honour it,
-/// and always get new credentials.
+/// and always get new credentials. These are not cached, so the next call
+/// without `ttl` gets the configured lifetime again.
+///
+/// AWS credentials carry `AWS_ACCOUNT_ID`, which the SDKs use for
+/// account-based endpoints.
 pub async fn credentials(
     config: &Config,
     profile: &Profile,
@@ -209,7 +213,9 @@ pub async fn credentials(
     let key = store::credentials_key(&profile.id);
     if use_cache {
         match store::get::<Credentials>(&key) {
-            Ok(Some(cached)) if cached.is_fresh(Timestamp::now()) => return Ok(cached),
+            Ok(Some(cached)) if cached.is_fresh(Timestamp::now()) => {
+                return Ok(with_aws_account(config, profile, cached));
+            }
             Ok(_) => {}
             Err(e) => tracing::debug!("ignoring unreadable cached credentials: {e:#}"),
         }
@@ -226,7 +232,7 @@ pub async fn credentials(
         && let Ok(Some(cached)) = store::get::<Credentials>(&key)
         && cached.is_fresh(Timestamp::now())
     {
-        return Ok(cached);
+        return Ok(with_aws_account(config, profile, cached));
     }
 
     let fresh = fetch(config, profile, ttl).await?;
@@ -234,10 +240,46 @@ pub async fn credentials(
         issued_at: Some(Timestamp::now()),
         ..fresh
     };
-    if let Err(e) = store::set(&key, &fresh) {
+    // The cache holds credentials of the configured lifetime only: a `ttl`
+    // request must not leave its shorter (or longer) ones for the next call.
+    // New credentials without `ttl`, as `fob console` gets, replace it.
+    if ttl.is_none()
+        && let Err(e) = store::set(&key, &fresh)
+    {
         tracing::warn!("could not cache credentials: {e:#}");
     }
-    Ok(fresh)
+    Ok(with_aws_account(config, profile, fresh))
+}
+
+/// The account an AWS profile's credentials belong to: the profile's for an
+/// Identity Center role and an IAM user's session, the role ARN's (in the
+/// current config) for chained and IAM user roles.
+fn aws_account_id<'a>(config: &'a Config, profile: &'a Profile) -> Option<&'a str> {
+    let integration = config.integration(&profile.integration).ok();
+    match (integration, &profile.target) {
+        (_, Target::Aws { account_id, .. } | Target::AwsIamSession { account_id }) => {
+            Some(account_id)
+        }
+        (Some(Integration::AwsSso(c)), Target::AwsChained { label, .. }) => {
+            c.chained.get(label).and_then(|role| role.account_id())
+        }
+        (Some(Integration::AwsIam(c)), Target::AwsIamRole { label, .. }) => {
+            c.roles.get(label).and_then(|role| role.account_id())
+        }
+        _ => None,
+    }
+}
+
+/// Adds `AWS_ACCOUNT_ID` to an AWS profile's credentials. Done on the way
+/// out rather than by each provider, so credentials cached before omnifob
+/// exported it carry it too.
+fn with_aws_account(config: &Config, profile: &Profile, mut creds: Credentials) -> Credentials {
+    if let Some(account) = aws_account_id(config, profile) {
+        creds
+            .env
+            .insert("AWS_ACCOUNT_ID".to_string(), account.to_string());
+    }
+    creds
 }
 
 /// Gets new credentials from the provider, bypassing the cache.
@@ -567,7 +609,7 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 .unwrap_or_else(|| c.region.clone());
             Ok(format!(
                 "acts as {}",
-                aws_sso::caller_identity(&creds, &region).await?
+                aws_sso::caller_identity(&creds, &region).await?.arn
             ))
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. } | Target::AwsIamRole { .. }) => {
@@ -579,7 +621,7 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 .unwrap_or_else(|| "us-east-1".to_string());
             Ok(format!(
                 "acts as {}",
-                aws_sso::caller_identity(&creds, &region).await?
+                aws_sso::caller_identity(&creds, &region).await?.arn
             ))
         }
         (Integration::Gcp(_), Target::Gcp { .. } | Target::GcpServiceAccount { .. }) => {
@@ -670,9 +712,73 @@ pub fn forget_credentials<'a>(profiles: impl IntoIterator<Item = &'a Profile>) {
     }
 }
 
+/// Drops cached credentials of the profiles in `before` that are not in
+/// `after`, so a sync that loses a profile (an assignment removed, a role
+/// taken out of the config, an integration deleted) leaves no credentials
+/// behind in the keychain. Returns how many profiles went away.
+pub fn forget_removed_credentials<'a>(
+    before: impl IntoIterator<Item = &'a Profile>,
+    after: impl IntoIterator<Item = &'a Profile>,
+) -> usize {
+    let kept: std::collections::BTreeSet<&str> = after.into_iter().map(|p| p.id.as_str()).collect();
+    let mut removed = 0;
+    for profile in before {
+        if !kept.contains(profile.id.as_str()) {
+            removed += 1;
+            if let Err(e) = store::delete(&store::credentials_key(&profile.id)) {
+                tracing::warn!(
+                    "could not delete the cached credentials of {}: {e:#}",
+                    profile.id
+                );
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profiles_that_go_away_lose_their_cached_credentials() {
+        store::use_memory_store().unwrap();
+        let profile = |integration: &str, account: &str| {
+            Profile::new(
+                integration,
+                account,
+                "Admin",
+                Target::Aws {
+                    account_id: "111111111111".into(),
+                    account_name: account.into(),
+                    role_name: "Admin".into(),
+                },
+            )
+        };
+        let kept = profile("prune", "kept");
+        let gone = profile("prune", "gone");
+        let removed_integration = profile("prune-removed", "a");
+        let never_cached = profile("prune", "never");
+        for p in [&kept, &gone, &removed_integration] {
+            store::set(&store::credentials_key(&p.id), &Credentials::default()).unwrap();
+        }
+        let cached = |p: &Profile| {
+            store::get::<Credentials>(&store::credentials_key(&p.id))
+                .unwrap()
+                .is_some()
+        };
+
+        let before = [&kept, &gone, &removed_integration, &never_cached];
+        let after = [profile("prune", "kept"), profile("prune", "new")];
+        let removed = forget_removed_credentials(before, &after);
+        assert_eq!(removed, 3);
+        assert!(cached(&kept));
+        assert!(!cached(&gone));
+        assert!(!cached(&removed_integration));
+        // Nothing to drop when nothing went away.
+        assert_eq!(forget_removed_credentials(&after, &after), 0);
+        assert!(cached(&kept));
+    }
 
     #[test]
     fn console_partition_comes_from_the_role_arn() {
