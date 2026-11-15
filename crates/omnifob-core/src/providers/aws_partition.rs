@@ -332,6 +332,10 @@ mod tests {
             "eu_west_1",
             "eu-west-1 ",
             "eu-wést-1",
+            "eu-west-1:443",
+            "eu-west-1@x",
+            "x@eu-west-1",
+            "aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-1",
         ] {
             assert!(!is_region_name(region), "{region:?}");
             assert!(Partition::of_region(region).is_err(), "{region:?}");
