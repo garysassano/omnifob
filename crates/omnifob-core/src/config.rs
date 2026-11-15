@@ -119,6 +119,11 @@ pub struct AwsSsoConfig {
     /// that becomes the middle of the profile id.
     #[serde(default)]
     pub chained: BTreeMap<String, ChainedRole>,
+    /// Roles in another AWS partition, reached with a web identity token
+    /// that one of this portal's roles requests, keyed by a label that
+    /// becomes the middle of the profile id.
+    #[serde(default)]
+    pub cross_partition: BTreeMap<String, CrossPartitionRole>,
     /// How long `fob console` sessions of this portal's roles last
     /// (`SessionDuration`), 15 minutes to 12 hours, and shorter than the
     /// permission set's session duration, which omnifob cannot see. Unset,
@@ -130,8 +135,67 @@ pub struct AwsSsoConfig {
 
 impl AwsSsoConfig {
     fn validate(&self) -> Result<(), String> {
+        check_region("region", &self.region)?;
+        if let Some(region) = &self.default_region {
+            check_region("default_region", region)?;
+        }
+        for (label, role) in &self.chained {
+            if let Some(region) = &role.region {
+                check_region(&format!("chained.{label}.region"), region)?;
+            }
+        }
+        for (label, role) in &self.cross_partition {
+            role.validate(label, self)
+                .map_err(|e| format!("cross_partition.{label}: {e}"))?;
+        }
+        self.check_profile_ids()?;
         check_console_duration("console_duration", self.console_duration)
     }
+
+    /// Fails when a cross-partition role would get the same profile id as a
+    /// chained role or another cross-partition role, which the config alone
+    /// shows. Collisions with Identity Center roles appear only at discovery.
+    fn check_profile_ids(&self) -> Result<(), String> {
+        let chained = self
+            .chained
+            .iter()
+            .map(|(label, role)| ("chained", label, role.role_name()));
+        let cross = self
+            .cross_partition
+            .iter()
+            .map(|(label, role)| ("cross_partition", label, role.role_name()));
+        let mut seen: BTreeMap<String, (&str, &String)> = BTreeMap::new();
+        for (table, label, role_name) in chained.chain(cross) {
+            let id = format!("{}/{role_name}", crate::profile::slug(label));
+            if let Some((other_table, other_label)) = seen.insert(id.clone(), (table, label))
+                && table == "cross_partition"
+            {
+                return Err(format!(
+                    "{other_table}.{other_label} and {table}.{label} would both be the profile \
+                     <integration>/{id}; rename one of them"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The Region a cross-partition role's token is requested in, when the
+    /// role sets none: `default_region`, else the portal's.
+    pub fn default_source_region(&self) -> &str {
+        self.default_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// The partition of the portal, which its roles' credentials belong to.
+    pub fn partition(&self) -> anyhow::Result<Partition> {
+        Partition::of_region(&self.region)
+    }
+}
+
+/// Fails unless `region` is shaped like an AWS Region, naming the key.
+/// Regions become part of host names, so a malformed one is refused when
+/// the config loads rather than when a command first uses it.
+fn check_region(key: &str, region: &str) -> Result<(), String> {
+    crate::providers::aws_partition::check_region_name(region).map_err(|e| format!("{key}: {e}"))
 }
 
 /// Fails unless a configured console session length is one the federation
@@ -193,6 +257,233 @@ impl ChainedRole {
     }
 }
 
+/// A role in another AWS partition, reached from an Identity Center role
+/// (`[integrations.<name>.cross_partition.<label>]`): the Identity Center
+/// role requests a web identity token with STS `GetWebIdentityToken` in its
+/// own partition, and `AssumeRoleWithWebIdentity` exchanges it for the
+/// role's credentials in the other partition. Checked when the config loads,
+/// so `role_arn` is an IAM role ARN in a partition other than the source
+/// Region's, and `region` is in the partition of `role_arn`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossPartitionRole {
+    /// Account of the Identity Center role that requests the token.
+    pub via_account_id: String,
+    /// Name of the Identity Center role (permission set) that requests the
+    /// token.
+    pub via_role: String,
+    /// The role to assume, in another partition.
+    pub role_arn: String,
+    /// The token's one audience: a client ID of the destination account's
+    /// OIDC provider for the source account's issuer.
+    pub audience: String,
+    /// The destination partition's STS Region, exported as `AWS_REGION`.
+    pub region: String,
+    /// Where the token is requested; defaults to the integration's
+    /// `default_region`, then the portal's Region
+    /// ([`CrossPartitionRole::source_region`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_region: Option<String>,
+    /// How the token is signed; ES384 unless set.
+    #[serde(default)]
+    pub signing_algorithm: SigningAlgorithm,
+    /// `RoleSessionName`; defaults to "omnifob".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Session length, 15 minutes to the destination role's maximum (at most
+    /// 12 hours); defaults to one hour
+    /// ([`CrossPartitionRole::DEFAULT_DURATION`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
+    pub duration: Option<SignedDuration>,
+}
+
+/// The algorithm `GetWebIdentityToken` signs the token with
+/// (`SigningAlgorithm`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SigningAlgorithm {
+    /// ECDSA with P-384 and SHA-384, the one AWS's examples use.
+    #[default]
+    #[serde(rename = "ES384")]
+    Es384,
+    /// RSA with SHA-256, for relying parties without ECDSA.
+    #[serde(rename = "RS256")]
+    Rs256,
+}
+
+impl SigningAlgorithm {
+    /// The value STS takes, `ES384` or `RS256`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Es384 => "ES384",
+            Self::Rs256 => "RS256",
+        }
+    }
+}
+
+impl CrossPartitionRole {
+    /// The session length `AssumeRoleWithWebIdentity` accepts: 15 minutes to
+    /// 12 hours, capped further by the role's maximum session duration.
+    pub const DURATION: std::ops::RangeInclusive<SignedDuration> =
+        SignedDuration::from_mins(15)..=SignedDuration::from_hours(12);
+
+    /// The session length asked for when `duration` is unset, as STS
+    /// itself defaults to.
+    pub const DEFAULT_DURATION: SignedDuration = SignedDuration::from_hours(1);
+
+    /// The role name at the end of `role_arn` (after any path).
+    pub fn role_name(&self) -> &str {
+        self.role_arn.rsplit('/').next().unwrap_or(&self.role_arn)
+    }
+
+    /// The account in `role_arn`, 12 digits once the config has loaded.
+    pub fn account_id(&self) -> &str {
+        self.role_arn.split(':').nth(4).unwrap_or_default()
+    }
+
+    /// The destination partition, the one in `role_arn`.
+    pub fn partition(&self) -> anyhow::Result<Partition> {
+        Partition::of_arn(&self.role_arn)
+    }
+
+    /// The Region the token is requested in: `source_region`, else the
+    /// portal's `default_region`, else the portal's Region.
+    pub fn source_region<'a>(&'a self, portal: &'a AwsSsoConfig) -> &'a str {
+        self.source_region
+            .as_deref()
+            .unwrap_or_else(|| portal.default_source_region())
+    }
+
+    /// `RoleSessionName`: `session_name`, else "omnifob".
+    pub fn session_name(&self) -> &str {
+        self.session_name.as_deref().unwrap_or("omnifob")
+    }
+
+    /// The session length to ask for: `duration`, else one hour.
+    pub fn duration_or_default(&self) -> SignedDuration {
+        self.duration.unwrap_or(Self::DEFAULT_DURATION)
+    }
+
+    fn validate(&self, label: &str, portal: &AwsSsoConfig) -> Result<(), String> {
+        check_name("the label", label).map_err(|e| e.to_string())?;
+        if self.via_account_id.len() != 12
+            || !self.via_account_id.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(format!(
+                "via_account_id '{}' must be a 12-digit AWS account ID",
+                self.via_account_id
+            ));
+        }
+        if self.via_role.is_empty() {
+            return Err("via_role must name the Identity Center role (permission set)".into());
+        }
+        check_role_arn(&self.role_arn)?;
+        let destination = self.partition().map_err(|e| format!("role_arn: {e:#}"))?;
+
+        check_region("region", &self.region)?;
+        destination
+            .check_region(&self.region)
+            .map_err(|e| format!("region must be in the partition of role_arn: {e:#}"))?;
+
+        if let Some(region) = &self.source_region {
+            check_region("source_region", region)?;
+        }
+        let source_region = self.source_region(portal);
+        let source_key = match (&self.source_region, &portal.default_region) {
+            (Some(_), _) => "source_region",
+            (None, Some(_)) => "default_region (the default source_region)",
+            (None, None) => "the portal's region (the default source_region)",
+        };
+        let source =
+            Partition::of_region(source_region).map_err(|e| format!("{source_key}: {e:#}"))?;
+        let portal_partition = portal.partition().map_err(|e| format!("region: {e:#}"))?;
+        if source != portal_partition {
+            return Err(format!(
+                "{source_key} {source_region} is in the {source} partition, but the Identity \
+                 Center role's credentials are for {portal_partition}, the portal's"
+            ));
+        }
+        if source == destination {
+            return Err(format!(
+                "role_arn is in the {destination} partition, the same as the source Region \
+                 {source_region}; a cross-partition role must be in another partition (use \
+                 `chained` for a role in the same one)"
+            ));
+        }
+
+        let audience = self.audience.chars().count();
+        if !(1..=1000).contains(&audience) {
+            return Err(format!(
+                "audience must be 1 to 1000 characters, not {audience}"
+            ));
+        }
+        if let Some(name) = &self.session_name {
+            check_session_name(name)?;
+        }
+        if let Some(d) = self.duration
+            && !Self::DURATION.contains(&d)
+        {
+            return Err("duration must be between 15m and 12h".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Fails unless `arn` is an IAM role ARN, `arn:<partition>:iam::<account>:
+/// role/[<path>/]<name>`, with a 12-digit account and a role name IAM
+/// allows. The role name ends up in a profile id.
+fn check_role_arn(arn: &str) -> Result<(), String> {
+    let bad = |why: &str| {
+        Err(format!(
+            "role_arn '{arn}' is not an IAM role ARN (arn:<partition>:iam::<account>:role/<name>): {why}"
+        ))
+    };
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, _partition, service, region, account, resource] = fields[..] else {
+        return bad("it needs six ':'-separated fields");
+    };
+    if prefix != "arn" || service != "iam" || !region.is_empty() {
+        return bad("it must start with arn:<partition>:iam::");
+    }
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return bad("the account must be 12 digits");
+    }
+    let Some(path_and_name) = resource.strip_prefix("role/") else {
+        return bad("the resource must be role/<name>");
+    };
+    let name = path_and_name.rsplit('/').next().unwrap_or_default();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+    {
+        return bad("the role name must be 1 to 64 letters, digits or +=,.@_-");
+    }
+    if !path_and_name.bytes().all(|b| b.is_ascii_graphic()) {
+        return bad("the role path may contain only printable ASCII");
+    }
+    Ok(())
+}
+
+/// Fails unless `name` is a `RoleSessionName` STS accepts: 2 to 64 letters,
+/// digits or `+=,.@_-`.
+fn check_session_name(name: &str) -> Result<(), String> {
+    if !(2..=64).contains(&name.len())
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+    {
+        return Err(format!(
+            "session_name '{name}' must be 2 to 64 letters, digits or +=,.@_-"
+        ));
+    }
+    Ok(())
+}
+
 /// An IAM user's access key, kept in the keychain (`type = "aws-iam"`), the
 /// way aws-vault keeps it. omnifob never hands the key out: it turns it into a
 /// session with STS `GetSessionToken` (with an MFA code when `mfa_serial` is
@@ -223,6 +514,14 @@ pub struct AwsIamConfig {
 
 impl AwsIamConfig {
     fn validate(&self) -> Result<(), String> {
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
+        }
+        for (label, role) in &self.roles {
+            if let Some(region) = &role.region {
+                check_region(&format!("roles.{label}.region"), region)?;
+            }
+        }
         if let Some(d) = self.session_duration
             && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(36)).contains(&d)
         {
@@ -930,6 +1229,321 @@ mod tests {
             "[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::2:role/R\"\nconsole_duration = \"1h\"",
         );
         assert!(chained.is_err());
+    }
+
+    /// An aws-sso integration in `portal_region` with `extra` keys, and one
+    /// cross-partition role made of `role` keys.
+    fn cross_partition(
+        portal_region: &str,
+        extra: &str,
+        role: &str,
+    ) -> anyhow::Result<CrossPartitionRole> {
+        let text = format!(
+            "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+             region = \"{portal_region}\"\n{extra}\n\
+             [integrations.acme.cross_partition.gov-audit]\n{role}\n"
+        );
+        match Config::parse(&text)?.integrations.remove("acme").unwrap() {
+            Integration::AwsSso(mut c) => Ok(c.cross_partition.remove("gov-audit").unwrap()),
+            _ => unreachable!(),
+        }
+    }
+
+    const GOV_ROLE: &str = "via_account_id = \"111111111111\"\nvia_role = \"AdministratorAccess\"\n\
+        role_arn = \"arn:aws-us-gov:iam::222222222222:role/Audit\"\naudience = \"omnifob\"\n\
+        region = \"us-gov-west-1\"";
+
+    fn cross_partition_error(portal_region: &str, extra: &str, role: &str) -> String {
+        format!(
+            "{:#}",
+            cross_partition(portal_region, extra, role).unwrap_err()
+        )
+    }
+
+    #[test]
+    fn cross_partition_roles_have_defaults() {
+        let role = cross_partition("us-east-1", "", GOV_ROLE).unwrap();
+        assert_eq!(role.signing_algorithm, SigningAlgorithm::Es384);
+        assert_eq!(role.signing_algorithm.as_str(), "ES384");
+        assert_eq!(role.session_name(), "omnifob");
+        assert_eq!(role.duration, None);
+        assert_eq!(role.duration_or_default(), SignedDuration::from_hours(1));
+        assert_eq!(role.role_name(), "Audit");
+        assert_eq!(role.account_id(), "222222222222");
+        assert_eq!(role.partition().unwrap(), Partition::UsGov);
+
+        // The source Region: source_region, else default_region, else the portal's.
+        let portal = |extra: &str| {
+            let text = format!(
+                "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+                 region = \"us-east-1\"\n{extra}\n[integrations.acme.cross_partition.gov-audit]\n{GOV_ROLE}\n"
+            );
+            match Config::parse(&text)
+                .unwrap()
+                .integrations
+                .remove("acme")
+                .unwrap()
+            {
+                Integration::AwsSso(c) => c,
+                _ => unreachable!(),
+            }
+        };
+        let c = portal("");
+        assert_eq!(
+            c.cross_partition["gov-audit"].source_region(&c),
+            "us-east-1"
+        );
+        let c = portal("default_region = \"eu-west-1\"");
+        assert_eq!(
+            c.cross_partition["gov-audit"].source_region(&c),
+            "eu-west-1"
+        );
+        let text = format!("{GOV_ROLE}\nsource_region = \"us-west-2\"");
+        let role = cross_partition("us-east-1", "default_region = \"eu-west-1\"", &text).unwrap();
+        assert_eq!(role.source_region(&c), "us-west-2");
+
+        let all = format!(
+            "{GOV_ROLE}\nsigning_algorithm = \"RS256\"\nsession_name = \"me@example.com\"\nduration = \"12h\""
+        );
+        let role = cross_partition("us-east-1", "", &all).unwrap();
+        assert_eq!(role.signing_algorithm, SigningAlgorithm::Rs256);
+        assert_eq!(role.session_name(), "me@example.com");
+        assert_eq!(role.duration, Some(SignedDuration::from_hours(12)));
+        // Written back the way it is read (for a later `fob import`).
+        let back: CrossPartitionRole = toml::from_str(&toml::to_string(&role).unwrap()).unwrap();
+        assert_eq!(back, role);
+    }
+
+    #[test]
+    fn cross_partition_roles_must_change_partition() {
+        // A role in the source Region's own partition is AssumeRole's job.
+        let same = GOV_ROLE.replace("us-gov-west-1", "us-gov-east-1");
+        let error = cross_partition_error("us-gov-west-1", "", &same);
+        assert!(error.contains("same as the source Region"), "{error}");
+        assert!(error.contains("cross_partition.gov-audit"), "{error}");
+        let commercial = "via_account_id = \"111111111111\"\nvia_role = \"A\"\n\
+            role_arn = \"arn:aws:iam::222222222222:role/R\"\naudience = \"x\"\nregion = \"eu-west-1\"";
+        let error = cross_partition_error("us-east-1", "", commercial);
+        assert!(error.contains("chained"), "{error}");
+        // The other direction works: a GovCloud portal reaching commercial.
+        assert!(cross_partition("us-gov-west-1", "", commercial).is_ok());
+        // Each partition can reach each other one.
+        for (arn, region) in [
+            ("aws-cn", "cn-north-1"),
+            ("aws-eusc", "eusc-de-east-1"),
+            ("aws-us-gov", "us-gov-east-1"),
+        ] {
+            let role = GOV_ROLE
+                .replace("aws-us-gov", arn)
+                .replace("us-gov-west-1", region);
+            assert!(cross_partition("eu-central-1", "", &role).is_ok(), "{arn}");
+        }
+
+        // The destination Region is in the role's partition.
+        let error = cross_partition_error(
+            "us-east-1",
+            "",
+            &GOV_ROLE.replace("\"us-gov-west-1\"", "\"cn-north-1\""),
+        );
+        assert!(
+            error.contains("region must be in the partition of role_arn")
+                && error.contains("cn-north-1 is in the aws-cn partition, not aws-us-gov"),
+            "{error}"
+        );
+
+        // The source Region is where the Identity Center role's credentials work.
+        let error = cross_partition_error(
+            "us-east-1",
+            "",
+            &format!("{GOV_ROLE}\nsource_region = \"cn-north-1\""),
+        );
+        assert!(
+            error.contains("source_region cn-north-1 is in the aws-cn partition"),
+            "{error}"
+        );
+        // ...also when it comes from default_region.
+        let error =
+            cross_partition_error("us-east-1", "default_region = \"us-gov-west-1\"", GOV_ROLE);
+        assert!(
+            error.contains("default_region (the default source_region)"),
+            "{error}"
+        );
+
+        // Isolated partitions have no cross-partition access.
+        let error = cross_partition_error(
+            "us-east-1",
+            "",
+            &GOV_ROLE.replace("aws-us-gov:", "aws-iso-b:"),
+        );
+        assert!(error.contains("isolated"), "{error}");
+    }
+
+    #[test]
+    fn cross_partition_keys_are_checked() {
+        let with = |key: &str, value: &str| {
+            let mut lines: Vec<String> = GOV_ROLE
+                .lines()
+                .filter(|l| !l.starts_with(&format!("{key} =")))
+                .map(str::to_string)
+                .collect();
+            lines.push(format!("{key} = {value}"));
+            cross_partition("us-east-1", "", &lines.join("\n"))
+        };
+        let error = |key: &str, value: &str| format!("{:#}", with(key, value).unwrap_err());
+
+        // The audience: 1 to 1000 characters.
+        assert!(with("audience", &format!("\"{}\"", "a".repeat(1000))).is_ok());
+        assert!(error("audience", "\"\"").contains("audience must be 1 to 1000 characters"));
+        assert!(error("audience", &format!("\"{}\"", "é".repeat(1001))).contains("not 1001"));
+        // The session: 15 minutes to 12 hours.
+        assert!(with("duration", "\"15m\"").is_ok());
+        assert!(with("duration", "\"12h\"").is_ok());
+        for bad in ["\"14m\"", "\"12h 1s\"", "\"13h\""] {
+            assert!(
+                error("duration", bad).contains("duration must be between 15m and 12h"),
+                "{bad}"
+            );
+        }
+        // The source account: 12 digits.
+        for bad in ["\"11111111111\"", "\"1111111111111\"", "\"11111111111a\""] {
+            assert!(error("via_account_id", bad).contains("12-digit"), "{bad}");
+        }
+        assert!(error("via_role", "\"\"").contains("via_role"));
+        // An IAM role ARN with a 12-digit account.
+        assert!(
+            with(
+                "role_arn",
+                "\"arn:aws-us-gov:iam::222222222222:role/path/to/Audit\""
+            )
+            .is_ok()
+        );
+        for bad in [
+            "\"Audit\"",
+            "\"arn:aws-us-gov:iam::222222222222:user/Audit\"",
+            "\"arn:aws-us-gov:sts::222222222222:role/Audit\"",
+            "\"arn:aws-us-gov:iam:us-gov-west-1:222222222222:role/Audit\"",
+            "\"arn:aws-us-gov:iam::2222:role/Audit\"",
+            "\"arn:aws-us-gov:iam::222222222222:role/\"",
+            "\"arn:aws-us-gov:iam::222222222222:role/Au dit\"",
+            "\"arn:aws-us-gov:iam::222222222222:role/Au/dit/\"",
+        ] {
+            assert!(
+                error("role_arn", bad).contains("not an IAM role ARN"),
+                "{bad}"
+            );
+        }
+        assert!(
+            error("role_arn", "\"arn:aws-mars:iam::222222222222:role/R\"").contains("aws-mars")
+        );
+        assert!(error("session_name", "\"a\"").contains("session_name"));
+        assert!(error("session_name", "\"a b\"").contains("session_name"));
+        assert!(error("signing_algorithm", "\"HS256\"").contains("ES384"));
+        assert!(error("unknown", "1").contains("unknown field"));
+        // `region` is required.
+        let no_region = GOV_ROLE
+            .lines()
+            .filter(|l| !l.starts_with("region ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let missing = format!(
+            "{:#}",
+            cross_partition("us-east-1", "", &no_region).unwrap_err()
+        );
+        assert!(missing.contains("missing field `region`"), "{missing}");
+    }
+
+    #[test]
+    fn cross_partition_labels_and_ids_are_checked() {
+        let parse = |label: &str, chained_label: &str| {
+            Config::parse(&format!(
+                "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+                 region = \"us-east-1\"\n\
+                 [integrations.acme.chained.\"{chained_label}\"]\nvia_account_id = \"1\"\nvia_role = \"A\"\n\
+                 role_arn = \"arn:aws:iam::333333333333:role/Audit\"\n\
+                 [integrations.acme.cross_partition.\"{label}\"]\n{GOV_ROLE}\n"
+            ))
+        };
+        assert!(parse("gov-audit", "audit").is_ok());
+        for bad in ["gov audit", "gov/audit", ""] {
+            let error = format!("{:#}", parse(bad, "audit").unwrap_err());
+            assert!(
+                error.contains("may contain only") || error.contains("empty"),
+                "{bad}: {error}"
+            );
+        }
+        // A chained role with the same id is refused, case aside, since
+        // labels become lowercase in ids.
+        for chained in ["gov-audit", "Gov-Audit"] {
+            let error = format!("{:#}", parse("gov-audit", chained).unwrap_err());
+            assert!(
+                error.contains(&format!(
+                    "chained.{chained} and cross_partition.gov-audit would both be the profile \
+                     <integration>/gov-audit/Audit"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_regions_are_checked_when_the_config_loads() {
+        let sso = |extra: &str| {
+            Config::parse(&format!(
+                "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\n{extra}"
+            ))
+            .map(|_| ())
+        };
+        let iam = |extra: &str| {
+            Config::parse(&format!("[integrations.u]\ntype = \"aws-iam\"\n{extra}")).map(|_| ())
+        };
+        let error = |result: anyhow::Result<()>| format!("{:#}", result.unwrap_err());
+        assert!(sso("region = \"eu-west-1\"\ndefault_region = \"us-gov-west-1\"").is_ok());
+        // Isolated Regions pass the shape check; the console refuses them later.
+        assert!(sso("region = \"us-isob-east-1\"").is_ok());
+        let bad = "attacker.example#";
+        for (key, result) in [
+            ("region", sso(&format!("region = \"{bad}\""))),
+            (
+                "default_region",
+                sso(&format!(
+                    "region = \"eu-west-1\"\ndefault_region = \"{bad}\""
+                )),
+            ),
+            (
+                "chained.c.region",
+                sso(&format!(
+                    "region = \"eu-west-1\"\n[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"A\"\n\
+                     role_arn = \"arn:aws:iam::2:role/R\"\nregion = \"{bad}\""
+                )),
+            ),
+            (
+                "cross_partition.gov-audit: region",
+                sso(&format!(
+                    "region = \"us-east-1\"\n[integrations.a.cross_partition.gov-audit]\n{}",
+                    GOV_ROLE.replace("us-gov-west-1", bad)
+                )),
+            ),
+            (
+                "cross_partition.gov-audit: source_region",
+                sso(&format!(
+                    "region = \"us-east-1\"\n[integrations.a.cross_partition.gov-audit]\n{GOV_ROLE}\nsource_region = \"{bad}\""
+                )),
+            ),
+            ("region", iam(&format!("region = \"{bad}\""))),
+            (
+                "roles.prod.region",
+                iam(&format!(
+                    "[integrations.u.roles.prod]\nrole_arn = \"arn:aws:iam::2:role/R\"\nregion = \"{bad}\""
+                )),
+            ),
+        ] {
+            let error = error(result);
+            assert!(
+                error.contains(&format!("{key}: '{bad}' is not an AWS Region name")),
+                "{key}: {error}"
+            );
+        }
+        assert!(error(sso("region = \"EU-WEST-1\"")).contains("not an AWS Region name"));
     }
 
     #[test]

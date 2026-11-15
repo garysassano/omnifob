@@ -497,6 +497,7 @@ fn profile_candidates() -> Vec<CompletionCandidate> {
             let kind = match p.target {
                 omnifob_core::Target::Aws { .. } => "aws",
                 omnifob_core::Target::AwsChained { .. } => "aws (chained)",
+                omnifob_core::Target::AwsCrossPartition { .. } => "aws (cross-partition)",
                 omnifob_core::Target::AwsIamSession { .. } => "aws (iam user)",
                 omnifob_core::Target::AwsIamRole { .. } => "aws (iam role)",
                 omnifob_core::Target::Gcp { .. } => "gcp",
@@ -1526,6 +1527,11 @@ fn export_aws_config(
                     .get(label)
                     .and_then(|r| r.region.clone())
                     .or_else(|| c.default_region.clone()),
+                // Always set: the destination partition's Region, which the
+                // portal's default_region cannot be.
+                omnifob_core::Target::AwsCrossPartition { label, .. } => {
+                    c.cross_partition.get(label).map(|r| r.region.clone())
+                }
                 _ => c.default_region.clone(),
             }?;
             Some((p.id.clone(), region))

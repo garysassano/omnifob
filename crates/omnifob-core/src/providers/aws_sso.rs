@@ -788,7 +788,7 @@ pub async fn discover(integration: &str, config: &AwsSsoConfig) -> Result<Vec<Pr
     }
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     disambiguate(&mut profiles);
-    add_chained(integration, config, &mut profiles);
+    add_configured(integration, config, &mut profiles)?;
     Ok(profiles)
 }
 
@@ -944,16 +944,28 @@ pub async fn credentials(
     })
 }
 
-/// Adds a profile per chained role, `<integration>/<label>/<role name>`. A
-/// label that collides with a discovered profile gets a `-chained` suffix.
-fn add_chained(integration: &str, config: &AwsSsoConfig, profiles: &mut Vec<Profile>) {
+/// Adds a profile per configured role, chained and cross-partition, each
+/// `<integration>/<label>/<role name>`. A chained role whose id a
+/// discovered profile already has gets a `-chained` suffix on its label, as
+/// it always has. A cross-partition role gets a `-cross-partition` suffix
+/// and a warning that says how to choose another label; if that id is taken
+/// too, discovery fails. The config check refuses collisions between the
+/// two tables, so only Identity Center roles (and earlier suffixed ids) can
+/// take a cross-partition role's id here.
+fn add_configured(
+    integration: &str,
+    config: &AwsSsoConfig,
+    profiles: &mut Vec<Profile>,
+) -> anyhow::Result<()> {
+    let taken =
+        |profiles: &[Profile], profile: &Profile| profiles.iter().any(|p| p.id == profile.id);
     for (label, role) in &config.chained {
         let target = Target::AwsChained {
             label: label.clone(),
             account_id: role.account_id().map(str::to_string),
         };
         let mut profile = Profile::new(integration, label, role.role_name(), target.clone());
-        if profiles.iter().any(|p| p.id == profile.id) {
+        if taken(profiles, &profile) {
             profile = Profile::new(
                 integration,
                 &format!("{label}-chained"),
@@ -963,6 +975,41 @@ fn add_chained(integration: &str, config: &AwsSsoConfig, profiles: &mut Vec<Prof
         }
         profiles.push(profile);
     }
+    for (label, role) in &config.cross_partition {
+        let target = Target::AwsCrossPartition {
+            label: label.clone(),
+            account_id: role.account_id().to_string(),
+        };
+        let profile = Profile::new(integration, label, role.role_name(), target.clone());
+        if !taken(profiles, &profile) {
+            profiles.push(profile);
+            continue;
+        }
+        let suffixed = Profile::new(
+            integration,
+            &format!("{label}-cross-partition"),
+            role.role_name(),
+            target,
+        );
+        if taken(profiles, &suffixed) {
+            bail!(
+                "the cross-partition role '{label}' of '{integration}' would be {} or {}, and \
+                 both are taken by other profiles; give it another label in \
+                 [integrations.{integration}.cross_partition]",
+                profile.id,
+                suffixed.id
+            );
+        }
+        tracing::warn!(
+            "{} is already an Identity Center or chained profile, so the cross-partition role \
+             '{label}' is {}; give it another label in [integrations.{integration}.cross_partition] \
+             to choose its id",
+            profile.id,
+            suffixed.id
+        );
+        profiles.push(suffixed);
+    }
+    Ok(())
 }
 
 /// Credentials for a chained role: the Identity Center role's credentials,
@@ -1384,7 +1431,7 @@ mod tests {
         };
         assert_eq!(config.chained["prod"].account_id(), Some("222222222222"));
         let mut profiles = vec![role("shared", "111")];
-        add_chained("acme", &config, &mut profiles);
+        add_configured("acme", &config, &mut profiles).unwrap();
         let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1393,6 +1440,92 @@ mod tests {
                 "acme/shared-chained/Admin",
                 "acme/prod/Deploy"
             ]
+        );
+    }
+
+    #[test]
+    fn cross_partition_roles_become_profiles() {
+        let config = match crate::Config::parse(
+            r#"
+            [integrations.acme]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "us-east-1"
+            [integrations.acme.chained.ops]
+            via_account_id = "111111111111"
+            via_role = "Admin"
+            role_arn = "arn:aws:iam::222222222222:role/Ops"
+            [integrations.acme.cross_partition.gov-audit]
+            via_account_id = "111111111111"
+            via_role = "AdministratorAccess"
+            role_arn = "arn:aws-us-gov:iam::222222222222:role/path/Audit"
+            audience = "omnifob"
+            region = "us-gov-west-1"
+            [integrations.acme.cross_partition.Prod]
+            via_account_id = "111111111111"
+            via_role = "AdministratorAccess"
+            role_arn = "arn:aws-cn:iam::333333333333:role/Admin"
+            audience = "omnifob"
+            region = "cn-north-1"
+            "#,
+        )
+        .unwrap()
+        .integrations
+        .remove("acme")
+        .unwrap()
+        {
+            crate::Integration::AwsSso(c) => c,
+            _ => unreachable!(),
+        };
+        let ids = |profiles: &[Profile]| -> Vec<String> {
+            profiles.iter().map(|p| p.id.clone()).collect()
+        };
+
+        let mut profiles = vec![role("dev", "444444444444")];
+        add_configured("acme", &config, &mut profiles).unwrap();
+        assert_eq!(
+            ids(&profiles),
+            [
+                "acme/dev/Admin",
+                "acme/ops/Ops",
+                "acme/prod/Admin",
+                "acme/gov-audit/Audit"
+            ]
+        );
+        assert_eq!(
+            profiles[3].target,
+            Target::AwsCrossPartition {
+                label: "gov-audit".into(),
+                account_id: "222222222222".into(),
+            }
+        );
+        assert!(profiles[3].target.is_aws());
+        assert_eq!(profiles[3].target.account_id(), Some("222222222222"));
+
+        // An Identity Center role with the same id keeps it; the
+        // cross-partition role is suffixed.
+        let mut profiles = vec![role("prod", "444444444444")];
+        add_configured("acme", &config, &mut profiles).unwrap();
+        assert_eq!(
+            ids(&profiles),
+            [
+                "acme/prod/Admin",
+                "acme/ops/Ops",
+                "acme/prod-cross-partition/Admin",
+                "acme/gov-audit/Audit"
+            ]
+        );
+        // With the suffixed id taken too, discovery says what to change.
+        let mut profiles = vec![
+            role("prod", "444444444444"),
+            role("prod-cross-partition", "5"),
+        ];
+        let error = add_configured("acme", &config, &mut profiles).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "would be acme/prod/Admin or acme/prod-cross-partition/Admin, and both are taken"
+            ),
+            "{error}"
         );
     }
 

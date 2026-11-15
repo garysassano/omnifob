@@ -198,8 +198,9 @@ fn is_region_name(name: &str) -> bool {
 
 /// Fails unless `name` is shaped like an AWS Region. Regions become part of
 /// sign-in and console host names, so anything else could send credentials
-/// to another host.
-fn check_region_name(name: &str) -> anyhow::Result<()> {
+/// to another host. Unlike [`Partition::of_region`], it accepts the isolated
+/// partitions' Regions: it checks the shape of the name only.
+pub fn check_region_name(name: &str) -> anyhow::Result<()> {
     if !is_region_name(name) {
         bail!("'{name}' is not an AWS Region name (such as eu-west-1)");
     }

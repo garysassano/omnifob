@@ -62,6 +62,21 @@ region = "us-east-1"         # optional, defaults to the integration's
 mfa_serial = "arn:aws:iam::111111111111:mfa/me"  # optional: asks for a code per session
 duration = "30m"             # optional, 15m to 1h
 
+# A role in another AWS partition (GovCloud, China, European Sovereign Cloud),
+# reached from an Identity Center role with a web identity token.
+# Profile id: acme/gov-audit/Audit. Not implemented yet: the config is checked,
+# but getting credentials fails.
+[integrations.acme.cross_partition.gov-audit]
+via_account_id = "111111111111"      # the Identity Center role that requests the token
+via_role = "AdministratorAccess"
+role_arn = "arn:aws-us-gov:iam::222222222222:role/Audit"
+audience = "omnifob"                 # a client ID of the destination's OIDC provider
+region = "us-gov-west-1"             # destination STS Region, exported as AWS_REGION
+source_region = "us-east-1"          # optional: defaults to default_region, then region
+signing_algorithm = "ES384"          # optional: ES384 (default) or RS256
+session_name = "me"                  # optional, defaults to "omnifob"
+duration = "1h"                      # optional, 15m to the role's maximum (at most 12h)
+
 # An additional Region of a multi-Region Identity Center instance: a second
 # integration with that Region's portal URL (no /start), signed in on its own,
 # since CLI sign-ins are not replicated across Regions.
