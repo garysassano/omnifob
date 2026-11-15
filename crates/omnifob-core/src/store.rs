@@ -182,6 +182,8 @@ mod wsl {
     use std::sync::OnceLock;
 
     use anyhow::{Context, bail};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
 
     const PROTECT: &str = "$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'))";
     const UNPROTECT: &str = "$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'))";
@@ -254,7 +256,7 @@ mod wsl {
         if !enabled() || !persisted(key) {
             return Ok(());
         }
-        let sealed = dpapi(PROTECT, &b64::encode(json.as_bytes()))?;
+        let sealed = dpapi(PROTECT, &BASE64.encode(json.as_bytes()))?;
         let path = file(key);
         std::fs::create_dir_all(dir())?;
         let tmp = path.with_extension("tmp");
@@ -283,7 +285,9 @@ mod wsl {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let plain = b64::decode(&dpapi(UNPROTECT, sealed.trim())?)?;
+        let plain = BASE64
+            .decode(dpapi(UNPROTECT, sealed.trim())?)
+            .context("decoding the output of Windows DPAPI")?;
         Ok(Some(String::from_utf8(plain)?))
     }
 
@@ -298,72 +302,29 @@ mod wsl {
         }
     }
 
-    /// Minimal standard base64, to avoid a dependency for two calls.
-    mod b64 {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    #[cfg(test)]
+    mod tests {
+        use base64::Engine;
 
-        pub fn encode(data: &[u8]) -> String {
-            let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-            for chunk in data.chunks(3) {
-                let n = chunk
-                    .iter()
-                    .enumerate()
-                    .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
-                for i in 0..4 {
-                    if i <= chunk.len() {
-                        out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
-                    } else {
-                        out.push('=');
-                    }
-                }
-            }
-            out
-        }
+        // Encoded by the hand-rolled base64 this replaced, and by
+        // PowerShell's [Convert]::ToBase64String, which writes the sealed
+        // files: standard alphabet, padded.
+        const KNOWN: [(&str, &str); 8] = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+            ("{\"k\":\"v\u{e9}?>~\"}", "eyJrIjoidsOpPz5+In0="),
+        ];
 
-        pub fn decode(text: &str) -> anyhow::Result<Vec<u8>> {
-            let mut out = Vec::with_capacity(text.len() / 4 * 3);
-            let (mut n, mut bits) = (0u32, 0);
-            for c in text
-                .bytes()
-                .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
-            {
-                let v = ALPHABET
-                    .iter()
-                    .position(|a| *a == c)
-                    .ok_or_else(|| anyhow::anyhow!("invalid base64"))?
-                    as u32;
-                n = n << 6 | v;
-                bits += 6;
-                if bits >= 8 {
-                    bits -= 8;
-                    out.push((n >> bits & 0xff) as u8);
-                }
-            }
-            Ok(out)
-        }
-
-        #[cfg(test)]
-        mod tests {
-            #[test]
-            fn round_trips() {
-                for s in [
-                    "",
-                    "f",
-                    "fo",
-                    "foo",
-                    "foob",
-                    "fooba",
-                    "foobar",
-                    "{\"k\":\"v\u{e9}\"}",
-                ] {
-                    assert_eq!(
-                        super::decode(&super::encode(s.as_bytes())).unwrap(),
-                        s.as_bytes()
-                    );
-                }
-                assert_eq!(super::encode(b"foobar"), "Zm9vYmFy");
-                assert_eq!(super::encode(b"fo"), "Zm8=");
+        #[test]
+        fn base64_matches_what_was_stored() {
+            for (plain, encoded) in KNOWN {
+                assert_eq!(super::BASE64.encode(plain.as_bytes()), encoded);
+                assert_eq!(super::BASE64.decode(encoded).unwrap(), plain.as_bytes());
             }
         }
     }
