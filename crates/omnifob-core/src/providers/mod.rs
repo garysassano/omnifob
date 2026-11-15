@@ -251,21 +251,32 @@ pub async fn credentials(
     Ok(with_aws_account(config, profile, fresh))
 }
 
-/// The account an AWS profile's credentials belong to: the profile's for an
-/// Identity Center role and an IAM user's session, the role ARN's (in the
-/// current config) for chained and IAM user roles.
+/// The account an AWS profile's credentials belong to, as the profile states
+/// it: the account of an Identity Center role and an IAM user's session, and
+/// the role ARN's account, recorded at discovery, for chained and IAM user
+/// roles. The profile's, not the current config's: credentials cached before
+/// a `role_arn` edit belong to the account the profile was synced with, and
+/// `fob sync` drops them along with the old profile. Only a role profile
+/// synced before omnifob recorded the account falls back to the config.
 fn aws_account_id<'a>(config: &'a Config, profile: &'a Profile) -> Option<&'a str> {
-    let integration = config.integration(&profile.integration).ok();
-    match (integration, &profile.target) {
-        (_, Target::Aws { account_id, .. } | Target::AwsIamSession { account_id }) => {
-            Some(account_id)
+    match &profile.target {
+        Target::Aws { account_id, .. } | Target::AwsIamSession { account_id } => Some(account_id),
+        Target::AwsChained {
+            account_id: Some(account_id),
+            ..
         }
-        (Some(Integration::AwsSso(c)), Target::AwsChained { label, .. }) => {
-            c.chained.get(label).and_then(|role| role.account_id())
-        }
-        (Some(Integration::AwsIam(c)), Target::AwsIamRole { label, .. }) => {
-            c.roles.get(label).and_then(|role| role.account_id())
-        }
+        | Target::AwsIamRole {
+            account_id: Some(account_id),
+            ..
+        } => Some(account_id),
+        Target::AwsChained { label, .. } => match config.integration(&profile.integration) {
+            Ok(Integration::AwsSso(c)) => c.chained.get(label).and_then(|role| role.account_id()),
+            _ => None,
+        },
+        Target::AwsIamRole { label, .. } => match config.integration(&profile.integration) {
+            Ok(Integration::AwsIam(c)) => c.roles.get(label).and_then(|role| role.account_id()),
+            _ => None,
+        },
         _ => None,
     }
 }

@@ -759,12 +759,28 @@ async fn credentials_carry_the_account_id() {
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCOUNT_ID"], "111111111111");
-    // From the role ARN, even when the synced profile lacks it.
+    // From the role ARN in the config when the synced profile lacks it.
     let creds = providers::credentials(&config, &chained, true, None)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACHAINED");
     assert_eq!(creds.env["AWS_ACCOUNT_ID"], "222222222222");
+    // The profile's own account wins over a `role_arn` edited since the
+    // sync: cached credentials belong to the account it was synced with.
+    let synced = Profile::new(
+        "acct",
+        "prod",
+        "Deploy",
+        Target::AwsChained {
+            label: "prod".into(),
+            account_id: Some("444444444444".into()),
+        },
+    );
+    let creds = providers::credentials(&config, &synced, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACHAINED");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "444444444444");
 
     // Credentials cached before omnifob exported the account get it too.
     let mut cached = creds.clone();
