@@ -1014,6 +1014,12 @@ impl App {
                 paths::config_file().display()
             );
         }
+        let before: Vec<Profile> = self
+            .cache
+            .integrations
+            .values()
+            .flat_map(|synced| synced.profiles.iter().cloned())
+            .collect();
         for name in &names {
             let integration = self.config.integration(name)?.clone();
             let profiles = self
@@ -1033,7 +1039,13 @@ impl App {
         self.cache
             .integrations
             .retain(|name, _| self.config.integrations.contains_key(name));
-        self.cache.save(&profiles_file())
+        self.cache.save(&profiles_file())?;
+        // Profiles that went away leave no cached credentials behind.
+        providers::forget_removed_credentials(
+            &before,
+            self.cache.integrations.values().flat_map(|s| &s.profiles),
+        );
+        Ok(())
     }
 
     /// Discovers the profiles of integrations never synced. One that cannot
@@ -1676,13 +1688,18 @@ fn creds_output(
                     .get(k)
                     .with_context(|| format!("{} is not an AWS profile", profile.id))
             };
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "Version": 1,
                 "AccessKeyId": get("AWS_ACCESS_KEY_ID")?,
                 "SecretAccessKey": get("AWS_SECRET_ACCESS_KEY")?,
                 "SessionToken": get("AWS_SESSION_TOKEN")?,
                 "Expiration": creds.expires_at,
-            })
+            });
+            // Optional in the process credential format; omitted, not null.
+            if let Some(account) = creds.env.get("AWS_ACCOUNT_ID") {
+                value["AccountId"] = account.clone().into();
+            }
+            value
         }
     };
     Ok(serde_json::to_string(&value)?)
@@ -1755,5 +1772,56 @@ fn exec(profile: &Profile, creds: &Credentials, command: &[String]) -> anyhow::R
             .status()
             .with_context(|| format!("running {}", command[0]))?;
         Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use omnifob_core::Target;
+
+    use super::*;
+
+    fn aws_creds(account: Option<&str>) -> Credentials {
+        let mut creds = Credentials {
+            expires_at: Some("2100-01-01T00:00:00Z".parse().unwrap()),
+            ..Default::default()
+        };
+        for (k, v) in [
+            ("AWS_ACCESS_KEY_ID", "ASIAEXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "token"),
+        ] {
+            creds.env.insert(k.into(), v.into());
+        }
+        if let Some(account) = account {
+            creds.env.insert("AWS_ACCOUNT_ID".into(), account.into());
+        }
+        creds
+    }
+
+    #[test]
+    fn credential_process_output_names_the_account_when_known() {
+        let profile = Profile::new(
+            "portal",
+            "dev",
+            "Admin",
+            Target::Aws {
+                account_id: "111111111111".into(),
+                account_name: "Dev".into(),
+                role_name: "Admin".into(),
+            },
+        );
+        let output = |creds| {
+            let text = creds_output(&profile, &creds, CredsFormat::CredentialProcess).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        let value = output(aws_creds(Some("111111111111")));
+        assert_eq!(value["Version"], 1);
+        assert_eq!(value["AccessKeyId"], "ASIAEXAMPLE");
+        assert_eq!(value["Expiration"], "2100-01-01T00:00:00Z");
+        assert_eq!(value["AccountId"], "111111111111");
+        // Optional in the format: left out rather than null.
+        let value = output(aws_creds(None));
+        assert!(value.get("AccountId").is_none(), "{value}");
     }
 }

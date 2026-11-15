@@ -10,7 +10,9 @@ use omnifob_core::providers::aws_sso::{self, Flow};
 use omnifob_core::{Error, store};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, MutexGuard};
-use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
+use wiremock::matchers::{
+    body_partial_json, body_string_contains, header, method, path, query_param,
+};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// The tests share environment variables, so they run one at a time.
@@ -453,6 +455,8 @@ async fn discovery_lists_every_account_and_role() {
     device_login(&server, "discover", 3600).await;
     Mock::given(method("GET"))
         .and(path("/assignment/accounts"))
+        // The largest page each API returns.
+        .and(query_param("max_result", "100"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "accountList": [
                 { "accountId": "111111111111", "accountName": "Prod" },
@@ -463,6 +467,7 @@ async fn discovery_lists_every_account_and_role() {
         .await;
     Mock::given(method("GET"))
         .and(path("/assignment/roles"))
+        .and(query_param("max_result", "100"))
         .respond_with(|r: &Request| {
             let account = r
                 .url
@@ -697,6 +702,98 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
     .unwrap_err()
     .to_string();
     assert!(err.contains("1 hour"), "{err}");
+}
+
+#[tokio::test]
+async fn credentials_carry_the_account_id() {
+    use omnifob_core::providers;
+    use omnifob_core::{Profile, Target};
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "acct", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=AssumeRole"))
+        .respond_with(sts_credentials("AssumeRole", "ASIACHAINED"))
+        .mount(&server)
+        .await;
+    let config = Config::parse(&format!(
+        r#"
+        [integrations.acct]
+        type = "aws-sso"
+        start_url = "{START_URL}"
+        region = "eu-west-1"
+        [integrations.acct.chained.prod]
+        via_account_id = "111111111111"
+        via_role = "Admin"
+        role_arn = "arn:aws:iam::222222222222:role/Deploy"
+        "#
+    ))
+    .unwrap();
+    let role = Profile::new(
+        "acct",
+        "dev",
+        "Admin",
+        Target::Aws {
+            account_id: "111111111111".into(),
+            account_name: "Dev".into(),
+            role_name: "Admin".into(),
+        },
+    );
+    let chained = Profile::new(
+        "acct",
+        "prod",
+        "Deploy",
+        Target::AwsChained {
+            label: "prod".into(),
+            account_id: None,
+        },
+    );
+
+    let creds = providers::credentials(&config, &role, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "111111111111");
+    // From the role ARN in the config when the synced profile lacks it.
+    let creds = providers::credentials(&config, &chained, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACHAINED");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "222222222222");
+    // The profile's own account wins over a `role_arn` edited since the
+    // sync: cached credentials belong to the account it was synced with.
+    let synced = Profile::new(
+        "acct",
+        "prod",
+        "Deploy",
+        Target::AwsChained {
+            label: "prod".into(),
+            account_id: Some("444444444444".into()),
+        },
+    );
+    let creds = providers::credentials(&config, &synced, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACHAINED");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "444444444444");
+
+    // Credentials cached before omnifob exported the account get it too.
+    let mut cached = creds.clone();
+    cached.env.remove("AWS_ACCOUNT_ID");
+    cached
+        .env
+        .insert("AWS_ACCESS_KEY_ID".into(), "ASIACACHED".into());
+    store::set(&store::credentials_key(&chained.id), &cached).unwrap();
+    let creds = providers::credentials(&config, &chained, true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACACHED");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "222222222222");
 }
 
 fn role_creds() -> omnifob_core::Credentials {

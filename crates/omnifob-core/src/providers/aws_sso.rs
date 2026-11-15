@@ -792,6 +792,9 @@ pub async fn discover(integration: &str, config: &AwsSsoConfig) -> Result<Vec<Pr
     Ok(profiles)
 }
 
+/// The largest page `ListAccounts` and `ListAccountRoles` return.
+const MAX_PAGE: i32 = 100;
+
 /// Every account with its name and role names.
 async fn list_roles(
     portal: &aws_sdk_sso::Client,
@@ -800,6 +803,8 @@ async fn list_roles(
     let accounts: Vec<_> = portal
         .list_accounts()
         .access_token(token)
+        // The most a page holds: fewer calls against an API that throttles.
+        .max_results(MAX_PAGE)
         .into_paginator()
         .items()
         .send()
@@ -813,6 +818,7 @@ async fn list_roles(
             .list_account_roles()
             .access_token(token)
             .account_id(account_id)
+            .max_results(MAX_PAGE)
             .into_paginator()
             .items()
             .send()
@@ -1041,14 +1047,29 @@ pub(crate) fn sts_client(creds: &Credentials, region: &str) -> anyhow::Result<aw
     Ok(aws_sdk_sts::Client::from_conf(config.build()))
 }
 
-/// The ARN these credentials act as, from STS GetCallerIdentity.
-pub async fn caller_identity(creds: &Credentials, region: &str) -> anyhow::Result<String> {
+/// Whom credentials act as, from STS `GetCallerIdentity`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerIdentity {
+    /// The ARN, `unknown` if STS sent none.
+    pub arn: String,
+    /// The account the credentials belong to, as STS states it.
+    pub account: Option<String>,
+}
+
+/// Whom these credentials act as, from STS GetCallerIdentity.
+pub async fn caller_identity(creds: &Credentials, region: &str) -> anyhow::Result<CallerIdentity> {
     let identity = sts_client(creds, region)?
         .get_caller_identity()
         .send()
         .await
         .map_err(|e| anyhow!("{}", aws_sdk_sts::error::DisplayErrorContext(&e)))?;
-    Ok(identity.arn().unwrap_or("unknown").to_string())
+    Ok(CallerIdentity {
+        arn: identity.arn().unwrap_or("unknown").to_string(),
+        account: identity
+            .account()
+            .filter(|a| !a.is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// Checks that the stored session works: it is refreshed when needed, and

@@ -191,6 +191,8 @@ fob creds acme/prod/ReadOnly --format credential-process  # for ~/.aws/config
 fob creds cf/personal/workers --format fnox               # for a fnox command lease
 ```
 
+AWS profiles export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CREDENTIAL_EXPIRATION` and `AWS_ACCOUNT_ID`, which the AWS SDKs use for account-based endpoints, plus `AWS_REGION` and `AWS_DEFAULT_REGION` when a Region is configured. The `credential-process` format carries the account as `AccountId`. These replace any you set yourself: an `AWS_ACCOUNT_ID` in your shell is overwritten by `fob exec` and `fob use`. With the account known, the SDKs send requests to account-based endpoints (DynamoDB, S3) on other hosts than the regional ones, which matters for firewall and VPC endpoint allowlists; `AWS_ACCOUNT_ID_ENDPOINT_MODE=disabled` turns that off.
+
 AWS profiles for tools that want `--profile` or `AWS_PROFILE`: `fob export aws-config` prints one `[profile fob-<integration>-<account>-<role>]` per discovered role, each using `credential_process = fob creds ... --format credential-process`. `--write` keeps them in a marked block of `~/.aws/config` (backing up the previous file) and never touches anything outside it.
 
 ```sh
@@ -212,7 +214,7 @@ SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentia
 
 Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json`.
 
-Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
+Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. Credentials asked for with `--ttl` are not cached, so the next command gets the configured lifetime again. `fob sync` deletes the cached credentials of profiles that went away. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
 
 ## Documentation
 
