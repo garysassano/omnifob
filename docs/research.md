@@ -12,7 +12,8 @@ Each was read from a shallow clone of its repository.
 - Design: an `Assumer` interface per profile type (SSO, IAM, credential process, SAML helpers) with `AssumeTerminal` and `AssumeConsole`. Profiles come from `~/.aws/config`.
 - SSO tokens are stored per start URL in the keychain (`99designs/keyring`). Device code flow by default, PKCE opt-in, device flow forced on headless machines.
 - A shell wrapper (`assume`) exports into the current shell; `credential_process` mode for SDKs.
-- **Taken:** terminal and console as the two outputs of every profile; the shell wrapper; the device flow on its own over SSH and in containers. Its device flow by default was taken at first and reversed on 2026-11-08: omnifob signs in with PKCE by default, as the AWS CLI does (see [decisions](decisions.md)).
+- Browsers (read 2026-11-16): one console browser and optionally a separate SSO sign-in browser, both global (`DefaultBrowser`, `CustomBrowserPath`, `CustomSSOBrowserPath`), or Go-template launch commands (`AWSConsoleBrowserLaunchTemplate`, `SSOBrowserLaunchTemplate`, with `{{.URL}}` and `{{.Profile}}`) split on whitespace and quotes. Chromium-based browsers get a profile per AWS profile, found by name in the browser's `Local State` file, which granted also rewrites to rename the profile; Firefox opens a container per profile through granted's extension. Nothing ties a browser to a start URL.
+- **Taken:** terminal and console as the two outputs of every profile; the shell wrapper; the device flow on its own over SSH and in containers; launch commands with a URL placeholder, as a list of arguments and per integration rather than global. Its device flow by default was taken at first and reversed on 2026-11-08: omnifob signs in with PKCE by default, as the AWS CLI does (see [decisions](decisions.md)).
 
 ### AWS CLI v2 (aws/aws-cli, Python; read 2026-11-08)
 

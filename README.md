@@ -171,6 +171,26 @@ verify_url = "https://api.example.com/me"     # optional: must answer 2xx for th
 console = "https://console.example.com"
 ```
 
+### Browsers
+
+Sign-ins and consoles open in the system's default browser. To keep each identity's sessions in a browser, or a browser profile, of its own, define the browsers once and name one in each integration with `browser`; it applies to `fob login` and `fob console` alike, and integrations without it keep the default.
+
+```toml
+[browsers.personal]
+command = ["firefox", "-P", "personal", "{url}"]
+
+[browsers.work]   # Windows Chrome from WSL; the profile is its folder, shown in chrome://version
+command = ["/mnt/c/Program Files/Google/Chrome/Application/chrome.exe", "--profile-directory=Profile 1", "{url}"]
+
+[integrations.acme]
+type = "aws-sso"
+start_url = "https://acme.awsapps.com/start"
+region = "eu-central-1"
+browser = "work"
+```
+
+The command runs without a shell, with `{url}` in any argument replaced by the URL. Chromium-based browsers (Chrome, Edge, Brave) pick a profile with `--profile-directory=<folder>`, Firefox with `-P <name>`. A sign-in must still open on this machine, since the browser returns to a listener on `127.0.0.1`.
+
 ## Use
 
 ```sh

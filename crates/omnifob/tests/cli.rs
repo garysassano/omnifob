@@ -592,3 +592,52 @@ async fn export_writes_the_aws_config_atomically_and_rename_warns_about_it() {
     let (stdout, _) = fob.ok(&["list"]);
     assert_eq!(lines(&stdout), ["corp/dev/Admin", "corp/prod/Admin"]);
 }
+
+/// Not a test of its own: `an_integration_opens_in_its_browser` names this test binary
+/// as a browser, run with `--ignored --exact` and the URL as its last
+/// argument, which it writes to `OMNIFOB_E2E_BROWSER_OUT`.
+#[test]
+#[ignore = "run by an_integration_opens_in_its_browser"]
+fn browser_child_records_its_url() {
+    let Some(out) = std::env::var_os("OMNIFOB_E2E_BROWSER_OUT") else {
+        return;
+    };
+    let url = std::env::args().last().unwrap();
+    std::fs::write(out, url).unwrap();
+}
+
+#[test]
+fn an_integration_opens_in_its_browser() {
+    let fob = Fob::new("browser");
+    let me = std::env::current_exe().unwrap();
+    fob.write_config(&format!(
+        r#"
+[browsers.work]
+command = ['{}', "browser_child_records_its_url", "--exact", "--ignored", "{{url}}"]
+
+[integrations.status]
+type = "token"
+console = "https://console.example.test/home?a=1&b=two words"
+browser = "work"
+"#,
+        me.display()
+    ));
+    let out = fob.root.join("opened");
+    fob.ok(&["sync"]);
+    let output = fob
+        .command(&["console", "status"])
+        .env("OMNIFOB_E2E_BROWSER_OUT", &out)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    // The browser runs on its own; fob does not wait for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !out.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "https://console.example.test/home?a=1&b=two words"
+    );
+}

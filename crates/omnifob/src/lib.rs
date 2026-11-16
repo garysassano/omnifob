@@ -4,6 +4,7 @@
 //! [`App`], which holds the config and the discovered profiles. The commands
 //! live in modules named after them.
 
+mod browser;
 mod cli;
 mod clipboard;
 mod console;
