@@ -26,7 +26,8 @@ impl App {
         if print {
             println!("{url}");
         } else {
-            open::that(&url).context("opening the browser; use --print to get the URL")?;
+            crate::browser::open(&self.config, &profile.integration, &url)
+                .context("opening the browser; use --print to get the URL")?;
             eprintln!("fob: opened the console for {}", profile.id);
         }
         Ok(())

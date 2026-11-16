@@ -12,8 +12,50 @@ use crate::providers::aws_partition::Partition;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Browsers, or profiles of one browser, that integrations open in,
+    /// keyed by the name their `browser` key refers to.
+    #[serde(default)]
+    pub browsers: BTreeMap<String, Browser>,
     #[serde(default)]
     pub integrations: BTreeMap<String, Integration>,
+}
+
+/// How to open a URL in one browser, or one profile of a browser, so that
+/// each integration's sign-in sessions stay in the profile it belongs to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Browser {
+    /// The program and its arguments, run without a shell; `{url}` in an
+    /// argument is replaced by the URL, e.g.
+    /// `["firefox", "-P", "work", "{url}"]`.
+    pub command: Vec<String>,
+}
+
+impl Browser {
+    /// The program and its arguments for opening `url`.
+    pub fn command_for(&self, url: &str) -> (&str, Vec<String>) {
+        let args = self.command[1..]
+            .iter()
+            .map(|arg| arg.replace("{url}", url))
+            .collect();
+        (&self.command[0], args)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self.command.split_first() {
+            None => Err("command must name a program".to_string()),
+            Some((program, _)) if program.is_empty() => {
+                Err("command must name a program".to_string())
+            }
+            Some((program, _)) if program.contains("{url}") => {
+                Err("{url} belongs in an argument, not in the program".to_string())
+            }
+            Some((_, args)) if !args.iter().any(|arg| arg.contains("{url}")) => {
+                Err("command must pass the URL: put {url} in an argument".to_string())
+            }
+            Some(_) => Ok(()),
+        }
+    }
 }
 
 /// An identity source: something you sign in to once and that yields many
@@ -42,6 +84,18 @@ impl Integration {
                 CloudflareSignIn::Oauth => "cloudflare-oauth",
             },
             Integration::Token(_) => "token",
+        }
+    }
+
+    /// The name of the browser this integration opens in, if it sets one.
+    pub fn browser(&self) -> Option<&str> {
+        match self {
+            Integration::AwsSso(c) => c.browser.as_deref(),
+            Integration::AwsIam(c) => c.browser.as_deref(),
+            Integration::Gcp(c) => c.browser.as_deref(),
+            Integration::Azure(c) => c.browser.as_deref(),
+            Integration::Cloudflare(c) => c.browser.as_deref(),
+            Integration::Token(c) => c.browser.as_deref(),
         }
     }
 }
@@ -131,6 +185,10 @@ pub struct AwsSsoConfig {
     /// roles cannot take it.
     #[serde(default, with = "opt_duration")]
     pub console_duration: Option<SignedDuration>,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
 }
 
 impl AwsSsoConfig {
@@ -553,6 +611,10 @@ pub struct AwsIamConfig {
     /// the middle of the profile id.
     #[serde(default)]
     pub roles: BTreeMap<String, IamRole>,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
 }
 
 impl AwsIamConfig {
@@ -656,6 +718,10 @@ pub struct GcpConfig {
     /// middle of the profile id.
     #[serde(default)]
     pub service_accounts: BTreeMap<String, GcpServiceAccount>,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
 }
 
 impl GcpConfig {
@@ -736,6 +802,10 @@ pub struct AzureConfig {
     /// can see, listed at `fob sync`.
     #[serde(default)]
     pub subscriptions: Option<Vec<String>>,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
 }
 
 fn default_sso_scopes() -> Vec<String> {
@@ -764,6 +834,10 @@ pub struct TokenConfig {
     /// URL that answers 2xx when the token is sent as a bearer token.
     #[serde(default)]
     pub verify_url: Option<String>,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -807,6 +881,10 @@ pub struct CloudflareConfig {
     /// Set from the integration's `type`.
     #[serde(skip)]
     pub sign_in: CloudflareSignIn,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
 }
 
 /// How a Cloudflare integration signs in.
@@ -914,7 +992,37 @@ impl Config {
 
     /// Parses a config without checking integration names.
     pub fn parse_allowing_any_names(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let config: Self = toml::from_str(text)?;
+        for (name, browser) in &config.browsers {
+            if let Err(e) = browser.validate() {
+                bail!("browser '{name}': {e}");
+            }
+        }
+        for (name, integration) in &config.integrations {
+            if let Some(browser) = integration.browser()
+                && !config.browsers.contains_key(browser)
+            {
+                let known: Vec<_> = config.browsers.keys().map(String::as_str).collect();
+                bail!(
+                    "integration '{name}' opens in browser '{browser}', which [browsers] does not define (defined: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                );
+            }
+        }
+        Ok(config)
+    }
+
+    /// The browser that integration `name` opens in, or `None` for the
+    /// system's default browser.
+    pub fn browser_for(&self, name: &str) -> anyhow::Result<Option<&Browser>> {
+        Ok(self
+            .integration(name)?
+            .browser()
+            .and_then(|browser| self.browsers.get(browser)))
     }
 
     pub fn integration(&self, name: &str) -> anyhow::Result<&Integration> {
@@ -1705,5 +1813,73 @@ mod tests {
                 .is_err()
         );
         assert!(Config::parse("[integrations.c]\ntype = \"cloudflare\"\n").is_err());
+    }
+
+    #[test]
+    fn integrations_open_in_the_browser_they_name() {
+        let config = Config::parse(
+            r#"
+            [browsers.work]
+            command = ["chrome", "--profile-directory=Profile 1", "{url}"]
+
+            [integrations.acme]
+            type = "aws-sso"
+            start_url = "https://acme.awsapps.com/start"
+            region = "eu-central-1"
+            browser = "work"
+
+            [integrations.google]
+            type = "gcp"
+            "#,
+        )
+        .unwrap();
+        let browser = config.browser_for("acme").unwrap().unwrap();
+        assert_eq!(
+            browser.command_for("https://x.test/?a=1&b={url}"),
+            (
+                "chrome",
+                vec![
+                    "--profile-directory=Profile 1".to_string(),
+                    "https://x.test/?a=1&b={url}".to_string()
+                ]
+            )
+        );
+        assert!(config.browser_for("google").unwrap().is_none());
+        assert!(config.browser_for("nope").is_err());
+    }
+
+    #[test]
+    fn a_browser_must_exist_and_pass_the_url() {
+        let error = |text: &str| Config::parse(text).unwrap_err().to_string();
+        let integration = "[integrations.c]\ntype = \"cloudflare-token\"\nbrowser = \"work\"\n";
+        assert_eq!(
+            error(integration),
+            "integration 'c' opens in browser 'work', which [browsers] does not define (defined: none)"
+        );
+        for (command, message) in [
+            ("[]", "command must name a program"),
+            ("[\"\", \"{url}\"]", "command must name a program"),
+            (
+                "[\"firefox\"]",
+                "command must pass the URL: put {url} in an argument",
+            ),
+            (
+                "[\"{url}\"]",
+                "{url} belongs in an argument, not in the program",
+            ),
+        ] {
+            let text = format!("[browsers.work]\ncommand = {command}\n{integration}");
+            assert_eq!(
+                error(&text),
+                format!("browser 'work': {message}"),
+                "{command}"
+            );
+        }
+        assert!(
+            Config::parse(&format!(
+                "[browsers.work]\ncommand = [\"firefox\", \"--url={{url}}\"]\n{integration}"
+            ))
+            .is_ok()
+        );
     }
 }

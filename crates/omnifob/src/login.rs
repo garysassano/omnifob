@@ -57,7 +57,7 @@ impl App {
                             );
                         }
                     }
-                    if !no_browser && let Err(e) = open::that(&prompt.url) {
+                    if !no_browser && let Err(e) = crate::browser::open(&self.config, name, &prompt.url) {
                         eprintln!("fob: could not open a browser ({e}); open the URL above");
                     }
                 })
@@ -82,7 +82,7 @@ impl App {
                             eprintln!(
                                 "     The browser must run on this machine; elsewhere, use --device-code."
                             );
-                            if !no_browser && let Err(e) = open::that(url) {
+                            if !no_browser && let Err(e) = crate::browser::open(&self.config, name, url) {
                                 eprintln!(
                                     "fob: could not open a browser ({e}); open the URL above"
                                 );
@@ -123,7 +123,7 @@ impl App {
                             );
                         }
                     }
-                    if !no_browser && let Err(e) = open::that(prompt.url) {
+                    if !no_browser && let Err(e) = crate::browser::open(&self.config, name, prompt.url) {
                         eprintln!("fob: could not open a browser ({e}); open the URL above");
                     }
                 })
@@ -138,7 +138,7 @@ impl App {
                     eprintln!("fob: approve the sign-in for '{name}' in your browser");
                     eprintln!("     Pick the accounts, and turn on Account API Tokens Write under Sensitive scopes.");
                     eprintln!("     {url}");
-                    if !no_browser && let Err(e) = open::that(url) {
+                    if !no_browser && let Err(e) = crate::browser::open(&self.config, name, url) {
                         eprintln!("fob: could not open a browser ({e}); open the URL above");
                     }
                 })
@@ -166,7 +166,7 @@ impl App {
                     let url = cloudflare::bootstrap_url(config);
                     eprintln!("{}", cloudflare_bootstrap_help(config.minting()));
                     eprintln!("     {url}");
-                    if !no_browser && let Err(e) = open::that(&url) {
+                    if !no_browser && let Err(e) = crate::browser::open(&self.config, name, &url) {
                         eprintln!("fob: could not open a browser ({e}); open the URL above");
                     }
                     let typed = dialoguer::Password::new()
