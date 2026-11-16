@@ -602,7 +602,7 @@ fn browser_child_records_its_url() {
     let Some(out) = std::env::var_os("OMNIFOB_E2E_BROWSER_OUT") else {
         return;
     };
-    let url = std::env::args().last().unwrap();
+    let url = std::env::args().next_back().unwrap();
     std::fs::write(out, url).unwrap();
 }
 
