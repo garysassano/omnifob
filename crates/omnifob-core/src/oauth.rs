@@ -233,22 +233,37 @@ fn answer(
     state: &str,
     provider: &str,
 ) -> Option<anyhow::Result<String>> {
-    let (status, message, result) = match callback_query(request_line, path) {
-        None => ("404 Not Found", String::new(), None),
+    let (status, content_type, body, result) = match callback_query(request_line, path) {
+        None => ("404 Not Found", "text/plain", String::new(), None),
         Some(query) => match parse_callback(&query, state, provider) {
             None => (
                 "400 Bad Request",
-                "This page belongs to another sign-in. The sign-in in the terminal is still waiting; finish it from the link it shows.".to_string(),
+                "text/html",
+                page(
+                    Outcome::Failed,
+                    "This page belongs to another sign-in",
+                    "The sign-in in the terminal is still waiting; finish it from the link it shows.",
+                ),
                 None,
             ),
             Some(result) => {
-                let message = match &result {
-                    Ok(_) => format!(
-                        "Signed in to {provider}. You can close this tab and return to the terminal."
+                let body = match &result {
+                    // The code still has to be exchanged for tokens, so the
+                    // terminal has the final word.
+                    Ok(_) => page(
+                        Outcome::Approved,
+                        "Sign-in approved",
+                        &format!(
+                            "fob is finishing the sign-in to {provider}. You can close this tab and return to the terminal."
+                        ),
                     ),
-                    Err(_) => "The sign-in failed. Return to the terminal for details.".to_string(),
+                    Err(_) => page(
+                        Outcome::Failed,
+                        "Sign-in failed",
+                        "Return to the terminal for details.",
+                    ),
                 };
-                ("200 OK", message, Some(result))
+                ("200 OK", "text/html", body, Some(result))
             }
         },
     };
@@ -258,12 +273,80 @@ fn answer(
         let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
         let _ = write!(
             stream,
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
-            message.len()
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         );
         let _ = stream.flush();
     }
     result
+}
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    Approved,
+    Failed,
+}
+
+/// The page the browser shows after the provider sends it back: a green or
+/// red box that follows the browser's light or dark theme. Self-contained, so
+/// it needs nothing else from the listener.
+fn page(outcome: Outcome, heading: &str, detail: &str) -> String {
+    let (class, icon) = match outcome {
+        Outcome::Approved => ("approved", r#"<path d="m8 12.5 2.5 2.5L16 9.5"/>"#),
+        Outcome::Failed => ("failed", r#"<path d="m9 9 6 6m0-6-6 6"/>"#),
+    };
+    let heading = escape_html(heading);
+    let detail = escape_html(detail);
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{heading} · fob</title>
+<style>
+:root {{ color-scheme: light dark; --page: #f3f4f6; --card: #ffffff; --text: #1f2328; --muted: #59636e; --line: #d1d9e0;
+  --ok: #1a7f37; --ok-bg: #edfaef; --bad: #cf222e; --bad-bg: #fff1f0; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --page: #0d1117; --card: #161b22; --text: #e6edf3; --muted: #9198a1; --line: #30363d;
+  --ok: #3fb950; --ok-bg: #12261e; --bad: #f85149; --bad-bg: #2a1215; }} }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--page); color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }}
+main {{ width: 100%; max-width: 440px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }}
+.box {{ display: flex; gap: 12px; align-items: flex-start; padding: 16px; border-radius: 8px; border: 1px solid var(--accent); background: var(--tint); }}
+.approved {{ --accent: var(--ok); --tint: var(--ok-bg); }}
+.failed {{ --accent: var(--bad); --tint: var(--bad-bg); }}
+svg {{ flex: none; width: 28px; height: 28px; color: var(--accent); }}
+h1 {{ margin: 0 0 4px; font-size: 1.05rem; }}
+p {{ margin: 0; color: var(--muted); }}
+</style>
+</head>
+<body>
+<main>
+<div class="box {class}">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/>{icon}</svg>
+<div><h1>{heading}</h1><p>{detail}</p></div>
+</div>
+</main>
+</body>
+</html>
+"#
+    )
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The query of a `GET <path>?...` request line.
@@ -356,7 +439,12 @@ mod tests {
         assert_eq!(code, "c1");
         let reply = browser.join().unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
-        assert!(reply.contains("Signed in to AWS"), "{reply}");
+        assert!(
+            reply.contains("Content-Type: text/html; charset=utf-8"),
+            "{reply}"
+        );
+        assert!(reply.contains("Sign-in approved"), "{reply}");
+        assert!(reply.contains("the sign-in to AWS"), "{reply}");
     }
 
     #[test]
@@ -492,7 +580,15 @@ mod tests {
             "{err}"
         );
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
-        assert!(reply.contains("sign-in failed"), "{reply}");
+        assert!(reply.contains("Sign-in failed"), "{reply}");
+    }
+
+    #[test]
+    fn the_page_escapes_its_text() {
+        let html = page(Outcome::Failed, "<b>&", "\"'");
+        assert!(html.contains("&lt;b&gt;&amp;"), "{html}");
+        assert!(html.contains("&quot;&#39;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
     }
 
     #[test]

@@ -667,6 +667,53 @@ fn cross_partition_console_request<'a>(
     })
 }
 
+/// How long a sign-in that cannot renew itself must still last for `fob login`
+/// to keep it.
+const KEEP_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_mins(15);
+
+/// Whether `fob login` can keep the stored sign-in instead of opening the
+/// browser again, as granted does: it works (checked as `fob check` does, so
+/// it may renew), was made for the configured portal and scopes, and does not
+/// end within [`KEEP_MARGIN`]. Returns the check's description when it can.
+///
+/// Only the browser sign-ins (Identity Center, Google, Azure and Cloudflare
+/// OAuth) are kept; for the others `fob login` is how a key or token is
+/// replaced.
+pub async fn keepable_sign_in(name: &str, integration: &Integration) -> Option<String> {
+    let scopes_match = match integration {
+        Integration::AwsSso(config) => aws_sso::session_has_scopes(name, config),
+        Integration::Gcp(_) | Integration::Azure(_) => Ok(true),
+        Integration::Cloudflare(config) if config.uses_oauth() => {
+            cloudflare_oauth::granted_scopes(name).map(|granted| {
+                granted.is_some_and(|granted| {
+                    cloudflare_oauth::scopes(config)
+                        .iter()
+                        .all(|s| granted.contains(s))
+                })
+            })
+        }
+        _ => return None,
+    };
+    if !scopes_match.unwrap_or(false) {
+        return None;
+    }
+    match sign_in(name, integration) {
+        Ok(SignIn::Token) => {}
+        Ok(SignIn::Session {
+            expires_at,
+            refreshable,
+        }) if refreshable || expires_at > Timestamp::now().saturating_add(KEEP_MARGIN).ok()? => {}
+        _ => return None,
+    }
+    match check_sign_in(name, integration).await {
+        Ok(detail) => Some(detail),
+        Err(e) => {
+            tracing::debug!("not keeping the stored sign-in of '{name}': {e:#}");
+            None
+        }
+    }
+}
+
 /// Checks that an integration's stored sign-in works, without signing in.
 pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<String> {
     match integration {

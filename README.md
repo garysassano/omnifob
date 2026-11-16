@@ -194,7 +194,8 @@ The command runs without a shell, with `{url}` in any argument replaced by the U
 ## Use
 
 ```sh
-fob login acme            # browser sign-in, then discovers profiles
+fob login acme            # browser sign-in (kept while it still works), then discovers profiles
+fob login acme --force    # sign in again even though the stored sign-in works
 fob login acme --device-code   # approve with a code on another device (automatic over SSH)
 fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...
 fob exec prod admin -- aws s3 ls
