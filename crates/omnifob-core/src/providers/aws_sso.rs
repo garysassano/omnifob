@@ -481,6 +481,22 @@ pub fn session(integration: &str) -> anyhow::Result<Option<(Timestamp, bool)>> {
     }))
 }
 
+/// Whether the stored session was registered with the configured scopes, as
+/// far as the stored client registrations tell; `false` when signed out.
+pub fn session_has_scopes(integration: &str, config: &AwsSsoConfig) -> anyhow::Result<bool> {
+    let Some(token) = store::get::<SsoToken>(&token_key(integration))? else {
+        return Ok(false);
+    };
+    for flow in [Flow::Browser, Flow::DeviceCode] {
+        if let Ok(Some(r)) = store::get::<Registration>(&registration_key(integration, flow))
+            && r.client_id == token.client_id
+        {
+            return Ok(r.scopes == config.scopes);
+        }
+    }
+    Ok(true)
+}
+
 fn load(integration: &str, config: &AwsSsoConfig) -> Result<SsoToken> {
     let Some(token) = store::get::<SsoToken>(&token_key(integration))? else {
         return Err(Error::not_signed_in(integration));

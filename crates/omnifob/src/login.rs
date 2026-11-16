@@ -20,6 +20,7 @@ impl App {
         device_code: bool,
         token_stdin: bool,
         from_clipboard: bool,
+        force: bool,
     ) -> anyhow::Result<()> {
         let integration = self.config.integration(name)?;
         if device_code
@@ -36,6 +37,9 @@ impl App {
             Integration::AwsSso(config) => {
                 if token_stdin || from_clipboard {
                     bail!("'{name}' signs in through IAM Identity Center; it takes no token");
+                }
+                if !force && self.keeps_sign_in(name, integration).await {
+                    return Ok(());
                 }
                 let flow = if device_code {
                     aws_sso::Flow::DeviceCode
@@ -66,6 +70,9 @@ impl App {
             Integration::Gcp(config) => {
                 if token_stdin || from_clipboard {
                     bail!("'{name}' signs in through Google; it takes no token");
+                }
+                if !force && self.keeps_sign_in(name, integration).await {
+                    return Ok(());
                 }
                 let browser_here = !device_code && !omnifob_core::oauth::browser_is_elsewhere();
                 if !browser_here && !interactive() {
@@ -107,6 +114,9 @@ impl App {
                 if token_stdin || from_clipboard {
                     bail!("'{name}' signs in through Entra ID; it takes no token");
                 }
+                if !force && self.keeps_sign_in(name, integration).await {
+                    return Ok(());
+                }
                 let browser_here = !device_code && !omnifob_core::oauth::browser_is_elsewhere();
                 let username = azure::login(name, config, browser_here, |prompt| {
                     match prompt.user_code {
@@ -133,6 +143,9 @@ impl App {
             Integration::Cloudflare(config) if config.uses_oauth() => {
                 if token_stdin || from_clipboard {
                     bail!("'{name}' signs in through the browser; it takes no token");
+                }
+                if !force && self.keeps_sign_in(name, integration).await {
+                    return Ok(());
                 }
                 let session = cloudflare_oauth::login(name, config, |url| {
                     eprintln!("fob: approve the sign-in for '{name}' in your browser");
@@ -247,6 +260,18 @@ impl App {
         }
         eprintln!("fob: signed in to '{name}'");
         Ok(())
+    }
+
+    /// Keeps a browser sign-in that still works instead of opening the
+    /// browser again; returns whether it did.
+    async fn keeps_sign_in(&self, name: &str, integration: &Integration) -> bool {
+        match providers::keepable_sign_in(name, integration).await {
+            Some(detail) => {
+                eprintln!("fob: kept the sign-in of '{name}' ({detail}); --force signs in again");
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) async fn logout(&mut self, name: &str) -> anyhow::Result<()> {

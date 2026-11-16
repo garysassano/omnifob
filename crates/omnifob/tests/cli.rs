@@ -317,11 +317,9 @@ fn a_bad_integration_name_points_at_fob_rename_which_fixes_it() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn login_signs_in_and_syncs() {
-    let server = MockServer::start().await;
-    let fob = Fob::new("login").with_server(&server);
-    fob.write_config(&portal_config("acme"));
+/// Identity Center answers a device-flow sign-in at once: it registers
+/// `client-1`, and the token comes back on the first poll.
+async fn mount_device_sign_in(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/client/register"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -330,7 +328,7 @@ async fn login_signs_in_and_syncs() {
             "clientIdIssuedAt": 1_700_000_000,
             "clientSecretExpiresAt": 4_102_444_800i64,
         })))
-        .mount(&server)
+        .mount(server)
         .await;
     Mock::given(method("POST"))
         .and(path("/device_authorization"))
@@ -342,7 +340,7 @@ async fn login_signs_in_and_syncs() {
             "expiresIn": 600,
             "interval": 1,
         })))
-        .mount(&server)
+        .mount(server)
         .await;
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -352,8 +350,16 @@ async fn login_signs_in_and_syncs() {
             "expiresIn": 3600,
             "refreshToken": "refresh-1",
         })))
-        .mount(&server)
+        .mount(server)
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_signs_in_and_syncs() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("login").with_server(&server);
+    fob.write_config(&portal_config("acme"));
+    mount_device_sign_in(&server).await;
     mount_portal(&server, &[("111111111111", "Dev")]).await;
 
     // fob creates the store's directory itself.
@@ -372,6 +378,63 @@ async fn login_signs_in_and_syncs() {
     }
     let (stdout, _) = fob.ok(&["list"]);
     assert_eq!(lines(&stdout), ["acme/dev/Admin"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_keeps_a_working_sign_in() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("login-keeps").with_server(&server);
+    fob.write_config(&portal_config("acme"));
+    fob.sign_in("acme");
+    mount_portal(&server, &[("111111111111", "Dev")]).await;
+    // No sign-in endpoints are mounted, so a new sign-in would fail.
+    let (_, stderr) = fob.ok(&["login", "acme", "--device-code", "--no-browser"]);
+    assert!(
+        stderr.contains("kept the sign-in of 'acme' (session valid for"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("approve"), "{stderr}");
+    assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_force_signs_in_again() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("login-force").with_server(&server);
+    fob.write_config(&portal_config("acme"));
+    fob.sign_in("acme");
+    mount_device_sign_in(&server).await;
+    mount_portal(&server, &[("111111111111", "Dev")]).await;
+    let (_, stderr) = fob.ok(&["login", "acme", "--force", "--device-code", "--no-browser"]);
+    assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
+    assert!(!stderr.contains("kept the sign-in"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_replaces_a_sign_in_made_with_other_scopes() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("login-scopes").with_server(&server);
+    fob.write_config(&portal_config("acme"));
+    fob.sign_in("acme");
+    // The stored session's client was registered with scopes the config no
+    // longer asks for.
+    let registration = json!({
+        "client_id": "client-1",
+        "client_secret": "client-secret-1",
+        "expires_at": "2100-01-01T00:00:00Z",
+        "start_url": START_URL,
+        "region": "eu-west-1",
+        "scopes": ["sso:account:access", "codewhisperer:completions"],
+    });
+    std::fs::write(
+        fob.secret("aws-sso/acme/client/device-code"),
+        registration.to_string(),
+    )
+    .unwrap();
+    mount_device_sign_in(&server).await;
+    mount_portal(&server, &[("111111111111", "Dev")]).await;
+    let (_, stderr) = fob.ok(&["login", "acme", "--device-code", "--no-browser"]);
+    assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

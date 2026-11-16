@@ -114,6 +114,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             device_code,
             token_stdin,
             from_clipboard,
+            force,
         } => {
             app.login(
                 &integration,
@@ -121,6 +122,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 device_code,
                 token_stdin,
                 from_clipboard,
+                force,
             )
             .await?;
             app.sync(std::slice::from_ref(&integration)).await?;
@@ -259,7 +261,9 @@ impl App {
                 reason,
             }) if interactive() => {
                 eprintln!("fob: {reason}; signing in again");
-                self.login(&integration, false, false, false, false).await?;
+                // The sign-in was just found lacking, so it is not kept.
+                self.login(&integration, false, false, false, false, true)
+                    .await?;
                 Ok(f().await?)
             }
             other => Ok(other?),

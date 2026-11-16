@@ -42,6 +42,10 @@ pub(crate) enum Command {
         /// Read the Cloudflare bootstrap token from the clipboard instead of prompting
         #[arg(long)]
         from_clipboard: bool,
+        /// Sign in again even when the stored browser sign-in (AWS IAM Identity
+        /// Center, Google, Azure, Cloudflare OAuth) still works
+        #[arg(long)]
+        force: bool,
     },
     /// Forget an integration's sign-in and cached credentials
     Logout { integration: String },
