@@ -1,6 +1,6 @@
 //! `fob console`: open the provider's web console as a profile.
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use omnifob_core::providers;
 
 use crate::{App, record_use};
@@ -13,6 +13,13 @@ impl App {
         options: &providers::ConsoleOptions,
     ) -> anyhow::Result<()> {
         let profile = self.select(query).await?;
+        // The URL signs in as the profile: a credential like any other.
+        if print && crate::agent::active() {
+            bail!(
+                "not printing the console sign-in URL into an agent's output; `fob console {}` opens it in the user's browser",
+                profile.id
+            );
+        }
         providers::check_console_options(&self.config, &profile, options)?;
         // New credentials, not cached ones: without a session length the
         // console signs out when they expire, and cached ones are handed

@@ -4,6 +4,7 @@
 //! [`App`], which holds the config and the discovered profiles. The commands
 //! live in modules named after them.
 
+mod agent;
 mod browser;
 mod cli;
 mod clipboard;
@@ -32,7 +33,7 @@ use omnifob_core::profile::ProfileCache;
 use omnifob_core::providers;
 use omnifob_core::{Config, Error, paths};
 
-use crate::cli::{Cli, CloudflareCommand, Command, ExportCommand, ImportCommand};
+use crate::cli::{Cli, CloudflareCommand, Command, CredsFormat, ExportCommand, ImportCommand};
 use crate::exec::{creds_output, exec, expiry_note};
 use crate::import_export::{export_aws_config, import_aws};
 use crate::logging::log_subscriber;
@@ -81,8 +82,10 @@ fn command() -> clap::Command {
     }
 }
 
+/// Whether someone can answer prompts: a terminal, and not an agent (some
+/// harnesses give commands a terminal no one watches).
 fn interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    !agent::active() && std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 struct App {
@@ -148,6 +151,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 print!("{}", shell::unset(shell, &previous));
             } else {
                 let profile = app.select(query(&profile).as_deref()).await?;
+                if agent::active() {
+                    return Err(agent::refuse_to_print(&profile.id));
+                }
                 let creds = app.credentials(&profile, !no_cache, ttl).await?;
                 print!("{}", shell::export(shell, &profile.id, &creds, &previous));
                 eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
@@ -160,12 +166,21 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             revoke,
             command,
         } => {
-            let profile = app.select(query(&profile).as_deref()).await?;
-            if revoke {
-                return app.exec_and_revoke(&profile, ttl, &command).await;
+            let result = async {
+                let profile = app.select(query(&profile).as_deref()).await?;
+                if revoke {
+                    return app.exec_and_revoke(&profile, ttl, &command).await;
+                }
+                let creds = app.credentials(&profile, !no_cache, ttl).await?;
+                exec(&profile, &creds, &command)
             }
-            let creds = app.credentials(&profile, !no_cache, ttl).await?;
-            return exec(&profile, &creds, &command);
+            .await;
+            // As `env` does: 125 when fob fails, so it is not mistaken for the
+            // command's own status.
+            return Ok(result.unwrap_or_else(|e| {
+                eprintln!("fob: {e:#}");
+                ExitCode::from(exec::FOB_FAILED)
+            }));
         }
         Command::Console {
             profile,
@@ -189,10 +204,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ttl,
         } => {
             let profile = app.select(query(&profile).as_deref()).await?;
+            // credential_process and fnox run fob inside the agent's own
+            // commands and hand the output to a program, not to the agent.
+            if agent::active() && matches!(format, CredsFormat::Json) {
+                return Err(agent::refuse_to_print(&profile.id));
+            }
             let creds = app.credentials(&profile, !no_cache, ttl).await?;
             println!("{}", creds_output(&profile, &creds, format)?);
         }
         Command::Revoke { profile } => app.revoke(query(&profile).as_deref()).await?,
+        Command::Use { .. } | Command::Unuse if agent::active() => {
+            bail!(
+                "each command an agent runs starts in a new shell, so `fob use` cannot carry over; run commands as `fob exec <profile> -- <command>`"
+            );
+        }
         Command::Use { .. } | Command::Unuse => {
             let shell = Shell::detect();
             bail!(
@@ -221,7 +246,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             write,
             file,
         }) => {
-            app.ensure_synced().await?;
+            app.ensure_synced().await?.report();
             export_aws_config(&app, &prefix, absolute, write, file)?;
         }
         Command::Renew { profile } => app.renew(&profile).await?,

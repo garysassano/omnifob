@@ -21,7 +21,7 @@ pub fn set_mfa_prompt(prompt: impl Fn(&str) -> anyhow::Result<String> + Send + S
 pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
     let Some(prompt) = MFA.get() else {
         bail!(
-            "{what} needs a code from the MFA device {serial}; run `fob creds {what}` in a terminal first"
+            "{what} needs a code from the MFA device {serial}; run `fob exec {what} -- true` in a terminal first, which asks for it"
         );
     };
     let code = prompt(serial)?.trim().to_string();

@@ -200,9 +200,8 @@ fob login acme --device-code   # approve with a code on another device (automati
 fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...
 fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare
-fob exec cf workers -- claude            # give an agent a token without pasting it anywhere
-fob exec cf workers --ttl 4h -- claude   # longer-lived token for a long session
-fob exec cf workers --revoke -- claude   # token for this command only, deleted when it ends
+fob exec cf workers --ttl 4h -- wrangler dev   # longer-lived token for a long session
+fob exec cf workers --revoke -- wrangler deploy   # token for this command only, deleted when it ends
 fob cf add-template cf pages             # pick services and access levels, save a template
 fob console prod admin    # opens the AWS console as that role
 fob console prod admin --service ec2 --region eu-west-1 --duration 8h
@@ -220,7 +219,9 @@ fob rename acme work      # rename an integration; keeps its sign-in and profile
 
 `--service` opens a console page, given as the path after the console host (`ec2`, `s3`, `lambda`, `cloudformation`, `route53/v2`), and `--region` the Region it opens in, which must be in the profile's partition; without it the profile's exported Region is used, if any.
 
-Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first.
+Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
+
+`fob exec` exits with the command's status, or with 125 when fob itself fails, 127 when the command is not found and 126 when it cannot run, as `env` does.
 
 ### In the current shell
 
@@ -260,6 +261,23 @@ fnox:
 type = "command"
 create_command = "fob creds cf/personal/workers --format fnox"
 ```
+
+### With coding agents
+
+Coding agents run each command in a new shell with no one at the terminal, and whatever a command prints lands in the agent's context and its saved transcripts. fob recognises them by the variables they set (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`, `CURSOR_AGENT`, `COPILOT_AGENT_SESSION_ID`; set `OMNIFOB_AGENT=1` for another agent, or `OMNIFOB_AGENT=0` to turn this off) and then:
+
+- Does not print credentials: `fob creds` (JSON), `fob env` and `fob console --print` refuse and point to `fob exec`. `--format credential-process` and `--format fnox` still work, because the AWS SDKs and fnox run them inside the agent's commands and read the output themselves.
+- Never prompts, and takes a profile only by its full id (`fob list` shows them), so a command does what it says and permission rules can match it.
+- Hands out only the profiles `[agent] profiles` allows, when it is set:
+
+  ```toml
+  [agent]
+  profiles = ["acme/dev/*", "*/*/ReadOnly"]   # `*` matches within one segment
+  ```
+
+An agent gets credentials with `fob exec acme/dev/ReadOnly -- aws s3 ls`, or through AWS profiles from `fob export aws-config`, which work without fob in the command. When a sign-in lapses, the agent can ask you to run `fob login <integration>`, or run it itself: the browser opens on your screen for you to approve. Let the agent run `fob exec` per command rather than starting the agent itself inside `fob exec`, which would put the credentials in the environment of every command it runs.
+
+This guards against accidents, not against the agent, which runs as you; the harness's sandbox and permission rules are the boundary. [`skills/omnifob`](skills/omnifob/SKILL.md) is a skill that teaches agents the above; install it with your agent's skill tooling, for example `npx skills add garysassano/omnifob`.
 
 ## Where secrets live
 

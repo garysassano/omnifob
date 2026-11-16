@@ -8,7 +8,7 @@ use omnifob_core::history::{self, History};
 use omnifob_core::profile::SyncedProfiles;
 use omnifob_core::{Error, Profile, paths, providers};
 
-use crate::{App, interactive, profiles_file};
+use crate::{App, agent, interactive, profiles_file};
 
 impl App {
     pub(crate) async fn sync(&mut self, names: &[String]) -> anyhow::Result<()> {
@@ -58,9 +58,10 @@ impl App {
     }
 
     /// Discovers the profiles of integrations never synced. One that cannot
-    /// be synced (not signed in, offline) is skipped with a note rather than
-    /// failing a command that may not need it, and is tried again next time.
-    pub(crate) async fn ensure_synced(&mut self) -> anyhow::Result<()> {
+    /// be synced (not signed in, offline) is skipped rather than failing a
+    /// command that may not need it, and is tried again next time; the
+    /// caller decides whether the skips are worth a note.
+    pub(crate) async fn ensure_synced(&mut self) -> anyhow::Result<Skipped> {
         let missing: Vec<String> = self
             .config
             .integrations
@@ -68,8 +69,9 @@ impl App {
             .filter(|name| !self.cache.integrations.contains_key(*name))
             .cloned()
             .collect();
+        let mut skipped = Skipped::default();
         if missing.is_empty() {
-            return Ok(());
+            return Ok(skipped);
         }
         for name in &missing {
             let integration = self.config.integration(name)?.clone();
@@ -84,17 +86,18 @@ impl App {
                         },
                     );
                 }
-                Err(Error::NeedsLogin { .. }) => {
-                    eprintln!("fob: skipping '{name}': not signed in (`fob login {name}`)");
-                }
-                Err(e) => eprintln!("fob: skipping '{name}': {e:#}"),
+                Err(Error::NeedsLogin { .. }) => skipped.0.push(format!(
+                    "skipping '{name}': not signed in (`fob login {name}`)"
+                )),
+                Err(e) => skipped.0.push(format!("skipping '{name}': {e:#}")),
             }
         }
-        self.cache.save(&profiles_file())
+        self.cache.save(&profiles_file())?;
+        Ok(skipped)
     }
 
     pub(crate) async fn list(&mut self, query: Option<&str>, json: bool) -> anyhow::Result<()> {
-        self.ensure_synced().await?;
+        self.ensure_synced().await?.report();
         let profiles: Vec<&Profile> = match query {
             Some(q) => self.cache.find(q),
             None => self.cache.all().collect(),
@@ -110,39 +113,87 @@ impl App {
     }
 
     /// Resolves a profile query, asking the user to pick when it is missing
-    /// or ambiguous and a terminal is available.
+    /// or ambiguous and a terminal is available. Under an agent the query must
+    /// be a full profile id that `[agent] profiles` allows, so a command does
+    /// what it says and permission rules can match it.
     pub(crate) async fn select(&mut self, query: Option<&str>) -> anyhow::Result<Profile> {
-        self.ensure_synced().await?;
+        let skipped = self.ensure_synced().await?;
         let mut candidates: Vec<&Profile> = match query {
             Some(q) => self.cache.find(q),
             None => self.cache.all().collect(),
         };
         // Recently used profiles first, in the picker and in error messages.
         History::load(&history::file()).sort_recent_first(&mut candidates, |p| p.id.as_str());
-        match candidates.as_slice() {
+        if candidates.is_empty() {
+            // Only now can a skipped integration be the reason.
+            skipped.report();
+        }
+        let profile = match candidates.as_slice() {
             [] if query.is_some() => bail!(
                 "no profile matches '{}'; see `fob list`",
                 query.unwrap_or_default()
             ),
             [] => bail!("no profiles yet; run `fob login <integration>`"),
-            [one] => return Ok((*one).clone()),
-            _ => {}
-        }
-        if !interactive() {
-            let shown: Vec<_> = candidates.iter().take(10).map(|p| p.id.as_str()).collect();
+            [one] if !agent::active() || query == Some(one.id.as_str()) => (*one).clone(),
+            _ if agent::active() => match query {
+                None => bail!("name a profile by its full id; `fob list` shows them"),
+                Some(q) => bail!(
+                    "name the profile by its full id: '{q}' matches {}",
+                    listing(&candidates)
+                ),
+            },
+            _ if !interactive() => match query {
+                None => bail!("name a profile; `fob list` shows them"),
+                Some(q) => bail!("'{q}' matches {}; name one in full", listing(&candidates)),
+            },
+            _ => {
+                let ids: Vec<&str> = candidates.iter().map(|p| p.id.as_str()).collect();
+                let picked = dialoguer::FuzzySelect::new()
+                    .with_prompt("Profile")
+                    .items(&ids)
+                    .default(0)
+                    .interact_on_opt(&Term::stderr())?
+                    .context("no profile selected")?;
+                candidates[picked].clone()
+            }
+        };
+        if agent::active() && !self.config.agent.allows(&profile.id) {
             bail!(
-                "'{}' matches several profiles: {}",
-                query.unwrap_or(""),
-                shown.join(", ")
+                "{} is not open to agents; ask the user to run the command or to give agents access",
+                profile.id
             );
         }
-        let ids: Vec<&str> = candidates.iter().map(|p| p.id.as_str()).collect();
-        let picked = dialoguer::FuzzySelect::new()
-            .with_prompt("Profile")
-            .items(&ids)
-            .default(0)
-            .interact_on_opt(&Term::stderr())?
-            .context("no profile selected")?;
-        Ok(candidates[picked].clone())
+        Ok(profile)
     }
+}
+
+/// Integrations [`App::ensure_synced`] could not sync, as notes for the user.
+#[derive(Default)]
+#[must_use]
+pub(crate) struct Skipped(Vec<String>);
+
+impl Skipped {
+    /// Prints the notes.
+    pub(crate) fn report(self) {
+        for note in self.0 {
+            eprintln!("fob: {note}");
+        }
+    }
+}
+
+/// "3 profiles: a, b, c", up to ten ids, then how many more.
+fn listing(profiles: &[&Profile]) -> String {
+    const SHOWN: usize = 10;
+    let ids: Vec<&str> = profiles.iter().take(SHOWN).map(|p| p.id.as_str()).collect();
+    let more = profiles.len().saturating_sub(SHOWN);
+    let noun = if profiles.len() == 1 {
+        "profile"
+    } else {
+        "profiles"
+    };
+    let mut text = format!("{} {noun}: {}", profiles.len(), ids.join(", "));
+    if more > 0 {
+        text.push_str(&format!(", and {more} more"));
+    }
+    text
 }
