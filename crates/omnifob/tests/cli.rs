@@ -96,10 +96,20 @@ impl Fob {
             let proxy = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]
                 .iter()
                 .any(|p| name.eq_ignore_ascii_case(p));
+            // Agents' markers too, so the tests run alike under an agent.
+            let agent = [
+                "CLAUDECODE",
+                "GEMINI_CLI",
+                "CURSOR_AGENT",
+                "CODEX_SANDBOX",
+                "COPILOT_AGENT_SESSION_ID",
+            ]
+            .contains(&&*name);
             if name.starts_with("AWS_")
                 || name.starts_with("OMNIFOB_")
                 || name == "COMPLETE"
                 || proxy
+                || agent
             {
                 cmd.env_remove(&*name);
             }
@@ -122,6 +132,14 @@ impl Fob {
 
     fn run(&self, args: &[&str]) -> Output {
         self.command(args).output().expect("running fob")
+    }
+
+    /// Runs fob as Claude Code runs commands.
+    fn run_as_agent(&self, args: &[&str]) -> Output {
+        self.command(args)
+            .env("CLAUDECODE", "1")
+            .output()
+            .expect("running fob")
     }
 
     /// Runs fob, expecting success; returns stdout and stderr.
@@ -468,6 +486,127 @@ async fn credential_process_output_names_the_account() {
     assert_eq!(value["AccountId"], "222222222222");
     // Cached under the profile.
     assert!(fob.secret("credentials/acme/prod/Admin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_gets_no_credentials_printed() {
+    let (fob, _server) = synced_portal("agent-print").await;
+    for args in [
+        &["creds", "acme/prod/Admin"][..],
+        &["env", "acme/prod/Admin", "--shell", "bash"],
+    ] {
+        let output = fob.run_as_agent(args);
+        let (stdout, stderr) = texts(&output);
+        assert!(!output.status.success(), "{args:?}: {stdout}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(
+            stderr.contains("not printing credentials into an agent's output; run the command as `fob exec acme/prod/Admin -- <command>`"),
+            "{stderr}"
+        );
+    }
+    let output = fob.run_as_agent(&["console", "acme/prod/Admin", "--print"]);
+    let (stdout, stderr) = texts(&output);
+    assert!(!output.status.success() && stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("not printing the console sign-in URL"),
+        "{stderr}"
+    );
+    // credential_process hands the output to the SDK, not to the agent.
+    let args = ["creds", "acme/prod/Admin", "--format", "credential-process"];
+    let output = fob.run_as_agent(&args);
+    assert!(output.status.success(), "{:?}", texts(&output));
+    assert_eq!(texts(&output).0, fob.ok(&args).0);
+    // OMNIFOB_AGENT=0 turns the detection off.
+    let output = fob
+        .command(&["creds", "acme/prod/Admin"])
+        .env("CLAUDECODE", "1")
+        .env("OMNIFOB_AGENT", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", texts(&output));
+    let stderr = texts(&fob.run_as_agent(&["use", "acme/prod/Admin"])).1;
+    assert!(stderr.contains("starts in a new shell"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_names_profiles_in_full_and_within_its_allowlist() {
+    let (fob, _server) = synced_portal("agent-select").await;
+    let creds = |query: &str| fob.run_as_agent(&["creds", query, "--format", "credential-process"]);
+    // A query that a person may use picks one profile; an agent must be exact.
+    fob.ok(&["creds", "prod", "--format", "credential-process"]);
+    let stderr = texts(&creds("prod")).1;
+    assert!(
+        stderr
+            .contains("name the profile by its full id: 'prod' matches 1 profile: acme/prod/Admin"),
+        "{stderr}"
+    );
+    let stderr = texts(&fob.run_as_agent(&["exec", "--", "true"])).1;
+    assert!(stderr.contains("name a profile by its full id"), "{stderr}");
+    assert!(creds("acme/prod/Admin").status.success());
+
+    let mut config = portal_config("acme");
+    config.push_str("\n[agent]\nprofiles = [\"acme/dev/*\"]\n");
+    fob.write_config(&config);
+    assert!(creds("acme/dev/Admin").status.success());
+    let output = creds("acme/prod/Admin");
+    assert!(!output.status.success());
+    assert!(
+        texts(&output)
+            .1
+            .contains("acme/prod/Admin is not open to agents"),
+        "{:?}",
+        texts(&output)
+    );
+    // People are not limited by it.
+    fob.ok(&["creds", "acme/prod/Admin", "--format", "credential-process"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_queries_list_the_matches() {
+    let (fob, _server) = synced_portal("ambiguous").await;
+    let stderr = fob.fails(&["creds", "Admin"]);
+    assert!(
+        stderr.contains(
+            "'Admin' matches 2 profiles: acme/dev/Admin, acme/prod/Admin; name one in full"
+        ) || stderr.contains(
+            "'Admin' matches 2 profiles: acme/prod/Admin, acme/dev/Admin; name one in full"
+        ),
+        "{stderr}"
+    );
+    let stderr = fob.fails(&["env", "--shell", "bash"]);
+    assert!(
+        stderr.contains("name a profile; `fob list` shows them"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_tells_its_own_failures_from_the_command() {
+    let (fob, _server) = synced_portal("exec-status").await;
+    let status = |args: &[&str]| fob.run(args).status.code();
+    assert_eq!(
+        status(&["exec", "nothing-matches", "--", "true"]),
+        Some(125)
+    );
+    assert_eq!(
+        status(&["exec", "acme/prod/Admin", "--", "fob-e2e-no-such-command"]),
+        Some(127)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_integration_not_signed_in_is_mentioned_only_when_it_matters() {
+    let (fob, _server) = synced_portal("skipped").await;
+    let mut config = portal_config("acme");
+    config.push_str(&portal_config("other").replace("acme.awsapps.com", "other.awsapps.com"));
+    fob.write_config(&config);
+    let note = "skipping 'other': not signed in (`fob login other`)";
+    let (_, stderr) = fob.ok(&["creds", "acme/prod/Admin", "--format", "credential-process"]);
+    assert!(!stderr.contains(note), "{stderr}");
+    let (_, stderr) = fob.ok(&["list"]);
+    assert!(stderr.contains(note), "{stderr}");
+    let stderr = fob.fails(&["creds", "other/x/Admin"]);
+    assert!(stderr.contains(note), "{stderr}");
 }
 
 /// Not a test of its own: `fob exec` runs this test binary with

@@ -18,6 +18,58 @@ pub struct Config {
     pub browsers: BTreeMap<String, Browser>,
     #[serde(default)]
     pub integrations: BTreeMap<String, Integration>,
+    /// What commands run by a coding agent may use.
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// Limits on what a coding agent can get, under `[agent]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    /// Profile ids agents may get credentials for, as patterns in which `*`
+    /// stands for any characters within one `/`-separated segment, e.g.
+    /// `"acme/dev/*"` or `"*/*/ReadOnly"`. Unset, agents may use every profile.
+    #[serde(default)]
+    pub profiles: Option<Vec<String>>,
+}
+
+impl AgentConfig {
+    /// Whether an agent may get credentials for `profile_id`.
+    pub fn allows(&self, profile_id: &str) -> bool {
+        self.profiles
+            .as_ref()
+            .is_none_or(|patterns| patterns.iter().any(|p| matches_pattern(p, profile_id)))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for pattern in self.profiles.iter().flatten() {
+            if pattern.is_empty() || pattern.split('/').any(str::is_empty) {
+                return Err(format!(
+                    "profiles: '{pattern}' has an empty segment; write a profile id such as \"acme/dev/*\""
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `id` matches `pattern`, in which `*` matches any run of characters
+/// other than `/`.
+fn matches_pattern(pattern: &str, id: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == id,
+        Some((literal, rest)) => {
+            let Some(after) = id.strip_prefix(literal) else {
+                return false;
+            };
+            // Let `*` take 0, 1, ... characters, up to the end of the segment.
+            let segment_end = after.find('/').unwrap_or(after.len());
+            (0..=segment_end)
+                .filter(|&n| after.is_char_boundary(n))
+                .any(|n| matches_pattern(rest, &after[n..]))
+        }
+    }
 }
 
 /// How to open a URL in one browser, or one profile of a browser, so that
@@ -993,6 +1045,9 @@ impl Config {
     /// Parses a config without checking integration names.
     pub fn parse_allowing_any_names(text: &str) -> anyhow::Result<Self> {
         let config: Self = toml::from_str(text)?;
+        if let Err(e) = config.agent.validate() {
+            bail!("[agent] {e}");
+        }
         for (name, browser) in &config.browsers {
             if let Err(e) = browser.validate() {
                 bail!("browser '{name}': {e}");
@@ -1881,5 +1936,37 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn agent_profiles_match_patterns_within_segments() {
+        let agent = |patterns: &[&str]| AgentConfig {
+            profiles: Some(patterns.iter().map(|p| p.to_string()).collect()),
+        };
+        assert!(AgentConfig::default().allows("acme/prod/Admin"));
+        let dev = agent(&["acme/dev/*", "*/*/ReadOnly"]);
+        assert!(dev.allows("acme/dev/Admin"));
+        assert!(dev.allows("other/prod/ReadOnly"));
+        assert!(!dev.allows("acme/prod/Admin"));
+        assert!(!dev.allows("acme/dev"));
+        // `*` stays within its segment.
+        assert!(!agent(&["acme/*"]).allows("acme/dev/Admin"));
+        assert!(agent(&["acme/*/*"]).allows("acme/dev/Admin"));
+        assert!(agent(&["acme/d*v/Ad*"]).allows("acme/dev/Admin"));
+        assert!(agent(&["acme/dév/*"]).allows("acme/dév/Admin"));
+        assert!(!agent(&[]).allows("acme/dev/Admin"));
+    }
+
+    #[test]
+    fn agent_section_is_parsed_and_checked() {
+        let config = Config::parse("[agent]\nprofiles = [\"acme/dev/*\"]\n").unwrap();
+        assert!(config.agent.allows("acme/dev/Admin"));
+        assert!(!config.agent.allows("acme/prod/Admin"));
+        assert!(Config::parse("").unwrap().agent.profiles.is_none());
+        let error = Config::parse("[agent]\nprofiles = [\"acme//x\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty segment"), "{error}");
+        assert!(Config::parse("[agent]\nother = 1\n").is_err());
     }
 }

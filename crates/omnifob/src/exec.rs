@@ -12,6 +12,20 @@ use crate::cli::CredsFormat;
 use crate::renew::spawn_renewal;
 use crate::{App, record_use};
 
+/// `fob exec`'s status when fob itself fails, before the command runs (as
+/// `env` and `nohup` use it).
+pub(crate) const FOB_FAILED: u8 = 125;
+
+/// `fob exec`'s status when the command cannot be started: 127 when it is not
+/// found, 126 when it is found but cannot run, as the shell and `env` report.
+fn could_not_start(program: &str, e: &std::io::Error) -> ExitCode {
+    eprintln!("fob: running {program}: {e}");
+    ExitCode::from(match e.kind() {
+        std::io::ErrorKind::NotFound => 127,
+        _ => 126,
+    })
+}
+
 pub(crate) fn expiry_note(creds: &Credentials) -> String {
     match creds.expires_at {
         Some(at) => {
@@ -137,12 +151,15 @@ pub(crate) async fn run_to_end(
     creds: &Credentials,
     command: &[String],
 ) -> anyhow::Result<ExitCode> {
-    let mut child = tokio::process::Command::new(&command[0])
+    let mut child = match tokio::process::Command::new(&command[0])
         .args(&command[1..])
         .envs(&creds.env)
         .env("OMNIFOB_PROFILE", &profile.id)
         .spawn()
-        .with_context(|| format!("running {}", command[0]))?;
+    {
+        Ok(child) => child,
+        Err(e) => return Ok(could_not_start(&command[0], &e)),
+    };
     // The terminal sends Ctrl-C, and a hangup when it closes, to the command
     // too; omnifob waits for the command to end instead of ending first.
     #[cfg(unix)]
@@ -193,13 +210,14 @@ pub(crate) fn exec(
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        Err(err).with_context(|| format!("running {}", command[0]))
+        Ok(could_not_start(&command[0], &err))
     }
     #[cfg(not(unix))]
     {
-        let status = cmd
-            .status()
-            .with_context(|| format!("running {}", command[0]))?;
+        let status = match cmd.status() {
+            Ok(status) => status,
+            Err(e) => return Ok(could_not_start(&command[0], &e)),
+        };
         Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
     }
 }
