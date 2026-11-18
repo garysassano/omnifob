@@ -44,7 +44,7 @@ fn config(extra: &str) -> AwsIamConfig {
 
         [integrations.legacy.roles.prod]
         role_arn = "arn:aws:iam::222222222222:role/Deploy"
-        duration = "2h"
+        duration = "45m"
         "#
     );
     match Config::parse(&text)
@@ -147,7 +147,7 @@ async fn one_mfa_code_covers_parallel_calls_and_every_role() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_string_contains("Action=AssumeRole"))
-        .and(body_string_contains("DurationSeconds=7200"))
+        .and(body_string_contains("DurationSeconds=2700"))
         // Signed with the session, which carries the MFA; no code is sent.
         .and(header_regex("authorization", "Credential=ASIASESSION/"))
         .respond_with(sts(
@@ -186,12 +186,25 @@ async fn durations_outside_what_sts_allows_are_refused() {
         &config,
         "prod",
         "limits/prod/Deploy",
-        Some(jiff::SignedDuration::from_hours(13)),
+        Some(jiff::SignedDuration::from_hours(2)),
     )
     .await
     .unwrap_err()
     .to_string();
-    assert!(err.contains("12 hours"), "{err}");
+    assert!(err.contains("1 hour"), "{err}");
+
+    // STS caps a role assumed with the user's session at an hour.
+    let bad = Config::parse(
+        r#"
+        [integrations.x]
+        type = "aws-iam"
+        [integrations.x.roles.prod]
+        role_arn = "arn:aws:iam::222222222222:role/Deploy"
+        duration = "2h"
+        "#,
+    )
+    .unwrap_err();
+    assert!(format!("{bad:#}").contains("between 15m and 1h"), "{bad:#}");
 
     let bad = Config::parse(
         r#"
@@ -255,7 +268,7 @@ fn whole_config(name: &str) -> (Config, Profile, Profile) {
         region = "eu-west-1"
         [integrations.{name}.roles.prod]
         role_arn = "arn:aws:iam::222222222222:role/Deploy"
-        duration = "2h"
+        duration = "45m"
         "#
     ))
     .unwrap();
@@ -310,7 +323,7 @@ async fn credentials_carry_the_account_id() {
     let (config, session, role) = whole_config("acct-id");
     login(&server, "acct-id", &integration(&config, "acct-id")).await;
     mock_sts(&server, "GetSessionToken", 28_800, "ASIASESSION").await;
-    mock_sts(&server, "AssumeRole", 7_200, "ASIAROLE").await;
+    mock_sts(&server, "AssumeRole", 2_700, "ASIAROLE").await;
 
     let creds = providers::credentials(&config, &session, true, None)
         .await
@@ -333,7 +346,7 @@ async fn a_ttl_request_leaves_the_cache_alone() {
     mock_sts(&server, "GetSessionToken", 900, "ASIASHORTSESSION").await;
     mock_sts(&server, "GetSessionToken", 28_800, "ASIASESSION").await;
     mock_sts(&server, "AssumeRole", 900, "ASIASHORTROLE").await;
-    mock_sts(&server, "AssumeRole", 7_200, "ASIAROLE").await;
+    mock_sts(&server, "AssumeRole", 2_700, "ASIAROLE").await;
 
     assert_eq!(key(&config, &session, short).await, "ASIASHORTSESSION");
     assert_eq!(key(&config, &session, None).await, "ASIASESSION");

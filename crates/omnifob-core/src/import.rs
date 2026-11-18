@@ -207,7 +207,7 @@ fn other_source(keys: &BTreeMap<String, String>) -> Option<&'static str> {
 /// How long AWS lets a role session last when it is chained from an
 /// Identity Center role, and when it is assumed with an IAM user's session.
 const CHAINED_SECONDS: std::ops::RangeInclusive<i64> = 900..=3600;
-const IAM_USER_ROLE_SECONDS: std::ops::RangeInclusive<i64> = 900..=43200;
+const IAM_USER_ROLE_SECONDS: std::ops::RangeInclusive<i64> = 900..=3600;
 
 /// `duration_seconds`, if set and within `range`.
 fn duration(
@@ -379,7 +379,7 @@ pub fn aws_import(text: &str) -> AwsImport {
         let Ok(duration) = duration(keys, IAM_USER_ROLE_SECONDS) else {
             skip(
                 name,
-                "its duration_seconds is not 900 to 43200, the range AWS allows for roles assumed by an IAM user".into(),
+                "its duration_seconds is not 900 to 3600, the range AWS allows for roles assumed with an IAM user's session, which STS counts as role chaining".into(),
             );
             continue;
         };
@@ -737,7 +737,7 @@ duration_seconds = 7200
 [profile from-static-keys]
 role_arn = arn:aws:iam::555555555555:role/Admin
 source_profile = plain-keys
-duration_seconds = 43200
+duration_seconds = 3600
 role_session_name = me
 mfa_serial = arn:aws:iam::555555555555:mfa/user
 
@@ -749,7 +749,7 @@ mfa_serial = arn:aws:iam::555555555555:mfa/another
 [profile too-long-from-keys]
 role_arn = arn:aws:iam::555555555555:role/Admin
 source_profile = plain-keys
-duration_seconds = 43201
+duration_seconds = 3601
 
 [profile from-credentials-file]
 role_arn = arn:aws:iam::777777777777:role/ReadOnly
@@ -852,7 +852,7 @@ credential_process = /usr/bin/creds
         assert!(skipped["half-chained"].contains("no account and role"));
         assert!(skipped["other-mfa"].contains("mfa_serial"));
         assert!(skipped["too-long-from-sso"].contains("900 to 3600"));
-        assert!(skipped["too-long-from-keys"].contains("900 to 43200"));
+        assert!(skipped["too-long-from-keys"].contains("900 to 3600"));
     }
 
     #[test]
@@ -911,8 +911,8 @@ credential_process = /usr/bin/creds
         assert_eq!(role.session_name.as_deref(), Some("me"));
         assert_eq!(
             role.duration,
-            Some(jiff::SignedDuration::from_hours(12)),
-            "IAM users' roles may last 12 hours"
+            Some(jiff::SignedDuration::from_hours(1)),
+            "IAM users' roles last at most an hour"
         );
 
         // The key may sit in the credentials file, which is not read.
