@@ -19,7 +19,8 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use aws_sdk_sso::error::{DisplayErrorContext, ProvideErrorMetadata};
+use aws_sdk_sso::config::http::HttpResponse;
+use aws_sdk_sso::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_ssooidc::operation::create_token::{CreateTokenError, CreateTokenOutput};
 use futures::StreamExt;
 use jiff::{SignedDuration, Timestamp};
@@ -155,11 +156,64 @@ fn endpoint_override() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The variable the AWS CLI and SDKs read for the OIDC service's endpoint.
+const OIDC_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_SSO_OIDC";
+
+/// The variable the AWS CLI and SDKs read for the portal's endpoint.
+const PORTAL_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_SSO";
+
+/// Where to send the calls of one Identity Center API: `OMNIFOB_AWS_ENDPOINT`,
+/// else the service's own variable (`AWS_ENDPOINT_URL_SSO_OIDC` or
+/// `AWS_ENDPOINT_URL_SSO`), which points the AWS CLI at a VPC endpoint whose
+/// private DNS is off, unless `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` is `true`.
+/// The global `AWS_ENDPOINT_URL` is not read: it usually points the command
+/// `fob exec` runs at a local emulator, which cannot sign anyone in.
+fn service_endpoint(variable: &str) -> Option<String> {
+    endpoint_override().or_else(|| {
+        let ignored = std::env::var("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+        if ignored {
+            return None;
+        }
+        std::env::var(variable).ok().filter(|v| !v.is_empty())
+    })
+}
+
+/// The reason IAM Identity Center gives when its network controls refuse a
+/// request that did not come through a VPC endpoint or network it allows.
+const NETWORK_CONTROLS_DENIED: &str = "NETWORK_CONTROLS_ACCESS_DENIED";
+
+/// Whether IAM Identity Center's network controls refused the call. The SDK
+/// models do not name this reason yet, so the response body is searched.
+fn network_controls_denied<E>(e: &SdkError<E, HttpResponse>) -> bool {
+    let needle = NETWORK_CONTROLS_DENIED.as_bytes();
+    e.raw_response()
+        .and_then(|response| response.body().bytes())
+        .is_some_and(|body| body.windows(needle.len()).any(|w| w == needle))
+}
+
+/// An SDK error as the user sees it, saying so when network controls refused
+/// the call, since connecting to the right network fixes it and signing in
+/// again does not.
+fn describe<E>(e: &SdkError<E, HttpResponse>) -> String
+where
+    E: std::error::Error + 'static,
+{
+    if network_controls_denied(e) {
+        format!(
+            "IAM Identity Center's network controls refused the request, which has to come through a network or VPC endpoint your organization allows; connect to it (for example through the VPN) and try again ({})",
+            DisplayErrorContext(e)
+        )
+    } else {
+        DisplayErrorContext(e).to_string()
+    }
+}
+
 fn oidc_client(region: &str) -> aws_sdk_ssooidc::Client {
     let mut config = aws_sdk_ssooidc::Config::builder()
         .region(aws_sdk_ssooidc::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_ssooidc::config::BehaviorVersion::latest());
-    if let Some(url) = endpoint_override() {
+    if let Some(url) = service_endpoint(OIDC_ENDPOINT_VARIABLE) {
         config = config.endpoint_url(url);
     }
     aws_sdk_ssooidc::Client::from_conf(config.build())
@@ -169,7 +223,7 @@ fn portal_client(region: &str) -> aws_sdk_sso::Client {
     let mut config = aws_sdk_sso::Config::builder()
         .region(aws_sdk_sso::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_sso::config::BehaviorVersion::latest());
-    if let Some(url) = endpoint_override() {
+    if let Some(url) = service_endpoint(PORTAL_ENDPOINT_VARIABLE) {
         config = config.endpoint_url(url);
     }
     aws_sdk_sso::Client::from_conf(config.build())
@@ -248,12 +302,10 @@ async fn registration(
             .redirect_uris(REGISTERED_REDIRECT)
             .issuer_url(&config.start_url);
     }
-    let client = request.send().await.map_err(|e| {
-        anyhow!(
-            "registering with IAM Identity Center: {}",
-            DisplayErrorContext(&e)
-        )
-    })?;
+    let client = request
+        .send()
+        .await
+        .map_err(|e| anyhow!("registering with IAM Identity Center: {}", describe(&e)))?;
     let registration = Registration {
         client_id: client
             .client_id()
@@ -292,9 +344,11 @@ async fn browser_sign_in(
         listener.local_addr()?.port()
     );
     let registration = registration(integration, config, oidc, Flow::Browser).await?;
+    // A configured endpoint wins over the one the registration names, as in
+    // the AWS CLI, which builds the consent URL from the client's endpoint.
     let endpoint = match &registration.authorization_endpoint {
-        Some(endpoint) => endpoint.clone(),
-        None => authorization_endpoint(&config.region).await?,
+        Some(endpoint) if service_endpoint(OIDC_ENDPOINT_VARIABLE).is_none() => endpoint.clone(),
+        _ => authorization_endpoint(&config.region).await?,
     };
     let (verifier, challenge) = oauth::pkce()?;
     let state = oauth::random_string(16)?;
@@ -324,14 +378,15 @@ async fn browser_sign_in(
         .redirect_uri(redirect_uri)
         .send()
         .await
-        .map_err(|e| anyhow!("exchanging the sign-in code: {}", DisplayErrorContext(&e)))?;
+        .map_err(|e| anyhow!("exchanging the sign-in code: {}", describe(&e)))?;
     Ok((registration, token))
 }
 
 /// The consent page of the OIDC service in `region`, as the SDK resolves its
-/// endpoint (so other partitions work), the way the AWS CLI finds it.
+/// endpoint (so other partitions work) or a configured one, the way the AWS
+/// CLI finds it.
 async fn authorization_endpoint(region: &str) -> anyhow::Result<String> {
-    if let Some(url) = endpoint_override() {
+    if let Some(url) = service_endpoint(OIDC_ENDPOINT_VARIABLE) {
         return Ok(format!("{}/authorize", url.trim_end_matches('/')));
     }
     use aws_sdk_ssooidc::config::endpoint::{DefaultResolver, Params, ResolveEndpoint};
@@ -400,7 +455,7 @@ async fn device_sign_in(
         .start_url(&config.start_url)
         .send()
         .await
-        .map_err(|e| anyhow!("starting device sign-in: {}", DisplayErrorContext(&e)))?;
+        .map_err(|e| anyhow!("starting device sign-in: {}", describe(&e)))?;
     let device_code = device.device_code().context("no device code returned")?;
     prompt(&SignInPrompt {
         url: device
@@ -428,7 +483,7 @@ async fn device_sign_in(
             Err(e) => match e.as_service_error() {
                 Some(CreateTokenError::AuthorizationPendingException(_)) => {}
                 Some(CreateTokenError::SlowDownException(_)) => interval += Duration::from_secs(5),
-                _ => bail!("waiting for sign-in approval: {}", DisplayErrorContext(&e)),
+                _ => bail!("waiting for sign-in approval: {}", describe(&e)),
             },
         }
         if Timestamp::now() > deadline {
@@ -666,6 +721,11 @@ async fn refresh(token: &SsoToken) -> std::result::Result<SsoToken, RefreshError
         .send()
         .await
         .map_err(|e| {
+            if network_controls_denied(&e) {
+                // Connecting to the allowed network fixes this; the session
+                // at Identity Center is intact.
+                return RefreshError::Transient(anyhow!("{}", describe(&e)));
+            }
             let refused = matches!(
                 e.as_service_error(),
                 Some(
@@ -728,14 +788,16 @@ enum PortalError {
     Other(anyhow::Error),
 }
 
-fn portal_error<E>(what: &str, e: E) -> PortalError
+fn portal_error<E>(what: &str, e: SdkError<E, HttpResponse>) -> PortalError
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
-    if e.code() == Some("UnauthorizedException") {
+    // A refusal by network controls says nothing about the token, so it must
+    // not end the session, whatever status it comes with.
+    if e.code() == Some("UnauthorizedException") && !network_controls_denied(&e) {
         PortalError::Unauthorized
     } else {
-        PortalError::Other(anyhow!("{what}: {}", DisplayErrorContext(&e)))
+        PortalError::Other(anyhow!("{what}: {}", describe(&e)))
     }
 }
 
@@ -905,7 +967,10 @@ pub async fn credentials(
                     .await;
                 match result {
                     Ok(response) => return Ok(response),
-                    Err(e) if e.code() == Some("ForbiddenException") => {
+                    Err(e)
+                        if e.code() == Some("ForbiddenException")
+                            && !network_controls_denied(&e) =>
+                    {
                         if attempt == FORBIDDEN_RETRIES {
                             return Err(PortalError::Other(anyhow!(
                                 "IAM Identity Center gives you no access to {role_name} in {account_id} \

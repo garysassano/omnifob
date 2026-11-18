@@ -22,6 +22,7 @@ Each was read from a shallow clone of its repository.
 - The consent URL is the OIDC endpoint the SDK resolves for the region plus `/authorize`, with `response_type`, `client_id`, `redirect_uri`, `state`, `code_challenge_method=S256`, `scopes` (space-separated, `%20`) and `code_challenge`.
 - Registrations are cached apart from tokens, keyed by start URL, session name and scopes, and reused until they expire (90 days); `aws sso logout` removes tokens and calls the portal's `Logout`.
 - Tokens are refreshed 15 minutes before expiry.
+- The consent URL's base is the endpoint the OIDC client resolves (`_get_base_authorization_uri` in `awscli/botocore/utils.py`, read 2026-11-18), so a configured endpoint such as `AWS_ENDPOINT_URL_SSO_OIDC` moves the consent page too; `RegisterClient`'s `authorizationEndpoint` is not used.
 - **Taken:** PKCE by default with the device flow as fallback, the portless registration, `scopes`, the separate registration cache, `Logout` on sign-out.
 
 ### aws-vault (ByteNess/aws-vault fork, Go)
