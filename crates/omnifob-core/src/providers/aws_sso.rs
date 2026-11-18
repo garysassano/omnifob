@@ -168,7 +168,7 @@ const PORTAL_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_SSO";
 /// private DNS is off, unless `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` is `true`.
 /// The global `AWS_ENDPOINT_URL` is not read: it usually points the command
 /// `fob exec` runs at a local emulator, which cannot sign anyone in.
-fn service_endpoint(variable: &str) -> Option<String> {
+pub(crate) fn service_endpoint(variable: &str) -> Option<String> {
     endpoint_override().or_else(|| {
         let ignored = std::env::var("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS")
             .is_ok_and(|v| v.eq_ignore_ascii_case("true"));
@@ -428,7 +428,7 @@ fn authorize_url(
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {

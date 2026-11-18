@@ -79,7 +79,7 @@ Every CLI studied lets an environment variable override its own active profile (
 1. Name the provider shapes in the core: _session exchange_, _mint_, _static_. Providers implement one; the CLI behaves the same for all.
 2. Add a generic `static-token` integration soon: keychain storage, multiple accounts, the right variable names. Cheap, and it covers Hetzner, DigitalOcean, Vultr, Upstash and Akamai immediately.
 3. Plan browser sign-in for Cloudflare, Linode and Scaleway together; they share a PKCE-then-mint design.
-4. Add an `aws-signin` integration for `aws login` (non-Identity Center accounts), with the DPoP key in the keychain.
+4. Add an integration for `aws login` (non-Identity Center accounts), with the DPoP key in the keychain. Done as `aws-login`.
 5. Add provisioners: files with cleanup, `credential_process`, Google executable-sourced credentials, kubectl exec plugin.
 6. Add an `--agent` mode: shorter lifetimes, marked credentials, and a record of what was handed to which agent.
 7. Two-stage refresh and background renewal.

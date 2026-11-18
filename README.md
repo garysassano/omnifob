@@ -10,6 +10,7 @@ Early. What changed in each version is in the [release notes](https://github.com
 | ------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | `aws-sso` (IAM Identity Center) | Browser (PKCE) or device flow, silent refresh           | Every account and role, plus configured chained and cross-partition roles | Role credentials; chained roles through STS AssumeRole; roles in other partitions through STS GetWebIdentityToken and AssumeRoleWithWebIdentity (the exchange not yet tried live) | Federated sign-in URL |
 | `aws-iam` (IAM user)            | Access key, stored once; MFA per session                | The user's session, plus configured roles                                 | Session from STS GetSessionToken; roles assumed with it (up to 1 hour)                                                                                                            | Federated sign-in URL |
+| `aws-login` (console sign-in)   | Browser or pasted code, as `aws login`; silent refresh  | The signed-in console identity                                            | 15 minute credentials from AWS Sign-In, renewed for up to 12 hours with a DPoP-bound refresh token (not yet tried live)                                                           | Federated sign-in URL |
 | `gcp` (Google account)          | Browser (PKCE) or pasted code, as `gcloud auth login`   | Every active project, plus configured service accounts                    | Your access token per project; service account tokens by impersonation                                                                                                            | Cloud console         |
 | `azure` (Entra ID)              | Browser (PKCE) or device flow, as `az login`            | Every subscription in every tenant                                        | A Resource Manager token, with the subscription and tenant IDs (not yet tried on a live tenant)                                                                                   | Azure portal          |
 | `cloudflare-oauth`              | Browser sign-in (OAuth with PKCE), silent refresh       | Approved accounts × templates                                             | Minted tokens, scoped by permission name, expiring                                                                                                                                | Dashboard             |
@@ -105,6 +106,14 @@ session_duration = "8h"        # optional, 15m to 36h (default 8h)
 role_arn = "arn:aws:iam::222222222222:role/Admin"
 duration = "45m"               # optional, 15m to 1h (default 1h)
 console_duration = "8h"        # optional: `fob console` session length, 15m to 12h
+
+# Console credentials, as `aws login` gets them: the browser picks a console
+# session (an IAM user, root or a federated role), and no access key is stored.
+# Profile id: console/<account ID>/<user, root or role name>.
+[integrations.console]
+type = "aws-login"
+region = "eu-central-1"        # the Region signed in through; also AWS_REGION
+default_region = "eu-west-1"   # optional: AWS_REGION instead of region
 
 # A Google account, signed in like `gcloud auth login` (with gcloud's OAuth client).
 # Profile ids: google/<project>/user, and google/<label>/<name> per service account.

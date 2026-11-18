@@ -117,6 +117,7 @@ impl Browser {
 pub enum Integration {
     AwsSso(AwsSsoConfig),
     AwsIam(AwsIamConfig),
+    AwsLogin(AwsLoginConfig),
     Gcp(GcpConfig),
     Azure(AzureConfig),
     /// Either Cloudflare type; `CloudflareConfig::sign_in` says which.
@@ -129,6 +130,7 @@ impl Integration {
         match self {
             Integration::AwsSso(_) => "aws-sso",
             Integration::AwsIam(_) => "aws-iam",
+            Integration::AwsLogin(_) => "aws-login",
             Integration::Gcp(_) => "gcp",
             Integration::Azure(_) => "azure",
             Integration::Cloudflare(c) => match c.sign_in {
@@ -144,6 +146,7 @@ impl Integration {
         match self {
             Integration::AwsSso(c) => c.browser.as_deref(),
             Integration::AwsIam(c) => c.browser.as_deref(),
+            Integration::AwsLogin(c) => c.browser.as_deref(),
             Integration::Gcp(c) => c.browser.as_deref(),
             Integration::Azure(c) => c.browser.as_deref(),
             Integration::Cloudflare(c) => c.browser.as_deref(),
@@ -159,6 +162,7 @@ impl Integration {
 enum RawIntegration {
     AwsSso(AwsSsoConfig),
     AwsIam(AwsIamConfig),
+    AwsLogin(AwsLoginConfig),
     Gcp(GcpConfig),
     Azure(AzureConfig),
     CloudflareToken(CloudflareConfig),
@@ -178,6 +182,10 @@ impl TryFrom<RawIntegration> for Integration {
             RawIntegration::AwsIam(c) => {
                 c.validate()?;
                 Integration::AwsIam(c)
+            }
+            RawIntegration::AwsLogin(c) => {
+                c.validate()?;
+                Integration::AwsLogin(c)
             }
             RawIntegration::Gcp(c) => {
                 c.validate()?;
@@ -697,6 +705,38 @@ impl AwsIamConfig {
                 &format!("roles.{label}.console_duration"),
                 role.console_duration,
             )?;
+        }
+        Ok(())
+    }
+}
+
+/// AWS console credentials (`type = "aws-login"`), as `aws login` gets
+/// them: the browser signs in with a console session (an IAM user, the root
+/// user or a federated role), and omnifob keeps a refresh token that renews
+/// 15 minute credentials for up to 12 hours, with no access key stored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsLoginConfig {
+    /// The Region signed in through; the refresh token works only there. It
+    /// is also exported as `AWS_REGION` unless `default_region` is set.
+    pub region: String,
+    /// Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` instead of `region`.
+    #[serde(default)]
+    pub default_region: Option<String>,
+    /// Middle segment of the profile's id; defaults to the account ID.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// The browser in `[browsers]` that this integration's sign-ins and
+    /// consoles open in; by default the system's.
+    #[serde(default)]
+    pub browser: Option<String>,
+}
+
+impl AwsLoginConfig {
+    fn validate(&self) -> Result<(), String> {
+        check_region("region", &self.region)?;
+        if let Some(region) = &self.default_region {
+            check_region("default_region", region)?;
         }
         Ok(())
     }
