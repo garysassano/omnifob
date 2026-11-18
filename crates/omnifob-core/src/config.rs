@@ -640,7 +640,8 @@ fn check_session_name(name: &str) -> Result<(), String> {
 /// An IAM user's access key, kept in the keychain (`type = "aws-iam"`), the
 /// way aws-vault keeps it. omnifob never hands the key out: it turns it into a
 /// session with STS `GetSessionToken` (with an MFA code when `mfa_serial` is
-/// set), and assumes `roles` with that session.
+/// set), and assumes `roles` with that session, which STS counts as role
+/// chaining.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AwsIamConfig {
@@ -686,10 +687,10 @@ impl AwsIamConfig {
         }
         for (label, role) in &self.roles {
             if let Some(d) = role.duration
-                && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(12)).contains(&d)
+                && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(1)).contains(&d)
             {
                 return Err(format!(
-                    "roles.{label}.duration must be between 15m and 12h"
+                    "roles.{label}.duration must be between 15m and 1h: STS counts a role assumed with the user's session as role chaining"
                 ));
             }
             check_console_duration(
@@ -714,8 +715,9 @@ pub struct IamRole {
     /// Region exported for this role; defaults to the integration's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
-    /// Session length, 15 minutes to the role's maximum (at most 12 hours);
-    /// defaults to one hour.
+    /// Session length, 15 minutes to 1 hour (STS counts a role assumed with
+    /// the user's `GetSessionToken` session as role chaining, which it caps
+    /// at one hour); defaults to one hour.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

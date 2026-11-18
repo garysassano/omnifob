@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use super::aws_partition::Partition;
 use super::aws_sso::{self, RoleRequest, SESSION_MIN};
 use crate::config::AwsIamConfig;
-use crate::credentials::EXPIRY_MARGIN;
 use crate::{Credentials, Error, Profile, Result, Target, store};
 
 /// STS when no region is configured.
@@ -224,18 +223,13 @@ pub async fn role_credentials(
         format!("no role '{label}' in integration '{integration}'; run `fob sync`")
     })?;
     let duration = ttl.or(role.duration).unwrap_or(DEFAULT_ROLE_SESSION);
-    if !(SESSION_MIN..=SignedDuration::from_hours(12)).contains(&duration) {
-        return Err(anyhow!("a role's session lasts 15 minutes to 12 hours").into());
+    // STS counts a role assumed with the user's session as role chaining.
+    if !(SESSION_MIN..=SignedDuration::from_hours(1)).contains(&duration) {
+        return Err(anyhow!("an IAM user's role session lasts 15 minutes to 1 hour").into());
     }
+    // The role's credentials outlive the session they came from (tried
+    // live), so the duration is not shortened to what is left of it.
     let session = session_credentials(integration, config, profile_id, None).await?;
-    // The role's credentials cannot outlive the session they came from.
-    let left = session
-        .expires_at
-        .map(|at| at.duration_since(Timestamp::now()) - EXPIRY_MARGIN);
-    let duration = match left {
-        Some(left) if left < duration => left.max(SESSION_MIN),
-        _ => duration,
-    };
     let region = role.region.as_deref().or(config.region.as_deref());
     let request = RoleRequest {
         role_arn: &role.role_arn,
