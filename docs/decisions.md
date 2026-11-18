@@ -229,3 +229,11 @@ Roles of an `aws-iam` integration are assumed with the user's `GetSessionToken` 
 Assuming roles with the access key itself would allow 12 hours (aws-vault's `--no-session`), at the cost of an MFA code per role and the key signing every `AssumeRole`. It is left until someone needs longer sessions.
 
 The same live check showed that role credentials keep working after the session they were assumed with has expired (an hour's role from a session with 15 minutes left answered `GetCallerIdentity` after the session returned `ExpiredToken`), so the duration is no longer shortened to what is left of the session; that only gave shorter sessions. The federation endpoint also returns a sign-in token with `SessionDuration` for these credentials, so `console_duration` on an IAM user's role works although STS calls them chained.
+
+## 2026-11-18: `aws-login` for console credentials
+
+`aws login` gives IAM users, the root user and federated roles short-lived credentials from their console session, with no access key on disk. omnifob does the same as `type = "aws-login"`, following the AWS CLI's implementation (`awscli/customizations/login/`, read 2026-11-18): the same public clients, consent parameters, pasted-code format and error codes, so AWS Sign-In treats omnifob as it treats the CLI. The token calls go through `aws-sdk-signin`, with the DPoP proof added to each attempt by `mutate_request`, which runs after the endpoint is resolved, rather than through an auth scheme like `aws-config`'s, since `CreateOAuth2Token` is unauthenticated and the header is all it needs. The key is P-256 from `aws-lc-rs`, already built into every release through rustls, so no new cryptography crate is added.
+
+The session, DPoP key included, is kept in the keychain like other providers' secrets, not in `~/.aws/login/cache` as plain JSON, so the AWS CLI does not see omnifob's sign-ins and omnifob does not read the CLI's. Sharing that cache would have kept a refresh token and its key in a file. The credentials last 15 minutes and are renewed five minutes before they expire, as the CLI does; refusals that mean the sign-in is over end it, anything else keeps it, as for Identity Center.
+
+There is one profile per integration, the signed-in identity. Roles assumed from it would be role chaining (an hour at most), and nothing asks for them yet.

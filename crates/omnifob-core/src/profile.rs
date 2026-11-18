@@ -51,6 +51,10 @@ pub enum Target {
     AwsIamSession {
         account_id: String,
     },
+    /// A console identity signed in through AWS Sign-In (`aws login`).
+    AwsLogin {
+        account_id: String,
+    },
     /// A role assumed with an IAM user's session; details live in the
     /// integration's `roles` table under `label`.
     AwsIamRole {
@@ -85,9 +89,9 @@ impl Target {
             Target::Aws { account_id, .. } | Target::Cloudflare { account_id, .. } => {
                 Some(account_id)
             }
-            Target::AwsIamSession { account_id } | Target::AwsCrossPartition { account_id, .. } => {
-                Some(account_id)
-            }
+            Target::AwsIamSession { account_id }
+            | Target::AwsLogin { account_id }
+            | Target::AwsCrossPartition { account_id, .. } => Some(account_id),
             Target::AwsChained { account_id, .. } | Target::AwsIamRole { account_id, .. } => {
                 account_id.as_deref()
             }
@@ -109,6 +113,7 @@ impl Target {
                 | Target::AwsCrossPartition { .. }
                 | Target::AwsIamSession { .. }
                 | Target::AwsIamRole { .. }
+                | Target::AwsLogin { .. }
         )
     }
 }

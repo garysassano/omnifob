@@ -270,6 +270,7 @@ pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
                 omnifob_core::Target::AwsCrossPartition { .. } => "aws (cross-partition)",
                 omnifob_core::Target::AwsIamSession { .. } => "aws (iam user)",
                 omnifob_core::Target::AwsIamRole { .. } => "aws (iam role)",
+                omnifob_core::Target::AwsLogin { .. } => "aws (console sign-in)",
                 omnifob_core::Target::Gcp { .. } => "gcp",
                 omnifob_core::Target::Azure { .. } => "azure",
                 omnifob_core::Target::GcpServiceAccount { .. } => "gcp (service account)",

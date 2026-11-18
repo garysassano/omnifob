@@ -25,6 +25,15 @@ Each was read from a shallow clone of its repository.
 - The consent URL's base is the endpoint the OIDC client resolves (`_get_base_authorization_uri` in `awscli/botocore/utils.py`, read 2026-11-18), so a configured endpoint such as `AWS_ENDPOINT_URL_SSO_OIDC` moves the consent page too; `RegisterClient`'s `authorizationEndpoint` is not used.
 - **Taken:** PKCE by default with the device flow as fallback, the portless registration, `scopes`, the separate registration cache, `Logout` on sign-out.
 
+### AWS CLI v2 `aws login` (aws/aws-cli, Python; read 2026-11-18)
+
+- `awscli/customizations/login/`: OAuth authorization code with PKCE against AWS Sign-In, with the public clients `arn:aws:signin:::devtools/same-device` (loopback redirect `http://127.0.0.1:<port>/oauth/callback`) and `arn:aws:signin:::devtools/cross-device` (`--remote`: redirect `<endpoint>/v1/sessions/confirmation`, and the user pastes base64 of `state=…&code=…`).
+- Consent page `<endpoint>/v1/authorize` with `response_type=code`, `client_id`, `state`, `code_challenge_method=SHA-256`, `scope=openid`, `redirect_uri`, `code_challenge`; the endpoint is the one the `signin` client resolves.
+- `CreateOAuth2Token` (unsigned, `tokenInput`) with a DPoP header: an ES256 JWT, `typ` `dpop+jwt`, the P-256 public key as `jwk`, claims `htm` `POST`, `htu` the request URL, `iat`, `jti`. A new key per sign-in, stored in the cache as SEC1 PEM.
+- The cache, `~/.aws/login/cache/<sha256 of the session ARN>.json`, holds the credentials, refresh token, client ID, ID token, DPoP key and the sign-in Region (`signInRegion`), which renewal uses. The profile gets `login_session = <ARN>`, the ID token's `sub`.
+- Renewal five minutes before expiry with the `refresh_token` grant; `TOKEN_EXPIRED`, `USER_CREDENTIALS_CHANGED` and `INSUFFICIENT_PERMISSIONS` are named, `AUTHCODE_EXPIRED` at sign-in. `aws logout` only deletes the cache.
+- **Taken:** the clients, parameters, DPoP proof, renewal window and error handling. **Not taken:** the file cache (the keychain instead).
+
 ### aws-vault (ByteNess/aws-vault fork, Go)
 
 - `SSORoleCredentialsProvider`: OIDC token cache keyed by start URL; with `sso:account:access` scope Identity Center returns a refresh token.

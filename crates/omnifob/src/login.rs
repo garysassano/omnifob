@@ -6,7 +6,7 @@ use anyhow::bail;
 use dialoguer::console::Term;
 use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::providers::{
-    self, aws_iam, aws_sso, azure, cloudflare, cloudflare_oauth, gcp, token,
+    self, aws_iam, aws_login, aws_sso, azure, cloudflare, cloudflare_oauth, gcp, token,
 };
 use omnifob_core::{Error, Integration};
 
@@ -26,11 +26,14 @@ impl App {
         if device_code
             && !matches!(
                 integration,
-                Integration::AwsSso(_) | Integration::Gcp(_) | Integration::Azure(_)
+                Integration::AwsSso(_)
+                    | Integration::AwsLogin(_)
+                    | Integration::Gcp(_)
+                    | Integration::Azure(_)
             )
         {
             bail!(
-                "--device-code only applies to AWS IAM Identity Center, Google and Azure integrations"
+                "--device-code only applies to AWS IAM Identity Center, AWS console sign-in, Google and Azure integrations"
             );
         }
         match integration {
@@ -66,6 +69,51 @@ impl App {
                     }
                 })
                 .await?;
+            }
+            Integration::AwsLogin(config) => {
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' signs in through the AWS console; it takes no token");
+                }
+                if !force && self.keeps_sign_in(name, integration).await {
+                    return Ok(());
+                }
+                let browser_here = !device_code && !omnifob_core::oauth::browser_is_elsewhere();
+                if !browser_here && !interactive() {
+                    bail!("no terminal to paste the AWS code into; run `fob login {name}` in one");
+                }
+                let identity = aws_login::login(
+                    name,
+                    config,
+                    browser_here,
+                    |url| {
+                        if browser_here {
+                            eprintln!("fob: pick the console session for '{name}' in your browser");
+                            eprintln!("     {url}");
+                            eprintln!(
+                                "     The browser must run on this machine; elsewhere, use --device-code."
+                            );
+                            if !no_browser && let Err(e) = crate::browser::open(&self.config, name, url) {
+                                eprintln!(
+                                    "fob: could not open a browser ({e}); open the URL above"
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "fob: open this on any device, pick the console session for '{name}', and copy the code AWS shows"
+                            );
+                            eprintln!("     {url}");
+                        }
+                    },
+                    || {
+                        Ok(dialoguer::Password::new()
+                            .with_prompt("Code from AWS")
+                            .interact_on(&Term::stderr())?)
+                    },
+                )
+                .await?;
+                eprintln!(
+                    "fob: signed in to AWS as {identity}; credentials renew for up to 12 hours"
+                );
             }
             Integration::Gcp(config) => {
                 if token_stdin || from_clipboard {
