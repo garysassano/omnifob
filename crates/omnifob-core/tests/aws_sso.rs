@@ -630,6 +630,89 @@ async fn a_lasting_403_says_there_is_no_access() {
     assert!(err.contains("no access to Admin"), "{err}");
 }
 
+/// IAM Identity Center's answer when its network controls refuse a request.
+fn network_controls_error(status: u16, kind: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .insert_header("x-amzn-errortype", kind)
+        .set_body_json(json!({
+            "error": "access_denied",
+            "reason": "NETWORK_CONTROLS_ACCESS_DENIED",
+            "error_description": "Access denied by network controls",
+        }))
+}
+
+#[tokio::test]
+async fn a_renewal_refused_by_network_controls_keeps_the_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "offvpn", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({ "grantType": "refresh_token" })))
+        .respond_with(network_controls_error(400, "AccessDeniedException"))
+        .mount(&server)
+        .await;
+
+    let err = aws_sso::credentials("offvpn", &config(), "111111111111", "Admin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Other(_)), "{err}");
+    let message = format!("{err:#}");
+    assert!(message.contains("network controls refused"), "{message}");
+    assert!(aws_sso::session("offvpn").unwrap().is_some(), "kept");
+}
+
+#[tokio::test]
+async fn a_portal_call_refused_by_network_controls_is_not_retried() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "blocked", 3600).await;
+    for (status, kind) in [(403, "ForbiddenException"), (401, "UnauthorizedException")] {
+        let mock = Mock::given(method("GET"))
+            .and(path("/federation/credentials"))
+            .respond_with(network_controls_error(status, kind))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let err = aws_sso::credentials("blocked", &config(), "111111111111", "Admin")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Other(_)), "{kind}: {err}");
+        let message = format!("{err:#}");
+        assert!(message.contains("network controls refused"), "{message}");
+        assert!(
+            aws_sso::session("blocked").unwrap().is_some(),
+            "{kind}: kept"
+        );
+        drop(mock);
+    }
+}
+
+#[tokio::test]
+async fn the_aws_cli_endpoint_variables_reach_a_vpc_endpoint() {
+    let (_guard, server) = setup().await;
+    // SAFETY: the tests run one at a time under SERIAL.
+    unsafe {
+        std::env::remove_var("OMNIFOB_AWS_ENDPOINT");
+        std::env::set_var("AWS_ENDPOINT_URL_SSO_OIDC", server.uri());
+        std::env::set_var("AWS_ENDPOINT_URL_SSO", server.uri());
+    }
+    device_login(&server, "private", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = aws_sso::credentials("private", &config(), "111111111111", "Admin").await;
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var("AWS_ENDPOINT_URL_SSO_OIDC");
+        std::env::remove_var("AWS_ENDPOINT_URL_SSO");
+    }
+    result.unwrap();
+}
+
 fn sts_credentials(action: &str, access_key: &str) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("content-type", "text/xml")
