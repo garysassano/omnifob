@@ -119,6 +119,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             from_clipboard,
             force,
         } => {
+            let integration = app.pick_integration(integration.as_deref(), "login")?;
             app.login(
                 &integration,
                 no_browser,
@@ -130,7 +131,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             .await?;
             app.sync(std::slice::from_ref(&integration)).await?;
         }
-        Command::Logout { integration } => app.logout(&integration).await?,
+        Command::Logout { integration } => {
+            let integration = app.pick_integration(integration.as_deref(), "logout")?;
+            app.logout(&integration).await?;
+        }
         Command::Status => app.status()?,
         Command::Check { profile, quiet } => {
             return app.check(query(&profile).as_deref(), quiet).await;

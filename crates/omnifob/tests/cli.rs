@@ -415,6 +415,21 @@ async fn login_keeps_a_working_sign_in() {
     assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
 }
 
+#[test]
+fn login_without_a_terminal_needs_the_integration_named() {
+    let fob = Fob::new("login-unnamed");
+    fob.write_config(&portal_config("acme"));
+    for command in ["login", "logout"] {
+        let stderr = fob.fails(&[command]);
+        assert!(
+            stderr.contains(&format!(
+                "name an integration: `fob {command} <integration>` (configured: acme)"
+            )),
+            "{stderr}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn login_force_signs_in_again() {
     let server = MockServer::start().await;

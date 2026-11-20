@@ -204,6 +204,7 @@ The command runs without a shell, with `{url}` in any argument replaced by the U
 
 ```sh
 fob login acme            # browser sign-in (kept while it still works), then discovers profiles
+fob login                 # pick the integration from a fuzzy list (fob logout too)
 fob login acme --force    # sign in again even though the stored sign-in works
 fob login acme --device-code   # approve with a code on another device (automatic over SSH)
 fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...

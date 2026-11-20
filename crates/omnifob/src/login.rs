@@ -2,17 +2,71 @@
 
 use std::io::Read;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use dialoguer::console::Term;
 use omnifob_core::config::CloudflareTokenType;
+use omnifob_core::history::{self, History};
 use omnifob_core::providers::{
     self, aws_iam, aws_login, aws_sso, azure, cloudflare, cloudflare_oauth, gcp, token,
 };
 use omnifob_core::{Error, Integration};
 
-use crate::{App, clipboard, interactive};
+use crate::{App, agent, clipboard, interactive};
 
 impl App {
+    /// The integration `fob login` or `fob logout` acts on: the one named, or
+    /// one picked from a list when none is named and someone can answer. The
+    /// list puts the integrations whose profiles were used most recently first.
+    pub(crate) fn pick_integration(
+        &self,
+        name: Option<&str>,
+        command: &str,
+    ) -> anyhow::Result<String> {
+        if let Some(name) = name {
+            return Ok(name.to_string());
+        }
+        let mut names: Vec<&str> = self
+            .config
+            .integrations
+            .keys()
+            .map(String::as_str)
+            .collect();
+        if names.is_empty() {
+            bail!(
+                "no integrations configured in {}",
+                omnifob_core::paths::config_file().display()
+            );
+        }
+        if agent::active() || !interactive() {
+            bail!(
+                "name an integration: `fob {command} <integration>` (configured: {})",
+                names.join(", ")
+            );
+        }
+        let history = History::load(&history::file());
+        let last_used = |name: &str| {
+            self.cache
+                .all()
+                .filter(|p| p.integration == name)
+                .filter_map(|p| history.used.get(&p.id))
+                .max()
+                .copied()
+        };
+        names.sort_by_cached_key(|n| std::cmp::Reverse(last_used(n)));
+        let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
+        let items: Vec<String> = names
+            .iter()
+            .map(|n| format!("{n:width$}  {}", self.config.integrations[*n].kind()))
+            .collect();
+        let picked = dialoguer::FuzzySelect::new()
+            .with_prompt("Integration")
+            .items(&items)
+            .default(0)
+            .interact_on_opt(&Term::stderr())?
+            .context("no integration selected")?;
+        Ok(names[picked].to_string())
+    }
+
     pub(crate) async fn login(
         &self,
         name: &str,

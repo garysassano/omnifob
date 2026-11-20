@@ -24,8 +24,9 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Sign in to an integration, then discover its profiles
     Login {
+        /// The integration; without it, pick one from a list
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
-        integration: String,
+        integration: Option<String>,
         /// Print the sign-in URL instead of opening a browser
         #[arg(long)]
         no_browser: bool,
@@ -48,7 +49,11 @@ pub(crate) enum Command {
         force: bool,
     },
     /// Forget an integration's sign-in and cached credentials
-    Logout { integration: String },
+    Logout {
+        /// The integration; without it, pick one from a list
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        integration: Option<String>,
+    },
     /// Show integrations and whether you are signed in
     Status,
     /// Check that sign-ins work, or that a profile's credentials do (never signs in)
