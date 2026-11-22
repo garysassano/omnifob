@@ -52,7 +52,7 @@ jobs:
           # No Actions cache in a workflow that builds release binaries.
           use-cache: false
       - if: contains(matrix.target, 'musl')
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-zigbuild@0.24.1
           fallback: none
@@ -102,7 +102,7 @@ jobs:
             tar -czf "$name.tar.gz" "$name"
           fi
           rm -r "$name"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.target }}
           path: dist/*
