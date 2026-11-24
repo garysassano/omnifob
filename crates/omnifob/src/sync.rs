@@ -147,10 +147,9 @@ impl App {
                 Some(q) => bail!("'{q}' matches {}; name one in full", listing(&candidates)),
             },
             _ => {
-                let ids: Vec<&str> = candidates.iter().map(|p| p.id.as_str()).collect();
                 let picked = dialoguer::FuzzySelect::new()
                     .with_prompt("Profile")
-                    .items(&ids)
+                    .items(picker_rows(&candidates))
                     .default(0)
                     .interact_on_opt(&Term::stderr())?
                     .context("no profile selected")?;
@@ -181,6 +180,37 @@ impl Skipped {
     }
 }
 
+/// The picker's rows: the parts of each id (integration, account, role) in
+/// aligned columns, then the account ID, so a long list is easy to scan.
+/// Typing still filters, and words separated by spaces now match across parts.
+fn picker_rows(profiles: &[&Profile]) -> Vec<String> {
+    let parts: Vec<Vec<&str>> = profiles.iter().map(|p| p.id.split('/').collect()).collect();
+    let columns = parts.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..columns)
+        .map(|i| {
+            parts
+                .iter()
+                .filter_map(|p| p.get(i))
+                .map(|part| part.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    profiles
+        .iter()
+        .zip(&parts)
+        .map(|(profile, parts)| {
+            let mut row = String::new();
+            for (i, width) in widths.iter().enumerate() {
+                let part = parts.get(i).copied().unwrap_or_default();
+                row.push_str(&format!("{part:width$}  "));
+            }
+            row.push_str(profile.target.account_id().unwrap_or_default());
+            row.trim_end().to_string()
+        })
+        .collect()
+}
+
 /// "3 profiles: a, b, c", up to ten ids, then how many more.
 fn listing(profiles: &[&Profile]) -> String {
     const SHOWN: usize = 10;
@@ -196,4 +226,43 @@ fn listing(profiles: &[&Profile]) -> String {
         text.push_str(&format!(", and {more} more"));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use omnifob_core::profile::Target;
+
+    use super::*;
+
+    fn aws(integration: &str, account: &str, role: &str, account_id: &str) -> Profile {
+        Profile::new(
+            integration,
+            account,
+            role,
+            Target::Aws {
+                account_id: account_id.into(),
+                account_name: account.into(),
+                role_name: role.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn picker_rows_align_the_parts_of_each_id() {
+        let a = aws("gary", "management", "AdministratorAccess", "111111111111");
+        let b = aws("itvstudios", "am-dev", "itvstudios-pe", "222222222222");
+        let token = Profile {
+            id: "tok/prod".into(),
+            integration: "tok".into(),
+            target: Target::Token {},
+        };
+        assert_eq!(
+            picker_rows(&[&a, &b, &token]),
+            [
+                "gary        management  AdministratorAccess  111111111111",
+                "itvstudios  am-dev      itvstudios-pe        222222222222",
+                "tok         prod",
+            ]
+        );
+    }
 }
