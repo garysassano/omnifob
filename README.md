@@ -200,6 +200,20 @@ browser = "work"
 
 The command runs without a shell, with `{url}` in any argument replaced by the URL. Chromium-based browsers (Chrome, Edge, Brave) pick a profile with `--profile-directory=<folder>`, Firefox with `-P <name>`. A sign-in must still open on this machine, since the browser returns to a listener on `127.0.0.1`.
 
+The AWS console signs out one identity when another signs in, so opening a second profile's console logs out the first. Set `isolate` on a browser to open each AWS profile's console apart from the others:
+
+```toml
+[browsers.work]
+command = ["/mnt/c/Program Files/Google/Chrome/Application/chrome.exe", "{url}"]
+isolate = "chromium-profile"    # a Chromium profile per fob profile, e.g. "fob acme prod Admin"
+
+[browsers.personal]
+command = ["firefox", "-P", "personal", "{url}"]
+isolate = "firefox-container"   # a container per fob profile, through the Granted Containers extension
+```
+
+`chromium-profile` replaces any `--profile-directory` in the command with `--profile-directory=fob <integration> <account> <role>`, which Chrome creates on first use and reuses after; delete one in Chrome's profile manager. `firefox-container` opens `ext+granted-containers:name=<profile id>&url=<console URL>`, which needs the [Granted Containers](https://addons.mozilla.org/en-US/firefox/addon/granted/) extension; the extension creates the container, named after the profile, the first time. Sign-ins and other providers' consoles keep opening as the command says, since they rely on the session already in that browser profile.
+
 ## Use
 
 ```sh

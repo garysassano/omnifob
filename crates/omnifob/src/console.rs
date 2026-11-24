@@ -33,7 +33,7 @@ impl App {
         if print {
             println!("{url}");
         } else {
-            crate::browser::open(&self.config, &profile.integration, &url)
+            crate::browser::open_console(&self.config, &profile, &url)
                 .context("opening the browser; use --print to get the URL")?;
             eprintln!("fob: opened the console for {}", profile.id);
         }

@@ -7,6 +7,7 @@ use anyhow::{Context, bail};
 use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
+use crate::Profile;
 use crate::providers::aws_partition::Partition;
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,6 +82,22 @@ pub struct Browser {
     /// argument is replaced by the URL, e.g.
     /// `["firefox", "-P", "work", "{url}"]`.
     pub command: Vec<String>,
+    /// Opens each AWS profile's console apart from the others, so that
+    /// signing in as one does not sign the console out of another.
+    #[serde(default)]
+    pub isolate: Option<Isolation>,
+}
+
+/// How a browser keeps AWS consoles apart, one per profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Isolation {
+    /// A Chromium profile per fob profile (`--profile-directory`), in place
+    /// of any the command names; Chrome creates it on first use.
+    ChromiumProfile,
+    /// A Firefox container per fob profile, opened through the Granted
+    /// Containers extension's `ext+granted-containers:` URLs.
+    FirefoxContainer,
 }
 
 impl Browser {
@@ -91,6 +108,43 @@ impl Browser {
             .map(|arg| arg.replace("{url}", url))
             .collect();
         (&self.command[0], args)
+    }
+
+    /// The program and its arguments for opening `url`, the console of
+    /// `profile`. AWS consoles open in the profile's own Chromium profile or
+    /// Firefox container when `isolate` says so: their URL is a federation
+    /// link that signs in by itself. Other consoles rely on the sign-in
+    /// already in the browser, so they open as [`Self::command_for`] does.
+    pub fn console_command_for(&self, url: &str, profile: &Profile) -> (&str, Vec<String>) {
+        if !profile.target.is_aws() {
+            return self.command_for(url);
+        }
+        match self.isolate {
+            None => self.command_for(url),
+            Some(Isolation::FirefoxContainer) => {
+                let container = form_urlencoded::Serializer::new(String::new())
+                    .append_pair("name", &profile.id)
+                    .append_pair("url", url)
+                    .finish();
+                self.command_for(&format!("ext+granted-containers:{container}"))
+            }
+            Some(Isolation::ChromiumProfile) => {
+                // Chromium takes switch values only after `=`.
+                let (program, args) = self.command_for(url);
+                let profile_dir = format!(
+                    "--profile-directory={}",
+                    chromium_profile_directory(&profile.id)
+                );
+                let isolated = [profile_dir, "--no-first-run".to_string()]
+                    .into_iter()
+                    .chain(
+                        args.into_iter()
+                            .filter(|arg| !arg.starts_with("--profile-directory=")),
+                    )
+                    .collect();
+                (program, isolated)
+            }
+        }
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -108,6 +162,24 @@ impl Browser {
             Some(_) => Ok(()),
         }
     }
+}
+
+/// The Chromium profile folder for fob profile `id`: `fob` and the id's
+/// segments, separated by spaces. Characters a Windows folder name cannot
+/// hold become `_`.
+fn chromium_profile_directory(id: &str) -> String {
+    let mut dir = String::from("fob");
+    for segment in id.split('/') {
+        dir.push(' ');
+        dir.extend(segment.chars().map(|c| {
+            if c.is_control() || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        }));
+    }
+    dir
 }
 
 /// An identity source: something you sign in to once and that yields many
@@ -1977,6 +2049,77 @@ mod tests {
                 "[browsers.work]\ncommand = [\"firefox\", \"--url={{url}}\"]\n{integration}"
             ))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn aws_consoles_open_isolated_per_profile() {
+        let config = Config::parse(
+            r#"
+            [browsers.chrome]
+            command = ["chrome", "--profile-directory=Profile 1", "--new-window", "{url}"]
+            isolate = "chromium-profile"
+
+            [browsers.firefox]
+            command = ["firefox", "-P", "work", "{url}"]
+            isolate = "firefox-container"
+            "#,
+        )
+        .unwrap();
+        let aws = Profile {
+            id: "acme/prod-eu/Admin:Access".into(),
+            integration: "acme".into(),
+            target: crate::Target::Aws {
+                account_id: "123456789012".into(),
+                account_name: "prod eu".into(),
+                role_name: "Admin:Access".into(),
+            },
+        };
+        let url = "https://signin.aws.amazon.com/federation?Action=login&SigninToken=a+b/c";
+        assert_eq!(
+            config.browsers["chrome"].console_command_for(url, &aws),
+            (
+                "chrome",
+                vec![
+                    "--profile-directory=fob acme prod-eu Admin_Access".to_string(),
+                    "--no-first-run".to_string(),
+                    "--new-window".to_string(),
+                    url.to_string(),
+                ]
+            )
+        );
+        let (_, args) = config.browsers["firefox"].console_command_for(url, &aws);
+        assert_eq!(&args[..2], ["-P", "work"]);
+        let container = args[2].strip_prefix("ext+granted-containers:").unwrap();
+        let params: Vec<(String, String)> = form_urlencoded::parse(container.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            params,
+            [
+                ("name".to_string(), aws.id.clone()),
+                ("url".to_string(), url.to_string())
+            ]
+        );
+
+        // Other consoles rely on the browser's own sign-in, so they stay put.
+        let gcp = Profile {
+            id: "g/proj/user".into(),
+            integration: "g".into(),
+            target: crate::Target::Gcp {
+                project_id: "proj".into(),
+                project_name: "proj".into(),
+            },
+        };
+        for browser in config.browsers.values() {
+            assert_eq!(
+                browser.console_command_for("https://x.test/", &gcp),
+                browser.command_for("https://x.test/")
+            );
+        }
+        assert!(
+            Config::parse("[browsers.b]\ncommand = [\"b\", \"{url}\"]\nisolate = \"tabs\"\n")
+                .is_err()
         );
     }
 

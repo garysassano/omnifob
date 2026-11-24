@@ -3,15 +3,28 @@
 use std::process::{Command, Stdio};
 
 use anyhow::Context;
-use omnifob_core::Config;
+use omnifob_core::{Config, Profile};
 
 /// Opens `url` in the browser that integration `name` names in `[browsers]`,
 /// or in the system's default browser.
 pub(crate) fn open(config: &Config, name: &str, url: &str) -> anyhow::Result<()> {
-    let Some(browser) = config.browser_for(name)? else {
-        return Ok(open::that(url)?);
-    };
-    let (program, args) = browser.command_for(url);
+    match config.browser_for(name)? {
+        Some(browser) => run(browser.command_for(url)),
+        None => Ok(open::that(url)?),
+    }
+}
+
+/// Opens `url`, the console of `profile`, in its integration's browser,
+/// isolated from other profiles' consoles as that browser's `isolate` says,
+/// or in the system's default browser.
+pub(crate) fn open_console(config: &Config, profile: &Profile, url: &str) -> anyhow::Result<()> {
+    match config.browser_for(&profile.integration)? {
+        Some(browser) => run(browser.console_command_for(url, profile)),
+        None => Ok(open::that(url)?),
+    }
+}
+
+fn run((program, args): (&str, Vec<String>)) -> anyhow::Result<()> {
     let mut command = Command::new(program);
     command
         .args(args)
