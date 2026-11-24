@@ -3,14 +3,15 @@
 //! The browser signs in through AWS Sign-In with an existing console session
 //! (an IAM user, the root user, or a role reached through federation), and
 //! omnifob redeems the code for 15 minute credentials and a refresh token
-//! that renews them for up to 12 hours. As in the AWS CLI, the code comes
-//! back to a loopback listener (`same-device`), or on another device the user
-//! pastes what the page shows (`cross-device`), and every token request
-//! carries a DPoP proof (RFC 9449) signed with a P-256 key made for the
-//! sign-in, so a stolen refresh token is useless without the key. The
-//! session, key included, is kept in the keychain per integration and
-//! renewed under a lock shared by every omnifob process, since each refresh
-//! returns a new refresh token.
+//! that renews them until the sign-in ends (12 hours by default; an
+//! administrator can allow up to 90 days per IAM user or role). As in the AWS
+//! CLI, the code comes back to a loopback listener (`same-device`), or on
+//! another device the user pastes what the page shows (`cross-device`), and
+//! every token request carries a DPoP proof (RFC 9449) signed with a P-256
+//! key made for the sign-in, so a stolen refresh token is useless without the
+//! key. The session, key included, is kept in the keychain per integration
+//! and renewed under a lock shared by every omnifob process, since each
+//! refresh returns a new refresh token.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -475,7 +476,7 @@ async fn current(integration: &str) -> Result<Session> {
         Err(e) => {
             let ended = match refusal(&e) {
                 Some(OAuth2ErrorCode::TokenExpired) => Some(format!(
-                    "the console sign-in for '{integration}' has ended (it lasts up to 12 hours)"
+                    "the console sign-in for '{integration}' has ended (12 hours by default, up to 90 days where the IAM user or role allows it)"
                 )),
                 Some(OAuth2ErrorCode::UserCredentialsChanged) => Some(format!(
                     "the password of the console identity for '{integration}' changed"

@@ -166,7 +166,7 @@ impl App {
                 )
                 .await?;
                 eprintln!(
-                    "fob: signed in to AWS as {identity}; credentials renew for up to 12 hours"
+                    "fob: signed in to AWS as {identity}; credentials renew until the sign-in ends (12 hours by default)"
                 );
             }
             Integration::Gcp(config) => {
