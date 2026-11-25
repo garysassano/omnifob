@@ -888,7 +888,7 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
             Ok(moved)
         }
         Integration::Cloudflare(_) => {
-            cloudflare::rename_catalog(old, new);
+            cloudflare::rename_catalog(old, new)?;
             let oauth = cloudflare_oauth::rename(old, new)?;
             Ok(store::rename(
                 &format!("cloudflare/{old}/bootstrap"),

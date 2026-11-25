@@ -539,28 +539,58 @@ pub struct Lock(#[allow(dead_code)] std::fs::File);
 /// another process holds it that long, so the caller can go ahead unguarded
 /// rather than hang.
 pub async fn lock(name: &str, timeout: std::time::Duration) -> anyhow::Result<Option<Lock>> {
-    let dir = lock_dir()?;
-    let path = dir.join(lock_file_name(name));
+    let (file, path) = open_lock(name)?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(taken) = try_lock(&file, &path, deadline)? {
+            return Ok(taken.then_some(Lock(file)));
+        }
+        tokio::time::sleep(LOCK_POLL).await;
+    }
+}
+
+/// [`lock`] for synchronous callers, which waits on this thread. Meant for
+/// locks held only as long as a file is read and written back.
+pub fn lock_blocking(name: &str, timeout: std::time::Duration) -> anyhow::Result<Option<Lock>> {
+    let (file, path) = open_lock(name)?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(taken) = try_lock(&file, &path, deadline)? {
+            return Ok(taken.then_some(Lock(file)));
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn open_lock(name: &str) -> anyhow::Result<(std::fs::File, std::path::PathBuf)> {
+    let path = lock_dir()?.join(lock_file_name(name));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(Some(Lock(file))),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                tracing::debug!("{} is still locked; going ahead", path.display());
-                return Ok(None);
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(e).with_context(|| format!("locking {}", path.display()));
-            }
+    Ok((file, path))
+}
+
+/// One attempt: `Some(true)` when taken, `Some(false)` when the deadline
+/// passed, `None` to try again.
+fn try_lock(
+    file: &std::fs::File,
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<bool>> {
+    match file.try_lock() {
+        Ok(()) => Ok(Some(true)),
+        Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => Ok(None),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            tracing::debug!("{} is still locked; going ahead", path.display());
+            Ok(Some(false))
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", path.display()))
         }
     }
 }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
 use omnifob_core::providers::cloudflare::{
-    self, Catalog, Client, mint, revoke_minted, start_session,
+    self, Catalog, Client, Groups, mint, revoke_minted, start_session,
 };
 use omnifob_core::{paths, providers, store};
 use serde_json::{Value, json};
@@ -534,7 +534,7 @@ async fn a_current_catalog_saves_the_lookups() {
             .unwrap();
     }
     assert_eq!(catalog.user_tag.as_deref(), Some("usertag9"));
-    assert_eq!(catalog.groups.len(), 5);
+    assert_eq!(catalog.permission_groups["user"].groups.len(), 5);
 }
 
 #[tokio::test]
@@ -559,11 +559,17 @@ async fn a_catalog_missing_a_permission_is_refreshed() {
 
     // Fetched an hour ago, before "DNS Write" existed.
     let mut catalog = Catalog {
-        fetched_at: Some(now() - jiff::SignedDuration::from_hours(1)),
-        groups: vec![serde_json::from_value(
-            json!({ "id": "g-zone", "name": "Zone Read", "scopes": ["com.cloudflare.api.account.zone"] }),
-        )
-        .unwrap()],
+        permission_groups: [(
+            "user".to_string(),
+            Groups {
+                fetched_at: now() - jiff::SignedDuration::from_hours(1),
+                groups: vec![serde_json::from_value(
+                    json!({ "id": "g-zone", "name": "Zone Read", "scopes": ["com.cloudflare.api.account.zone"] }),
+                )
+                .unwrap()],
+            },
+        )]
+        .into(),
         user_tag: None,
         ..Default::default()
     };
@@ -579,7 +585,7 @@ async fn a_catalog_missing_a_permission_is_refreshed() {
     )
     .await
     .unwrap();
-    assert_eq!(catalog.fetched_at, Some(now()));
+    assert_eq!(catalog.permission_groups["user"].fetched_at, now());
 }
 
 #[tokio::test]
@@ -1045,4 +1051,110 @@ async fn sync_under_oauth_prunes_expired_tokens_of_every_account() {
         [("cf/acct-a/workers".to_string(), vec!["a1".to_string()])],
         "the live token stays tracked; the pruned and the missing ones are forgotten"
     );
+}
+
+#[tokio::test]
+async fn each_account_keeps_its_own_permission_groups() {
+    let server = MockServer::start().await;
+    for account in ["acct-a", "acct-b"] {
+        let base = format!("/accounts/{account}/tokens");
+        // Fetched once per account, then served from the catalog.
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/permission_groups")))
+            .respond_with(ok(account_permission_groups()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(base.clone()))
+            .respond_with(ok(json!({ "value": "secret" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ok(json!([])))
+            .mount(&server)
+            .await;
+    }
+    let client = Client::new(server.uri(), "bootstrap");
+    let config = config("account", r#""Zone Read""#);
+    let mut catalog = Catalog::default();
+    for account in ["acct-a", "acct-b", "acct-a", "acct-b"] {
+        mint(&client, &config, "p", account, "t", now(), &mut catalog)
+            .await
+            .unwrap();
+    }
+    let keys: Vec<_> = catalog.permission_groups.keys().cloned().collect();
+    assert_eq!(keys, ["account/acct-a", "account/acct-b"]);
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_json_is_quoted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user/tokens/permission_groups"))
+        .respond_with(
+            ResponseTemplate::new(502)
+                .set_body_string("<html>\n<title>502 Bad Gateway</title>\n</html>"),
+        )
+        .mount(&server)
+        .await;
+    let err = Client::new(server.uri(), "bootstrap")
+        .permission_groups(omnifob_core::config::CloudflareTokenType::User, ACCOUNT)
+        .await
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("502"), "{msg}");
+    assert!(
+        msg.contains("<html> <title>502 Bad Gateway</title> </html>"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn renaming_files_the_minted_tokens_under_the_new_name_and_back() {
+    let _cf = SignedIn::new("rename").await;
+    let original = tracked(&[("cf/acct/workers", "w1"), ("cf/acct/dns", "d1")]);
+    SignedIn::save_catalog(&original);
+
+    cloudflare::rename_catalog("cf", "cf2").unwrap();
+    assert!(!SignedIn::catalog_file().exists());
+    let moved: Catalog = serde_json::from_str(
+        &std::fs::read_to_string(paths::state_dir().join("cloudflare-cf2.json")).unwrap(),
+    )
+    .unwrap();
+    let keys: Vec<_> = moved.minted.keys().cloned().collect();
+    assert_eq!(keys, ["cf2/acct/dns", "cf2/acct/workers"]);
+
+    // As `fob rename` rolls back when the config cannot be written.
+    cloudflare::rename_catalog("cf2", "cf").unwrap();
+    assert_eq!(SignedIn::load_catalog().unwrap().minted, original.minted);
+    // Nothing to move is no error.
+    cloudflare::rename_catalog("none", "other").unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_catalog_updates_keep_every_tracked_token() {
+    let _cf = SignedIn::new("concurrent").await;
+    SignedIn::save_catalog(&Catalog::default());
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            std::thread::spawn(move || {
+                for j in 0..10 {
+                    cloudflare::update_catalog("cf", |c| {
+                        c.minted
+                            .entry(format!("cf/acct/t{i}"))
+                            .or_default()
+                            .push(format!("id-{i}-{j}"));
+                    })
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let catalog = SignedIn::load_catalog().unwrap();
+    assert_eq!(catalog.minted.values().flatten().count(), 80);
 }

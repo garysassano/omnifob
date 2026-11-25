@@ -40,6 +40,22 @@ impl App {
                 "fob: ~/.aws/config still has profiles for '{old}'; run `fob export aws-config --write` to update them"
             );
         }
+        let stale: Vec<&str> = self
+            .config
+            .agent
+            .profiles
+            .iter()
+            .flatten()
+            .filter(|p| p.starts_with(&format!("{old}/")))
+            .map(String::as_str)
+            .collect();
+        if !stale.is_empty() {
+            eprintln!(
+                "fob: [agent] profiles in {} still names '{old}' ({}); rename it there so agents keep these profiles",
+                path.display(),
+                stale.join(", ")
+            );
+        }
         Ok(())
     }
 }

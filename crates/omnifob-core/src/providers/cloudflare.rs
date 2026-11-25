@@ -707,8 +707,10 @@ pub async fn login(
         .verify(config.minting(), account_id)
         .await
         .context("the token was rejected")?;
-    let mut catalog = load_catalog(integration);
-    let previous = catalog.bootstrap.take().map(|b| b.id).filter(|p| *p != id);
+    let previous = load_catalog(integration)
+        .bootstrap
+        .map(|b| b.id)
+        .filter(|p| *p != id);
     let expires_at = match config.session {
         Some(session) => {
             let tokens = Client::tokens_path(config.minting(), account_id);
@@ -717,8 +719,7 @@ pub async fn login(
         None => None,
     };
     store::set(&bootstrap_key(integration), &token.trim())?;
-    catalog.bootstrap = Some(Bootstrap { id, expires_at });
-    save_catalog(integration, &catalog)?;
+    update_catalog(integration, |c| c.bootstrap = Some(Bootstrap { id, expires_at }))?;
     Ok(expires_at)
 }
 
@@ -789,19 +790,22 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
     // Keep the IDs of minted tokens that could not be deleted, so a later
     // sign-in still recognises them (and deletes them once expired); drop
     // the rest, including the bootstrap's record.
-    let minted = load_catalog(integration).minted;
-    let kept = !minted.is_empty()
-        && save_catalog(
-            integration,
-            &Catalog {
-                minted,
-                ..Catalog::default()
-            },
-        )
-        .inspect_err(|e| tracing::warn!("could not keep the IDs of undeleted tokens: {e:#}"))
-        .is_ok();
-    if !kept {
-        forget_catalog(integration);
+    {
+        let _lock = lock_catalog(integration)?;
+        let minted = load_catalog(integration).minted;
+        let kept = !minted.is_empty()
+            && save_catalog(
+                integration,
+                &Catalog {
+                    minted,
+                    ..Catalog::default()
+                },
+            )
+            .inspect_err(|e| tracing::warn!("could not keep the IDs of undeleted tokens: {e:#}"))
+            .is_ok();
+        if !kept {
+            forget_catalog(integration);
+        }
     }
     let oauth = super::cloudflare_oauth::logout(integration)?;
     Ok(store::delete(&bootstrap_key(integration))? || oauth)
@@ -905,15 +909,19 @@ pub async fn permission_groups(
     Ok(groups)
 }
 
-/// What minting needs to know about the bootstrap token's account but which
+/// What minting needs to know about the bootstrap token's accounts but which
 /// rarely changes: the permission groups (about 400) and the user tag. Kept on
 /// disk, without secrets, to save two to three API calls per mint.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Every update goes through [`update_catalog`], under a lock per
+/// integration, so concurrent mints never lose each other's token IDs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Catalog {
-    #[serde(default)]
-    pub fetched_at: Option<Timestamp>,
-    #[serde(default)]
-    pub groups: Vec<PermissionGroup>,
+    /// The permission groups tokens can carry, per [`groups_key`]: user
+    /// tokens share one list, while each account offers its own (a product
+    /// enabled in one account only).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permission_groups: BTreeMap<String, Groups>,
     #[serde(default)]
     pub user_tag: Option<String>,
     /// IDs of the tokens minted for each profile that may still exist.
@@ -924,10 +932,26 @@ pub struct Catalog {
     pub bootstrap: Option<Bootstrap>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Bootstrap {
     pub id: String,
     pub expires_at: Option<Timestamp>,
+}
+
+/// One list of permission groups and when it was fetched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Groups {
+    pub fetched_at: Timestamp,
+    pub groups: Vec<PermissionGroup>,
+}
+
+/// The key of the permission groups a token of `token_type` in `account_id`
+/// can carry, in [`Catalog::permission_groups`].
+pub fn groups_key(token_type: CloudflareTokenType, account_id: &str) -> String {
+    match token_type {
+        CloudflareTokenType::User => "user".to_string(),
+        CloudflareTokenType::Account => format!("account/{account_id}"),
+    }
 }
 
 impl Catalog {
@@ -965,11 +989,74 @@ impl Catalog {
 const CATALOG_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 
 impl Catalog {
-    fn is_current(&self, now: Timestamp) -> bool {
-        !self.groups.is_empty()
-            && self
-                .fetched_at
-                .is_some_and(|at| now.duration_since(at) < CATALOG_MAX_AGE)
+    fn is_current(&self, key: &str, now: Timestamp) -> bool {
+        self.permission_groups.get(key).is_some_and(|g| {
+            !g.groups.is_empty() && now.duration_since(g.fetched_at) < CATALOG_MAX_AGE
+        })
+    }
+}
+
+/// The groups stored under `key`; takes the field rather than the catalog,
+/// so the rest of the catalog stays free to change while they are in use.
+fn groups_in<'a>(groups: &'a BTreeMap<String, Groups>, key: &str) -> &'a [PermissionGroup] {
+    groups.get(key).map_or(&[], |g| g.groups.as_slice())
+}
+
+/// What a mint, revocation or cleanup changed in the catalog it loaded,
+/// applied to the catalog as it is on disk once the lock is held: another
+/// process may have tracked or untracked tokens meanwhile, and both
+/// processes' changes are kept.
+#[derive(Debug, Default)]
+struct CatalogChanges {
+    groups: BTreeMap<String, Groups>,
+    user_tag: Option<Option<String>>,
+    tracked: Vec<(String, String)>,
+    untracked: Vec<String>,
+}
+
+impl CatalogChanges {
+    fn between(before: &Catalog, after: &Catalog) -> Self {
+        let ids = |c: &Catalog| -> Vec<String> { c.minted.values().flatten().cloned().collect() };
+        let (was, is) = (ids(before), ids(after));
+        Self {
+            groups: after
+                .permission_groups
+                .iter()
+                .filter(|(k, g)| before.permission_groups.get(*k) != Some(g))
+                .map(|(k, g)| (k.clone(), g.clone()))
+                .collect(),
+            user_tag: (before.user_tag != after.user_tag).then(|| after.user_tag.clone()),
+            tracked: after
+                .minted
+                .iter()
+                .flat_map(|(p, ids)| ids.iter().map(move |id| (p, id)))
+                .filter(|(_, id)| !was.contains(id))
+                .map(|(p, id)| (p.clone(), id.clone()))
+                .collect(),
+            untracked: was.into_iter().filter(|id| !is.contains(id)).collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+            && self.user_tag.is_none()
+            && self.tracked.is_empty()
+            && self.untracked.is_empty()
+    }
+
+    fn apply(self, catalog: &mut Catalog) {
+        catalog.permission_groups.extend(self.groups);
+        if let Some(tag) = self.user_tag {
+            catalog.user_tag = tag;
+        }
+        for (profile, id) in &self.tracked {
+            if !catalog.is_tracked(id) {
+                catalog.track(profile, id);
+            }
+        }
+        for id in &self.untracked {
+            catalog.untrack(id);
+        }
     }
 }
 
@@ -988,6 +1075,42 @@ fn save_catalog(integration: &str, catalog: &Catalog) -> anyhow::Result<()> {
     crate::files::write_private(&catalog_file(integration), serde_json::to_string(catalog)?)
 }
 
+/// How long to wait for another process updating the same catalog, which
+/// holds the lock only while it reads and writes the file.
+const CATALOG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Holds the catalog lock of an integration. Synchronous, and never held
+/// across an API call.
+fn lock_catalog(integration: &str) -> anyhow::Result<Option<store::Lock>> {
+    store::lock_blocking(
+        &format!("cloudflare-catalog-{integration}"),
+        CATALOG_LOCK_TIMEOUT,
+    )
+}
+
+/// Reads the catalog, lets `change` update it, and writes it back, under
+/// the integration's catalog lock.
+pub fn update_catalog(integration: &str, change: impl FnOnce(&mut Catalog)) -> anyhow::Result<()> {
+    let _lock = lock_catalog(integration)?;
+    let mut catalog = load_catalog(integration);
+    let before = catalog.clone();
+    change(&mut catalog);
+    if catalog == before && catalog_file(integration).exists() {
+        return Ok(());
+    }
+    save_catalog(integration, &catalog)
+}
+
+/// Stores what changed between `before` (as loaded) and `after`, merged
+/// into the catalog as it is now.
+fn save_changes(integration: &str, before: &Catalog, after: &Catalog) -> anyhow::Result<()> {
+    let changes = CatalogChanges::between(before, after);
+    if changes.is_empty() {
+        return Ok(());
+    }
+    update_catalog(integration, |c| changes.apply(c))
+}
+
 /// Mints a token for the template and cleans up expired omnifob tokens.
 pub async fn credentials(
     integration: &str,
@@ -1004,8 +1127,8 @@ pub async fn credentials(
     } else {
         config
     };
-    let mut catalog = load_catalog(integration);
-    let before = serde_json::to_string(&catalog).unwrap_or_default();
+    let before = load_catalog(integration);
+    let mut catalog = before.clone();
     let minted = mint(
         &client,
         config,
@@ -1016,9 +1139,7 @@ pub async fn credentials(
         &mut catalog,
     )
     .await;
-    if serde_json::to_string(&catalog).unwrap_or_default() != before
-        && let Err(e) = save_catalog(integration, &catalog)
-    {
+    if let Err(e) = save_changes(integration, &before, &catalog) {
         tracing::warn!("could not save the Cloudflare permission catalog: {e:#}");
     }
     Ok(minted?)
@@ -1067,9 +1188,29 @@ fn within_granted_scopes(
     Ok(config)
 }
 
-/// Moves the stored catalog to a renamed integration.
-pub fn rename_catalog(old: &str, new: &str) {
-    let _ = std::fs::rename(catalog_file(old), catalog_file(new));
+/// Moves the stored catalog to a renamed integration, with the IDs of the
+/// tokens minted for its profiles filed under their new IDs (`<new>/...`),
+/// so `fob revoke` still finds them. Renaming back undoes it exactly.
+pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
+    // Both locks, always in the same order, so two renames cannot deadlock.
+    let (first, second) = if old < new { (old, new) } else { (new, old) };
+    let _first = lock_catalog(first)?;
+    let _second = lock_catalog(second)?;
+    let from = catalog_file(old);
+    if !from.exists() {
+        return Ok(());
+    }
+    let mut catalog = load_catalog(old);
+    let prefix = format!("{old}/");
+    catalog.minted = std::mem::take(&mut catalog.minted)
+        .into_iter()
+        .map(|(profile, ids)| match profile.strip_prefix(&prefix) {
+            Some(rest) => (format!("{new}/{rest}"), ids),
+            None => (profile, ids),
+        })
+        .collect();
+    save_catalog(new, &catalog)?;
+    std::fs::remove_file(&from).with_context(|| format!("removing {}", from.display()))
 }
 
 /// Removes the stored catalog, for example after signing out.
@@ -1080,12 +1221,7 @@ pub fn forget_catalog(integration: &str) {
 /// Forgets every tracked token ID, once all the accounts' minted tokens are
 /// deleted: the IDs left belong to tokens no listing showed.
 pub fn forget_minted(integration: &str) -> anyhow::Result<()> {
-    let mut catalog = load_catalog(integration);
-    if catalog.minted.is_empty() {
-        return Ok(());
-    }
-    catalog.minted.clear();
-    save_catalog(integration, &catalog)
+    update_catalog(integration, |c| c.minted.clear())
 }
 
 /// Where to create the bootstrap token. For account-owned tokens this is a
@@ -1159,25 +1295,33 @@ pub async fn mint(
     let token_type = config.minting();
     let tokens = Client::tokens_path(token_type, account_id);
 
+    let key = groups_key(token_type, account_id);
     let fetch = |catalog: &mut Catalog, groups: Vec<PermissionGroup>| {
-        catalog.groups = groups;
-        catalog.fetched_at = Some(now);
+        catalog.permission_groups.insert(
+            key.clone(),
+            Groups {
+                fetched_at: now,
+                groups,
+            },
+        );
     };
-    if !catalog.is_current(now) {
+    let fetched_now =
+        |catalog: &Catalog| catalog.permission_groups.get(&key).map(|g| g.fetched_at) == Some(now);
+    if !catalog.is_current(&key, now) {
         fetch(
             catalog,
             client.permission_groups(token_type, account_id).await?,
         );
     }
     // A name missing from a stored catalog may be a product added since.
-    let selected = match select(&template, &catalog.groups, token_type) {
+    let selected = match select(&template, groups_in(&catalog.permission_groups, &key), token_type) {
         Ok(selected) => selected,
-        Err(_) if catalog.fetched_at != Some(now) => {
+        Err(_) if !fetched_now(catalog) => {
             fetch(
                 catalog,
                 client.permission_groups(token_type, account_id).await?,
             );
-            select(&template, &catalog.groups, token_type)?
+            select(&template, groups_in(&catalog.permission_groups, &key), token_type)?
         }
         Err(e) => return Err(e),
     };
@@ -1221,21 +1365,23 @@ pub async fn mint(
         catalog.track(profile_id, id);
     }
 
-    // Cleaning up overlaps with waiting for D1 to accept the new token.
+    // Cleaning up overlaps with waiting for products to accept the new token.
     let minted = client.with_token(&created.value);
+    // D1 and Workers AI each take a few seconds, waited for side by side.
     let wait = async {
-        if uses_d1 {
-            wait_until_accepted(
-                &minted,
-                &format!("/accounts/{account_id}/d1/database"),
-                "D1",
-            )
-            .await;
-        }
-        if uses_ai {
-            let path = format!("/accounts/{account_id}/ai/models/search");
-            wait_until_accepted(&minted, &path, "Workers AI").await;
-        }
+        let d1 = async {
+            if uses_d1 {
+                let path = format!("/accounts/{account_id}/d1/database");
+                wait_until_accepted(&minted, &path, "D1").await;
+            }
+        };
+        let ai = async {
+            if uses_ai {
+                let path = format!("/accounts/{account_id}/ai/models/search");
+                wait_until_accepted(&minted, &path, "Workers AI").await;
+            }
+        };
+        tokio::join!(d1, ai);
     };
     // Tracked IDs missing from this listing are kept: a new token may not be
     // listed yet, and other accounts' tokens are listed elsewhere.
@@ -1384,9 +1530,10 @@ pub async fn revoke(
 ) -> Result<usize> {
     let client = bootstrap_client(integration, config).await?;
     let tokens = Client::tokens_path(config.minting(), account_id);
-    let mut catalog = load_catalog(integration);
+    let before = load_catalog(integration);
+    let mut catalog = before.clone();
     let deleted = revoke_minted(&client, &tokens, profile_id, &mut catalog).await;
-    save_catalog(integration, &catalog)?;
+    save_changes(integration, &before, &catalog)?;
     Ok(deleted?)
 }
 
@@ -1401,9 +1548,7 @@ pub async fn revoke_token(
     let client = bootstrap_client(integration, config).await?;
     let tokens = Client::tokens_path(config.minting(), account_id);
     delete_token(&client, &tokens, token_id).await?;
-    let mut catalog = load_catalog(integration);
-    catalog.untrack(token_id);
-    save_catalog(integration, &catalog)?;
+    update_catalog(integration, |c| c.untrack(token_id))?;
     Ok(())
 }
 
@@ -1414,7 +1559,8 @@ pub async fn cleanup(
     account_ids: &[String],
 ) -> Result<usize> {
     let client = bootstrap_client(integration, config).await?;
-    let mut catalog = load_catalog(integration);
+    let before = load_catalog(integration);
+    let mut catalog = before.clone();
     let mut deleted = 0;
     let mut listed = Vec::new();
     let mut result = Ok(());
@@ -1436,7 +1582,7 @@ pub async fn cleanup(
     if result.is_ok() {
         catalog.forget_missing(&listed);
     }
-    save_catalog(integration, &catalog)?;
+    save_changes(integration, &before, &catalog)?;
     result?;
     Ok(deleted)
 }
@@ -1448,6 +1594,29 @@ pub fn console_url(account_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_changes_merge_into_what_others_stored_meanwhile() {
+        let mut before = Catalog::default();
+        before.track("cf/a/t", "old");
+        before.track("cf/a/t", "expired");
+        // This process mints `mine` and prunes `expired`.
+        let mut ours = before.clone();
+        ours.track("cf/a/t", "mine");
+        ours.untrack("expired");
+        ours.user_tag = Some("tag".into());
+        // Meanwhile another process minted `theirs` and revoked `old`.
+        let mut on_disk = before.clone();
+        on_disk.track("cf/b/t", "theirs");
+        on_disk.untrack("old");
+
+        CatalogChanges::between(&before, &ours).apply(&mut on_disk);
+        let mut ids: Vec<_> = on_disk.minted.values().flatten().cloned().collect();
+        ids.sort();
+        assert_eq!(ids, ["mine", "theirs"]);
+        assert_eq!(on_disk.user_tag.as_deref(), Some("tag"));
+        assert!(CatalogChanges::between(&ours, &ours).is_empty());
+    }
 
     fn group(id: &str, name: &str, scope: &str) -> PermissionGroup {
         PermissionGroup {
