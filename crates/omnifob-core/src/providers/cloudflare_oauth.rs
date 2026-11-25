@@ -101,8 +101,9 @@ fn token_key(integration: &str) -> String {
     format!("cloudflare/{integration}/oauth")
 }
 
-/// What the keychain keeps for a signed-in integration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What the keychain keeps for a signed-in integration. Not `Debug`: it holds
+/// the tokens.
+#[derive(Clone, Serialize, Deserialize)]
 struct Stored {
     access_token: String,
     expires_at: Timestamp,

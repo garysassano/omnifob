@@ -95,8 +95,9 @@ pub fn keys(integration: &str) -> Vec<String> {
     vec![token_key(integration)]
 }
 
-/// What the keychain keeps for a signed-in integration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What the keychain keeps for a signed-in integration. Not `Debug`: it holds
+/// the tokens.
+#[derive(Clone, Serialize, Deserialize)]
 struct Stored {
     refresh_token: String,
     access_token: String,

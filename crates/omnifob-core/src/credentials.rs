@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 /// so a command started with them does not fail halfway through.
 pub const EXPIRY_MARGIN: SignedDuration = SignedDuration::from_mins(5);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Not `Debug`-derived: its [`Debug`](std::fmt::Debug) shows the variable
+/// names but never their values.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,6 +24,28 @@ pub struct Credentials {
     /// before they expire (a minted Cloudflare token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_id: Option<String>,
+}
+
+/// Stands in for a secret value in `Debug` output.
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: BTreeMap<&str, Redacted> =
+            self.env.keys().map(|k| (k.as_str(), Redacted)).collect();
+        f.debug_struct("Credentials")
+            .field("env", &env)
+            .field("expires_at", &self.expires_at)
+            .field("issued_at", &self.issued_at)
+            .field("token_id", &self.token_id)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -48,6 +72,26 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_names_the_variables_but_never_their_values() {
+        let creds = Credentials {
+            env: BTreeMap::from([
+                ("AWS_ACCESS_KEY_ID".into(), "AKIAEXAMPLE".into()),
+                ("AWS_SECRET_ACCESS_KEY".into(), "s3cr3t-value".into()),
+            ]),
+            expires_at: None,
+            issued_at: None,
+            token_id: Some("tok-1".into()),
+        };
+        for shown in [format!("{creds:?}"), format!("{creds:#?}")] {
+            assert!(shown.contains("AWS_SECRET_ACCESS_KEY"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+            assert!(shown.contains("tok-1"), "{shown}");
+            assert!(!shown.contains("AKIAEXAMPLE"), "{shown}");
+            assert!(!shown.contains("s3cr3t-value"), "{shown}");
+        }
+    }
 
     #[test]
     fn freshness_respects_margin() {

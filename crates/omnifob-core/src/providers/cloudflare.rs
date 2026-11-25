@@ -193,7 +193,8 @@ struct Token {
     condition: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Not `Debug`: it holds the new token's value.
+#[derive(Deserialize)]
 struct CreatedToken {
     #[serde(default)]
     id: String,
