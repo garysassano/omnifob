@@ -21,11 +21,50 @@ pub struct Preset {
     /// Secret name → environment variables that receive it.
     pub secrets: &'static [(&'static str, &'static [&'static str])],
     /// Fixed variables the provider's tools need alongside the secrets;
-    /// the integration's `vars` override them.
+    /// the integration's `vars` override them, and a `secrets` table
+    /// replaces them together with the preset's secrets.
     pub vars: &'static [(&'static str, &'static str)],
-    /// A URL that answers 2xx for a valid token sent as a bearer token.
-    pub verify_url: Option<&'static str>,
+    /// How to check the secrets with the provider, when it has a call every
+    /// valid token may make.
+    pub verify: Option<Verify>,
     pub console: Option<&'static str>,
+}
+
+/// A call that succeeds only with a valid token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verify {
+    /// The URL to `GET`. `{name}` stands for the secret `name`,
+    /// percent-encoded (Scaleway's access key).
+    pub url: &'static str,
+    /// The secret that authenticates the call.
+    pub secret: &'static str,
+    pub scheme: AuthScheme,
+    /// Whether a 403 still proves the token valid: Scaleway answers 401 for
+    /// an unknown key and 403 for a key whose policies do not cover the
+    /// call.
+    pub forbidden_is_valid: bool,
+}
+
+/// How a token check sends the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `Authorization: Bearer <secret>`.
+    Bearer,
+    /// `<header>: <secret>`, as Scaleway's `X-Auth-Token`.
+    Header(&'static str),
+    /// HTTP Basic with the value of the variable `user_var` from the
+    /// integration's `vars` as the user and the secret as the password, as
+    /// Upstash's API takes the account email and API key.
+    Basic { user_var: &'static str },
+}
+
+const fn bearer(url: &'static str, secret: &'static str) -> Option<Verify> {
+    Some(Verify {
+        url,
+        secret,
+        scheme: AuthScheme::Bearer,
+        forbidden_is_valid: false,
+    })
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -33,7 +72,7 @@ pub const PRESETS: &[Preset] = &[
         name: "hetzner",
         secrets: &[("token", &["HCLOUD_TOKEN"])],
         vars: &[],
-        verify_url: Some("https://api.hetzner.cloud/v1/locations"),
+        verify: bearer("https://api.hetzner.cloud/v1/locations", "token"),
         console: Some("https://console.hetzner.cloud/projects"),
     },
     Preset {
@@ -44,14 +83,14 @@ pub const PRESETS: &[Preset] = &[
             &["DIGITALOCEAN_ACCESS_TOKEN", "DIGITALOCEAN_TOKEN"],
         )],
         vars: &[],
-        verify_url: Some("https://api.digitalocean.com/v2/account"),
+        verify: bearer("https://api.digitalocean.com/v2/account", "token"),
         console: Some("https://cloud.digitalocean.com"),
     },
     Preset {
         name: "vultr",
         secrets: &[("api_key", &["VULTR_API_KEY"])],
         vars: &[],
-        verify_url: Some("https://api.vultr.com/v2/account"),
+        verify: bearer("https://api.vultr.com/v2/account", "api_key"),
         console: Some("https://my.vultr.com"),
     },
     Preset {
@@ -59,15 +98,24 @@ pub const PRESETS: &[Preset] = &[
         // Akamai Cloud. linode-cli reads the second, Terraform the first.
         secrets: &[("token", &["LINODE_TOKEN", "LINODE_CLI_TOKEN"])],
         vars: &[],
-        verify_url: Some("https://api.linode.com/v4/profile"),
+        verify: bearer("https://api.linode.com/v4/profile", "token"),
         console: Some("https://cloud.linode.com"),
     },
     Preset {
         name: "upstash",
-        // Set UPSTASH_EMAIL under `vars`; the API key is the secret.
+        // Set UPSTASH_EMAIL under `vars`; the API key is the secret. The
+        // Developer API takes both as HTTP Basic credentials, as the
+        // Upstash CLI sends them.
         secrets: &[("api_key", &["UPSTASH_API_KEY"])],
         vars: &[],
-        verify_url: None,
+        verify: Some(Verify {
+            url: "https://api.upstash.com/v2/redis/databases",
+            secret: "api_key",
+            scheme: AuthScheme::Basic {
+                user_var: "UPSTASH_EMAIL",
+            },
+            forbidden_is_valid: false,
+        }),
         console: Some("https://console.upstash.com"),
     },
     Preset {
@@ -78,7 +126,7 @@ pub const PRESETS: &[Preset] = &[
             ("access_token", &["AKAMAI_ACCESS_TOKEN"]),
         ],
         vars: &[],
-        verify_url: None,
+        verify: None,
         console: Some("https://control.akamai.com"),
     },
     Preset {
@@ -88,7 +136,15 @@ pub const PRESETS: &[Preset] = &[
             ("secret_key", &["SCW_SECRET_KEY"]),
         ],
         vars: &[],
-        verify_url: None,
+        // The call `scw init` makes to look the key up: the secret key in
+        // `X-Auth-Token`, the access key in the path. A key whose policies
+        // do not allow reading API keys gets 403, which still proves it.
+        verify: Some(Verify {
+            url: "https://api.scaleway.com/iam/v1alpha1/api-keys/{access_key}",
+            secret: "secret_key",
+            scheme: AuthScheme::Header("X-Auth-Token"),
+            forbidden_is_valid: true,
+        }),
         console: Some("https://console.scaleway.com"),
     },
     Preset {
@@ -100,7 +156,7 @@ pub const PRESETS: &[Preset] = &[
             ("token_secret", &["MODAL_TOKEN_SECRET"]),
         ],
         vars: &[],
-        verify_url: None,
+        verify: None,
         console: Some("https://modal.com/apps"),
     },
     Preset {
@@ -110,42 +166,46 @@ pub const PRESETS: &[Preset] = &[
         // Set UKC_METRO under `vars`.
         secrets: &[("token", &["UKC_TOKEN"])],
         vars: &[("UNIKRAFT_PROFILE_ENV", "true")],
-        verify_url: Some("https://controlplane.unikraft.cloud/v1/auth"),
+        verify: bearer("https://controlplane.unikraft.cloud/v1/auth", "token"),
         console: Some("https://console.unikraft.com"),
     },
     Preset {
         name: "vercel",
         secrets: &[("token", &["VERCEL_TOKEN"])],
         vars: &[],
-        verify_url: Some("https://api.vercel.com/v2/user"),
+        verify: bearer("https://api.vercel.com/v2/user", "token"),
         console: Some("https://vercel.com/dashboard"),
     },
     Preset {
         name: "netlify",
         secrets: &[("token", &["NETLIFY_AUTH_TOKEN"])],
         vars: &[],
-        verify_url: Some("https://api.netlify.com/api/v1/user"),
+        verify: bearer("https://api.netlify.com/api/v1/user", "token"),
         console: Some("https://app.netlify.com"),
     },
     Preset {
         name: "fly",
+        // No check: Fly.io has no call that every token may make. Deploy
+        // tokens are limited to one app, listing apps needs an organization
+        // slug, and flyctl's `fly auth whoami` asks GraphQL for the user,
+        // which an app's token has none of.
         secrets: &[("token", &["FLY_API_TOKEN"])],
         vars: &[],
-        verify_url: None,
+        verify: None,
         console: Some("https://fly.io/dashboard"),
     },
     Preset {
         name: "neon",
         secrets: &[("api_key", &["NEON_API_KEY"])],
         vars: &[],
-        verify_url: Some("https://console.neon.tech/api/v2/users/me"),
+        verify: bearer("https://console.neon.tech/api/v2/users/me", "api_key"),
         console: Some("https://console.neon.tech"),
     },
     Preset {
         name: "supabase",
         secrets: &[("token", &["SUPABASE_ACCESS_TOKEN"])],
         vars: &[],
-        verify_url: Some("https://api.supabase.com/v1/projects"),
+        verify: bearer("https://api.supabase.com/v1/projects", "token"),
         console: Some("https://supabase.com/dashboard"),
     },
     Preset {
@@ -153,7 +213,7 @@ pub const PRESETS: &[Preset] = &[
         // gh prefers GH_TOKEN; most other tools read GITHUB_TOKEN.
         secrets: &[("token", &["GH_TOKEN", "GITHUB_TOKEN"])],
         vars: &[],
-        verify_url: Some("https://api.github.com/user"),
+        verify: bearer("https://api.github.com/user", "token"),
         console: Some("https://github.com"),
     },
 ];
@@ -217,25 +277,133 @@ pub async fn login(
         .into_iter()
         .map(|(k, v)| (k, v.trim().to_string()))
         .collect();
-    if let [only] = expected.as_slice()
-        && let Some(url) = verify_url(config)?
-    {
-        verify(url, &values[only]).await?;
+    if let Some(check) = verification(config)? {
+        match verify(&check, &values, &config.vars).await? {
+            Verified::Accepted(_) => {}
+            Verified::Skipped(why) => tracing::warn!("the token was not checked: {why}"),
+        }
     }
     store::set(&secrets_key(integration), &Stored(values))
 }
 
-async fn verify(url: &str, token: &str) -> anyhow::Result<()> {
-    let response = crate::http::client()
-        .get(url)
-        .bearer_auth(token)
+/// How an integration's token is checked: `verify_url` with the one secret
+/// as a bearer token, else the preset's check when the integration has the
+/// secrets it uses (a `secrets` table may name others).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Check {
+    pub url: String,
+    pub secret: String,
+    pub scheme: AuthScheme,
+    pub forbidden_is_valid: bool,
+}
+
+pub(crate) fn verification(config: &TokenConfig) -> anyhow::Result<Option<Check>> {
+    let names: Vec<String> = secrets(config)?.into_iter().map(|(name, _)| name).collect();
+    if let Some(url) = &config.verify_url {
+        let [only] = names.as_slice() else {
+            return Ok(None);
+        };
+        return Ok(Some(Check {
+            url: url.clone(),
+            secret: only.clone(),
+            scheme: AuthScheme::Bearer,
+            forbidden_is_valid: false,
+        }));
+    }
+    let Some(verify) = config
+        .preset
+        .as_deref()
+        .map(preset)
+        .transpose()?
+        .and_then(|p| p.verify)
+    else {
+        return Ok(None);
+    };
+    let has = |name: &str| names.iter().any(|n| n == name);
+    if !has(verify.secret) || placeholders(verify.url).any(|name| !has(name)) {
+        return Ok(None);
+    }
+    Ok(Some(Check {
+        url: verify.url.to_string(),
+        secret: verify.secret.to_string(),
+        scheme: verify.scheme,
+        forbidden_is_valid: verify.forbidden_is_valid,
+    }))
+}
+
+/// The secret names a check URL refers to as `{name}`.
+fn placeholders(url: &str) -> impl Iterator<Item = &str> {
+    url.split('{')
+        .skip(1)
+        .filter_map(|part| part.split_once('}').map(|(name, _)| name))
+}
+
+/// What a check found out, short of an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verified {
+    /// The provider took the token; what it said, for `fob check`.
+    Accepted(String),
+    /// The check could not be made, and why.
+    Skipped(String),
+}
+
+/// Checks `values` with `check`. A token the provider refuses (401, or 403
+/// unless that still proves it) fails as rejected; a provider that cannot
+/// be reached or answers 5xx fails as not checked, since the token may be
+/// fine.
+pub(crate) async fn verify(
+    check: &Check,
+    values: &BTreeMap<String, String>,
+    vars: &BTreeMap<String, String>,
+) -> anyhow::Result<Verified> {
+    let secret = values
+        .get(&check.secret)
+        .with_context(|| format!("missing a value for '{}'", check.secret))?;
+    let mut url = check.url.clone();
+    for name in placeholders(&check.url)
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    {
+        let value = values
+            .get(&name)
+            .with_context(|| format!("missing a value for '{name}'"))?;
+        let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
+        url = url.replace(&format!("{{{name}}}"), &encoded);
+    }
+    let request = crate::http::client().get(&url);
+    let request = match check.scheme {
+        AuthScheme::Bearer => request.bearer_auth(secret),
+        AuthScheme::Header(header) => request.header(header, secret),
+        AuthScheme::Basic { user_var } => match vars.get(user_var) {
+            Some(user) => request.basic_auth(user, Some(secret)),
+            None => {
+                return Ok(Verified::Skipped(format!(
+                    "set {user_var} under `vars` so omnifob can check the token"
+                )));
+            }
+        },
+    };
+    let response = request
         .send()
         .await
-        .with_context(|| format!("checking the token against {url}"))?;
-    if !response.status().is_success() {
-        bail!("the token was rejected ({} from {url})", response.status());
+        .map_err(|e| anyhow::anyhow!("could not reach {} to check the token: {e}", check.url))?;
+    let status = response.status();
+    match status.as_u16() {
+        _ if status.is_success() => Ok(Verified::Accepted(format!(
+            "token accepted by {}",
+            check.url
+        ))),
+        403 if check.forbidden_is_valid => Ok(Verified::Accepted(format!(
+            "token accepted by {} (it may not read this URL, which needs no more)",
+            check.url
+        ))),
+        401 | 403 => bail!("the token was rejected ({status} from {})", check.url),
+        500.. => bail!(
+            "could not check the token: {} answered {status}; try again later",
+            check.url
+        ),
+        _ => bail!("could not check the token: {} answered {status}", check.url),
     }
-    Ok(())
 }
 
 /// Checks the stored token against the provider when a check is known.
@@ -243,26 +411,15 @@ pub async fn check(integration: &str, config: &TokenConfig) -> Result<String> {
     let Some(Stored(values)) = store::get(&secrets_key(integration))? else {
         return Err(Error::not_signed_in(integration));
     };
-    let names: Vec<String> = secrets(config)?.into_iter().map(|(name, _)| name).collect();
-    match (names.as_slice(), verify_url(config)?) {
-        ([only], Some(url)) => {
-            let token = values
-                .get(only)
-                .ok_or_else(|| Error::not_signed_in(integration))?;
-            verify(url, token).await?;
-            Ok(format!("token accepted by {url}"))
-        }
-        _ => Ok("token stored; this provider has no check".to_string()),
+    let Some(check) = verification(config)? else {
+        return Ok("token stored; this provider has no check".to_string());
+    };
+    if !values.contains_key(&check.secret) {
+        return Err(Error::not_signed_in(integration));
     }
-}
-
-fn verify_url(config: &TokenConfig) -> anyhow::Result<Option<&str>> {
-    if let Some(url) = &config.verify_url {
-        return Ok(Some(url.as_str()));
-    }
-    Ok(match &config.preset {
-        Some(name) => preset(name)?.verify_url,
-        None => None,
+    Ok(match verify(&check, &values, &config.vars).await? {
+        Verified::Accepted(said) => said,
+        Verified::Skipped(why) => format!("token stored, not checked: {why}"),
     })
 }
 
@@ -408,5 +565,177 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), PRESETS.len());
         assert!(PRESETS.iter().all(|p| !p.secrets.is_empty()));
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn check_at(server: &wiremock::MockServer, path: &str, verify: Verify) -> Check {
+        Check {
+            url: format!("{}{path}", server.uri()),
+            secret: verify.secret.to_string(),
+            scheme: verify.scheme,
+            forbidden_is_valid: verify.forbidden_is_valid,
+        }
+    }
+
+    #[test]
+    fn presets_check_with_the_secrets_they_name() {
+        let scaleway = verification(&config("preset = \"scaleway\""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(scaleway.scheme, AuthScheme::Header("X-Auth-Token"));
+        assert_eq!(scaleway.secret, "secret_key");
+        assert!(scaleway.forbidden_is_valid);
+        let upstash = verification(&config("preset = \"upstash\""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            upstash.scheme,
+            AuthScheme::Basic {
+                user_var: "UPSTASH_EMAIL"
+            }
+        );
+        assert_eq!(verification(&config("preset = \"fly\"")).unwrap(), None);
+        // A `secrets` table without the secret the check sends: no check.
+        let renamed =
+            config("preset = \"hetzner\"\n[integrations.t.secrets]\nkey = [\"HCLOUD_TOKEN\"]");
+        assert_eq!(verification(&renamed).unwrap(), None);
+        // `verify_url` replaces the preset's check.
+        let own = config("preset = \"hetzner\"\nverify_url = \"https://x.test/me\"");
+        let own = verification(&own).unwrap().unwrap();
+        assert_eq!(
+            (own.url.as_str(), own.secret.as_str()),
+            ("https://x.test/me", "token")
+        );
+        assert_eq!(own.scheme, AuthScheme::Bearer);
+    }
+
+    #[tokio::test]
+    async fn each_scheme_sends_the_secret_its_way() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/iam/v1alpha1/api-keys/SCW%2FKEY"))
+            .and(header("X-Auth-Token", "secret"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/redis/databases"))
+            // me@example.com:key
+            .and(header("Authorization", "Basic bWVAZXhhbXBsZS5jb206a2V5"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .and(header("Authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let scaleway = preset("scaleway").unwrap().verify.unwrap();
+        let check = check_at(&server, "/iam/v1alpha1/api-keys/{access_key}", scaleway);
+        let said = verify(
+            &check,
+            &values(&[("access_key", "SCW/KEY"), ("secret_key", "secret")]),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(said, Verified::Accepted(ref s) if s.contains("may not read")),
+            "{said:?}"
+        );
+
+        let upstash = preset("upstash").unwrap().verify.unwrap();
+        let check = check_at(&server, "/v2/redis/databases", upstash);
+        let key = values(&[("api_key", "key")]);
+        let vars = values(&[("UPSTASH_EMAIL", "me@example.com")]);
+        assert!(matches!(
+            verify(&check, &key, &vars).await.unwrap(),
+            Verified::Accepted(_)
+        ));
+        // Without the email there is nothing to check with.
+        let skipped = verify(&check, &key, &BTreeMap::new()).await.unwrap();
+        assert_eq!(
+            skipped,
+            Verified::Skipped(
+                "set UPSTASH_EMAIL under `vars` so omnifob can check the token".into()
+            )
+        );
+
+        let hetzner = preset("hetzner").unwrap().verify.unwrap();
+        let check = check_at(&server, "/me", hetzner);
+        assert!(matches!(
+            verify(&check, &values(&[("token", "tok")]), &BTreeMap::new())
+                .await
+                .unwrap(),
+            Verified::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_told_apart_from_an_outage() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (route, status) in [("/401", 401), ("/403", 403), ("/503", 503), ("/404", 404)] {
+            Mock::given(path(route))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+        let bearer = bearer("", "token").unwrap();
+        let token = values(&[("token", "t")]);
+        let error = |route: &str| {
+            let check = check_at(&server, route, bearer);
+            let token = token.clone();
+            async move {
+                verify(&check, &token, &BTreeMap::new())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+            }
+        };
+        assert!(
+            error("/401")
+                .await
+                .contains("the token was rejected (401 Unauthorized")
+        );
+        assert!(
+            error("/403")
+                .await
+                .contains("the token was rejected (403 Forbidden")
+        );
+        let outage = error("/503").await;
+        assert!(
+            outage.contains("could not check the token")
+                && outage.contains("503")
+                && outage.contains("try again later"),
+            "{outage}"
+        );
+        assert!(error("/404").await.contains("could not check the token"));
+        let unreachable = Check {
+            url: "http://127.0.0.1:9/me".into(),
+            ..check_at(&server, "", bearer)
+        };
+        let error = verify(&unreachable, &token, &BTreeMap::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("could not reach http://127.0.0.1:9/me"),
+            "{error}"
+        );
     }
 }

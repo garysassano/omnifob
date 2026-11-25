@@ -1169,8 +1169,9 @@ pub struct TokenConfig {
     /// A known provider: its variable names, token check and console URL.
     #[serde(default)]
     pub preset: Option<String>,
-    /// Secret name → environment variables that receive it; replaces the
-    /// preset's secrets.
+    /// Secret name → environment variables that receive it. It replaces the
+    /// preset's secrets and the fixed variables that come with them (such
+    /// as unikraft's `UNIKRAFT_PROFILE_ENV`); set those under `vars`.
     #[serde(default)]
     pub secrets: BTreeMap<String, Vec<String>>,
     /// Non-secret variables exported along with the secrets.
@@ -1181,7 +1182,8 @@ pub struct TokenConfig {
     pub account: Option<String>,
     #[serde(default)]
     pub console: Option<String>,
-    /// URL that answers 2xx when the token is sent as a bearer token.
+    /// URL that answers 2xx when the token is sent as a bearer token; it
+    /// needs exactly one secret, and replaces the preset's check.
     #[serde(default)]
     pub verify_url: Option<String>,
     /// The browser in `[browsers]` that this integration's sign-ins and
