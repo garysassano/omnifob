@@ -197,6 +197,35 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
 ///
 /// AWS credentials carry `AWS_ACCOUNT_ID`, which the SDKs use for
 /// account-based endpoints.
+///
+/// Functions find their files, keychain and endpoints in the current
+/// [`Context`](crate::Context); here, an in-memory keychain:
+///
+/// ```
+/// use std::collections::BTreeMap;
+///
+/// use omnifob_core::store::Keychain;
+/// use omnifob_core::{Config, Context, Integration, providers};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> anyhow::Result<()> {
+/// let context = Context::builder().keychain(Keychain::Memory).build();
+/// context.scope(async {
+///     let config = Config::parse("[integrations.fly]\ntype = \"token\"\npreset = \"fly\"")?;
+///     let Integration::Token(fly) = config.integration("fly")? else { unreachable!() };
+///     // What `fob login fly` stores; Fly.io has no token check.
+///     let secret = BTreeMap::from([("token".to_string(), "FlyV1 fm2_example".to_string())]);
+///     providers::token::login("fly", fly, secret).await?;
+///
+///     let profile = providers::token::discover("fly", fly).remove(0);
+///     assert_eq!(profile.id, "fly/default/fly");
+///     let creds = providers::credentials(&config, &profile, true, None).await?;
+///     assert_eq!(creds.env["FLY_API_TOKEN"], "FlyV1 fm2_example");
+///     anyhow::Ok(())
+/// })
+/// .await
+/// # }
+/// ```
 pub async fn credentials(
     config: &Config,
     profile: &Profile,

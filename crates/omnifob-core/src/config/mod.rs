@@ -250,6 +250,28 @@ impl Config {
     /// Parses a config. Integration names may contain only letters, digits,
     /// `.`, `_` and `-` (see [`check_name`]); the error for another name says
     /// how to rename it.
+    ///
+    /// ```
+    /// use omnifob_core::{Config, Integration};
+    ///
+    /// let config = Config::parse(
+    ///     r#"
+    ///     [integrations.acme]
+    ///     type = "aws-sso"
+    ///     start_url = "https://acme.awsapps.com/start"
+    ///     region = "eu-west-1"
+    ///     "#,
+    /// )?;
+    /// assert!(matches!(config.integration("acme")?, Integration::AwsSso(_)));
+    ///
+    /// // Every key is checked as the config loads, and the error names it.
+    /// let err = Config::parse(
+    ///     "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"http://acme\"\nregion = \"eu-west-1\"",
+    /// )
+    /// .unwrap_err();
+    /// assert!(format!("{err:#}").contains("start_url"));
+    /// # anyhow::Ok(())
+    /// ```
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let config = Self::parse_allowing_any_names(text)?;
         for name in config.integrations.keys() {
