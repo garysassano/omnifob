@@ -1,15 +1,13 @@
 //! `fob cloudflare`: permissions and token templates.
 
-use std::io::IsTerminal;
-
 use anyhow::{Context, bail};
 use dialoguer::console::Term;
 use omnifob_core::providers::cloudflare;
 use omnifob_core::{Config, Integration, paths};
 
-use crate::App;
 use crate::cli::CloudflareCommand;
 use crate::files::write_atomically;
+use crate::{App, interactive};
 
 impl App {
     pub(crate) async fn cloudflare(&self, command: CloudflareCommand) -> anyhow::Result<()> {
@@ -98,7 +96,7 @@ impl App {
             .with_login(|| cloudflare::permission_groups(integration, &config))
             .await?;
         let permissions = if permissions.is_empty() {
-            if !std::io::stdin().is_terminal() {
+            if !interactive() {
                 bail!(
                     "name the permissions with --permission, or run this in a terminal to pick them"
                 );

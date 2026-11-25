@@ -62,3 +62,39 @@ pub fn read_token() -> anyhow::Result<String> {
     }
     Ok(text)
 }
+
+/// Reads a stored token integration's secret from the clipboard. Secrets
+/// take many shapes (base64 with `/`, short API keys), so only what is
+/// clearly not one is refused: nothing, text with whitespace, or a URL.
+pub fn read_secret() -> anyhow::Result<String> {
+    check_secret(read()?)
+}
+
+fn check_secret(text: String) -> anyhow::Result<String> {
+    if text.is_empty() {
+        bail!("the clipboard is empty; copy the secret first");
+    }
+    let lower = text.to_ascii_lowercase();
+    if text.chars().any(char::is_whitespace)
+        || lower.starts_with("http://")
+        || lower.starts_with("https://")
+    {
+        bail!("the clipboard does not look like a secret; copy the secret first");
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_may_have_any_shape_but_a_url_or_a_sentence() {
+        for ok in ["abc", "a/b+c==", "ukc_0123/xyz"] {
+            assert_eq!(check_secret(ok.into()).unwrap(), ok);
+        }
+        for bad in ["", "two words", "https://example.com/token", "HTTP://x"] {
+            assert!(check_secret(bad.into()).is_err(), "{bad}");
+        }
+    }
+}

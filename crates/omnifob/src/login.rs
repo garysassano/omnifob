@@ -302,6 +302,11 @@ impl App {
                 }
             }
             Integration::AwsIam(config) => {
+                if from_clipboard {
+                    bail!(
+                        "'{name}' takes an access key ID and a secret access key, more than the clipboard holds; pipe both to --token-stdin"
+                    );
+                }
                 let (key_id, secret) = if token_stdin {
                     // Two words: the access key ID, then the secret.
                     let mut text = String::new();
@@ -334,20 +339,30 @@ impl App {
                     .map(|(name, _)| name)
                     .collect();
                 let mut values = std::collections::BTreeMap::new();
-                if token_stdin {
+                if token_stdin || from_clipboard {
+                    let flag = if token_stdin {
+                        "--token-stdin"
+                    } else {
+                        "--from-clipboard"
+                    };
                     let [only] = names.as_slice() else {
                         bail!(
-                            "--token-stdin works for a single secret; '{name}' has {}",
+                            "{flag} works for a single secret; '{name}' has {}",
                             names.len()
                         );
                     };
-                    let mut value = String::new();
-                    std::io::stdin().read_to_string(&mut value)?;
+                    let value = if token_stdin {
+                        let mut value = String::new();
+                        std::io::stdin().read_to_string(&mut value)?;
+                        value
+                    } else {
+                        clipboard::read_secret()?
+                    };
                     values.insert(only.clone(), value);
                 } else {
                     if !interactive() {
                         bail!(
-                            "no terminal to prompt for secrets; pass a single one with --token-stdin"
+                            "no terminal to prompt for secrets; pass a single one with --from-clipboard or --token-stdin"
                         );
                     }
                     for secret in &names {
@@ -422,6 +437,9 @@ impl App {
                 Ok(true) if config.uses_oauth() => eprintln!("fob: revoked the browser sign-in"),
                 Ok(true) => eprintln!("fob: deleted the session's bootstrap token"),
                 Ok(false) | Err(Error::NeedsLogin { .. }) => {}
+                Err(e) if config.uses_oauth() => {
+                    eprintln!("fob: could not revoke the browser sign-in: {e:#}")
+                }
                 Err(e) => eprintln!("fob: could not delete the session's bootstrap token: {e:#}"),
             }
         }

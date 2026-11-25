@@ -41,7 +41,8 @@ pub(crate) enum Command {
         /// whitespace) from stdin instead of prompting
         #[arg(long, conflicts_with = "from_clipboard")]
         token_stdin: bool,
-        /// Read the Cloudflare bootstrap token from the clipboard instead of prompting
+        /// Read the token (a Cloudflare bootstrap token or a token integration's
+        /// single secret) from the clipboard instead of prompting
         #[arg(long)]
         from_clipboard: bool,
         /// Sign in again even when the stored browser sign-in (AWS IAM Identity
