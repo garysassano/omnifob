@@ -4,7 +4,6 @@
 pub mod aws;
 pub mod azure;
 pub mod cloudflare;
-pub mod cloudflare_oauth;
 pub mod gcp;
 pub mod token;
 
@@ -159,7 +158,7 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
             }
         }
         Integration::Cloudflare(c) if c.uses_oauth() => {
-            match cloudflare_oauth::sign_in_ends(name)? {
+            match cloudflare::oauth::sign_in_ends(name)? {
                 None => SignIn::SignedOut,
                 Some((expires_at, refreshable)) => SignIn::Session {
                     expires_at,
@@ -734,9 +733,9 @@ pub async fn keepable_sign_in(name: &str, integration: &Integration) -> Option<S
         Integration::Gcp(config) => gcp::session_matches(name, config),
         Integration::Azure(config) => azure::session_matches(name, config),
         Integration::Cloudflare(config) if config.uses_oauth() => {
-            cloudflare_oauth::granted_scopes(name).map(|granted| {
+            cloudflare::oauth::granted_scopes(name).map(|granted| {
                 granted.is_some_and(|granted| {
-                    cloudflare_oauth::scopes(config)
+                    cloudflare::oauth::scopes(config)
                         .iter()
                         .all(|s| granted.contains(s))
                 })
@@ -893,7 +892,7 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
         }
         Integration::Cloudflare(_) => {
             cloudflare::rename_catalog(old, new)?;
-            let oauth = cloudflare_oauth::rename(old, new)?;
+            let oauth = cloudflare::oauth::rename(old, new)?;
             Ok(store::rename(
                 &format!("cloudflare/{old}/bootstrap"),
                 &format!("cloudflare/{new}/bootstrap"),

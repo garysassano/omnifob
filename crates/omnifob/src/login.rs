@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use dialoguer::console::Term;
 use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::history::{self, History};
-use omnifob_core::providers::{self, aws, azure, cloudflare, cloudflare_oauth, gcp, token};
+use omnifob_core::providers::{self, aws, azure, cloudflare, gcp, token};
 use omnifob_core::{Error, Integration};
 
 use crate::{App, agent, clipboard, interactive};
@@ -247,7 +247,7 @@ impl App {
                 if !force && self.keeps_sign_in(name, integration).await {
                     return Ok(());
                 }
-                let session = cloudflare_oauth::login(name, config, |url| {
+                let session = cloudflare::oauth::login(name, config, |url| {
                     eprintln!("fob: approve the sign-in for '{name}' in your browser");
                     eprintln!("     Pick the accounts, and turn on Account API Tokens Write under Sensitive scopes.");
                     eprintln!("     {url}");

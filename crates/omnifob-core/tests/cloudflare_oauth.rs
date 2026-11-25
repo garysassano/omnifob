@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 
 use jiff::{SignedDuration, Timestamp};
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
-use omnifob_core::providers::{cloudflare, cloudflare_oauth};
+use omnifob_core::providers::cloudflare::{self, oauth as cloudflare_oauth};
 use omnifob_core::{Error, store};
 use serde_json::{Value, json};
 use support::Scratch;
