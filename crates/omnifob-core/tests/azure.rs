@@ -248,7 +248,9 @@ async fn discovery_walks_tenants_and_skips_refusing_ones() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             // Also reachable from the home tenant: kept once.
             "value": [{ "subscriptionId": "sub-a", "displayName": "Prod" },
-                      { "subscriptionId": "sub-c", "displayName": "Partner" }],
+                      { "subscriptionId": "sub-c", "displayName": "Partner" },
+                      // Named like the home tenant's, so both get their IDs.
+                      { "subscriptionId": "sub-d", "displayName": "Dev-Box" }],
         })))
         .mount(&server)
         .await;
@@ -257,7 +259,12 @@ async fn discovery_walks_tenants_and_skips_refusing_ones() {
     let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["work/prod/user", "work/dev-box/user", "work/partner/user"]
+        [
+            "work/prod/user",
+            "work/dev-box-sub-b/user",
+            "work/partner/user",
+            "work/dev-box-sub-d/user"
+        ]
     );
     assert_eq!(
         profiles[2].target,

@@ -128,7 +128,7 @@ pub async fn discover(integration: &str, config: &AwsIamConfig) -> Result<Vec<Pr
         Target::AwsIamSession { account_id },
     )];
     for (label, role) in &config.roles {
-        profiles.push(Profile::new(
+        let profile = Profile::new(
             integration,
             label,
             role.role_name(),
@@ -136,7 +136,18 @@ pub async fn discover(integration: &str, config: &AwsIamConfig) -> Result<Vec<Pr
                 label: label.clone(),
                 account_id: role.account_id().map(str::to_string),
             },
-        ));
+        );
+        // The config check catches this when `account` is set; without it
+        // the session's id holds the account ID, known only now.
+        if profile.id == profiles[0].id {
+            return Err(anyhow!(
+                "the role '{label}' of '{integration}' would be {}, the user's session profile; \
+                 give it another label in [integrations.{integration}.roles]",
+                profile.id
+            )
+            .into());
+        }
+        profiles.push(profile);
     }
     Ok(profiles)
 }

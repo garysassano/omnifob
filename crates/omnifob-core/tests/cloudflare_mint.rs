@@ -1162,7 +1162,7 @@ async fn concurrent_catalog_updates_keep_every_tracked_token() {
 #[tokio::test]
 async fn an_unreadable_catalog_is_never_replaced() {
     let _cf = SignedIn::new("unreadable").await;
-    std::fs::create_dir_all(paths::state_dir()).unwrap();
+    std::fs::create_dir_all(paths::state_dir().unwrap()).unwrap();
     std::fs::write(SignedIn::catalog_file(), "{ not json").unwrap();
     let err = cloudflare::update_catalog("cf", |c| {
         c.minted
@@ -1182,4 +1182,42 @@ async fn an_unreadable_catalog_is_never_replaced() {
     );
     assert!(cloudflare::rename_catalog("cf", "cf2").is_err());
     assert!(SignedIn::catalog_file().exists());
+}
+
+/// Accounts whose names slug alike keep their profiles apart with their IDs,
+/// every template of an account moving together.
+#[tokio::test]
+async fn accounts_named_alike_get_their_ids() {
+    let cf = SignedIn::new("named-alike").await;
+    Mock::given(method("GET"))
+        .and(path("/accounts"))
+        .respond_with(ok(json!([
+            { "id": "aaa", "name": "Acme (EU)" },
+            { "id": "bbb", "name": "ACME EU" },
+            { "id": "ccc", "name": "Other" }
+        ])))
+        .mount(&cf.server)
+        .await;
+    let Integration::Cloudflare(config) = &cf.integration else {
+        unreachable!()
+    };
+    let profiles = cloudflare::discover("cf", config).await.unwrap();
+    let ids: Vec<&str> = profiles
+        .iter()
+        .filter(|p| p.id.ends_with("/read"))
+        .map(|p| p.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "cf/acme-eu-aaa/read",
+            "cf/acme-eu-bbb/read",
+            "cf/other/read"
+        ]
+    );
+    let mut all: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+    let count = all.len();
+    all.dedup();
+    assert_eq!(all.len(), count, "no two profiles share an id");
+    assert!(profiles.iter().all(|p| !p.id.starts_with("cf/acme-eu/")));
 }

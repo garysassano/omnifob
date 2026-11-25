@@ -931,6 +931,15 @@ pub async fn discover(integration: &str, config: &CloudflareConfig) -> Result<Ve
             ));
         }
     }
+    // Two accounts named "Acme (EU)" and "ACME EU" both slug to acme-eu.
+    crate::profile::disambiguate_accounts(&mut profiles, |target| match target {
+        Target::Cloudflare {
+            account_id,
+            account_name,
+            ..
+        } => Some((account_name, account_id)),
+        _ => None,
+    });
     Ok(profiles)
 }
 

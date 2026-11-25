@@ -19,6 +19,12 @@ use crate::{Config, Credentials, Error, Integration, Profile, Result, Target, st
 
 /// Discovers every profile an integration offers.
 pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
+    let profiles = discover_unchecked(name, integration).await?;
+    crate::profile::check_unique_ids(name, &profiles)?;
+    Ok(profiles)
+}
+
+async fn discover_unchecked(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
     match integration {
         Integration::AwsSso(config) => aws_sso::discover(name, config).await,
         Integration::AwsIam(config) => aws_iam::discover(name, config).await,

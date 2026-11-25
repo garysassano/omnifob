@@ -564,6 +564,15 @@ pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Pro
             }
         }
     }
+    // "Pay-As-You-Go" in two tenants, or "Acme (EU)" and "ACME EU".
+    crate::profile::disambiguate_accounts(&mut profiles, |target| match target {
+        Target::Azure {
+            subscription_id,
+            subscription_name,
+            ..
+        } => Some((subscription_name, subscription_id)),
+        _ => None,
+    });
     Ok(profiles)
 }
 

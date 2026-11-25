@@ -908,28 +908,17 @@ async fn list_roles(
     per_account.into_iter().collect()
 }
 
-/// Two accounts whose names slug the same would collide; suffix their ids
-/// with the account id.
+/// Two accounts whose names slug the same would collide; suffix every id of
+/// those accounts with the account ID.
 fn disambiguate(profiles: &mut [Profile]) {
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    for p in profiles.iter() {
-        *seen.entry(p.id.clone()).or_default() += 1;
-    }
-    for p in profiles.iter_mut() {
-        if seen[&p.id] > 1
-            && let Target::Aws {
-                account_id,
-                account_name,
-                role_name,
-            } = &p.target
-        {
-            p.id = format!(
-                "{}/{}-{account_id}/{role_name}",
-                p.integration,
-                crate::profile::slug(account_name)
-            );
-        }
-    }
+    crate::profile::disambiguate_accounts(profiles, |target| match target {
+        Target::Aws {
+            account_id,
+            account_name,
+            ..
+        } => Some((account_name, account_id)),
+        _ => None,
+    });
 }
 
 /// Exchanges the SSO token for role credentials.
@@ -1016,34 +1005,29 @@ pub async fn credentials(
 }
 
 /// Adds a profile per configured role, chained and cross-partition, each
-/// `<integration>/<label>/<role name>`. A chained role whose id a
-/// discovered profile already has gets a `-chained` suffix on its label, as
-/// it always has. A cross-partition role gets a `-cross-partition` suffix
-/// and a warning that says how to choose another label; if that id is taken
-/// too, discovery fails. The config check refuses collisions between the
-/// two tables, so only Identity Center roles (and earlier suffixed ids) can
-/// take a cross-partition role's id here.
+/// `<integration>/<label>/<role name>`. A role whose id a discovered
+/// profile already has gets a suffix on its label, `-chained` or
+/// `-cross-partition`, and a warning that says how to choose another label;
+/// if that id is taken too, discovery fails. The config check refuses
+/// collisions between configured roles, so only Identity Center roles (and
+/// earlier suffixed ids) can take a configured role's id here.
 fn add_configured(
     integration: &str,
     config: &AwsSsoConfig,
     profiles: &mut Vec<Profile>,
 ) -> anyhow::Result<()> {
-    let taken =
-        |profiles: &[Profile], profile: &Profile| profiles.iter().any(|p| p.id == profile.id);
     for (label, role) in &config.chained {
         let target = Target::AwsChained {
             label: label.clone(),
             account_id: role.account_id().map(str::to_string),
         };
-        let mut profile = Profile::new(integration, label, role.role_name(), target.clone());
-        if taken(profiles, &profile) {
-            profile = Profile::new(
-                integration,
-                &format!("{label}-chained"),
-                role.role_name(),
-                target,
-            );
-        }
+        let profile = configured_profile(
+            integration,
+            ("chained", label, "-chained"),
+            role.role_name(),
+            target,
+            profiles,
+        )?;
         profiles.push(profile);
     }
     for (label, role) in &config.cross_partition {
@@ -1051,36 +1035,49 @@ fn add_configured(
             label: label.clone(),
             account_id: role.account_id().to_string(),
         };
-        let profile = Profile::new(integration, label, role.role_name(), target.clone());
-        if !taken(profiles, &profile) {
-            profiles.push(profile);
-            continue;
-        }
-        let suffixed = Profile::new(
+        let profile = configured_profile(
             integration,
-            &format!("{label}-cross-partition"),
+            ("cross_partition", label, "-cross-partition"),
             role.role_name(),
             target,
-        );
-        if taken(profiles, &suffixed) {
-            bail!(
-                "the cross-partition role '{label}' of '{integration}' would be {} or {}, and \
-                 both are taken by other profiles; give it another label in \
-                 [integrations.{integration}.cross_partition]",
-                profile.id,
-                suffixed.id
-            );
-        }
-        tracing::warn!(
-            "{} is already an Identity Center or chained profile, so the cross-partition role \
-             '{label}' is {}; give it another label in [integrations.{integration}.cross_partition] \
-             to choose its id",
+            profiles,
+        )?;
+        profiles.push(profile);
+    }
+    Ok(())
+}
+
+/// The profile of a configured role, `(table, label, suffix)`: its own id
+/// when free, else the label with `suffix`, with a warning; fails when
+/// both are taken.
+fn configured_profile(
+    integration: &str,
+    (table, label, suffix): (&str, &str, &str),
+    role_name: &str,
+    target: Target,
+    profiles: &[Profile],
+) -> anyhow::Result<Profile> {
+    let taken = |profile: &Profile| profiles.iter().any(|p| p.id == profile.id);
+    let profile = Profile::new(integration, label, role_name, target.clone());
+    if !taken(&profile) {
+        return Ok(profile);
+    }
+    let suffixed = Profile::new(integration, &format!("{label}{suffix}"), role_name, target);
+    if taken(&suffixed) {
+        bail!(
+            "the {table} role '{label}' of '{integration}' would be {} or {}, and both are taken \
+             by other profiles; give it another label in [integrations.{integration}.{table}]",
             profile.id,
             suffixed.id
         );
-        profiles.push(suffixed);
     }
-    Ok(())
+    tracing::warn!(
+        "{} is already an Identity Center or configured profile, so the {table} role '{label}' \
+         is {}; give it another label in [integrations.{integration}.{table}] to choose its id",
+        profile.id,
+        suffixed.id
+    );
+    Ok(suffixed)
 }
 
 /// Credentials for a chained role: the Identity Center role's credentials,
@@ -1951,6 +1948,16 @@ mod tests {
                 "acme/prod/Deploy"
             ]
         );
+
+        // An account named like the suffixed label takes that id too.
+        let mut profiles = vec![role("shared", "111"), role("shared-chained", "444")];
+        let error = add_configured("acme", &config, &mut profiles).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the chained role 'Shared' of 'acme' would be acme/shared/Admin or \
+             acme/shared-chained/Admin, and both are taken by other profiles; give it another \
+             label in [integrations.acme.chained]"
+        );
     }
 
     #[test]
@@ -2050,6 +2057,25 @@ mod tests {
                 "acme/prod-111/Admin",
                 "acme/prod-222/Admin",
                 "acme/dev/Admin"
+            ]
+        );
+
+        // Every role of an account moves with it, not just the roles whose
+        // ids collide.
+        let mut profiles = vec![
+            role("Prod", "111"),
+            role("prod", "222"),
+            role("Prod", "111"),
+        ];
+        profiles[2].id = "acme/prod/ReadOnly".into();
+        disambiguate(&mut profiles);
+        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "acme/prod-111/Admin",
+                "acme/prod-222/Admin",
+                "acme/prod-111/ReadOnly"
             ]
         );
     }

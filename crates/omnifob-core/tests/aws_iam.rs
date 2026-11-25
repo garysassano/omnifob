@@ -241,6 +241,19 @@ async fn discovery_takes_the_account_from_sts() {
             account_id: "123456789012".into()
         }
     );
+    // A role labelled with the account ID and named `session` would take
+    // the session's id, which only STS's answer shows.
+    let clash = self::config(
+        "[integrations.legacy.roles.\"123456789012\"]\nrole_arn = \"arn:aws:iam::222222222222:role/session\"",
+    );
+    let error = aws_iam::discover("acct-sts", &clash)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("would be acct-sts/123456789012/session, the user's session profile"),
+        "{error}"
+    );
 
     server.reset().await;
     Mock::given(method("POST"))
