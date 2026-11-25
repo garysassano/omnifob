@@ -6,9 +6,7 @@ use anyhow::{Context, bail};
 use dialoguer::console::Term;
 use omnifob_core::config::CloudflareTokenType;
 use omnifob_core::history::{self, History};
-use omnifob_core::providers::{
-    self, aws_iam, aws_login, aws_sso, azure, cloudflare, cloudflare_oauth, gcp, token,
-};
+use omnifob_core::providers::{self, aws, azure, cloudflare, cloudflare_oauth, gcp, token};
 use omnifob_core::{Error, Integration};
 
 use crate::{App, agent, clipboard, interactive};
@@ -99,11 +97,11 @@ impl App {
                     return Ok(());
                 }
                 let flow = if device_code {
-                    aws_sso::Flow::DeviceCode
+                    aws::sso::Flow::DeviceCode
                 } else {
-                    aws_sso::Flow::for_this_session()
+                    aws::sso::Flow::for_this_session()
                 };
-                aws_sso::login(name, config, flow, |prompt| {
+                aws::sso::login(name, config, flow, |prompt| {
                     match &prompt.user_code {
                         Some(code) => {
                             eprintln!("fob: approve the sign-in for '{name}' on any device");
@@ -135,7 +133,7 @@ impl App {
                 if !browser_here && !interactive() {
                     bail!("no terminal to paste the AWS code into; run `fob login {name}` in one");
                 }
-                let identity = aws_login::login(
+                let identity = aws::login::login(
                     name,
                     config,
                     browser_here,
@@ -330,7 +328,7 @@ impl App {
                         .interact_on(&Term::stderr())?;
                     (id, secret)
                 };
-                let arn = aws_iam::login(name, config, &key_id, &secret).await?;
+                let arn = aws::iam::login(name, config, &key_id, &secret).await?;
                 eprintln!("fob: the access key belongs to {arn}; it stays in the keychain");
             }
             Integration::Token(config) => {
@@ -442,7 +440,7 @@ impl App {
             Err(e) => eprintln!("fob: could not delete minted tokens: {e:#}"),
         }
         if let Integration::AwsSso(config) = &integration {
-            match aws_sso::end_session(name, config).await {
+            match aws::sso::end_session(name, config).await {
                 Ok(true) => eprintln!("fob: ended the IAM Identity Center session"),
                 Ok(false) => {}
                 Err(e) => eprintln!("fob: could not end the IAM Identity Center session: {e:#}"),

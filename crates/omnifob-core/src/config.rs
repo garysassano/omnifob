@@ -8,7 +8,7 @@ use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
 use crate::Profile;
-use crate::providers::aws_partition::Partition;
+use crate::providers::aws::partition::Partition;
 
 #[derive(Debug, Default, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -521,14 +521,14 @@ fn check_region_partition(key: &str, region: &str, role_arn: &str) -> Result<(),
 /// Regions become part of host names, so a malformed one is refused when
 /// the config loads rather than when a command first uses it.
 fn check_region(key: &str, region: &str) -> Result<(), String> {
-    crate::providers::aws_partition::check_region_name(region).map_err(|e| format!("{key}: {e}"))
+    crate::providers::aws::partition::check_region_name(region).map_err(|e| format!("{key}: {e}"))
 }
 
 /// Fails unless a configured console session length is one the federation
 /// endpoint accepts.
 fn check_console_duration(key: &str, duration: Option<SignedDuration>) -> Result<(), String> {
     match duration {
-        Some(d) if !crate::providers::aws_sso::CONSOLE_SESSION.contains(&d) => {
+        Some(d) if !crate::providers::aws::console::CONSOLE_SESSION.contains(&d) => {
             Err(format!("{key} must be between 15m and 12h"))
         }
         _ => Ok(()),

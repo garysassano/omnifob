@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use omnifob_core::config::{AwsSsoConfig, Config, Integration};
-use omnifob_core::providers::aws_sso::{self, Flow};
+use omnifob_core::providers::aws::{self, sso::Flow};
 use omnifob_core::{Error, store};
 use serde_json::{Value, json};
 use support::Scratch;
@@ -122,7 +122,7 @@ async fn device_login(server: &MockServer, integration: &str, expires_in: i64) {
         .respond_with(token("a1", "r1", expires_in))
         .mount(server)
         .await;
-    aws_sso::login(integration, &config(), Flow::DeviceCode, |_| {})
+    aws::sso::login(integration, &config(), Flow::DeviceCode, |_| {})
         .await
         .unwrap();
 }
@@ -131,7 +131,7 @@ async fn device_login(server: &MockServer, integration: &str, expires_in: i64) {
 async fn device_sign_in_reuses_the_client_registration() {
     let (_guard, server) = setup().await;
     device_login(&server, "device", 3600).await;
-    aws_sso::login("device", &config(), Flow::DeviceCode, |prompt| {
+    aws::sso::login("device", &config(), Flow::DeviceCode, |prompt| {
         assert_eq!(prompt.user_code.as_deref(), Some("ABCD-EFGH"));
     })
     .await
@@ -147,7 +147,7 @@ async fn device_sign_in_reuses_the_client_registration() {
     assert_eq!(registered["scopes"], json!(["sso:account:access"]));
     assert!(registered.get("grantTypes").is_none(), "{registered}");
     assert!(
-        aws_sso::session("device").unwrap().unwrap().1,
+        aws::sso::session("device").unwrap().unwrap().1,
         "refreshable"
     );
 }
@@ -175,7 +175,7 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
     let opened = browser.clone();
     let thread = std::sync::Arc::new(std::sync::Mutex::new(None));
     let started = thread.clone();
-    aws_sso::login("browser", &config(), Flow::Browser, move |prompt| {
+    aws::sso::login("browser", &config(), Flow::Browser, move |prompt| {
         assert!(prompt.user_code.is_none());
         let url = reqwest::Url::parse(&prompt.url).unwrap();
         let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
@@ -260,7 +260,7 @@ async fn concurrent_callers_refresh_an_expiring_session_once() {
         .await;
 
     let config = config();
-    let calls = (0..8).map(|_| aws_sso::credentials("race", &config, "111111111111", "Admin"));
+    let calls = (0..8).map(|_| aws::sso::credentials("race", &config, "111111111111", "Admin"));
     for result in futures::future::join_all(calls).await {
         let creds = result.unwrap();
         assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "AKIAEXAMPLE");
@@ -293,7 +293,7 @@ async fn a_refused_token_is_renewed_and_the_call_retried() {
         .mount(&server)
         .await;
 
-    aws_sso::credentials("revoked", &config(), "111111111111", "Admin")
+    aws::sso::credentials("revoked", &config(), "111111111111", "Admin")
         .await
         .unwrap();
 }
@@ -314,11 +314,11 @@ async fn an_ended_session_asks_for_sign_in_and_is_forgotten() {
         .mount(&server)
         .await;
 
-    let err = aws_sso::credentials("ended", &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials("ended", &config(), "111111111111", "Admin")
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
-    assert!(aws_sso::session("ended").unwrap().is_none());
+    assert!(aws::sso::session("ended").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -337,7 +337,7 @@ async fn a_server_error_during_renewal_keeps_the_session() {
         .mount(&server)
         .await;
 
-    let err = aws_sso::credentials("outage", &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials("outage", &config(), "111111111111", "Admin")
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Other(_)), "{err}");
@@ -345,7 +345,7 @@ async fn a_server_error_during_renewal_keeps_the_session() {
         format!("{err:#}").contains("could not renew the sign-in for 'outage'"),
         "{err:#}"
     );
-    assert!(aws_sso::session("outage").unwrap().unwrap().1, "kept");
+    assert!(aws::sso::session("outage").unwrap().unwrap().1, "kept");
 }
 
 #[tokio::test]
@@ -359,11 +359,11 @@ async fn an_expired_token_that_cannot_be_renewed_now_does_not_ask_for_sign_in() 
         .mount(&server)
         .await;
 
-    let err = aws_sso::credentials("offline", &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials("offline", &config(), "111111111111", "Admin")
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Other(_)), "{err}");
-    assert!(aws_sso::session("offline").unwrap().is_some(), "kept");
+    assert!(aws::sso::session("offline").unwrap().is_some(), "kept");
 }
 
 #[tokio::test]
@@ -377,7 +377,7 @@ async fn an_unreachable_identity_center_keeps_the_session() {
     // SAFETY: the tests run one at a time under SERIAL.
     unsafe { std::env::set_var("OMNIFOB_AWS_ENDPOINT", url) };
 
-    let err = aws_sso::credentials("unreachable", &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials("unreachable", &config(), "111111111111", "Admin")
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Other(_)), "{err}");
@@ -387,7 +387,7 @@ async fn an_unreachable_identity_center_keeps_the_session() {
             && message.contains("run `fob login unreachable` if this persists"),
         "{message}"
     );
-    assert!(aws_sso::session("unreachable").unwrap().is_some(), "kept");
+    assert!(aws::sso::session("unreachable").unwrap().is_some(), "kept");
 }
 
 #[tokio::test]
@@ -410,10 +410,10 @@ async fn a_refused_renewal_keeps_using_a_token_still_valid() {
         .mount(&server)
         .await;
 
-    aws_sso::credentials("valid", &config(), "111111111111", "Admin")
+    aws::sso::credentials("valid", &config(), "111111111111", "Admin")
         .await
         .unwrap();
-    assert!(aws_sso::session("valid").unwrap().is_some(), "kept");
+    assert!(aws::sso::session("valid").unwrap().is_some(), "kept");
 }
 
 /// Identity Center refuses the client with `kind`: the session ends and the
@@ -428,11 +428,11 @@ async fn refused_client_is_registered_again(integration: &str, kind: &str) {
         .mount(&server)
         .await;
 
-    let err = aws_sso::credentials(integration, &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials(integration, &config(), "111111111111", "Admin")
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
-    assert!(aws_sso::session(integration).unwrap().is_none());
+    assert!(aws::sso::session(integration).unwrap().is_none());
 
     device_login(&server, integration, 3600).await;
     let registers = server
@@ -492,7 +492,7 @@ async fn discovery_lists_every_account_and_role() {
         .mount(&server)
         .await;
 
-    let profiles = aws_sso::discover("discover", &config()).await.unwrap();
+    let profiles = aws::sso::discover("discover", &config()).await.unwrap();
     let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -517,9 +517,9 @@ async fn signing_out_ends_the_portal_session() {
         .mount(&server)
         .await;
 
-    assert!(aws_sso::end_session("logout", &config()).await.unwrap());
-    assert!(aws_sso::logout("logout").unwrap());
-    assert!(aws_sso::session("logout").unwrap().is_none());
+    assert!(aws::sso::end_session("logout", &config()).await.unwrap());
+    assert!(aws::sso::logout("logout").unwrap());
+    assert!(aws::sso::session("logout").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -543,7 +543,7 @@ async fn signing_out_renews_an_expired_token_to_end_the_session() {
         .mount(&server)
         .await;
 
-    assert!(aws_sso::end_session("stale", &config()).await.unwrap());
+    assert!(aws::sso::end_session("stale", &config()).await.unwrap());
 }
 
 #[tokio::test]
@@ -564,7 +564,7 @@ async fn signing_out_reports_a_renewal_that_fails_for_now() {
         .mount(&server)
         .await;
 
-    let err = aws_sso::end_session("later", &config()).await.unwrap_err();
+    let err = aws::sso::end_session("later", &config()).await.unwrap_err();
     let message = format!("{err:#}");
     assert!(
         message.contains("renewing the expired sign-in failed")
@@ -572,7 +572,7 @@ async fn signing_out_reports_a_renewal_that_fails_for_now() {
             && !message.contains("fob login"),
         "{message}"
     );
-    assert!(aws_sso::session("later").unwrap().is_some(), "kept");
+    assert!(aws::sso::session("later").unwrap().is_some(), "kept");
 }
 
 #[tokio::test]
@@ -592,7 +592,7 @@ async fn signing_out_of_an_ended_session_has_nothing_to_end() {
         .mount(&server)
         .await;
 
-    assert!(!aws_sso::end_session("gone", &config()).await.unwrap());
+    assert!(!aws::sso::end_session("gone", &config()).await.unwrap());
 }
 
 #[tokio::test]
@@ -613,7 +613,7 @@ async fn a_new_assignment_is_retried_until_it_applies() {
         .mount(&server)
         .await;
 
-    aws_sso::credentials("fresh", &config(), "111111111111", "Admin")
+    aws::sso::credentials("fresh", &config(), "111111111111", "Admin")
         .await
         .unwrap();
 }
@@ -629,7 +629,7 @@ async fn a_lasting_403_says_there_is_no_access() {
         .mount(&server)
         .await;
 
-    let err = aws_sso::credentials("denied", &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials("denied", &config(), "111111111111", "Admin")
         .await
         .unwrap_err()
         .to_string();
@@ -658,13 +658,13 @@ async fn a_renewal_refused_by_network_controls_keeps_the_session() {
         .mount(&server)
         .await;
 
-    let err = aws_sso::credentials("offvpn", &config(), "111111111111", "Admin")
+    let err = aws::sso::credentials("offvpn", &config(), "111111111111", "Admin")
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Other(_)), "{err}");
     let message = format!("{err:#}");
     assert!(message.contains("network controls refused"), "{message}");
-    assert!(aws_sso::session("offvpn").unwrap().is_some(), "kept");
+    assert!(aws::sso::session("offvpn").unwrap().is_some(), "kept");
 }
 
 #[tokio::test]
@@ -679,14 +679,14 @@ async fn a_portal_call_refused_by_network_controls_is_not_retried() {
             .mount_as_scoped(&server)
             .await;
 
-        let err = aws_sso::credentials("blocked", &config(), "111111111111", "Admin")
+        let err = aws::sso::credentials("blocked", &config(), "111111111111", "Admin")
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Other(_)), "{kind}: {err}");
         let message = format!("{err:#}");
         assert!(message.contains("network controls refused"), "{message}");
         assert!(
-            aws_sso::session("blocked").unwrap().is_some(),
+            aws::sso::session("blocked").unwrap().is_some(),
             "{kind}: kept"
         );
         drop(mock);
@@ -710,7 +710,7 @@ async fn the_aws_cli_endpoint_variables_reach_a_vpc_endpoint() {
         .mount(&server)
         .await;
 
-    let result = aws_sso::credentials("private", &config(), "111111111111", "Admin").await;
+    let result = aws::sso::credentials("private", &config(), "111111111111", "Admin").await;
     // SAFETY: as above.
     unsafe {
         std::env::remove_var("AWS_ENDPOINT_URL_SSO_OIDC");
@@ -771,7 +771,7 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
     else {
         unreachable!()
     };
-    let creds = aws_sso::chained_credentials("chain", &config, "prod", "chain/prod/Deploy", None)
+    let creds = aws::sso::chained_credentials("chain", &config, "prod", "chain/prod/Deploy", None)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACHAINED");
@@ -780,7 +780,7 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
         "no region configured"
     );
 
-    let err = aws_sso::chained_credentials(
+    let err = aws::sso::chained_credentials(
         "chain",
         &config,
         "prod",
@@ -899,9 +899,9 @@ fn role_creds() -> omnifob_core::Credentials {
 
 fn console_request(
     session_duration: Option<jiff::SignedDuration>,
-) -> aws_sso::ConsoleRequest<'static> {
-    aws_sso::ConsoleRequest {
-        partition: omnifob_core::providers::aws_partition::Partition::Aws,
+) -> aws::console::ConsoleRequest<'static> {
+    aws::console::ConsoleRequest {
+        partition: omnifob_core::providers::aws::partition::Partition::Aws,
         home_region: Some("eu-west-1"),
         region: Some("eu-west-1"),
         service: Some("ec2"),
@@ -932,11 +932,11 @@ async fn console_sign_in_posts_the_credentials_in_a_form() {
         .mount(&server)
         .await;
 
-    let url = aws_sso::console_url(&role_creds(), &console_request(None))
+    let url = aws::console::console_url(&role_creds(), &console_request(None))
         .await
         .unwrap();
     let eight_hours = jiff::SignedDuration::from_hours(8);
-    aws_sso::console_url(&role_creds(), &console_request(Some(eight_hours)))
+    aws::console::console_url(&role_creds(), &console_request(Some(eight_hours)))
         .await
         .unwrap();
 
@@ -986,7 +986,7 @@ async fn a_refused_console_session_length_says_why_without_the_credentials() {
         .await;
 
     let twelve_hours = jiff::SignedDuration::from_hours(12);
-    let error = aws_sso::console_url(&role_creds(), &console_request(Some(twelve_hours)))
+    let error = aws::console::console_url(&role_creds(), &console_request(Some(twelve_hours)))
         .await
         .unwrap_err();
     let error = format!("{error:#}");
@@ -998,7 +998,7 @@ async fn a_refused_console_session_length_says_why_without_the_credentials() {
 
     // A length the endpoint never accepts is refused before any request.
     let thirteen_hours = jiff::SignedDuration::from_hours(13);
-    let error = aws_sso::console_url(&role_creds(), &console_request(Some(thirteen_hours)))
+    let error = aws::console::console_url(&role_creds(), &console_request(Some(thirteen_hours)))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("12 hours"), "{error}");
@@ -1264,7 +1264,7 @@ async fn cross_partition_roles_exchange_a_web_identity_token() {
 
 /// Runs the flow once against what is mounted, and returns the error.
 async fn cross_partition_error(config: &AwsSsoConfig, integration: &str) -> String {
-    let error = aws_sso::cross_partition_credentials(integration, config, "gov", None)
+    let error = aws::cross_partition::cross_partition_credentials(integration, config, "gov", None)
         .await
         .unwrap_err();
     let error = format!("{error:#}");
@@ -1349,7 +1349,7 @@ async fn refused_token_requests_say_who_has_to_act() {
         .expect(1)
         .mount(&server)
         .await;
-    let creds = aws_sso::cross_partition_credentials("xp-token", &config, "gov", None)
+    let creds = aws::cross_partition::cross_partition_credentials("xp-token", &config, "gov", None)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
@@ -1427,9 +1427,10 @@ async fn refused_exchanges_show_the_tokens_claims() {
     // The SDK retries an unreachable issuer with the same token, up to
     // three attempts in all.
     mount("IDPCommunicationError", Some(1)).await;
-    let creds = aws_sso::cross_partition_credentials("xp-exchange", &config, "gov", None)
-        .await
-        .unwrap();
+    let creds =
+        aws::cross_partition::cross_partition_credentials("xp-exchange", &config, "gov", None)
+            .await
+            .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
     let requests = server.received_requests().await.unwrap();
     assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 1);
@@ -1449,9 +1450,10 @@ async fn refused_exchanges_show_the_tokens_claims() {
     // `ExpiredTokenException`.
     for code in ["ExpiredToken", "ExpiredTokenException"] {
         mount(code, Some(1)).await;
-        let creds = aws_sso::cross_partition_credentials("xp-exchange", &config, "gov", None)
-            .await
-            .unwrap();
+        let creds =
+            aws::cross_partition::cross_partition_credentials("xp-exchange", &config, "gov", None)
+                .await
+                .unwrap();
         assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAGOV");
         let requests = server.received_requests().await.unwrap();
         assert_eq!(count(&requests, "Action=GetWebIdentityToken"), 2, "{code}");

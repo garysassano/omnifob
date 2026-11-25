@@ -1,10 +1,7 @@
 //! Provider dispatch: each integration kind implements sign-in, discovery,
 //! credentials and a console link.
 
-pub mod aws_iam;
-pub mod aws_login;
-pub mod aws_partition;
-pub mod aws_sso;
+pub mod aws;
 pub mod azure;
 pub mod cloudflare;
 pub mod cloudflare_oauth;
@@ -14,7 +11,7 @@ pub mod token;
 use anyhow::Context;
 use jiff::Timestamp;
 
-use self::aws_partition::Partition;
+use self::aws::partition::Partition;
 use crate::{Config, Credentials, Error, Integration, Profile, Result, Target, store};
 
 /// Discovers every profile an integration offers.
@@ -26,9 +23,9 @@ pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profi
 
 async fn discover_unchecked(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
     match integration {
-        Integration::AwsSso(config) => aws_sso::discover(name, config).await,
-        Integration::AwsIam(config) => aws_iam::discover(name, config).await,
-        Integration::AwsLogin(config) => aws_login::discover(name, config),
+        Integration::AwsSso(config) => aws::sso::discover(name, config).await,
+        Integration::AwsIam(config) => aws::iam::discover(name, config).await,
+        Integration::AwsLogin(config) => aws::login::discover(name, config),
         Integration::Gcp(config) => gcp::discover(name, config).await,
         Integration::Azure(config) => azure::discover(name, config).await,
         Integration::Cloudflare(config) => {
@@ -94,9 +91,9 @@ pub async fn revoke_all(
 /// Removes the stored sign-in of an integration; returns whether one existed.
 pub fn logout(name: &str, integration: &Integration) -> anyhow::Result<bool> {
     match integration {
-        Integration::AwsSso(_) => aws_sso::logout(name),
-        Integration::AwsIam(_) => aws_iam::logout(name),
-        Integration::AwsLogin(_) => aws_login::logout(name),
+        Integration::AwsSso(_) => aws::sso::logout(name),
+        Integration::AwsIam(_) => aws::iam::logout(name),
+        Integration::AwsLogin(_) => aws::login::logout(name),
         Integration::Gcp(_) => gcp::logout(name),
         Integration::Azure(_) => azure::logout(name),
         Integration::Cloudflare(_) => cloudflare::logout(name),
@@ -119,7 +116,7 @@ pub enum SignIn {
 
 pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> {
     Ok(match integration {
-        Integration::AwsSso(_) => match aws_sso::session(name)? {
+        Integration::AwsSso(_) => match aws::sso::session(name)? {
             Some((expires_at, refreshable)) => SignIn::Session {
                 expires_at,
                 refreshable,
@@ -128,7 +125,7 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
         },
         // Renewed silently until the console sign-in ends (up to 12 hours),
         // which the session cannot tell.
-        Integration::AwsLogin(_) => match aws_login::session(name)? {
+        Integration::AwsLogin(_) => match aws::login::session(name)? {
             Some(expires_at) => SignIn::Session {
                 expires_at,
                 refreshable: true,
@@ -136,7 +133,7 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
             None => SignIn::SignedOut,
         },
         Integration::AwsIam(_) => {
-            if aws_iam::has_key(name)? {
+            if aws::iam::has_key(name)? {
                 SignIn::Token
             } else {
                 SignIn::SignedOut
@@ -340,21 +337,22 @@ async fn fetch(
                 role_name,
                 ..
             },
-        ) => aws_sso::credentials(&profile.integration, c, account_id, role_name).await?,
+        ) => aws::sso::credentials(&profile.integration, c, account_id, role_name).await?,
         (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
-            aws_sso::chained_credentials(&profile.integration, c, label, &profile.id, ttl).await?
+            aws::sso::chained_credentials(&profile.integration, c, label, &profile.id, ttl).await?
         }
         (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
-            aws_sso::cross_partition_credentials(&profile.integration, c, label, ttl).await?
+            aws::cross_partition::cross_partition_credentials(&profile.integration, c, label, ttl)
+                .await?
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
-            aws_iam::session_credentials(&profile.integration, c, &profile.id, ttl).await?
+            aws::iam::session_credentials(&profile.integration, c, &profile.id, ttl).await?
         }
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
-            aws_iam::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
+            aws::iam::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
         }
         (Integration::AwsLogin(c), Target::AwsLogin { .. }) => {
-            aws_login::credentials(&profile.integration, c, renew).await?
+            aws::login::credentials(&profile.integration, c, renew).await?
         }
         (Integration::Gcp(c), Target::Gcp { project_id, .. }) => {
             gcp::user_credentials(&profile.integration, c, project_id).await?
@@ -461,8 +459,8 @@ fn aws_console_partition(
             .with_context(|| format!("no role '{label}' in integration '{name}'; run `fob sync`"))?
             .partition(),
         (Integration::AwsSso(c), _) => Partition::of_region(&c.region),
-        (Integration::AwsIam(c), _) => Partition::of_region(aws_iam::sts_region(c)),
-        (Integration::AwsLogin(c), _) => aws_login::partition(c),
+        (Integration::AwsIam(c), _) => Partition::of_region(aws::iam::sts_region(c)),
+        (Integration::AwsLogin(c), _) => aws::login::partition(c),
         _ => anyhow::bail!("not an AWS profile"),
     }
 }
@@ -551,7 +549,7 @@ fn console_session_duration(
         _ => None,
     };
     if let Some(duration) = duration {
-        aws_sso::check_console_duration(duration)?;
+        aws::console::check_console_duration(duration)?;
     }
     Ok(duration)
 }
@@ -576,7 +574,7 @@ pub fn check_console_options(
     }
     console_session_duration(integration, profile, options)?;
     if let Some(service) = &options.service {
-        aws_sso::check_service(service)?;
+        aws::console::check_service(service)?;
     }
     if let Some(region) = &options.region {
         aws_console_partition(&profile.integration, integration, &profile.target)?
@@ -600,7 +598,7 @@ pub async fn console_url(
     let region = options.region.as_deref();
     Ok(match (integration, &profile.target) {
         (Integration::AwsSso(c), target @ (Target::Aws { .. } | Target::AwsChained { .. })) => {
-            let request = aws_sso::ConsoleRequest {
+            let request = aws::console::ConsoleRequest {
                 partition: aws_console_partition(&profile.integration, integration, target)?,
                 home_region: Some(&c.region),
                 region: region.or(match target {
@@ -610,7 +608,7 @@ pub async fn console_url(
                 service,
                 session_duration,
             };
-            aws_sso::console_url(creds, &request).await?
+            aws::console::console_url(creds, &request).await?
         }
         (Integration::AwsSso(c), target @ Target::AwsCrossPartition { label, .. }) => {
             let request = cross_partition_console_request(
@@ -623,32 +621,32 @@ pub async fn console_url(
                 options,
                 session_duration,
             )?;
-            aws_sso::console_url(creds, &request).await?
+            aws::console::console_url(creds, &request).await?
         }
         (Integration::AwsIam(c), target @ Target::AwsIamSession { .. }) => {
             let partition = aws_console_partition(&profile.integration, integration, target)?;
             let region = region.or(c.region.as_deref());
-            aws_iam::console_url(&profile.integration, c, partition, region, service).await?
+            aws::iam::console_url(&profile.integration, c, partition, region, service).await?
         }
         (Integration::AwsIam(c), target @ Target::AwsIamRole { .. }) => {
-            let request = aws_sso::ConsoleRequest {
+            let request = aws::console::ConsoleRequest {
                 partition: aws_console_partition(&profile.integration, integration, target)?,
                 home_region: c.region.as_deref(),
                 region: region.or(creds.env.get("AWS_REGION").map(String::as_str)),
                 service,
                 session_duration,
             };
-            aws_sso::console_url(creds, &request).await?
+            aws::console::console_url(creds, &request).await?
         }
         (Integration::AwsLogin(c), target @ Target::AwsLogin { .. }) => {
-            let request = aws_sso::ConsoleRequest {
+            let request = aws::console::ConsoleRequest {
                 partition: aws_console_partition(&profile.integration, integration, target)?,
                 home_region: Some(&c.region),
                 region: region.or(creds.env.get("AWS_REGION").map(String::as_str)),
                 service,
                 session_duration,
             };
-            aws_sso::console_url(creds, &request).await?
+            aws::console::console_url(creds, &request).await?
         }
         (Integration::Gcp(_), Target::Gcp { project_id, .. }) => {
             gcp::console_url(&profile.integration, Some(project_id))?
@@ -698,11 +696,11 @@ fn cross_partition_console_request<'a>(
     creds: &'a Credentials,
     options: &'a ConsoleOptions,
     session_duration: Option<jiff::SignedDuration>,
-) -> anyhow::Result<aws_sso::ConsoleRequest<'a>> {
+) -> anyhow::Result<aws::console::ConsoleRequest<'a>> {
     let role = config.cross_partition.get(label).with_context(|| {
         format!("no cross-partition role '{label}' in integration '{name}'; run `fob sync`")
     })?;
-    Ok(aws_sso::ConsoleRequest {
+    Ok(aws::console::ConsoleRequest {
         partition: aws_console_partition(name, integration, target)?,
         home_region: Some(&role.region),
         region: options
@@ -731,8 +729,8 @@ const KEEP_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_mins(15);
 /// an Azure one only for the configured tenant.
 pub async fn keepable_sign_in(name: &str, integration: &Integration) -> Option<String> {
     let scopes_match = match integration {
-        Integration::AwsSso(config) => aws_sso::session_has_scopes(name, config),
-        Integration::AwsLogin(config) => aws_login::session_matches(name, config),
+        Integration::AwsSso(config) => aws::sso::session_has_scopes(name, config),
+        Integration::AwsLogin(config) => aws::login::session_matches(name, config),
         Integration::Gcp(config) => gcp::session_matches(name, config),
         Integration::Azure(config) => azure::session_matches(name, config),
         Integration::Cloudflare(config) if config.uses_oauth() => {
@@ -769,9 +767,9 @@ pub async fn keepable_sign_in(name: &str, integration: &Integration) -> Option<S
 /// Checks that an integration's stored sign-in works, without signing in.
 pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<String> {
     match integration {
-        Integration::AwsSso(config) => aws_sso::check(name, config).await,
-        Integration::AwsIam(config) => aws_iam::check(name, config).await,
-        Integration::AwsLogin(config) => aws_login::check(name, config).await,
+        Integration::AwsSso(config) => aws::sso::check(name, config).await,
+        Integration::AwsIam(config) => aws::iam::check(name, config).await,
+        Integration::AwsLogin(config) => aws::login::check(name, config).await,
         Integration::Gcp(config) => gcp::check(name, config).await,
         Integration::Azure(_) => azure::check(name).await,
         Integration::Cloudflare(config) => cloudflare::check(name, config).await,
@@ -792,7 +790,7 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 .unwrap_or_else(|| c.region.clone());
             Ok(format!(
                 "acts as {}",
-                aws_sso::caller_identity(&creds, &region).await?.arn
+                aws::sts::caller_identity(&creds, &region).await?.arn
             ))
         }
         (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
@@ -806,7 +804,7 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
             })?;
             Ok(format!(
                 "acts as {}",
-                aws_sso::caller_identity(&creds, &role.region).await?.arn
+                aws::sts::caller_identity(&creds, &role.region).await?.arn
             ))
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. } | Target::AwsIamRole { .. }) => {
@@ -818,12 +816,12 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 .unwrap_or_else(|| "us-east-1".to_string());
             Ok(format!(
                 "acts as {}",
-                aws_sso::caller_identity(&creds, &region).await?.arn
+                aws::sts::caller_identity(&creds, &region).await?.arn
             ))
         }
         (Integration::AwsLogin(c), Target::AwsLogin { .. }) => Ok(format!(
             "acts as {}",
-            aws_sso::caller_identity(&creds, &c.region).await?.arn
+            aws::sts::caller_identity(&creds, &c.region).await?.arn
         )),
         (Integration::Gcp(_), Target::Gcp { .. } | Target::GcpServiceAccount { .. }) => {
             gcp::check_token(&creds).await
@@ -879,9 +877,9 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
         | Integration::Gcp(_)
         | Integration::Azure(_) => {
             let (from, to) = match integration {
-                Integration::AwsSso(_) => (aws_sso::keys(old), aws_sso::keys(new)),
-                Integration::AwsIam(_) => (aws_iam::keys(old), aws_iam::keys(new)),
-                Integration::AwsLogin(_) => (aws_login::keys(old), aws_login::keys(new)),
+                Integration::AwsSso(_) => (aws::sso::keys(old), aws::sso::keys(new)),
+                Integration::AwsIam(_) => (aws::iam::keys(old), aws::iam::keys(new)),
+                Integration::AwsLogin(_) => (aws::login::keys(old), aws::login::keys(new)),
                 Integration::Gcp(_) => (gcp::keys(old), gcp::keys(new)),
                 _ => (azure::keys(old), azure::keys(new)),
             };
@@ -1198,7 +1196,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            aws_sso::console_endpoints(&request).unwrap()
+            aws::console::console_endpoints(&request).unwrap()
         };
         let none = ConsoleOptions::default();
         for exported in [true, false] {

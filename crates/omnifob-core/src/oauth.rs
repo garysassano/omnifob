@@ -485,6 +485,19 @@ fn parse_callback(query: &str, state: &str, provider: &str) -> Option<anyhow::Re
     Some(param("code").context("the callback carries no code"))
 }
 
+/// Percent-encodes everything but RFC 3986's unreserved characters.
+pub(crate) fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
