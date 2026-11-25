@@ -51,12 +51,11 @@ fn is_executable(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
     fn programs_are_found_on_path_without_running_them() {
         // `sh` is on every Unix PATH the tests run with.
         assert!(on_path("sh"));
