@@ -81,6 +81,12 @@ A template lists `permissions` (required) and `optional` ones, which are added w
 fob cf add-template cf pages -p "Pages Edit" -p "Account Settings Read" --ttl 30m
 ```
 
+`--optional`, `--r2-bucket`, `--s3` and `--ip` (each repeatable but `--s3`) set the template's `optional`, `r2_buckets`, `s3` and `ips` (below), so a narrow template can be made without editing the config:
+
+```sh
+fob cf add-template cf assets -p "Workers R2 Storage Bucket Item Write" --r2-bucket assets --s3 --ip current
+```
+
 `--replace` overwrites a template of the same name. A template named like a built-in one replaces it for that integration.
 
 ## Narrower tokens

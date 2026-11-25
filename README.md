@@ -47,7 +47,7 @@ Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM 
 
 Integration names may contain only letters, digits, `.`, `_` and `-`, and may not start with `-`. A config with another name is refused with a pointer to `fob rename "<old name>" <new-name>`, which still works on it.
 
-`~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`):
+`~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`, or `--config <path>` on any command):
 
 ```toml
 [integrations.acme]
@@ -180,6 +180,8 @@ verify_url = "https://api.example.com/me"     # optional: must answer 2xx for th
 console = "https://console.example.com"
 ```
 
+`fob login <name>` asks for each secret. An integration with a single secret also takes it from the clipboard (`--from-clipboard`, which refuses an empty clipboard, text with whitespace and URLs) or from stdin (`--token-stdin`).
+
 ### Browsers
 
 Sign-ins and consoles open in the system's default browser. To keep each identity's sessions in a browser, or a browser profile, of its own, define the browsers once and name one in each integration with `browser`; it applies to `fob login` and `fob console` alike, and integrations without it keep the default.
@@ -222,18 +224,27 @@ fob login                 # pick the integration from a fuzzy list (fob logout t
 fob login acme --force    # sign in again even though the stored sign-in works
 fob login acme --device-code   # approve with a code on another device (automatic over SSH)
 fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...
+fob list prod admin       # only the profiles those words match
 fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare
 fob exec cf workers --ttl 4h -- wrangler dev   # longer-lived token for a long session
 fob exec cf workers --revoke -- wrangler deploy   # token for this command only, deleted when it ends
 fob cf add-template cf pages             # pick services and access levels, save a template
+fob cf add-template cf r2 -p "Workers R2 Storage Bucket Item Write" --r2-bucket assets --s3
 fob console prod admin    # opens the AWS console as that role
 fob console prod admin --service ec2 --region eu-west-1 --duration 8h
-fob status
-fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts)
+fob console prod admin --copy   # copy the sign-in URL instead (over SSH, to your terminal's clipboard)
+fob status                # sign-ins, profile counts, when each was synced, and the active profile
+fob status --json         # the same for scripts and status bars
+fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts, --json)
+fob check --integration acme   # only this sign-in
 fob check prod admin      # do this profile's credentials work, and what do they act as?
 fob rename acme work      # rename an integration; keeps its sign-in and profiles
+fob revoke --all          # delete every minted token and clear every cached credential
+fob logout --all          # sign out of every integration
 ```
+
+Without `browser`, URLs open in the system's default browser; on WSL without a Linux opener (`wslview`, `xdg-open`) that is Windows' default browser, through `explorer.exe`.
 
 ### The AWS console
 
@@ -245,7 +256,9 @@ fob rename acme work      # rename an integration; keeps its sign-in and profile
 
 Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
 
-`fob exec` exits with the command's status, or with 125 when fob itself fails, 127 when the command is not found and 126 when it cannot run, as `env` does.
+`fob exec` exits with the command's status, or with 125 when fob itself fails, 127 when the command is not found and 126 when it cannot run, as `env` does. A Windows exit code too large for the 0 to 255 range of `--revoke` runs is reported as 1 when its low byte would read as success; plain `fob exec` passes it on whole.
+
+The command gets the profile's variables, `OMNIFOB_PROFILE` and, when the credentials expire, `OMNIFOB_EXPIRES_AT`. What a `fob use` in the same shell exported and this profile does not set is removed, and so is `OMNIFOB_VARS`. When the profile hands out an AWS access key, the AWS credential variables it does not set (`AWS_SESSION_TOKEN`, `AWS_SECURITY_TOKEN`, `AWS_CREDENTIAL_EXPIRATION`, `AWS_ACCOUNT_ID`) and `AWS_ENDPOINT_URL_S3` are removed too, so a session token or an R2 endpoint left in the shell is not mixed with the new key. A Region you set yourself stays for a profile without one, but is replaced when the profile sets one (R2 sets `AWS_REGION=auto` and removes `AWS_DEFAULT_REGION`).
 
 ### In the current shell
 
@@ -257,7 +270,7 @@ fob activate fish | source      # fish
 fob activate powershell | Out-String | Invoke-Expression   # PowerShell
 ```
 
-Then `fob use prod admin` exports the credentials into the current shell, and `fob unuse` removes them. Switching profiles removes variables the previous one set and the new one does not.
+Then `fob use prod admin` exports the credentials into the current shell, and `fob unuse` removes them. Switching profiles removes variables the previous one set and the new one does not. `OMNIFOB_PROFILE` names the active profile and `OMNIFOB_EXPIRES_AT` (RFC 3339) says when its credentials expire, for a shell prompt; `fob status` shows both. `fob activate` and `fob unuse` work even when the config or `profiles.json` is broken, so a typo does not break every new shell. In PowerShell the wrapper finds the `fob` binary on `PATH`, so it works with `pwsh` on Linux and macOS too.
 
 The same line enables tab completion of commands, integration names and profile ids (`fob exec cf<TAB>`), read live from your discovered profiles. Only completion, without the `fob use` wrapper: `source <(COMPLETE=bash fob)`, `source <(COMPLETE=zsh fob)` or `COMPLETE=fish fob | source`.
 
@@ -291,7 +304,7 @@ create_command = "fob creds cf/personal/workers --format fnox"
 Coding agents run each command in a new shell with no one at the terminal, and whatever a command prints lands in the agent's context and its saved transcripts. fob recognises them by the variables they set (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`, `CURSOR_AGENT`, `COPILOT_AGENT_SESSION_ID`; set `OMNIFOB_AGENT=1` for another agent, or `OMNIFOB_AGENT=0` to turn this off) and then:
 
 - Does not print credentials: `fob creds` (JSON), `fob env` and `fob console --print` refuse and point to `fob exec`. `--format credential-process` and `--format fnox` still work, because the AWS SDKs and fnox run them inside the agent's commands and read the output themselves.
-- Never prompts, and takes a profile only by its full id (`fob list` shows them), so a command does what it says and permission rules can match it.
+- Never prompts, and takes a profile only by its full id (`fob list` shows them, marking those `[agent] profiles` keeps from agents with `(not open to agents)`, or `"open_to_agents": false` with `--json`), so a command does what it says and permission rules can match it.
 - Hands out only the profiles `[agent] profiles` allows, when it is set:
 
   ```toml
@@ -307,9 +320,9 @@ This guards against accidents, not against the agent, which runs as you; the har
 
 SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentials are kept in the OS keychain under the service `omnifob`: Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux. Where no Secret Service runs (WSL, servers), the kernel keyring is used, straight away when there is no D-Bus session bus; it forgets everything on reboot. On WSL, long-lived secrets are therefore also written to `~/.local/state/omnifob/vault`, encrypted with Windows DPAPI for your Windows user, and restored after a reboot (`OMNIFOB_WSL_DPAPI=0` turns this off). `OMNIFOB_KEYRING` forces a store; `fob status` shows which one is in use.
 
-Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json`. On Linux and macOS the state directory and the vault are readable by you only (`0700`, files `0600`), and every file in them is replaced atomically, so a concurrent `fob` never reads half of one.
+Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json`. If it cannot be read, `fob sync` and `fob login` start over from no profiles and rewrite it, and `fob status` and `fob logout` carry on with a warning. On Linux and macOS the state directory and the vault are readable by you only (`0700`, files `0600`), and every file in them is replaced atomically, so a concurrent `fob` never reads half of one.
 
-Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. Credentials asked for with `--ttl` are not cached, so the next command gets the configured lifetime again. `fob sync` deletes the cached credentials of profiles that went away. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
+Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. Credentials asked for with `--ttl` are not cached, so the next command gets the configured lifetime again. `fob sync` deletes the cached credentials of profiles that went away. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache; `fob revoke --all` does it for every profile, leaving the sign-ins. A renewal in the background is skipped for a chained role with `mfa_serial`, which needs a code each session; the next command that needs one asks for it. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
 
 ## Documentation
 

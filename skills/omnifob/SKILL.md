@@ -9,7 +9,7 @@ fob keeps the user's sign-ins and hands out short-lived credentials per profile.
 
 ## Running commands
 
-1. Find the profile: `fob list` (optionally `fob list <words>`). Ids look like `<integration>/<account>/<role or template>`, e.g. `acme/prod/ReadOnly`.
+1. Find the profile: `fob list` (optionally `fob list <words>`). Ids look like `<integration>/<account>/<role or template>`, e.g. `acme/prod/ReadOnly`. Profiles marked `(not open to agents)` are ones the user keeps from you; don't try them.
 2. Run the command with it, naming the profile by its full id:
 
    ```sh
@@ -38,4 +38,4 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 - "is not open to agents": the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
 - "needs a code from the MFA device": ask the user to run the `fob exec ... -- true` command it names in their terminal, then retry.
 - AWS `AccessDenied` right after the user was given access: Identity Center takes a minute to propagate; retry once, then report.
-- `fob check` (exit status 1 if a sign-in fails) and `fob check <profile>` (what the credentials act as) diagnose without printing secrets.
+- `fob check` (exit status 1 if a sign-in fails; `--integration <name>` for one, `--json` for structured output), `fob check <profile>` (what the credentials act as) and `fob status` diagnose without printing secrets.
