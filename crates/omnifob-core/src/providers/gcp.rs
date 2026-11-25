@@ -514,10 +514,11 @@ async fn list_projects_with(token: &str) -> anyhow::Result<Vec<Project>> {
         #[serde(default)]
         next_page_token: Option<String>,
     }
+    let http = crate::http::client();
     let mut projects = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
-        let mut request = crate::http::client()
+        let mut request = http
             .get(url(Endpoint::Projects))
             .bearer_auth(token)
             .query(&[("filter", "lifecycleState:ACTIVE")]);
