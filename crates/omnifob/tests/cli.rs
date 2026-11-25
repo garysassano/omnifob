@@ -635,6 +635,114 @@ async fn ambiguous_queries_list_the_matches() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn profiles_are_picked_by_account_and_role() {
+    let (fob, _server) = synced_portal("by-account").await;
+    let key = |args: &[&str]| {
+        let mut all = vec!["creds", "--format", "credential-process"];
+        all.extend_from_slice(args);
+        let (stdout, _) = fob.ok(&all);
+        serde_json::from_str::<Value>(&stdout).unwrap()["AccessKeyId"].clone()
+    };
+    assert_eq!(
+        key(&["--account-id", "111111111111", "--role", "admin"]),
+        "ASIA111111111111"
+    );
+    assert_eq!(key(&["--account-id", "222222222222"]), "ASIA222222222222");
+    let stderr = fob.fails(&["creds", "--role", "Admin"]);
+    assert!(
+        stderr.contains("'--role Admin' matches 2 profiles"),
+        "{stderr}"
+    );
+    let stderr = fob.fails(&["creds", "--account-id", "333333333333"]);
+    assert!(
+        stderr.contains("no profile matches '--account-id 333333333333'"),
+        "{stderr}"
+    );
+    assert!(
+        fob.fails(&["creds", "acme", "--role", "Admin"])
+            .contains("cannot be used with")
+    );
+    // An account and role that name one profile are exact enough for an agent.
+    let output = fob.run_as_agent(&[
+        "creds",
+        "--account-id",
+        "222222222222",
+        "--role",
+        "Admin",
+        "--format",
+        "credential-process",
+    ]);
+    assert!(output.status.success(), "{:?}", texts(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_picks_its_default_profile() {
+    let (fob, _server) = synced_portal("directories").await;
+    let project = fob.root.join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    let mut config = portal_config("acme");
+    config.push_str(&format!(
+        "\n[directories]\n'{}' = \"acme/prod/Admin\"\n'{}' = \"acme/dev/Admin\"\n",
+        fob.root.display(),
+        project.join("src").display()
+    ));
+    fob.write_config(&config);
+    let env_in = |dir: &Path| {
+        let output = fob
+            .command(&["env", "--shell", "bash"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = texts(&output);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        stdout
+    };
+    assert!(env_in(&project).contains("ASIA222222222222"));
+    // The longest directory wins.
+    assert!(env_in(&project.join("src")).contains("ASIA111111111111"));
+    // A named profile still wins over the directory's.
+    let output = fob
+        .command(&["env", "acme/dev/Admin", "--shell", "bash"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(texts(&output).0.contains("ASIA111111111111"));
+    // An agent has to name it, and is told which one it is.
+    let output = fob
+        .command(&["exec", "--", "true"])
+        .env("CLAUDECODE", "1")
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stderr = texts(&output).1;
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("name a profile by its full id; this directory's default")
+            && stderr.contains("is acme/prod/Admin"),
+        "{stderr}"
+    );
+    // A default that is not a profile says so.
+    let mut config = portal_config("acme");
+    config.push_str(&format!(
+        "\n[directories]\n'{}' = \"acme/gone/Admin\"\n",
+        project.display()
+    ));
+    fob.write_config(&config);
+    let output = fob
+        .command(&["env", "--shell", "bash"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        texts(&output)
+            .1
+            .contains("acme/gone/Admin, the default profile of"),
+        "{:?}",
+        texts(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn exec_tells_its_own_failures_from_the_command() {
     let (fob, _server) = synced_portal("exec-status").await;
     let status = |args: &[&str]| fob.run(args).status.code();

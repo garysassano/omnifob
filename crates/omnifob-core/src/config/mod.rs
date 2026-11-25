@@ -44,6 +44,12 @@ pub struct Config {
     /// The local audit log of credentials handed out.
     #[serde(default)]
     pub audit: AuditConfig,
+    /// Default profiles per directory: a directory (absolute, or starting
+    /// with `~/`) and the id of the profile that `fob exec` and `fob use`
+    /// pick in it, and in every directory below it, when no profile is
+    /// named. The longest matching directory wins.
+    #[serde(default)]
+    pub directories: BTreeMap<String, String>,
 }
 
 /// An identity source: something you sign in to once and that yields many
@@ -250,6 +256,11 @@ impl Config {
         if let Err(e) = config.agent.validate() {
             bail!("[agent] {e}");
         }
+        for (dir, profile) in &config.directories {
+            if let Err(e) = check_directory(dir, profile) {
+                bail!("[directories] {e}");
+            }
+        }
         for (name, browser) in &config.browsers {
             if let Err(e) = browser.validate() {
                 bail!("browser '{name}': {e}");
@@ -282,6 +293,32 @@ impl Config {
             .and_then(|browser| self.browsers.get(browser)))
     }
 
+    /// The default profile for directory `cwd` from `[directories]`: the
+    /// entry of the longest directory that is `cwd` or contains it, with the
+    /// directory as written. `~` stands for `home`. Directories compare by
+    /// whole components, and also as their real path when they hold a
+    /// symbolic link, since the working directory has none.
+    pub fn directory_profile(&self, cwd: &Path, home: Option<&Path>) -> Option<(&str, &str)> {
+        self.directories
+            .iter()
+            .filter_map(|(dir, profile)| {
+                let path = match dir.strip_prefix('~') {
+                    Some(rest) => home?.join(rest.trim_start_matches(['/', '\\'])),
+                    None => std::path::PathBuf::from(dir),
+                };
+                let real = std::fs::canonicalize(&path).ok();
+                let depth = [Some(path), real]
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| cwd.starts_with(p))
+                    .map(|p| p.components().count())
+                    .max()?;
+                Some((depth, dir.as_str(), profile.as_str()))
+            })
+            .max_by_key(|(depth, ..)| *depth)
+            .map(|(_, dir, profile)| (dir, profile))
+    }
+
     pub fn integration(&self, name: &str) -> anyhow::Result<&Integration> {
         self.integrations.get(name).with_context(|| {
             let known: Vec<_> = self.integrations.keys().map(String::as_str).collect();
@@ -291,6 +328,23 @@ impl Config {
             )
         })
     }
+}
+
+/// Fails unless a `[directories]` entry names an absolute directory, or
+/// one under `~/`, and a profile id.
+fn check_directory(dir: &str, profile: &str) -> Result<(), String> {
+    let home_relative = dir == "~" || dir.starts_with("~/") || dir.starts_with("~\\");
+    if !home_relative && !Path::new(dir).is_absolute() {
+        return Err(format!(
+            "'{dir}' must be an absolute directory or start with ~/"
+        ));
+    }
+    if profile.is_empty() || profile.split('/').any(str::is_empty) {
+        return Err(format!(
+            "'{dir}' must name a profile id, such as \"acme/prod/ReadOnly\""
+        ));
+    }
+    Ok(())
 }
 
 /// Fails unless `name` is non-empty, made of ASCII letters, digits, `.`, `_`
@@ -429,6 +483,56 @@ mod tests {
         assert!(Config::parse(&renamed).is_err(), "'b c' is still to fix");
         let renamed = rename_integration(&renamed, "b c", "b-c").unwrap();
         assert!(Config::parse(&renamed).is_ok());
+    }
+
+    #[test]
+    fn directories_pick_a_default_profile_by_longest_prefix() {
+        let root = std::env::temp_dir().join(format!("omnifob-dirs-{}", std::process::id()));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("git/acme/api")).unwrap();
+        let text = format!(
+            r#"
+            [directories]
+            "~/git/acme" = "acme/dev/Admin"
+            "~/git/acme/api" = "acme/prod/ReadOnly"
+            "{}" = "cf/personal/workers"
+            "#,
+            root.join("other").display().to_string().replace('\\', "/")
+        );
+        let config = Config::parse(&text).unwrap();
+        let pick = |cwd: &Path| config.directory_profile(cwd, Some(&home)).map(|(_, p)| p);
+        assert_eq!(pick(&home.join("git/acme")), Some("acme/dev/Admin"));
+        assert_eq!(pick(&home.join("git/acme/web/src")), Some("acme/dev/Admin"));
+        assert_eq!(
+            pick(&home.join("git/acme/api/src")),
+            Some("acme/prod/ReadOnly")
+        );
+        // Whole components only: acme-old is not under acme.
+        assert_eq!(pick(&home.join("git/acme-old")), None);
+        assert_eq!(pick(&root.join("other/x")), Some("cf/personal/workers"));
+        // Without a home directory, `~` entries match nothing.
+        assert_eq!(config.directory_profile(&home.join("git/acme"), None), None);
+        #[cfg(unix)]
+        {
+            // A configured directory that is a symbolic link matches its target.
+            std::os::unix::fs::symlink(home.join("git"), home.join("code")).unwrap();
+            let linked =
+                Config::parse("[directories]\n\"~/code/acme\" = \"acme/dev/Admin\"\n").unwrap();
+            assert_eq!(
+                linked.directory_profile(&home.join("git/acme/x"), Some(&home)),
+                Some(("~/code/acme", "acme/dev/Admin"))
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+
+        for (entry, message) in [
+            ("\"git/acme\" = \"a/b/c\"", "must be an absolute directory"),
+            ("\"~/x\" = \"\"", "must name a profile id"),
+            ("\"~/x\" = \"a//c\"", "must name a profile id"),
+        ] {
+            let error = parse_error(&format!("[directories]\n{entry}\n"));
+            assert!(error.contains(message), "{entry}: {error}");
+        }
     }
 
     #[test]

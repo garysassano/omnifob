@@ -230,6 +230,34 @@ isolate = "firefox-container"   # a container per fob profile, through the Grant
 
 `chromium-profile` replaces any `--profile-directory` in the command with `--profile-directory=fob <integration> <account> <role>`, which Chrome creates on first use and reuses after; delete one in Chrome's profile manager. `firefox-container` opens `ext+granted-containers:name=<profile id>&url=<console URL>`, which needs the [Granted Containers](https://addons.mozilla.org/en-US/firefox/addon/granted/) extension; the extension creates the container, named after the profile, the first time. Sign-ins and other providers' consoles keep opening as the command says, since they rely on the session already in that browser profile.
 
+Containers can be told apart at a glance by colour and icon, set per profile pattern (`*` matches within one part of the id, as in `[agent] profiles`); the first entry that matches wins, and unmatched containers get the extension's own colour:
+
+```toml
+[[browsers.personal.containers]]
+profiles = ["*/prod/*", "*/prod-*/*"]
+color = "red"         # blue, turquoise, green, yellow, orange, red, pink or purple
+icon = "fingerprint"  # fingerprint, briefcase, dollar, cart, circle, gift, vacation, food, fruit, pet, tree or chill
+
+[[browsers.personal.containers]]
+profiles = ["*/dev/*"]
+color = "green"
+```
+
+fob adds them to the URL as `color` and `icon`, which Granted Containers applies when it creates the container.
+
+### Default profiles per directory
+
+`[directories]` maps a directory to the profile `fob exec` and `fob use` pick in it, and below it, when you name none. The longest matching directory wins, and a named profile always beats it. The mapping lives in your own config, so repositories carry no integration names:
+
+```toml
+[directories]
+"~/git/acme" = "acme/dev/ReadOnly"
+"~/git/acme/billing" = "acme/prod-billing/ReadOnly"
+"/srv/deploy" = "acme/prod/Deploy"
+```
+
+`fob exec -- terraform plan` in `~/git/acme/billing/infra` then runs with `acme/prod-billing/ReadOnly`. Commands run by a coding agent still name the profile in full (the error says which one the directory would pick), so what they use stays in the command.
+
 ## Use
 
 ```sh
@@ -269,7 +297,7 @@ Without `browser`, URLs open in the system's default browser; on WSL without a L
 
 `--service` opens a console page, given as the path after the console host (`ec2`, `s3`, `lambda`, `cloudformation`, `route53/v2`), and `--region` the Region it opens in, which must be in the profile's partition; without it the profile's exported Region is used, if any.
 
-Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
+Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`), and `--account-id` with `--role` picks a profile without naming it at all, so a command written in a runbook works for colleagues whose integrations and accounts are named differently: `fob exec --account-id 123456789012 --role AdministratorAccess -- aws sts get-caller-identity` (also on `fob env`, `fob creds` and `fob console`). The account is the provider's (an AWS account, an Azure subscription, a Google Cloud project, a Cloudflare account) and the role is the last part of the id, ignoring case. With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
 
 `fob exec` exits with the command's status, or with 125 when fob itself fails (a config that does not load included), 127 when the command is not found and 126 when it cannot run, as `env` does. A Windows exit code too large for the 0 to 255 range is reported as 1 when its low byte would read as success in the runs fob waits for: `--revoke`, `--server`, `--token-file`, and Azure and Google profiles unless `--no-server`. Other `fob exec` runs pass it on whole.
 

@@ -16,11 +16,11 @@ pub(crate) enum Action {
 impl App {
     pub(crate) async fn console(
         &mut self,
-        query: Option<&str>,
+        pick: crate::sync::Pick<'_>,
         action: Action,
         options: &providers::ConsoleOptions,
     ) -> anyhow::Result<()> {
-        let profile = self.select(query).await?;
+        let profile = self.select(pick).await?;
         // The URL signs in as the profile: a credential like any other.
         // Over SSH, copying writes it to the terminal, which an agent reads.
         if crate::agent::active()

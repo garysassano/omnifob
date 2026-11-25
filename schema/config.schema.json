@@ -49,6 +49,13 @@
           },
           "type": "array"
         },
+        "containers": {
+          "description": "The colour and icon of the Firefox containers of the profiles each\nentry matches, the first match winning (`isolate =\n\"firefox-container\"`). Unmatched containers get the extension's own.",
+          "items": {
+            "$ref": "#/definitions/ContainerStyle"
+          },
+          "type": "array"
+        },
         "isolate": {
           "$ref": "#/definitions/Isolation",
           "description": "Opens each AWS profile's console apart from the others, so that\nsigning in as one does not sign the console out of another."
@@ -169,6 +176,61 @@
           "type": "string"
         }
       ]
+    },
+    "ContainerColor": {
+      "description": "The colours Firefox containers come in, as Granted Containers takes them.",
+      "enum": [
+        "blue",
+        "turquoise",
+        "green",
+        "yellow",
+        "orange",
+        "red",
+        "pink",
+        "purple"
+      ],
+      "type": "string"
+    },
+    "ContainerIcon": {
+      "description": "The icons Firefox containers come with, as Granted Containers takes them.",
+      "enum": [
+        "fingerprint",
+        "briefcase",
+        "dollar",
+        "cart",
+        "circle",
+        "gift",
+        "vacation",
+        "food",
+        "fruit",
+        "pet",
+        "tree",
+        "chill"
+      ],
+      "type": "string"
+    },
+    "ContainerStyle": {
+      "additionalProperties": false,
+      "description": "How the Firefox containers of some profiles look, e.g. red with a\nfingerprint for `*/prod/*`.",
+      "properties": {
+        "color": {
+          "$ref": "#/definitions/ContainerColor"
+        },
+        "icon": {
+          "$ref": "#/definitions/ContainerIcon"
+        },
+        "profiles": {
+          "description": "Profile ids this applies to, as patterns in which `*` stands for any\ncharacters within one `/`-separated segment, as in `[agent]\nprofiles`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "type": "object"
     },
     "CrossPartitionRole": {
       "additionalProperties": false,
@@ -741,6 +803,14 @@
         "$ref": "#/definitions/Browser"
       },
       "description": "Browsers, or profiles of one browser, that integrations open in,\nkeyed by the name their `browser` key refers to.",
+      "type": "object"
+    },
+    "directories": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Default profiles per directory: a directory (absolute, or starting\nwith `~/`) and the id of the profile that `fob exec` and `fob use`\npick in it, and in every directory below it, when no profile is\nnamed. The longest matching directory wins.",
       "type": "object"
     },
     "integrations": {

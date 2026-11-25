@@ -238,6 +238,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::List { query: words, json } => app.list(query(&words).as_deref(), json).await?,
         Command::Env {
             profile,
+            by,
             shell,
             unset,
             no_cache,
@@ -246,7 +247,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             debug_assert!(!unset, "handled before loading the config");
             let previous = std::env::var("OMNIFOB_VARS").unwrap_or_default();
             let previous: Vec<&str> = previous.split(',').filter(|v| !v.is_empty()).collect();
-            let profile = app.select(query(&profile).as_deref()).await?;
+            // `fob use` runs `fob env`, so both take the directory's default.
+            let words = query(&profile);
+            let pick = sync::Pick {
+                directory_default: true,
+                ..by.pick(&words)
+            };
+            let profile = app.select(pick).await?;
             if agent::active() {
                 return Err(agent::refuse_to_print(&profile.id));
             }
@@ -256,6 +263,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Exec {
             profile,
+            by,
             no_cache,
             ttl,
             revoke,
@@ -269,8 +277,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 no_server,
                 token_file,
             };
+            let words = query(&profile);
             let result = async {
-                let profile = app.select(query(&profile).as_deref()).await?;
+                let pick = sync::Pick {
+                    directory_default: true,
+                    ..by.pick(&words)
+                };
+                let profile = app.select(pick).await?;
                 // Under an agent with `[agent] auto_revoke`, each command
                 // gets a Cloudflare token of its own, deleted afterwards.
                 let auto_revoke = agent::active()
@@ -300,6 +313,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Console {
             profile,
+            by,
             print,
             copy,
             duration,
@@ -318,18 +332,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 console::Action::Open
             };
-            app.console(query(&profile).as_deref(), action, &options)
-                .await?
+            let words = query(&profile);
+            app.console(by.pick(&words), action, &options).await?
         }
         Command::Creds {
             profile,
+            by,
             format,
             cluster,
             region,
             no_cache,
             ttl,
         } => {
-            let profile = app.select(query(&profile).as_deref()).await?;
+            let words = query(&profile);
+            let profile = app.select(by.pick(&words)).await?;
             // credential_process, fnox, Google's libraries and kubectl run
             // fob inside the agent's own commands and hand the output to a
             // program, not to the agent.

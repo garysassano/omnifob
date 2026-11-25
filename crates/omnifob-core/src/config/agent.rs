@@ -71,7 +71,7 @@ pub struct AuditConfig {
 /// Whether `id` matches `pattern`, in which `*` matches any run of characters
 /// other than `/`: both have the same number of `/`-separated segments, and
 /// each segment matches its pattern segment.
-fn matches_pattern(pattern: &str, id: &str) -> bool {
+pub(crate) fn matches_pattern(pattern: &str, id: &str) -> bool {
     let (mut patterns, mut segments) = (pattern.split('/'), id.split('/'));
     loop {
         match (patterns.next(), segments.next()) {
