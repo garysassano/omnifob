@@ -1025,6 +1025,7 @@ mod tests {
             r#"
             [integrations.user]
             type = "aws-iam"
+            region = "cn-north-1"
             [integrations.user.roles.cn]
             role_arn = "arn:aws-cn:iam::333333333333:role/Admin"
             "#,
@@ -1051,7 +1052,7 @@ mod tests {
                 Target::AwsIamSession {
                     account_id: "444444444444".into(),
                 },
-                Partition::Aws,
+                Partition::China,
             ),
             (
                 user,

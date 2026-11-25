@@ -242,11 +242,11 @@ pub(crate) fn import_aws(
         print!("{toml}");
         eprintln!(
             "fob: review the names, then run again with --write to append them to {}{key_hint}",
-            paths::config_file().display()
+            paths::config_file()?.display()
         );
         return Ok(());
     }
-    let path = paths::config_file();
+    let path = paths::config_file()?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

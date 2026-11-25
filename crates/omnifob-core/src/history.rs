@@ -16,8 +16,8 @@ pub struct History {
     pub used: BTreeMap<String, Timestamp>,
 }
 
-pub fn file() -> PathBuf {
-    crate::paths::state_dir().join("history.json")
+pub fn file() -> anyhow::Result<PathBuf> {
+    Ok(crate::paths::state_dir()?.join("history.json"))
 }
 
 impl History {

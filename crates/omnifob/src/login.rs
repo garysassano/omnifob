@@ -34,7 +34,7 @@ impl App {
         if names.is_empty() {
             bail!(
                 "no integrations configured in {}",
-                omnifob_core::paths::config_file().display()
+                omnifob_core::paths::config_file()?.display()
             );
         }
         if agent::active() || !interactive() {
@@ -43,7 +43,7 @@ impl App {
                 names.join(", ")
             );
         }
-        let history = History::load(&history::file());
+        let history = History::load(&history::file()?);
         let last_used = |name: &str| {
             self.cache
                 .all()
@@ -416,7 +416,7 @@ impl App {
         if names.is_empty() {
             bail!(
                 "no integrations configured in {}",
-                omnifob_core::paths::config_file().display()
+                omnifob_core::paths::config_file()?.display()
             );
         }
         let mut failed = Vec::new();

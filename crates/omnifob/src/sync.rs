@@ -20,7 +20,7 @@ impl App {
         if names.is_empty() {
             bail!(
                 "no integrations configured in {}",
-                paths::config_file().display()
+                paths::config_file()?.display()
             );
         }
         let integrations = names
@@ -74,7 +74,7 @@ impl App {
         self.cache
             .integrations
             .retain(|name, _| self.config.integrations.contains_key(name));
-        self.cache.save(&profiles_file())?;
+        self.cache.save(&profiles_file()?)?;
         // Profiles that went away leave no cached credentials behind.
         providers::forget_removed_credentials(
             &before,
@@ -143,7 +143,7 @@ impl App {
                 Err(e) => skipped.0.push(format!("skipping '{name}': {e:#}")),
             }
         }
-        self.cache.save(&profiles_file())?;
+        self.cache.save(&profiles_file()?)?;
         Ok(skipped)
     }
 
@@ -193,7 +193,7 @@ impl App {
             None => self.cache.all().collect(),
         };
         // Recently used profiles first, in the picker and in error messages.
-        History::load(&history::file()).sort_recent_first(&mut candidates, |p| p.id.as_str());
+        History::load(&history::file()?).sort_recent_first(&mut candidates, |p| p.id.as_str());
         if candidates.is_empty() {
             // Only now can a skipped integration be the reason.
             skipped.report();

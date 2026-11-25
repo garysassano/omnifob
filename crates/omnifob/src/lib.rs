@@ -152,7 +152,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
     // A config named with `--config` has to exist, so a mistyped path is not
     // taken for an empty config. `fob import --write` may create it.
-    let config_file = paths::config_file();
+    let config_file = paths::config_file()?;
     if cli.config.is_some()
         && !matches!(cli.command, Command::Import(_))
         && matches!(std::fs::metadata(&config_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -360,7 +360,7 @@ fn load_profiles(command: &Command) -> anyhow::Result<ProfileCache> {
         | Command::Revoke { all: true, .. } => true,
         _ => false,
     };
-    match ProfileCache::load(&profiles_file()) {
+    match profiles_file().and_then(|file| ProfileCache::load(&file)) {
         Err(e) if tolerant => {
             eprintln!("fob: ignoring the discovered profiles: {e:#}");
             Ok(ProfileCache::default())
@@ -376,7 +376,9 @@ fn query(words: &[String]) -> Option<String> {
 
 /// Remembers that a profile was used, for the picker's ordering.
 fn record_use(profile_id: &str) {
-    let path = history::file();
+    let Ok(path) = history::file() else {
+        return;
+    };
     let mut history = History::load(&path);
     history.record(profile_id, Timestamp::now());
     if let Err(e) = history.save(&path) {
@@ -384,8 +386,8 @@ fn record_use(profile_id: &str) {
     }
 }
 
-fn profiles_file() -> std::path::PathBuf {
-    paths::state_dir().join("profiles.json")
+fn profiles_file() -> anyhow::Result<std::path::PathBuf> {
+    Ok(paths::state_dir()?.join("profiles.json"))
 }
 
 impl App {

@@ -842,11 +842,11 @@ impl SignedIn {
     }
 
     fn catalog_file() -> PathBuf {
-        paths::state_dir().join("cloudflare-cf.json")
+        paths::state_dir().unwrap().join("cloudflare-cf.json")
     }
 
     fn save_catalog(catalog: &Catalog) {
-        std::fs::create_dir_all(paths::state_dir()).unwrap();
+        std::fs::create_dir_all(paths::state_dir().unwrap()).unwrap();
         std::fs::write(
             Self::catalog_file(),
             serde_json::to_string(catalog).unwrap(),
@@ -1120,7 +1120,7 @@ async fn renaming_files_the_minted_tokens_under_the_new_name_and_back() {
     cloudflare::rename_catalog("cf", "cf2").unwrap();
     assert!(!SignedIn::catalog_file().exists());
     let moved: Catalog = serde_json::from_str(
-        &std::fs::read_to_string(paths::state_dir().join("cloudflare-cf2.json")).unwrap(),
+        &std::fs::read_to_string(paths::state_dir().unwrap().join("cloudflare-cf2.json")).unwrap(),
     )
     .unwrap();
     let keys: Vec<_> = moved.minted.keys().cloned().collect();

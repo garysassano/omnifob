@@ -8,7 +8,7 @@ use crate::{App, profiles_file};
 
 impl App {
     pub(crate) fn rename(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
-        let path = paths::config_file();
+        let path = paths::config_file()?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let renamed = omnifob_core::config::rename_integration(&text, old, new)?;
@@ -24,7 +24,7 @@ impl App {
             return Err(e);
         }
         self.cache.rename_integration(old, new);
-        self.cache.save(&profiles_file())?;
+        self.cache.save(&profiles_file()?)?;
 
         let kept = if moved {
             "kept the sign-in"

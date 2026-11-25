@@ -926,7 +926,7 @@ credential_process = /usr/bin/creds
 
         // A profile that is its own source assumes the role with its own key.
         let own = aws_import(
-            "[profile self]\naws_access_key_id = AKIAEXAMPLEKEYID0002\nrole_arn = arn:aws:iam::1:role/R\nsource_profile = self\n",
+            "[profile self]\naws_access_key_id = AKIAEXAMPLEKEYID0002\nrole_arn = arn:aws:iam::111111111111:role/R\nsource_profile = self\n",
         );
         assert_eq!(own.iam_users.len(), 1, "{own:#?}");
         assert!(own.skipped.is_empty());
@@ -1052,8 +1052,8 @@ credential_process = /usr/bin/creds
     fn dotted_names_stay_one_key() {
         let import = aws_import(
             "[profile john.doe]\nregion = eu-west-1\n\
-             [profile john.doe-admin]\nrole_arn = arn:aws:iam::1:role/Admin\nsource_profile = john.doe\n\
-             [profile p]\nsso_session = acme.prod\nsso_account_id = 1\nsso_role_name = Admin\n\
+             [profile john.doe-admin]\nrole_arn = arn:aws:iam::111111111111:role/Admin\nsource_profile = john.doe\n\
+             [profile p]\nsso_session = acme.prod\nsso_account_id = 111111111111\nsso_role_name = Admin\n\
              [profile p.deploy]\nrole_arn = arn:aws:iam::222222222222:role/Deploy\nsource_profile = p\n\
              [sso-session acme.prod]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = eu-west-1\n",
         );
@@ -1093,7 +1093,7 @@ credential_process = /usr/bin/creds
         };
         assert_eq!(
             user.roles["john.doe-admin"].role_arn,
-            "arn:aws:iam::1:role/Admin"
+            "arn:aws:iam::111111111111:role/Admin"
         );
     }
 

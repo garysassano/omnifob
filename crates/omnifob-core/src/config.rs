@@ -292,13 +292,17 @@ impl TryFrom<RawIntegration> for Integration {
                 Integration::Gcp(c)
             }
             RawIntegration::Azure(c) => Integration::Azure(c),
-            RawIntegration::Token(c) => Integration::Token(c),
+            RawIntegration::Token(c) => {
+                c.validate()?;
+                Integration::Token(c)
+            }
             RawIntegration::CloudflareToken(c) => {
                 if c.client_id.is_some() || c.scopes.is_some() {
                     return Err(
                         "client_id and scopes belong to type = \"cloudflare-oauth\"".to_string()
                     );
                 }
+                c.validate()?;
                 Integration::Cloudflare(c)
             }
             RawIntegration::CloudflareOauth(mut c) => {
@@ -308,6 +312,7 @@ impl TryFrom<RawIntegration> for Integration {
                         .to_string());
                 }
                 c.sign_in = CloudflareSignIn::Oauth;
+                c.validate()?;
                 Integration::Cloudflare(c)
             }
         })
@@ -353,15 +358,22 @@ pub struct AwsSsoConfig {
 
 impl AwsSsoConfig {
     fn validate(&self) -> Result<(), String> {
+        check_https_url("start_url", &self.start_url)?;
         check_region("region", &self.region)?;
         if let Some(region) = &self.default_region {
             check_region("default_region", region)?;
+        }
+        if self.scopes.is_empty() || self.scopes.iter().any(|s| s.trim().is_empty()) {
+            return Err(
+                "scopes must name at least one scope, and none may be empty; leave it out for                  the default, [\"sso:account:access\"]"
+                    .to_string(),
+            );
         }
         for (label, role) in &self.chained {
             if let Some(region) = &role.region {
                 check_region(&format!("chained.{label}.region"), region)?;
             }
-            self.check_chained_arn(role)
+            role.validate(&self.region)
                 .map_err(|e| format!("chained.{label}: {e}"))?;
         }
         for (label, role) in &self.cross_partition {
@@ -372,13 +384,10 @@ impl AwsSsoConfig {
         check_console_duration("console_duration", self.console_duration)
     }
 
-    fn check_chained_arn(&self, role: &ChainedRole) -> Result<(), String> {
-        check_chained_role_arn(&role.role_arn, &self.region)
-    }
-
-    /// Fails when a cross-partition role would get the same profile id as a
-    /// chained role or another cross-partition role, which the config alone
-    /// shows. Collisions with Identity Center roles appear only at discovery.
+    /// Fails when two configured roles, chained or cross-partition, would get
+    /// the same profile id, which the config alone shows: labels become
+    /// lowercase in ids, so `Prod` and `prod` collide. Collisions with
+    /// Identity Center roles appear only at discovery.
     fn check_profile_ids(&self) -> Result<(), String> {
         let chained = self
             .chained
@@ -388,19 +397,7 @@ impl AwsSsoConfig {
             .cross_partition
             .iter()
             .map(|(label, role)| ("cross_partition", label, role.role_name()));
-        let mut seen: BTreeMap<String, (&str, &String)> = BTreeMap::new();
-        for (table, label, role_name) in chained.chain(cross) {
-            let id = format!("{}/{role_name}", crate::profile::slug(label));
-            if let Some((other_table, other_label)) = seen.insert(id.clone(), (table, label))
-                && table == "cross_partition"
-            {
-                return Err(format!(
-                    "{other_table}.{other_label} and {table}.{label} would both be the profile \
-                     <integration>/{id}; rename one of them"
-                ));
-            }
-        }
-        Ok(())
+        check_unique_ids(chained.chain(cross))
     }
 
     /// The Region a cross-partition role's token is requested in, when the
@@ -431,6 +428,70 @@ pub(crate) fn check_chained_role_arn(role_arn: &str, portal_region: &str) -> Res
             "role_arn is in the {partition} partition, but the portal and its roles are in \
              {portal}; AssumeRole cannot cross partitions, so configure this role under \
              `cross_partition` instead"
+        ));
+    }
+    Ok(())
+}
+
+/// Fails when two configured entries, given as `(table, label, leaf)`,
+/// would get the same profile id `<integration>/<slug of label>/<leaf>`,
+/// naming both keys.
+fn check_unique_ids<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a String, &'a str)>,
+) -> Result<(), String> {
+    let mut seen: BTreeMap<String, (&str, &String)> = BTreeMap::new();
+    for (table, label, leaf) in entries {
+        let id = format!("{}/{leaf}", crate::profile::slug(label));
+        if let Some((other_table, other_label)) = seen.insert(id.clone(), (table, label)) {
+            return Err(format!(
+                "{other_table}.{other_label} and {table}.{label} would both be the profile \
+                 <integration>/{id}; rename one of them"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fails unless `value` is a 12-digit AWS account ID, naming the key.
+fn check_account_id(key: &str, value: &str) -> Result<(), String> {
+    if value.len() != 12 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{key} '{value}' must be a 12-digit AWS account ID"));
+    }
+    Ok(())
+}
+
+/// Fails unless `value` is an `https://` URL with a host, naming the key.
+fn check_https_url(key: &str, value: &str) -> Result<(), String> {
+    let url = parse_url(key, value)?;
+    if url.scheme() != "https" {
+        return Err(format!("{key} '{value}' must be an https:// URL"));
+    }
+    Ok(())
+}
+
+/// `value` as an absolute `http(s)://` URL with a host, naming the key.
+fn parse_url(key: &str, value: &str) -> Result<reqwest::Url, String> {
+    let url =
+        reqwest::Url::parse(value).map_err(|e| format!("{key} '{value}' is not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
+        return Err(format!(
+            "{key} '{value}' must be an http:// or https:// URL"
+        ));
+    }
+    Ok(url)
+}
+
+/// Fails unless `region` is in the partition of `role_arn`, when both are
+/// in partitions omnifob models: a role's credentials work only in its own
+/// partition, and STS is called in that Region.
+fn check_region_partition(key: &str, region: &str, role_arn: &str) -> Result<(), String> {
+    let (Ok(role), Ok(of_region)) = (Partition::of_arn(role_arn), Partition::of_region(region))
+    else {
+        return Ok(());
+    };
+    if role != of_region {
+        return Err(format!(
+            "{key} {region} is in the {of_region} partition, but role_arn is in {role}"
         ));
     }
     Ok(())
@@ -499,6 +560,34 @@ impl ChainedRole {
     /// The partition in `role_arn`.
     pub fn partition(&self) -> anyhow::Result<Partition> {
         Partition::of_arn(&self.role_arn)
+    }
+
+    /// The checks `[integrations.<name>.chained.<label>]` gets when the
+    /// config loads, for a portal in `portal_region`; `fob import aws`
+    /// skips a role that fails them, with the reason. The shape of `region`
+    /// is checked by the caller, which names the whole key.
+    pub(crate) fn validate(&self, portal_region: &str) -> Result<(), String> {
+        check_account_id("via_account_id", &self.via_account_id)?;
+        if self.via_role.trim().is_empty() {
+            return Err("via_role must name the Identity Center role (permission set)".into());
+        }
+        check_chained_role_arn(&self.role_arn, portal_region)?;
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
+            check_region_partition("region", region, &self.role_arn)?;
+        }
+        if let Some(name) = &self.session_name {
+            check_session_name(name)?;
+        }
+        if let Some(d) = self.duration
+            && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(1)).contains(&d)
+        {
+            return Err(
+                "duration must be between 15m and 1h: AWS caps role-chaining sessions at one hour"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -614,14 +703,7 @@ impl CrossPartitionRole {
 
     fn validate(&self, label: &str, portal: &AwsSsoConfig) -> Result<(), String> {
         check_name("the label", label).map_err(|e| e.to_string())?;
-        if self.via_account_id.len() != 12
-            || !self.via_account_id.bytes().all(|b| b.is_ascii_digit())
-        {
-            return Err(format!(
-                "via_account_id '{}' must be a 12-digit AWS account ID",
-                self.via_account_id
-            ));
-        }
+        check_account_id("via_account_id", &self.via_account_id)?;
         if self.via_role.is_empty() {
             return Err("via_role must name the Identity Center role (permission set)".into());
         }
@@ -787,6 +869,8 @@ impl AwsIamConfig {
             if let Some(region) = &role.region {
                 check_region(&format!("roles.{label}.region"), region)?;
             }
+            role.validate(self.region.as_deref())
+                .map_err(|e| format!("roles.{label}: {e}"))?;
         }
         if let Some(d) = self.session_duration
             && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(36)).contains(&d)
@@ -806,7 +890,23 @@ impl AwsIamConfig {
                 role.console_duration,
             )?;
         }
-        Ok(())
+        self.check_profile_ids()
+    }
+
+    /// Fails when two roles, or a role and the user's session profile
+    /// (`<account>/session`), would get the same profile id. Without
+    /// `account` the session's id holds the account ID, known only at
+    /// discovery, which checks it then.
+    fn check_profile_ids(&self) -> Result<(), String> {
+        let session = self
+            .account
+            .as_ref()
+            .map(|account| ("account", account, "session"));
+        let roles = self
+            .roles
+            .iter()
+            .map(|(label, role)| ("roles", label, role.role_name()));
+        check_unique_ids(session.into_iter().chain(roles))
     }
 }
 
@@ -890,6 +990,37 @@ impl IamRole {
     pub fn partition(&self) -> anyhow::Result<Partition> {
         Partition::of_arn(&self.role_arn)
     }
+
+    /// The checks `[integrations.<name>.roles.<label>]` gets when the config
+    /// loads, for a user whose STS Region is `user_region` (us-east-1 when
+    /// unset); `fob import aws` skips a role that fails them, with the
+    /// reason. The shape of `region` is checked by the caller, which names
+    /// the whole key.
+    pub(crate) fn validate(&self, user_region: Option<&str>) -> Result<(), String> {
+        check_role_arn(&self.role_arn)?;
+        // The role is assumed with the user's session, in the user's
+        // partition; AssumeRole cannot leave it. A user in an isolated
+        // partition, which `Partition` does not model, gets the shape check
+        // only, as a chained role's portal does.
+        let sts_region = user_region.unwrap_or("us-east-1");
+        if let Ok(user) = Partition::of_region(sts_region) {
+            let role = Partition::of_arn(&self.role_arn).map_err(|e| format!("role_arn: {e:#}"))?;
+            if user != role {
+                return Err(format!(
+                    "role_arn is in the {role} partition, but the user's STS Region {sts_region} is \
+                     in {user}; AssumeRole cannot cross partitions"
+                ));
+            }
+        }
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
+            check_region_partition("region", region, &self.role_arn)?;
+        }
+        if let Some(name) = &self.session_name {
+            check_session_name(name)?;
+        }
+        Ok(())
+    }
 }
 
 /// A Google account (`type = "gcp"`), signed in the way `gcloud auth login`
@@ -924,10 +1055,12 @@ impl GcpConfig {
             return Err("client_id and client_secret go together".to_string());
         }
         for (label, sa) in &self.service_accounts {
-            if !sa.email.contains('@') {
-                return Err(format!(
-                    "service_accounts.{label}.email must be a service account's email"
-                ));
+            check_service_account_email(&format!("service_accounts.{label}.email"), &sa.email)?;
+            for delegate in &sa.delegates {
+                check_service_account_email(
+                    &format!("service_accounts.{label}.delegates"),
+                    delegate,
+                )?;
             }
             if let Some(d) = sa.lifetime
                 && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(12)).contains(&d)
@@ -937,8 +1070,31 @@ impl GcpConfig {
                 ));
             }
         }
-        Ok(())
+        check_unique_ids(
+            self.service_accounts
+                .iter()
+                .map(|(label, sa)| ("service_accounts", label, sa.name())),
+        )
     }
+}
+
+/// Fails unless `email` looks like a service account's email: one `@`
+/// between non-empty parts, and none of the characters that would change
+/// the IAM Credentials URL it goes into (`/`, `?`, `#`, `%`), whitespace or
+/// control characters.
+fn check_service_account_email(key: &str, email: &str) -> Result<(), String> {
+    let well_formed = email.split_once('@').is_some_and(|(name, domain)| {
+        !name.is_empty() && !domain.is_empty() && !domain.contains('@')
+    }) && !email
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '%'));
+    if !well_formed {
+        return Err(format!(
+            "{key} '{email}' must be a service account's email, such as \
+             name@project.iam.gserviceaccount.com"
+        ));
+    }
+    Ok(())
 }
 
 /// A service account the signed-in account impersonates, which needs the
@@ -1034,6 +1190,81 @@ pub struct TokenConfig {
     pub browser: Option<String>,
 }
 
+impl TokenConfig {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.preset {
+            crate::providers::token::preset(name).map_err(|e| format!("preset: {e}"))?;
+        } else if self.secrets.is_empty() {
+            return Err(
+                "a token integration needs a `preset` or a `secrets` table naming its secrets"
+                    .to_string(),
+            );
+        }
+        for (name, vars) in &self.secrets {
+            if name.trim().is_empty() {
+                return Err("secrets: a secret's name must not be empty".to_string());
+            }
+            if vars.is_empty() {
+                return Err(format!(
+                    "secrets.{name} must list the environment variables that receive it"
+                ));
+            }
+            for var in vars {
+                check_var_name(&format!("secrets.{name}"), var)?;
+            }
+        }
+        for var in self.vars.keys() {
+            check_var_name("vars", var)?;
+        }
+        if let Some(url) = &self.verify_url {
+            let parsed = parse_url("verify_url", url)?;
+            // The token goes to this URL: only over TLS, or to this machine.
+            let host = parsed.host_str().unwrap_or_default();
+            let loopback = host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback());
+            if parsed.scheme() != "https" && !loopback {
+                return Err(format!(
+                    "verify_url '{url}' must be an https:// URL: the token is sent to it"
+                ));
+            }
+            let secrets = if self.secrets.is_empty() {
+                self.preset
+                    .as_deref()
+                    .and_then(|name| crate::providers::token::preset(name).ok())
+                    .map_or(0, |preset| preset.secrets.len())
+            } else {
+                self.secrets.len()
+            };
+            if secrets != 1 {
+                return Err(format!(
+                    "verify_url sends the token as a bearer token, so it needs exactly one \
+                     secret, not {secrets}"
+                ));
+            }
+        }
+        if let Some(url) = &self.console {
+            parse_url("console", url)?;
+        }
+        Ok(())
+    }
+}
+
+/// Fails unless `var` is an environment variable name a shell can set,
+/// naming the key it is under.
+fn check_var_name(key: &str, var: &str) -> Result<(), String> {
+    if !crate::credentials::is_var_name(var) {
+        return Err(format!(
+            "{key}: '{var}' is not an environment variable name (letters, digits and _, not \
+             starting with a digit)"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudflareConfig {
@@ -1099,6 +1330,52 @@ impl CloudflareConfig {
         self.sign_in == CloudflareSignIn::Oauth
     }
 
+    fn validate(&self) -> Result<(), String> {
+        if self.uses_oauth()
+            && self
+                .client_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(
+                "client_id is required: register an OAuth client for omnifob in the dashboard \
+                 (Manage Account > OAuth clients) and put its ID here"
+                    .to_string(),
+            );
+        }
+        if self.minting() == CloudflareTokenType::Account
+            && !self.uses_oauth()
+            && self.account_id.is_none()
+        {
+            return Err(
+                "token_type = \"account\" needs account_id: account-owned tokens are made in \
+                 one account"
+                    .to_string(),
+            );
+        }
+        if self
+            .account_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err("account_id must not be empty".to_string());
+        }
+        check_cloudflare_ttl("ttl", self.ttl)?;
+        check_ips("ips", &self.ips)?;
+        if let Some(scopes) = &self.scopes
+            && (scopes.is_empty() || scopes.iter().any(|s| s.trim().is_empty()))
+        {
+            return Err("scopes must name at least one scope, and none may be empty".to_string());
+        }
+        for (name, template) in &self.templates {
+            check_name("template name", name).map_err(|e| format!("templates: {e}"))?;
+            template
+                .validate()
+                .map_err(|e| format!("templates.{name}.{e}"))?;
+        }
+        Ok(())
+    }
+
     /// Who owns the tokens omnifob mints. With OAuth sign-in they are
     /// account-owned, created in each approved account.
     pub fn minting(&self) -> CloudflareTokenType {
@@ -1112,6 +1389,30 @@ impl CloudflareConfig {
 
 fn default_cloudflare_ttl() -> SignedDuration {
     SignedDuration::from_hours(1)
+}
+
+/// Fails unless a minted token's lifetime is longer than
+/// [`crate::credentials::EXPIRY_MARGIN`]: a token that is never fresh would
+/// be minted again on every use.
+fn check_cloudflare_ttl(key: &str, ttl: SignedDuration) -> Result<(), String> {
+    if ttl <= crate::credentials::EXPIRY_MARGIN {
+        return Err(format!(
+            "{key} must be longer than {:#}, which is when omnifob mints a token again",
+            crate::credentials::EXPIRY_MARGIN
+        ));
+    }
+    Ok(())
+}
+
+/// Fails unless each entry of `ips` is `current`, an IP address or a CIDR
+/// range.
+fn check_ips(key: &str, ips: &[String]) -> Result<(), String> {
+    for ip in ips {
+        if ip != "current" {
+            crate::providers::cloudflare::ip_range(ip).map_err(|e| format!("{key}: {e:#}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -1147,6 +1448,34 @@ pub struct CloudflareTemplate {
     /// Overrides the integration's `ips` for this template.
     #[serde(default)]
     pub ips: Option<Vec<String>>,
+}
+
+impl CloudflareTemplate {
+    /// The checks a template gets when the config loads; errors start with
+    /// the key, to follow `templates.<name>.`.
+    fn validate(&self) -> Result<(), String> {
+        if self.permissions.is_empty() {
+            return Err("permissions must name at least one permission".to_string());
+        }
+        for (key, list) in [
+            ("permissions", &self.permissions),
+            ("optional", &self.optional),
+        ] {
+            if list.iter().any(|p| p.trim().is_empty()) {
+                return Err(format!("{key} must not contain an empty name"));
+            }
+        }
+        if self.r2_buckets.iter().any(|b| b.trim().is_empty()) {
+            return Err("r2_buckets must not contain an empty name".to_string());
+        }
+        if let Some(ttl) = self.ttl {
+            check_cloudflare_ttl("ttl", ttl)?;
+        }
+        if let Some(ips) = &self.ips {
+            check_ips("ips", ips)?;
+        }
+        Ok(())
+    }
 }
 
 impl Config {
@@ -1453,7 +1782,7 @@ mod tests {
 
     #[test]
     fn renames_keep_comments_order_and_subtables() {
-        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"1\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
+        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
         let renamed = rename_integration(text, "gary", "aws").unwrap();
         assert_eq!(
             renamed,
@@ -1556,7 +1885,7 @@ mod tests {
 
         let iam = |extra: &str| {
             Config::parse(&format!(
-                "[integrations.u]\ntype = \"aws-iam\"\n[integrations.u.roles.prod]\nrole_arn = \"arn:aws:iam::2:role/R\"\n{extra}"
+                "[integrations.u]\ntype = \"aws-iam\"\n[integrations.u.roles.prod]\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n{extra}"
             ))
         };
         let Integration::AwsIam(c) = &iam("console_duration = \"4h\"").unwrap().integrations["u"]
@@ -1574,7 +1903,7 @@ mod tests {
         );
         // Chained roles cannot take it: role chaining refuses SessionDuration.
         let chained = sso(
-            "[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nconsole_duration = \"1h\"",
+            "[integrations.a.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nconsole_duration = \"1h\"",
         );
         assert!(chained.is_err());
     }
@@ -1830,7 +2159,7 @@ mod tests {
             Config::parse(&format!(
                 "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
                  region = \"us-east-1\"\n\
-                 [integrations.acme.chained.\"{chained_label}\"]\nvia_account_id = \"1\"\nvia_role = \"A\"\n\
+                 [integrations.acme.chained.\"{chained_label}\"]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
                  role_arn = \"arn:aws:iam::333333333333:role/Audit\"\n\
                  [integrations.acme.cross_partition.\"{label}\"]\n{GOV_ROLE}\n"
             ))
@@ -1957,7 +2286,7 @@ mod tests {
             (
                 "chained.c.region",
                 sso(&format!(
-                    "region = \"eu-west-1\"\n[integrations.a.chained.c]\nvia_account_id = \"1\"\nvia_role = \"A\"\n\
+                    "region = \"eu-west-1\"\n[integrations.a.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
                      role_arn = \"arn:aws:iam::222222222222:role/R\"\nregion = \"{bad}\""
                 )),
             ),
@@ -1978,7 +2307,7 @@ mod tests {
             (
                 "roles.prod.region",
                 iam(&format!(
-                    "[integrations.u.roles.prod]\nrole_arn = \"arn:aws:iam::2:role/R\"\nregion = \"{bad}\""
+                    "[integrations.u.roles.prod]\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nregion = \"{bad}\""
                 )),
             ),
         ] {
@@ -2208,5 +2537,298 @@ mod tests {
             .to_string();
         assert!(error.contains("empty segment"), "{error}");
         assert!(Config::parse("[agent]\nother = 1\n").is_err());
+    }
+
+    /// The error a config made of `text` fails with, with its causes.
+    fn parse_error(text: &str) -> String {
+        format!("{:#}", Config::parse(text).unwrap_err())
+    }
+
+    const SSO: &str = "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
+    const CHAINED: &str = "via_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n";
+
+    #[test]
+    fn aws_sso_keys_are_checked() {
+        let with = |extra: &str| Config::parse(&format!("{SSO}{extra}"));
+        let chained = |keys: &str| with(&format!("[integrations.a.chained.c]\n{CHAINED}{keys}"));
+        let error = |r: anyhow::Result<Config>| format!("{:#}", r.unwrap_err());
+        assert!(chained("duration = \"15m\"\nsession_name = \"me@example.com\"").is_ok());
+        for (keys, message) in [
+            (
+                "duration = \"61m\"",
+                "chained.c: duration must be between 15m and 1h",
+            ),
+            (
+                "duration = \"10m\"",
+                "chained.c: duration must be between 15m and 1h",
+            ),
+            (
+                "session_name = \"a b\"",
+                "chained.c: session_name 'a b' must be",
+            ),
+            (
+                "region = \"us-gov-west-1\"",
+                "chained.c: region us-gov-west-1 is in the aws-us-gov partition",
+            ),
+        ] {
+            let error = error(chained(keys));
+            assert!(error.contains(message), "{keys}: {error}");
+        }
+        for (key, value, message) in [
+            (
+                "via_account_id",
+                "\"1\"",
+                "chained.c: via_account_id '1' must be a 12-digit",
+            ),
+            ("via_role", "\"\"", "chained.c: via_role must name"),
+        ] {
+            let keys = CHAINED
+                .lines()
+                .filter(|l| !l.starts_with(key))
+                .chain([format!("{key} = {value}").as_str()])
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = error(with(&format!("[integrations.a.chained.c]\n{keys}\n")));
+            assert!(error.contains(message), "{key}: {error}");
+        }
+        let start_url = |url: &str| {
+            Config::parse(&SSO.replace("https://a.awsapps.com/start", url))
+                .map_err(|e| format!("{e:#}"))
+        };
+        assert!(
+            start_url("http://a.awsapps.com/start")
+                .unwrap_err()
+                .contains("start_url 'http://a.awsapps.com/start' must be an https:// URL")
+        );
+        assert!(
+            start_url("a.awsapps.com/start")
+                .unwrap_err()
+                .contains("start_url 'a.awsapps.com/start' is not a URL")
+        );
+        assert!(error(with("scopes = []")).contains("scopes must name at least one scope"));
+        assert!(error(with("scopes = [\"\"]")).contains("scopes must name"));
+
+        // Two chained labels that differ only in case would share an id.
+        let error = error(with(&format!(
+            "[integrations.a.chained.Prod]\n{CHAINED}[integrations.a.chained.prod]\n{CHAINED}"
+        )));
+        assert!(
+            error.contains(
+                "chained.Prod and chained.prod would both be the profile <integration>/prod/R"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn aws_iam_keys_are_checked() {
+        let iam = |extra: &str, role: &str| {
+            Config::parse(&format!(
+                "[integrations.u]\ntype = \"aws-iam\"\n{extra}\n[integrations.u.roles.prod]\n{role}\n"
+            ))
+            .map_err(|e| format!("{e:#}"))
+        };
+        let arn = "role_arn = \"arn:aws:iam::222222222222:role/R\"";
+        assert!(
+            iam(
+                "",
+                &format!("{arn}\nsession_name = \"me\"\nregion = \"eu-west-1\"")
+            )
+            .is_ok()
+        );
+        for (extra, role, message) in [
+            (
+                "",
+                "role_arn = \"R\"".to_string(),
+                "roles.prod: role_arn 'R' is not an IAM role ARN",
+            ),
+            (
+                "",
+                "role_arn = \"arn:aws:iam::2:role/R\"".to_string(),
+                "the account must be 12 digits",
+            ),
+            (
+                "",
+                format!("{arn}\nsession_name = \"x\""),
+                "roles.prod: session_name 'x'",
+            ),
+            (
+                "",
+                format!("{arn}\nregion = \"cn-north-1\""),
+                "roles.prod: region cn-north-1 is in the aws-cn partition, but role_arn is in aws",
+            ),
+            (
+                "region = \"us-gov-west-1\"",
+                arn.to_string(),
+                "roles.prod: role_arn is in the aws partition, but the user's STS Region us-gov-west-1 is in aws-us-gov",
+            ),
+            (
+                "account = \"prod\"",
+                "role_arn = \"arn:aws:iam::222222222222:role/session\"".to_string(),
+                "account.prod and roles.prod would both be the profile <integration>/prod/session",
+            ),
+        ] {
+            let error = iam(extra, &role).unwrap_err();
+            assert!(error.contains(message), "{role}: {error}");
+        }
+        // A GovCloud user assumes GovCloud roles.
+        assert!(
+            iam(
+                "region = \"us-gov-west-1\"",
+                "role_arn = \"arn:aws-us-gov:iam::222222222222:role/R\""
+            )
+            .is_ok()
+        );
+        let error = parse_error(&format!(
+            "[integrations.u]\ntype = \"aws-iam\"\n[integrations.u.roles.A]\n{arn}\n[integrations.u.roles.a]\n{arn}\n"
+        ));
+        assert!(
+            error.contains("roles.A and roles.a would both be"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gcp_service_accounts_are_checked() {
+        let gcp = |sa: &str| {
+            Config::parse(&format!(
+                "[integrations.g]\ntype = \"gcp\"\n[integrations.g.service_accounts.ci]\n{sa}\n"
+            ))
+            .map_err(|e| format!("{e:#}"))
+        };
+        assert!(gcp("email = \"ci@p.iam.gserviceaccount.com\"\ndelegates = [\"hop@p.iam.gserviceaccount.com\"]").is_ok());
+        for bad in [
+            "ci", "@p", "ci@", "ci@p/x", "ci@p?x", "ci@p#x", "c i@p", "ci@p%2F", "a@b@c",
+        ] {
+            let error = gcp(&format!("email = \"{bad}\"")).unwrap_err();
+            assert!(
+                error.contains(&format!("service_accounts.ci.email '{bad}' must be")),
+                "{error}"
+            );
+        }
+        let error =
+            gcp("email = \"ci@p.iam.gserviceaccount.com\"\ndelegates = [\"x/y@p\"]").unwrap_err();
+        assert!(
+            error.contains("service_accounts.ci.delegates 'x/y@p'"),
+            "{error}"
+        );
+        let error = parse_error(
+            "[integrations.g]\ntype = \"gcp\"\n[integrations.g.service_accounts.CI]\nemail = \"ci@p.iam.gserviceaccount.com\"\n[integrations.g.service_accounts.ci]\nemail = \"ci@q.iam.gserviceaccount.com\"\n",
+        );
+        assert!(error.contains("service_accounts.CI and service_accounts.ci would both be the profile <integration>/ci/ci"), "{error}");
+    }
+
+    #[test]
+    fn cloudflare_keys_are_checked() {
+        let cf = |kind: &str, extra: &str| {
+            Config::parse(&format!(
+                "[integrations.c]\ntype = \"cloudflare-{kind}\"\n{extra}\n"
+            ))
+            .map_err(|e| format!("{e:#}"))
+        };
+        assert!(
+            cf(
+                "token",
+                "ttl = \"6m\"\nips = [\"current\", \"203.0.113.7\", \"2001:db8::/32\"]"
+            )
+            .is_ok()
+        );
+        for (kind, extra, message) in [
+            ("oauth", "", "client_id is required"),
+            ("oauth", "client_id = \" \"", "client_id is required"),
+            (
+                "token",
+                "token_type = \"account\"",
+                "token_type = \"account\" needs account_id",
+            ),
+            ("token", "ttl = \"5m\"", "ttl must be longer than 5m"),
+            (
+                "token",
+                "ips = [\"10.0.0.0/33\"]",
+                "ips: '10.0.0.0/33' has an invalid prefix length",
+            ),
+            (
+                "token",
+                "ips = [\"example.com\"]",
+                "ips: 'example.com' is not an IP address",
+            ),
+            (
+                "token",
+                "[integrations.c.templates.\"my pages\"]\npermissions = [\"Pages Write\"]",
+                "templates: template name 'my pages' may contain only",
+            ),
+            (
+                "token",
+                "[integrations.c.templates.p]\npermissions = []",
+                "templates.p.permissions must name at least one permission",
+            ),
+            (
+                "token",
+                "[integrations.c.templates.p]\npermissions = [\"Pages Write\"]\noptional = [\"\"]",
+                "templates.p.optional must not contain an empty name",
+            ),
+            (
+                "token",
+                "[integrations.c.templates.p]\npermissions = [\"Pages Write\"]\nttl = \"4m\"",
+                "templates.p.ttl must be longer than 5m",
+            ),
+            (
+                "token",
+                "[integrations.c.templates.p]\npermissions = [\"Pages Write\"]\nips = [\"1.2.3\"]",
+                "templates.p.ips: '1.2.3'",
+            ),
+        ] {
+            let error = cf(kind, extra).unwrap_err();
+            assert!(error.contains(message), "{extra}: {error}");
+        }
+        assert!(cf("token", "token_type = \"account\"\naccount_id = \"abc\"").is_ok());
+    }
+
+    #[test]
+    fn token_keys_are_checked() {
+        let token = |extra: &str| {
+            Config::parse(&format!("[integrations.t]\ntype = \"token\"\n{extra}\n"))
+                .map_err(|e| format!("{e:#}"))
+        };
+        assert!(token("preset = \"hetzner\"\nvars = { HCLOUD_ENDPOINT = \"x\" }\nconsole = \"https://x.test/\"").is_ok());
+        assert!(token("verify_url = \"http://127.0.0.1:8080/me\"\n[integrations.t.secrets]\nkey = [\"MY_KEY\"]").is_ok());
+        for (extra, message) in [
+            ("", "needs a `preset` or a `secrets` table"),
+            (
+                "preset = \"nope\"",
+                "preset: unknown token preset 'nope' (known: hetzner",
+            ),
+            (
+                "[integrations.t.secrets]\nkey = []",
+                "secrets.key must list the environment variables",
+            ),
+            (
+                "[integrations.t.secrets]\nkey = [\"MY-KEY\"]",
+                "secrets.key: 'MY-KEY' is not an environment variable name",
+            ),
+            (
+                "preset = \"hetzner\"\nvars = { \"1X\" = \"y\" }",
+                "vars: '1X' is not an environment variable name",
+            ),
+            (
+                "preset = \"hetzner\"\nverify_url = \"http://api.example.com/me\"",
+                "verify_url 'http://api.example.com/me' must be an https:// URL",
+            ),
+            (
+                "preset = \"hetzner\"\nverify_url = \"me\"",
+                "verify_url 'me' is not a URL",
+            ),
+            (
+                "preset = \"scaleway\"\nverify_url = \"https://x.test/\"",
+                "needs exactly one secret, not 2",
+            ),
+            (
+                "preset = \"hetzner\"\nconsole = \"ftp://x.test/\"",
+                "console 'ftp://x.test/' must be an http:// or https:// URL",
+            ),
+        ] {
+            let error = token(extra).unwrap_err();
+            assert!(error.contains(message), "{extra}: {error}");
+        }
     }
 }

@@ -316,11 +316,13 @@ pub(crate) fn parse_ttl(s: &str) -> anyhow::Result<jiff::SignedDuration> {
 /// Profile ids for shell completion, recently used ones first, with the
 /// provider kind as a hint.
 pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
-    let Ok(cache) = ProfileCache::load(&profiles_file()) else {
+    let Ok(cache) = profiles_file().and_then(|file| ProfileCache::load(&file)) else {
         return Vec::new();
     };
     let mut profiles: Vec<_> = cache.all().collect();
-    History::load(&history::file()).sort_recent_first(&mut profiles, |p| p.id.as_str());
+    if let Ok(file) = history::file() {
+        History::load(&file).sort_recent_first(&mut profiles, |p| p.id.as_str());
+    }
     profiles
         .into_iter()
         .map(|p| {
@@ -344,7 +346,8 @@ pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
 
 /// Integration names for shell completion.
 pub(crate) fn integration_candidates() -> Vec<CompletionCandidate> {
-    let Ok(config) = Config::load_allowing_any_names(&paths::config_file()) else {
+    let Ok(config) = paths::config_file().and_then(|file| Config::load_allowing_any_names(&file))
+    else {
         return Vec::new();
     };
     config

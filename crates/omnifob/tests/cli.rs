@@ -1006,6 +1006,9 @@ command = ['{}', "browser_child_records_its_url", "--exact", "--ignored", "{{url
 type = "token"
 console = "https://console.example.test/home?a=1&b=two words"
 browser = "work"
+
+[integrations.status.secrets]
+token = ["STATUS_TOKEN"]
 "#,
         me.display()
     ));

@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn unknown_preset_lists_known_ones() {
-        let err = secrets(&config("preset = \"nope\"")).unwrap_err();
+        let err = preset("nope").unwrap_err();
         assert!(err.to_string().contains("hetzner"), "{err}");
     }
 
