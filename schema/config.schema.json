@@ -141,6 +141,14 @@
         },
         "ttl": {
           "type": "string"
+        },
+        "zones": {
+          "default": [],
+          "description": "Zones that zone-level permissions (\"DNS Write\") apply to, as domain\nnames (\"example.com\", looked up in the account when a token is\nminted) or zone IDs. Empty means every zone in the account.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [

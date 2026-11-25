@@ -322,6 +322,10 @@ pub(crate) enum CloudflareCommand {
         /// a jurisdiction); repeat for more
         #[arg(long = "r2-bucket")]
         r2_buckets: Vec<String>,
+        /// A zone that zone-level permissions apply to, as a domain name or
+        /// zone ID; repeat for more (default: every zone in the account)
+        #[arg(long = "zone")]
+        zones: Vec<String>,
         /// Also hand out R2's S3-compatible credentials
         #[arg(long)]
         s3: bool,

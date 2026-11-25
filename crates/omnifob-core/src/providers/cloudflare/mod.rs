@@ -616,7 +616,26 @@ pub async fn mint(
     } else {
         None
     };
-    let policies = build_policies(&selected, account_id, user_tag, &template.r2_buckets)?;
+    let zone_ids = if template.zones.is_empty() {
+        Vec::new()
+    } else {
+        if !selected
+            .iter()
+            .any(|g| g.scopes.iter().any(|s| s == SCOPE_ZONE))
+        {
+            tracing::warn!(
+                "template '{template_name}' lists zones but has no zone permission for them to apply to"
+            );
+        }
+        zone_ids(client, account_id, &template.zones).await?
+    };
+    let policies = build_policies(
+        &selected,
+        account_id,
+        user_tag,
+        &template.r2_buckets,
+        &zone_ids,
+    )?;
     let ips = resolve_ips(template.ips.as_ref().unwrap_or(&config.ips), &client.base).await?;
     let uses_d1 = selected.iter().any(|g| g.name.starts_with("D1 "));
     let uses_ai = selected.iter().any(|g| g.name.starts_with("Workers AI "));
@@ -681,6 +700,46 @@ pub async fn mint(
         issued_at: None,
         token_id,
     })
+}
+
+/// The IDs of a template's `zones`: IDs as written, and domain names looked
+/// up in the account with `GET /zones?name=`, which the sign-in can answer
+/// only for zones it may read.
+async fn zone_ids(
+    client: &Client,
+    account_id: &str,
+    zones: &[String],
+) -> anyhow::Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Zone {
+        id: String,
+    }
+    let mut ids = Vec::new();
+    for zone in zones {
+        if is_zone_id(zone) {
+            ids.push(zone.to_ascii_lowercase());
+            continue;
+        }
+        let query = [
+            ("name", zone.to_lowercase()),
+            ("account.id", account_id.to_string()),
+        ];
+        let (found, _): (Vec<Zone>, _) = client
+            .call(Method::GET, "/zones", &query, None)
+            .await
+            .with_context(|| format!("looking up the zone '{zone}'"))?;
+        match found.as_slice() {
+            [one] => ids.push(one.id.clone()),
+            [] => bail!(
+                "no zone named '{zone}' in account {account_id} that this sign-in can read; give \
+                 the bootstrap token \"Zone Read\" on it, or write the zone's ID in `zones`"
+            ),
+            _ => bail!("several zones are named '{zone}'; write the zone's ID in `zones`"),
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// A new token reaches some products a few seconds after it is created, and

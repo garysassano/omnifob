@@ -371,6 +371,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             permissions,
             optional,
             r2_buckets,
+            zones,
             s3,
             ips,
             ttl,
@@ -383,6 +384,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 r2_buckets,
                 s3,
                 ips: (!ips.is_empty()).then_some(ips),
+                zones,
             };
             app.add_template(&integration, &name, template, replace)
                 .await?

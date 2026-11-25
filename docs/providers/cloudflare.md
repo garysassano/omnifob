@@ -24,7 +24,8 @@ From developers.cloudflare.com/fundamentals/oauth:
 
 - User-owned tokens: `POST /user/tokens`, permission groups from `GET /user/tokens/permission_groups`. The bootstrap token comes from the "Create additional tokens" template (User > API Tokens > Edit, only available in that template).
 - Account-owned tokens: `POST /accounts/{id}/tokens`, groups from `GET /accounts/{id}/tokens/permission_groups`; bootstrap needs Account > Account API Tokens > Edit.
-- Policies: resources `com.cloudflare.api.account.<id>: "*"`, zones of an account as `com.cloudflare.api.account.<id>: {"com.cloudflare.api.account.zone.*": "*"}`, the user as `com.cloudflare.api.user.<tag>: "*"`. Permission groups carry their scope.
+- Policies: resources `com.cloudflare.api.account.<id>: "*"`, zones of an account as `com.cloudflare.api.account.<id>: {"com.cloudflare.api.account.zone.*": "*"}`, single zones flat as `com.cloudflare.api.account.zone.<zone id>: "*"` (not nested under the account; [Create a token via the API](https://developers.cloudflare.com/fundamentals/api/how-to/create-via-api/), checked 2026-11-25), the user as `com.cloudflare.api.user.<tag>: "*"`. Permission groups carry their scope.
+- Zone IDs are 32 lowercase hexadecimal digits. `GET /zones?name=<domain>&account.id=<id>` finds one by name, answering only zones the caller can read; an empty list means no such zone or no access to it.
 - `expires_on` and `not_before` as `YYYY-MM-DDTHH:MM:SSZ`; optional `condition.request.ip` CIDR lists.
 - Expired tokens stay listed until deleted.
 

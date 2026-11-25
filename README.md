@@ -245,6 +245,7 @@ fob exec cf workers --ttl 4h -- wrangler dev   # longer-lived token for a long s
 fob exec cf workers --revoke -- wrangler deploy   # token for this command only, deleted when it ends
 fob cf add-template cf pages             # pick services and access levels, save a template
 fob cf add-template cf r2 -p "Workers R2 Storage Bucket Item Write" --r2-bucket assets --s3
+fob cf add-template cf dns -p "DNS Edit" --zone example.com   # only that zone
 fob console prod admin    # opens the AWS console as that role
 fob console prod admin --service ec2 --region eu-west-1 --duration 8h
 fob console prod admin --copy   # copy the sign-in URL instead (over SSH, to your terminal's clipboard)

@@ -81,7 +81,7 @@ A template lists `permissions` (required) and `optional` ones, which are added w
 fob cf add-template cf pages -p "Pages Edit" -p "Account Settings Read" --ttl 30m
 ```
 
-`--optional`, `--r2-bucket`, `--s3` and `--ip` (each repeatable but `--s3`) set the template's `optional`, `r2_buckets`, `s3` and `ips` (below), so a narrow template can be made without editing the config:
+`--optional`, `--r2-bucket`, `--zone`, `--s3` and `--ip` (each repeatable but `--s3`) set the template's `optional`, `r2_buckets`, `zones`, `s3` and `ips` (below), so a narrow template can be made without editing the config:
 
 ```sh
 fob cf add-template cf assets -p "Workers R2 Storage Bucket Item Write" --r2-bucket assets --s3 --ip current
@@ -91,7 +91,7 @@ fob cf add-template cf assets -p "Workers R2 Storage Bucket Item Write" --r2-buc
 
 ## Narrower tokens
 
-Three template settings narrow what a minted token can do beyond its permissions:
+Four template settings narrow what a minted token can do beyond its permissions:
 
 ```toml
 [integrations.cf]
@@ -103,10 +103,15 @@ permissions = ["Workers R2 Storage Bucket Item Edit"]
 r2_buckets = ["backups", "eu/archive"]   # only these buckets; "eu/" for a jurisdiction
 s3 = true                                # also hand out R2's S3 credentials
 ips = ["203.0.113.0/24"]                 # replaces the integration's ips
+
+[integrations.cf.templates.dns]
+permissions = ["Zone Read", "DNS Edit"]
+zones = ["example.com", "0123456789abcdef0123456789abcdef"]   # names or zone IDs
 ```
 
 - `ips` limits where the token can be used from: IP addresses, CIDR ranges, or `"current"` for this machine's public IPv4 and IPv6 addresses when the token is minted. Cloudflare rejects the token anywhere else ("Cannot use the access token from location"). A cached token stops working if your address changes; `fob exec --no-cache` or `fob revoke` gets a new one.
 - `r2_buckets` lists the buckets that bucket-level permissions ("Workers R2 Storage Bucket Item Read" or "Edit") apply to. Account-level R2 permissions ("Workers R2 Storage Write") still cover every bucket.
+- `zones` limits zone-level permissions ("DNS Edit", "Zone Read", "Cache Purge") to those zones instead of every zone in the account. Write a domain name or a zone ID (32 hexadecimal digits, on the zone's Overview page). Names are looked up with `GET /zones?name=` each time a token is minted, which needs a sign-in that can read the zone: an OAuth sign-in with `zone:read`, or a bootstrap token with "Zone Read" on it. A bootstrap token from the "Create additional tokens" template cannot, so write IDs there. Account-level permissions in the same template still cover the account.
 - `s3 = true` adds the S3-compatible credentials R2 derives from the token, so S3 tools work without creating R2 API keys in the dashboard: `AWS_ACCESS_KEY_ID` (the token ID), `AWS_SECRET_ACCESS_KEY` (the SHA-256 of the token), `AWS_ENDPOINT_URL_S3` and `AWS_REGION=auto`. For example `fob exec cf backups -- aws s3 ls s3://backups`. These variables replace AWS credentials in that shell, so prefer `fob exec` over `fob use` for such templates.
 
 ## Tokens for one command

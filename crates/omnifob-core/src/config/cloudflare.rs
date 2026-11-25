@@ -196,6 +196,11 @@ pub struct CloudflareTemplate {
     /// Overrides the integration's `ips` for this template.
     #[serde(default)]
     pub ips: Option<Vec<String>>,
+    /// Zones that zone-level permissions ("DNS Write") apply to, as domain
+    /// names ("example.com", looked up in the account when a token is
+    /// minted) or zone IDs. Empty means every zone in the account.
+    #[serde(default)]
+    pub zones: Vec<String>,
 }
 
 impl CloudflareTemplate {
@@ -215,6 +220,13 @@ impl CloudflareTemplate {
         }
         if self.r2_buckets.iter().any(|b| b.trim().is_empty()) {
             return Err("r2_buckets must not contain an empty name".to_string());
+        }
+        for zone in &self.zones {
+            if zone.trim().is_empty() || zone.contains(['/', ' ', '*']) {
+                return Err(format!(
+                    "zones: '{zone}' is neither a domain name nor a zone ID"
+                ));
+            }
         }
         if let Some(ttl) = self.ttl {
             check_cloudflare_ttl("ttl", ttl)?;
@@ -310,6 +322,11 @@ mod tests {
                 "token",
                 "[integrations.c.templates.p]\npermissions = [\"Pages Write\"]\nips = [\"1.2.3\"]",
                 "templates.p.ips: '1.2.3'",
+            ),
+            (
+                "token",
+                "[integrations.c.templates.p]\npermissions = [\"DNS Write\"]\nzones = [\"*.example.com\"]",
+                "templates.p.zones: '*.example.com' is neither",
             ),
         ] {
             let error = cf(kind, extra).unwrap_err();

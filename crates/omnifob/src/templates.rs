@@ -54,6 +54,9 @@ impl App {
                     if !template.r2_buckets.is_empty() {
                         println!("  R2 buckets: {}", template.r2_buckets.join(", "));
                     }
+                    if !template.zones.is_empty() {
+                        println!("  zones: {}", template.zones.join(", "));
+                    }
                     if template.s3 {
                         println!("  with R2 S3 credentials");
                     }
