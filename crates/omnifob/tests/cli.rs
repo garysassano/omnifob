@@ -700,49 +700,112 @@ async fn sync_saves_what_synced_and_reports_the_rest() {
 
 /// Not a test of its own: `fob exec` runs this test binary with
 /// `--ignored --exact` and `OMNIFOB_E2E_CHILD` set, as a child that works on
-/// every platform, and it prints the variables it got.
+/// every platform, and it prints the variables `OMNIFOB_E2E_CHILD_VARS` names.
 #[test]
-#[ignore = "run by exec_hands_the_account_and_region_to_the_command"]
+#[ignore = "run by exec_child"]
 fn child_prints_its_environment() {
     if std::env::var_os("OMNIFOB_E2E_CHILD").is_none() {
         return;
     }
-    for name in [
-        "AWS_ACCESS_KEY_ID",
-        "AWS_ACCOUNT_ID",
-        "AWS_REGION",
-        "OMNIFOB_PROFILE",
-    ] {
-        println!("child: {name}={}", std::env::var(name).unwrap_or_default());
+    let names = std::env::var("OMNIFOB_E2E_CHILD_VARS").unwrap_or_default();
+    for name in names.split(',') {
+        match std::env::var(name) {
+            Ok(value) => println!("child: {name}={value}"),
+            Err(_) => println!("child: {name} unset"),
+        }
     }
+}
+
+/// Runs `fob exec <profile> -- <this test binary>` with `env` added to
+/// fob's environment; returns what the child printed of `names`.
+fn exec_child(fob: &Fob, profile: &str, env: &[(&str, &str)], names: &[&str]) -> Vec<String> {
+    let me = std::env::current_exe().unwrap();
+    let mut cmd = fob.command(&[
+        "exec",
+        profile,
+        "--",
+        me.to_str().unwrap(),
+        "child_prints_its_environment",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    cmd.env("OMNIFOB_E2E_CHILD", "1")
+        .env("OMNIFOB_E2E_CHILD_VARS", names.join(","));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    stdout
+        .lines()
+        .filter_map(|l| l.split_once("child: ").map(|(_, v)| v.to_string()))
+        .collect()
+}
+
+/// What an earlier `fob use` or another tool left in the shell does not
+/// reach the command next to the new profile's credentials.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_leaves_no_stale_variables_in_the_command() {
+    let (fob, _server) = synced_portal("exec-stale").await;
+    let printed = exec_child(
+        &fob,
+        "acme/dev/Admin",
+        &[
+            // An R2 profile's `fob use`, and a variable it set.
+            ("OMNIFOB_VARS", "AWS_ENDPOINT_URL_S3,CLOUDFLARE_API_TOKEN"),
+            (
+                "AWS_ENDPOINT_URL_S3",
+                "https://acct.r2.cloudflarestorage.com",
+            ),
+            ("CLOUDFLARE_API_TOKEN", "stale"),
+            // Set by another tool, not by fob.
+            ("AWS_SECURITY_TOKEN", "stale"),
+            ("OMNIFOB_EXPIRES_AT", "2000-01-01T00:00:00Z"),
+            ("UNRELATED", "kept"),
+        ],
+        &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SESSION_TOKEN",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_SECURITY_TOKEN",
+            "CLOUDFLARE_API_TOKEN",
+            "OMNIFOB_VARS",
+            "OMNIFOB_EXPIRES_AT",
+            "UNRELATED",
+        ],
+    );
+    assert_eq!(
+        printed,
+        [
+            "AWS_ACCESS_KEY_ID=ASIA111111111111",
+            "AWS_SESSION_TOKEN=role-session",
+            "AWS_ENDPOINT_URL_S3 unset",
+            "AWS_SECURITY_TOKEN unset",
+            "CLOUDFLARE_API_TOKEN unset",
+            "OMNIFOB_VARS unset",
+            "OMNIFOB_EXPIRES_AT=2100-01-01T00:00:00Z",
+            "UNRELATED=kept",
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_hands_the_account_and_region_to_the_command() {
     let (fob, _server) = synced_portal("exec").await;
-    let me = std::env::current_exe().unwrap();
-    let output = fob
-        .command(&[
-            "exec",
-            "acme/dev/Admin",
-            "--",
-            me.to_str().unwrap(),
-            "child_prints_its_environment",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("OMNIFOB_E2E_CHILD", "1")
-        .output()
-        .unwrap();
-    let (stdout, stderr) = texts(&output);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
-    // The harness writes "test <name> ... " before the first line.
-    let printed: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.split_once("child: ").map(|(_, v)| v))
-        .collect();
+    let printed = exec_child(
+        &fob,
+        "acme/dev/Admin",
+        &[],
+        &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_ACCOUNT_ID",
+            "AWS_REGION",
+            "OMNIFOB_PROFILE",
+        ],
+    );
     assert_eq!(
         printed,
         [
