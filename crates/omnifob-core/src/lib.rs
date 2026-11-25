@@ -32,7 +32,19 @@ pub enum Error {
     NeedsLogin { integration: String, reason: String },
 
     #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    Other(anyhow::Error),
+}
+
+/// A [`Error::NeedsLogin`] that passed through code returning
+/// `anyhow::Result` (a renewal deep in an API call) comes out as itself, so
+/// callers can still offer the sign-in.
+impl From<anyhow::Error> for Error {
+    fn from(e: anyhow::Error) -> Self {
+        match e.downcast::<Error>() {
+            Ok(e) => e,
+            Err(e) => Self::Other(e),
+        }
+    }
 }
 
 impl Error {
@@ -50,3 +62,19 @@ impl Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn a_needed_login_survives_anyhow() {
+        let wrapped: anyhow::Result<()> =
+            Err(Error::needs_login("cf", "it ended")).context("minting a token");
+        let err: Error = wrapped.unwrap_err().into();
+        assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
+        let plain: Error = anyhow::anyhow!("boom").into();
+        assert!(matches!(plain, Error::Other(_)));
+    }
+}

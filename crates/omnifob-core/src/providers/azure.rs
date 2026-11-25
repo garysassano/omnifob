@@ -188,6 +188,9 @@ pub async fn login(
         tenant_id: claims.tid,
         tenant: config.tenant.clone(),
     };
+    // Not while a token is being fetched, which would write back the
+    // sign-in it read.
+    let _lock = store::lock(&lock_name(integration), TOKEN_LOCK_TIMEOUT).await?;
     store::set(&token_key(integration), &stored)?;
     Ok(username)
 }
@@ -296,11 +299,34 @@ fn stored(integration: &str) -> Result<Stored> {
     store::get::<Stored>(&token_key(integration))?.ok_or_else(|| Error::not_signed_in(integration))
 }
 
+fn lock_name(integration: &str) -> String {
+    format!("azure-{integration}")
+}
+
+/// How long to wait for another process that is using the same refresh
+/// token, or storing a new sign-in.
+const TOKEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deletes the stored sign-in if it still holds `refresh_token`, so one
+/// stored meanwhile is kept.
+fn drop_if_current(integration: &str, refresh_token: &str) {
+    if let Ok(Some(stored)) = store::get::<Stored>(&token_key(integration))
+        && stored.refresh_token == refresh_token
+    {
+        let _ = store::delete(&token_key(integration));
+    }
+}
+
 /// A Resource Manager token for `tenant`, from the refresh token; stores the
 /// rotated refresh token. A refusal particular to the tenant (MFA, conditional
-/// access) is an error for it alone; a refusal of the sign-in itself asks
-/// for a new one.
+/// access) is an error for it alone; a refusal of the sign-in itself forgets
+/// it and asks for a new one.
+///
+/// Entra ID keeps the previous refresh token valid after a rotation, so
+/// parallel commands lose nothing; the lock (which `login` takes too) keeps
+/// a rotated token from overwriting a sign-in stored meanwhile.
 async fn arm_token(integration: &str, tenant: &str) -> Result<(String, Timestamp)> {
+    let _lock = store::lock(&lock_name(integration), TOKEN_LOCK_TIMEOUT).await?;
     let mut stored = stored(integration)?;
     let now = Timestamp::now();
     let response = match exchange(
@@ -316,6 +342,7 @@ async fn arm_token(integration: &str, tenant: &str) -> Result<(String, Timestamp
     {
         Exchange::Ok(r) => r,
         Exchange::Refused(e) if e.error == "invalid_grant" && tenant == stored.tenant_id => {
+            drop_if_current(integration, &stored.refresh_token);
             return Err(Error::needs_login(
                 integration,
                 format!(

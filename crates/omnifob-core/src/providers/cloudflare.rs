@@ -133,7 +133,11 @@ fn bootstrap_key(integration: &str) -> String {
 pub struct Client {
     http: reqwest::Client,
     base: String,
-    token: String,
+    /// Shared by clones, so a renewed access token serves them all.
+    token: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The browser sign-in the token belongs to: renewed, and the request
+    /// sent once more, when Cloudflare rejects it with 401.
+    oauth: Option<std::sync::Arc<(String, CloudflareConfig)>>,
 }
 
 #[derive(Deserialize)]
@@ -202,7 +206,8 @@ impl Client {
         Self {
             http: self.http.clone(),
             base: self.base.clone(),
-            token: token.into(),
+            token: std::sync::Arc::new(std::sync::Mutex::new(token.into())),
+            oauth: None,
         }
     }
 
@@ -210,8 +215,26 @@ impl Client {
         Self {
             http: crate::http::client(),
             base: base.into(),
-            token: token.into(),
+            token: std::sync::Arc::new(std::sync::Mutex::new(token.into())),
+            oauth: None,
         }
+    }
+
+    /// A client with the access token of `integration`'s browser sign-in,
+    /// renewed once if Cloudflare rejects it.
+    async fn for_sign_in(base: String, integration: &str, config: &CloudflareConfig) -> Result<Self> {
+        let token = super::cloudflare_oauth::access_token(integration, config).await?;
+        Ok(Self {
+            oauth: Some(std::sync::Arc::new((
+                integration.to_string(),
+                config.clone(),
+            ))),
+            ..Self::new(base, token)
+        })
+    }
+
+    fn token(&self) -> String {
+        self.token.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     async fn call<T: DeserializeOwned>(
@@ -221,22 +244,44 @@ impl Client {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> anyhow::Result<(T, Option<ResultInfo>)> {
-        let mut request = self
-            .http
-            .request(method.clone(), format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
-            .query(query);
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("{method} {path}"))?;
-        let status = response.status();
-        let text = response.text().await?;
-        let envelope: Envelope<T> = serde_json::from_str(&text)
-            .with_context(|| format!("{method} {path}: unexpected response ({status})"))?;
+        let mut renewed = false;
+        let (status, text) = loop {
+            let token = self.token();
+            let mut request = self
+                .http
+                .request(method.clone(), format!("{}{path}", self.base))
+                .bearer_auth(&token)
+                .query(query);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("{method} {path}"))?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && !renewed
+                && let Some(oauth) = &self.oauth
+            {
+                // An access token can stop working before its time; one
+                // renewal is worth a try.
+                tracing::debug!("{method} {path}: Cloudflare rejected the access token; renewing it");
+                let (integration, config) = &**oauth;
+                let fresh =
+                    super::cloudflare_oauth::renew_rejected(integration, config, &token).await?;
+                *self.token.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+                renewed = true;
+                continue;
+            }
+            break (status, response.text().await?);
+        };
+        let envelope: Envelope<T> = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{method} {path}: unexpected response ({status}): {}",
+                snippet(&text)
+            )
+        })?;
         if !envelope.success {
             let messages: Vec<_> = envelope
                 .errors
@@ -310,6 +355,17 @@ impl Client {
             Self::tokens_path(token_type, account_id)
         );
         self.get_all(&path).await
+    }
+}
+
+/// The start of a response body that is not the API's JSON, such as an
+/// HTML error page from a proxy or the WAF, on one line.
+fn snippet(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(200) {
+        Some((at, _)) => format!("{}...", &flat[..at]),
+        None if flat.is_empty() => "(empty body)".to_string(),
+        None => flat,
     }
 }
 
@@ -615,8 +671,7 @@ fn user_tag_from_policies(policies: &[Value]) -> Option<String> {
 /// for `cloudflare-oauth` the browser sign-in's access token.
 async fn bootstrap_client(integration: &str, config: &CloudflareConfig) -> Result<Client> {
     if config.uses_oauth() {
-        let token = super::cloudflare_oauth::access_token(integration, config).await?;
-        return Ok(Client::new(api_base(), token));
+        return Client::for_sign_in(api_base(), integration, config).await;
     }
     let token: String = store::get(&bootstrap_key(integration))?
         .ok_or_else(|| Error::not_signed_in(integration))?;

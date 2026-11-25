@@ -173,6 +173,8 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
 
     let browser = std::sync::Arc::new(std::sync::Mutex::new(None));
     let opened = browser.clone();
+    let thread = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let started = thread.clone();
     aws_sso::login("browser", &config(), Flow::Browser, move |prompt| {
         assert!(prompt.user_code.is_none());
         let url = reqwest::Url::parse(&prompt.url).unwrap();
@@ -184,7 +186,7 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
         assert_eq!(query["code_challenge_method"], "S256");
         // The browser approves and Identity Center redirects back.
         *opened.lock().unwrap() = Some((query["redirect_uri"].clone(), challenge));
-        std::thread::spawn(move || {
+        *started.lock().unwrap() = Some(std::thread::spawn(move || {
             let mut s =
                 std::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).unwrap();
             write!(
@@ -194,10 +196,13 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
             .unwrap();
             let mut reply = String::new();
             s.read_to_string(&mut reply).unwrap();
-        });
+            reply
+        }));
     })
     .await
     .unwrap();
+    let reply = thread.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(reply.contains("Sign-in approved"), "{reply}");
 
     let (redirect_uri, challenge) = browser.lock().unwrap().clone().unwrap();
     let requests = server.received_requests().await.unwrap();

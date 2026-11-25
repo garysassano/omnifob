@@ -102,6 +102,8 @@ async fn browser_login(
     mock_code_exchange(server).await;
     let opened = std::sync::Arc::new(std::sync::Mutex::new(None));
     let seen = opened.clone();
+    let browser = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let started = browser.clone();
     let email = gcp::login(
         integration,
         config,
@@ -112,7 +114,7 @@ async fn browser_login(
             let redirect = reqwest::Url::parse(&query["redirect_uri"]).unwrap();
             let state = query["state"].clone();
             *seen.lock().unwrap() = Some(query);
-            std::thread::spawn(move || {
+            *started.lock().unwrap() = Some(std::thread::spawn(move || {
                 let mut s =
                     std::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).unwrap();
                 write!(
@@ -122,14 +124,18 @@ async fn browser_login(
                 .unwrap();
                 let mut reply = String::new();
                 s.read_to_string(&mut reply).unwrap();
-                assert!(reply.contains("Signed in to Google"), "{reply}");
-            });
+                reply
+            }));
         },
         || unreachable!("the browser flow pastes nothing"),
     )
     .await
     .unwrap();
     assert_eq!(email, "me@example.com");
+    // Joined, so a failed assertion in the browser's thread fails the test.
+    let reply = browser.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(reply.contains("Sign-in approved"), "{reply}");
+    assert!(reply.contains("the sign-in to Google"), "{reply}");
     opened.lock().unwrap().take().unwrap()
 }
 
@@ -157,6 +163,49 @@ async fn browser_sign_in_follows_gcloud() {
         gcp::account("g").unwrap().as_deref(),
         Some("me@example.com")
     );
+    // `fob login` keeps the sign-in only for the client it was made with.
+    assert!(gcp::session_matches("g", &config).unwrap());
+    let own_client = gcp_config(
+        r#"client_id = "mine.apps.googleusercontent.com"
+        client_secret = "s""#,
+    );
+    assert!(!gcp::session_matches("g", &own_client).unwrap());
+}
+
+#[tokio::test]
+async fn a_rejected_access_token_is_renewed_once() {
+    let (_guard, server) = setup().await;
+    let config = gcp_config("");
+    browser_login(&server, "g", &config).await;
+    // Revoked early: still within its lifetime, but Google refuses it.
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .and(header("authorization", "Bearer user-access-1"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "user-access-2",
+            "expires_in": 3599,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .and(header("authorization", "Bearer user-access-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "projects": [{ "projectId": "proj-a" }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let profiles = gcp::discover("g", &config).await.unwrap();
+    assert_eq!(profiles[0].id, "g/proj-a/user");
 }
 
 #[tokio::test]

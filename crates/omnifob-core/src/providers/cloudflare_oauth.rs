@@ -210,6 +210,7 @@ pub async fn login(
         ("code_verifier", &verifier),
     ])
     .await
+    .map_err(anyhow::Error::from)
     .context("exchanging the sign-in code")?;
     if let Some(granted) = &response.scope
         && !granted.split(' ').any(|s| s == "account-api-tokens.write")
@@ -222,22 +223,47 @@ pub async fn login(
     let session_ends = config.session.map(|s| now.checked_add(s)).transpose()?;
     let requested = scopes(config);
     let stored = stored(response, now, None, session_ends, &requested)?;
+    // Not while a renewal is under way, which would write back the sign-in
+    // it read.
+    let _lock = store::lock(&lock_name(integration), RENEW_LOCK_TIMEOUT).await?;
     store::set(&token_key(integration), &stored)?;
     Ok(session_ends)
 }
 
-async fn exchange(form: &[(&str, &str)]) -> anyhow::Result<TokenResponse> {
+/// Why the token endpoint gave no token.
+#[derive(Debug, thiserror::Error)]
+enum ExchangeError {
+    /// An OAuth error answer (RFC 6749, section 5.2) to a client error.
+    #[error("Cloudflare refused: {error} {description}")]
+    Refused { error: String, description: String },
+    /// Anything else: the network, a server error, an unexpected answer.
+    #[error(transparent)]
+    Other(anyhow::Error),
+}
+
+impl ExchangeError {
+    /// Whether the refusal means the sign-in itself is over, rather than
+    /// a problem that may pass.
+    fn is_final(&self) -> bool {
+        matches!(self, Self::Refused { error, .. }
+            if matches!(error.as_str(), "invalid_grant" | "invalid_client" | "unauthorized_client"))
+    }
+}
+
+async fn exchange(form: &[(&str, &str)]) -> std::result::Result<TokenResponse, ExchangeError> {
     let mut body = reqwest::Url::parse("http://localhost/").expect("valid URL");
     body.query_pairs_mut().extend_pairs(form);
+    let other = |e: reqwest::Error| ExchangeError::Other(e.into());
     let response = crate::http::client()
         .post(format!("{}/oauth2/token", dash()))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .body(body.query().unwrap_or_default().to_string())
         .send()
-        .await?;
+        .await
+        .map_err(other)?;
     let status = response.status();
-    let text = response.text().await?;
+    let text = response.text().await.map_err(other)?;
     if !status.is_success() {
         #[derive(Deserialize)]
         struct OauthError {
@@ -245,13 +271,20 @@ async fn exchange(form: &[(&str, &str)]) -> anyhow::Result<TokenResponse> {
             #[serde(default)]
             error_description: Option<String>,
         }
-        let detail = match serde_json::from_str::<OauthError>(&text) {
-            Ok(e) => format!("{} {}", e.error, e.error_description.unwrap_or_default()),
-            Err(_) => text.chars().take(200).collect(),
-        };
-        bail!("token endpoint answered {status}: {}", detail.trim());
+        return Err(match serde_json::from_str::<OauthError>(&text) {
+            Ok(e) if status.is_client_error() => ExchangeError::Refused {
+                error: e.error,
+                description: e.error_description.unwrap_or_default(),
+            },
+            _ => ExchangeError::Other(anyhow::anyhow!(
+                "token endpoint answered {status}: {}",
+                text.chars().take(200).collect::<String>().trim()
+            )),
+        });
     }
-    serde_json::from_str(&text).context("unexpected token response")
+    serde_json::from_str(&text)
+        .context("unexpected token response")
+        .map_err(ExchangeError::Other)
 }
 
 fn stored(
@@ -277,19 +310,81 @@ fn stored(
     })
 }
 
-/// A current access token, renewed with the refresh token when it is about
-/// to expire.
-pub async fn access_token(integration: &str, config: &CloudflareConfig) -> Result<String> {
-    let key = token_key(integration);
-    let stored: Stored = store::get(&key)?.ok_or_else(|| Error::not_signed_in(integration))?;
-    let now = Timestamp::now();
-    if stored.session_ends.is_some_and(|end| end <= now) {
+/// How long to wait for another process that is renewing the same sign-in.
+const RENEW_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn lock_name(integration: &str) -> String {
+    format!("cloudflare-oauth-{integration}")
+}
+
+fn load(integration: &str) -> Result<Stored> {
+    let stored: Stored =
+        store::get(&token_key(integration))?.ok_or_else(|| Error::not_signed_in(integration))?;
+    if stored.session_ends.is_some_and(|end| end <= Timestamp::now()) {
         return Err(Error::needs_login(
             integration,
             format!("the Cloudflare session of '{integration}' ended"),
         ));
     }
-    if stored.expires_at.duration_since(now) > RENEW_MARGIN {
+    Ok(stored)
+}
+
+fn lasts(stored: &Stored, now: Timestamp) -> bool {
+    stored.expires_at.duration_since(now) > RENEW_MARGIN
+}
+
+/// Deletes the stored sign-in if it still holds `refresh_token`, so a
+/// sign-in another process has just renewed (or made anew) is kept.
+fn drop_if_current(integration: &str, refresh_token: &str) {
+    if let Ok(Some(stored)) = store::get::<Stored>(&token_key(integration))
+        && stored.refresh_token.as_deref() == Some(refresh_token)
+    {
+        let _ = store::delete(&token_key(integration));
+    }
+}
+
+/// A current access token, renewed with the refresh token when it is about
+/// to expire.
+pub async fn access_token(integration: &str, config: &CloudflareConfig) -> Result<String> {
+    current(integration, config, None).await
+}
+
+/// A new access token after Cloudflare rejected `rejected` before its time
+/// (the grant was revoked, or the token rotated elsewhere).
+pub async fn renew_rejected(
+    integration: &str,
+    config: &CloudflareConfig,
+    rejected: &str,
+) -> Result<String> {
+    current(integration, config, Some(rejected)).await
+}
+
+/// The stored access token while it lasts, else a renewed one. With
+/// `rejected`, renews unless the stored token is already another one.
+///
+/// Cloudflare rotates refresh tokens, so renewal runs under a lock shared by
+/// every omnifob process and the sign-in is read again once it is held: a
+/// process that waited gets the token the first one stored, instead of
+/// spending the old refresh token a second time. A refusal of the sign-in
+/// itself (`invalid_grant` and the like) forgets it and asks for a new one;
+/// anything else (the network, a server error) keeps it for the next try.
+async fn current(
+    integration: &str,
+    config: &CloudflareConfig,
+    rejected: Option<&str>,
+) -> Result<String> {
+    let usable = |stored: &Stored, now| match rejected {
+        Some(rejected) => stored.access_token != rejected,
+        None => lasts(stored, now),
+    };
+    let stored = load(integration)?;
+    if usable(&stored, Timestamp::now()) {
+        return Ok(stored.access_token);
+    }
+    let _lock = store::lock(&lock_name(integration), RENEW_LOCK_TIMEOUT).await?;
+    let stored = load(integration)?;
+    let now = Timestamp::now();
+    if usable(&stored, now) {
         return Ok(stored.access_token);
     }
     let Some(refresh) = stored.refresh_token.clone() else {
@@ -309,22 +404,28 @@ pub async fn access_token(integration: &str, config: &CloudflareConfig) -> Resul
         Ok(response) => {
             let renewed =
                 stored_capped(response, now, refresh, stored.session_ends, &stored.scopes)?;
-            store::set(&key, &renewed)?;
+            store::set(&token_key(integration), &renewed)?;
             Ok(renewed.access_token)
         }
-        Err(e) => {
-            // Another fob process may have renewed it first, which spends the
-            // refresh token this one read.
-            if let Some(latest) = store::get::<Stored>(&key)?
-                && latest.refresh_token.as_deref() != Some(refresh.as_str())
-                && latest.expires_at.duration_since(now) > RENEW_MARGIN
-            {
-                return Ok(latest.access_token);
-            }
+        Err(e) if e.is_final() => {
+            tracing::debug!("Cloudflare refused to renew: {e}");
+            drop_if_current(integration, &refresh);
             Err(Error::needs_login(
                 integration,
-                format!("renewing the Cloudflare sign-in failed: {e:#}"),
+                format!("Cloudflare no longer accepts the sign-in of '{integration}' ({e})"),
             ))
+        }
+        Err(e) => {
+            if rejected.is_none() && stored.expires_at > now {
+                // Still valid for a little while; renewal is tried again on
+                // the next use.
+                tracing::debug!("renewing the Cloudflare sign-in failed: {e:#}");
+                return Ok(stored.access_token);
+            }
+            Err(anyhow::anyhow!(
+                "could not renew the Cloudflare sign-in of '{integration}': {e:#}; run `fob login {integration}` if this persists"
+            )
+            .into())
         }
     }
 }

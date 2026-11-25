@@ -254,6 +254,9 @@ pub async fn login(
         email: email.clone(),
         client_id: client_id.to_string(),
     };
+    // Not while a renewal is under way, which would write back the sign-in
+    // it read.
+    let _lock = store::lock(&lock_name(integration), RENEW_LOCK_TIMEOUT).await?;
     store::set(&token_key(integration), &stored)?;
     Ok(email)
 }
@@ -319,8 +322,20 @@ fn stored(integration: &str) -> Result<Stored> {
     store::get::<Stored>(&token_key(integration))?.ok_or_else(|| Error::not_signed_in(integration))
 }
 
+fn lock_name(integration: &str) -> String {
+    format!("gcp-{integration}")
+}
+
+/// How long to wait for another process that is renewing the same sign-in,
+/// or storing a new one.
+const RENEW_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A new access token from the refresh token, stored for omnifob's own calls.
+///
+/// Under a lock that `login` takes too, so a sign-in stored while this one
+/// renews is never overwritten with the renewed old one.
 async fn renew(integration: &str, config: &GcpConfig) -> Result<Stored> {
+    let _lock = store::lock(&lock_name(integration), RENEW_LOCK_TIMEOUT).await?;
     let mut stored = stored(integration)?;
     let (client_id, client_secret) = client(config);
     if stored.client_id != client_id {
@@ -368,6 +383,30 @@ async fn access_token(integration: &str, config: &GcpConfig) -> Result<String> {
         return Ok(stored.access_token);
     }
     Ok(renew(integration, config).await?.access_token)
+}
+
+/// Google rejected the access token (401), which happens before its time
+/// when the grant is revoked or the token is replaced.
+#[derive(Debug, thiserror::Error)]
+#[error("Google rejected the access token (401 Unauthorized)")]
+struct Unauthorized;
+
+/// Runs `call` with the stored access token, and once more with a renewed
+/// one if Google rejects it.
+async fn with_access_token<T, F, Fut>(integration: &str, config: &GcpConfig, call: F) -> Result<T>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let token = access_token(integration, config).await?;
+    match call(token).await {
+        Err(e) if e.is::<Unauthorized>() => {
+            tracing::debug!("Google rejected the stored access token; renewing it");
+            let token = renew(integration, config).await?.access_token;
+            Ok(call(token).await?)
+        }
+        result => Ok(result?),
+    }
 }
 
 pub fn is_signed_in(integration: &str) -> anyhow::Result<bool> {
@@ -457,6 +496,13 @@ struct Project {
 
 /// Every active project the account can see.
 async fn list_projects(integration: &str, config: &GcpConfig) -> Result<Vec<Project>> {
+    with_access_token(integration, config, |token| async move {
+        list_projects_with(&token).await
+    })
+    .await
+}
+
+async fn list_projects_with(token: &str) -> anyhow::Result<Vec<Project>> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Page {
@@ -465,28 +511,29 @@ async fn list_projects(integration: &str, config: &GcpConfig) -> Result<Vec<Proj
         #[serde(default)]
         next_page_token: Option<String>,
     }
-    let token = access_token(integration, config).await?;
     let mut projects = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
         let mut request = crate::http::client()
             .get(url(Endpoint::Projects))
-            .bearer_auth(&token)
+            .bearer_auth(token)
             .query(&[("filter", "lifecycleState:ACTIVE")]);
         if let Some(t) = &page_token {
             request = request.query(&[("pageToken", t)]);
         }
-        let response = request.send().await.map_err(anyhow::Error::from)?;
+        let response = request.send().await?;
         let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(Unauthorized.into());
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
+            bail!(
                 "listing projects failed ({status}): {}",
                 body.chars().take(300).collect::<String>()
-            )
-            .into());
+            );
         }
-        let page: Page = response.json().await.map_err(anyhow::Error::from)?;
+        let page: Page = response.json().await?;
         projects.extend(page.projects);
         match page.next_page_token.filter(|t| !t.is_empty()) {
             Some(t) => page_token = Some(t),
@@ -585,8 +632,10 @@ pub async fn service_account_credentials(
     if !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(12)).contains(&lifetime) {
         return Err(anyhow!("a service account token lasts 15 minutes to 12 hours").into());
     }
-    let token = access_token(integration, config).await?;
-    let (access_token, expires_at) = impersonate(&token, sa, lifetime).await?;
+    let (access_token, expires_at) = with_access_token(integration, config, |token| async move {
+        impersonate(&token, sa, lifetime).await
+    })
+    .await?;
     Ok(token_credentials(access_token, sa.project(), expires_at))
 }
 
@@ -632,6 +681,9 @@ async fn impersonate(
         .send()
         .await?;
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Unauthorized.into());
+    }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let hint = if status == reqwest::StatusCode::FORBIDDEN {
