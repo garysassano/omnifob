@@ -270,6 +270,43 @@ async fn discovery_walks_tenants_and_skips_refusing_ones() {
 }
 
 #[tokio::test]
+async fn a_next_link_to_another_host_is_not_followed() {
+    let (_guard, server) = setup().await;
+    let elsewhere = MockServer::start().await;
+    device_login(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{HOME}/oauth2/v2.0/token")))
+        .respond_with(tokens("home-2", "refresh-2"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tenants"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "tenantId": HOME }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/subscriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "subscriptionId": "sub-a", "displayName": "Prod" }],
+            "nextLink": format!("{}/subscriptions?$skiptoken=2", elsewhere.uri()),
+        })))
+        .mount(&server)
+        .await;
+
+    let err = azure::discover("work", &azure_config(""))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nextLink"), "{err}");
+    assert!(
+        elsewhere.received_requests().await.unwrap().is_empty(),
+        "the token went to another host"
+    );
+}
+
+#[tokio::test]
 async fn credentials_name_the_subscription_and_tenant() {
     let (_guard, server) = setup().await;
     device_login(&server).await;

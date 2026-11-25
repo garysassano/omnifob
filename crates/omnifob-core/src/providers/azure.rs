@@ -442,9 +442,37 @@ async fn arm_list<T: serde::de::DeserializeOwned>(
         }
         let page: Page<T> = response.json().await?;
         items.extend(page.value);
-        next = page.next_link.filter(|l| !l.is_empty());
+        next = match page.next_link.filter(|l| !l.is_empty()) {
+            Some(link) => Some(same_origin(&link, &arm_host())?),
+            None => None,
+        };
     }
     Ok(items)
+}
+
+/// Checks that a `nextLink` points at Resource Manager itself (the same
+/// scheme, host and port as `arm`) before the bearer token is sent to it, so
+/// a tampered or unexpected answer cannot send the token elsewhere.
+fn same_origin(link: &str, arm: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(link)
+        .with_context(|| format!("Resource Manager gave an invalid nextLink: {link}"))?;
+    let arm = reqwest::Url::parse(arm).with_context(|| format!("invalid endpoint {arm}"))?;
+    let origin = |u: &reqwest::Url| {
+        (
+            u.scheme().to_owned(),
+            u.host_str().map(str::to_ascii_lowercase),
+            u.port_or_known_default(),
+        )
+    };
+    if origin(&url) != origin(&arm) {
+        bail!(
+            "Resource Manager's nextLink leaves {}: not following {}://{}",
+            arm.origin().ascii_serialization(),
+            url.scheme(),
+            url.host_str().unwrap_or_default()
+        );
+    }
+    Ok(url.into())
 }
 
 #[derive(Deserialize)]
@@ -581,6 +609,26 @@ mod tests {
         let c = claims(&format!("h.{payload}.s")).unwrap();
         assert_eq!(c.preferred_username.as_deref(), Some("me@contoso.com"));
         assert_eq!(c.tid, "t-1");
+    }
+
+    #[test]
+    fn next_links_must_stay_on_resource_manager() {
+        let arm = "https://management.azure.com";
+        let ok = "https://Management.Azure.com:443/subscriptions?api-version=1&$skiptoken=2";
+        assert!(same_origin(ok, arm).is_ok());
+        for bad in [
+            "http://management.azure.com/subscriptions",
+            "https://management.azure.com:8443/subscriptions",
+            "https://evil.example/subscriptions",
+            "https://management.azure.com.evil.example/subscriptions",
+            "https://user@evil.example/subscriptions",
+            "/subscriptions?page=2",
+        ] {
+            assert!(same_origin(bad, arm).is_err(), "{bad}");
+        }
+        // A test endpoint keeps its own port.
+        assert!(same_origin("http://127.0.0.1:4000/x", "http://127.0.0.1:4000").is_ok());
+        assert!(same_origin("http://127.0.0.1:4001/x", "http://127.0.0.1:4000").is_err());
     }
 
     #[test]
