@@ -91,6 +91,11 @@ pub fn keys(integration: &str) -> Vec<String> {
 /// The P-256 key a sign-in's token requests are bound to.
 struct DpopKey(EcdsaKeyPair);
 
+/// The `htu` of a DPoP proof: `url` without its query and fragment.
+fn htu(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 impl DpopKey {
     /// A new key, and how to store it.
     fn generate() -> anyhow::Result<(Self, String)> {
@@ -111,8 +116,10 @@ impl DpopKey {
     }
 
     /// A DPoP proof for a POST to `url`: a JWT with the public key in its
-    /// header, signed with ES256, as the AWS CLI builds it.
+    /// header, signed with ES256, as the AWS CLI builds it. The `htu` claim
+    /// is the URL without its query and fragment (RFC 9449, section 4.2).
     fn proof(&self, url: &str) -> anyhow::Result<String> {
+        let url = htu(url);
         // An uncompressed point: 0x04, then the 32-byte x and y.
         let point = self.0.public_key().as_ref();
         let (x, y) = point
@@ -629,11 +636,24 @@ mod tests {
     }
 
     #[test]
+    fn the_dpop_htu_has_no_query_or_fragment() {
+        let url = "https://us-east-1.signin.aws.amazon.com/v1/token";
+        for with in [
+            url.to_string(),
+            format!("{url}?x=1"),
+            format!("{url}#frag"),
+            format!("{url}?x=1#frag"),
+        ] {
+            assert_eq!(htu(&with), url, "{with}");
+        }
+    }
+
+    #[test]
     fn the_dpop_proof_names_the_url_and_verifies() {
         use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
         let (key, stored) = DpopKey::generate().unwrap();
         let proof = key
-            .proof("https://us-east-1.signin.aws.amazon.com/v1/token")
+            .proof("https://us-east-1.signin.aws.amazon.com/v1/token?ignored=1")
             .unwrap();
         let parts: Vec<&str> = proof.split('.').collect();
         assert_eq!(parts.len(), 3);
