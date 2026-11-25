@@ -403,8 +403,9 @@ pub async fn check(integration: &str) -> Result<String> {
     Ok(format!("signed in as {}", stored.username))
 }
 
-/// GETs every page of a Resource Manager list.
+/// GETs every page of a Resource Manager list, all with one client.
 async fn arm_list<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
     token: &str,
     path: &str,
 ) -> anyhow::Result<Vec<T>> {
@@ -422,11 +423,7 @@ async fn arm_list<T: serde::de::DeserializeOwned>(
         arm_host()
     ));
     while let Some(url) = next {
-        let response = crate::http::client()
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await?;
+        let response = http.get(&url).bearer_auth(token).send().await?;
         let status = response.status();
         if !status.is_success() {
             bail!(
@@ -485,8 +482,18 @@ struct Subscription {
 }
 
 /// One profile per subscription, in every tenant that grants a token.
+///
+/// Tenants are worked on together: each one's token is obtained in tenant
+/// order, one exchange at a time (each rotates the refresh token, and
+/// `arm_token` holds the integration's lock), while the subscription lists
+/// of the tenants that already have a token are fetched meanwhile. Results
+/// are merged in tenant order, so a subscription reachable from two tenants
+/// keeps the first, as `az` does. A tenant other than the home tenant that
+/// refuses a token or fails to list its subscriptions is skipped with a
+/// warning.
 pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Profile>> {
     let stored = stored(integration)?;
+    let http = crate::http::client();
     let (home_token, _) = arm_token(integration, &stored.tenant_id).await?;
     let tenants: Vec<String> = if config.tenant.is_some() {
         vec![stored.tenant_id.clone()]
@@ -496,28 +503,48 @@ pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Pro
         struct Tenant {
             tenant_id: String,
         }
-        arm_list::<Tenant>(&home_token, "/tenants")
+        arm_list::<Tenant>(&http, &home_token, "/tenants")
             .await?
             .into_iter()
             .map(|t| t.tenant_id)
             .collect()
     };
 
-    let mut profiles: Vec<Profile> = Vec::new();
-    for tenant in tenants {
-        let token = if tenant == stored.tenant_id {
-            home_token.clone()
-        } else {
-            match arm_token(integration, &tenant).await {
-                Ok((token, _)) => token,
-                Err(e @ Error::NeedsLogin { .. }) => return Err(e),
+    // Taken in tenant order: `join_all` polls the futures in order, and a
+    // Tokio mutex hands itself out first come, first served.
+    let exchanges = tokio::sync::Mutex::new(());
+    let per_tenant = futures::future::join_all(tenants.iter().map(|tenant| {
+        let (http, home_token, exchanges) = (&http, &home_token, &exchanges);
+        let home = *tenant == stored.tenant_id;
+        async move {
+            let token = if home {
+                home_token.clone()
+            } else {
+                let _turn = exchanges.lock().await;
+                match arm_token(integration, tenant).await {
+                    Ok((token, _)) => token,
+                    Err(e @ Error::NeedsLogin { .. }) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!("skipping tenant {tenant}: {e}");
+                        return Ok(Vec::new());
+                    }
+                }
+            };
+            match arm_list::<Subscription>(http, &token, "/subscriptions").await {
+                Ok(subs) => Ok(subs),
+                Err(e) if home => Err(e.into()),
                 Err(e) => {
-                    tracing::warn!("skipping tenant {tenant}: {e}");
-                    continue;
+                    tracing::warn!("skipping tenant {tenant}: {e:#}");
+                    Ok(Vec::new())
                 }
             }
-        };
-        for sub in arm_list::<Subscription>(&token, "/subscriptions").await? {
+        }
+    }))
+    .await;
+
+    let mut profiles: Vec<Profile> = Vec::new();
+    for (tenant, subs) in tenants.iter().zip(per_tenant) {
+        for sub in subs? {
             let wanted = config.subscriptions.as_ref().is_none_or(|ids| {
                 ids.iter()
                     .any(|id| id.eq_ignore_ascii_case(&sub.subscription_id))
