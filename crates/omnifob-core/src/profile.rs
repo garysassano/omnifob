@@ -232,9 +232,10 @@ fn match_quality(profile: &Profile, words: &[String]) -> Option<u8> {
     let mut id = profile.id.to_lowercase();
     let mut segments: Vec<String> = id.split('/').map(str::to_string).collect();
     if let Some(account) = profile.target.account_id() {
-        segments.push(account.to_string());
+        let account = account.to_lowercase();
         id.push('/');
-        id.push_str(account);
+        id.push_str(&account);
+        segments.push(account);
     }
     words
         .iter()
@@ -352,6 +353,29 @@ mod tests {
             "chained roles too"
         );
         assert!(ids("999999999999").is_empty());
+    }
+
+    #[test]
+    fn find_by_mixed_case_account_id() {
+        let mut cache = ProfileCache::default();
+        cache.integrations.insert(
+            "az".into(),
+            SyncedProfiles {
+                synced_at: Timestamp::UNIX_EPOCH,
+                profiles: vec![Profile::new(
+                    "az",
+                    "Prod",
+                    "sub",
+                    Target::Azure {
+                        subscription_id: "ABCDEF12-0000-0000-0000-000000000000".into(),
+                        subscription_name: "Prod".into(),
+                        tenant_id: "t".into(),
+                    },
+                )],
+            },
+        );
+        assert_eq!(cache.find("abcdef12").len(), 1);
+        assert_eq!(cache.find("ABCDEF12-0000-0000-0000-000000000000").len(), 1);
     }
 
     #[test]

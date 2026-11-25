@@ -40,6 +40,10 @@ pub(crate) fn export_aws_config(
                 }?;
                 return Some((p.id.clone(), region));
             }
+            if let Integration::AwsLogin(c) = integration {
+                let region = c.default_region.as_deref().unwrap_or(&c.region);
+                return Some((p.id.clone(), region.to_string()));
+            }
             let Integration::AwsSso(c) = integration else {
                 return None;
             };
