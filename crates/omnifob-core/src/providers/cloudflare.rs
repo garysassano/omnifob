@@ -817,7 +817,15 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
     // the rest, including the bootstrap's record.
     {
         let _lock = lock_catalog(integration)?;
-        let minted = load_catalog(integration).minted;
+        // An unreadable catalog is left as it is: it may hold IDs of tokens
+        // that still exist.
+        let minted = match read_catalog(integration) {
+            Ok(catalog) => catalog.minted,
+            Err(e) => {
+                tracing::warn!("keeping the Cloudflare catalog as it is: {e:#}");
+                return finish_logout(integration);
+            }
+        };
         let kept = !minted.is_empty()
             && save_catalog(
                 integration,
@@ -832,6 +840,11 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
             forget_catalog(integration);
         }
     }
+    finish_logout(integration)
+}
+
+/// Deletes the stored sign-in, browser or bootstrap token.
+fn finish_logout(integration: &str) -> anyhow::Result<bool> {
     let oauth = super::cloudflare_oauth::logout(integration)?;
     Ok(store::delete(&bootstrap_key(integration))? || oauth)
 }
@@ -1089,35 +1102,95 @@ fn catalog_file(integration: &str) -> std::path::PathBuf {
     crate::paths::state_dir().join(format!("cloudflare-{integration}.json"))
 }
 
+/// The catalog for reading only, such as the copy a mint starts from:
+/// empty when it is missing or unreadable. Never written back as it is;
+/// updates go through [`update_catalog`], which reads with [`read_catalog`].
 fn load_catalog(integration: &str) -> Catalog {
-    std::fs::read_to_string(catalog_file(integration))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    read_catalog(integration).unwrap_or_else(|e| {
+        tracing::debug!("reading the Cloudflare catalog: {e:#}");
+        Catalog::default()
+    })
+}
+
+/// How often, and how far apart, a catalog file operation is tried before
+/// it fails. On Windows, a file being replaced, or held by an antivirus or
+/// indexer, can refuse to open or to be replaced for a moment.
+const CATALOG_IO_ATTEMPTS: u32 = 10;
+const CATALOG_IO_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Runs `io` until it succeeds or [`CATALOG_IO_ATTEMPTS`] are used up.
+fn retried<T>(mut io: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut attempt = 1;
+    loop {
+        match io() {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && attempt < CATALOG_IO_ATTEMPTS => {
+                tracing::debug!("Cloudflare catalog file busy ({e}); trying again");
+                attempt += 1;
+                std::thread::sleep(CATALOG_IO_PAUSE);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The catalog as stored: empty only when there is no file. A file that
+/// cannot be read or parsed is an error, never an empty catalog, so an
+/// update cannot replace token IDs it failed to see.
+fn read_catalog(integration: &str) -> anyhow::Result<Catalog> {
+    let file = catalog_file(integration);
+    let text = match retried(|| std::fs::read_to_string(&file)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Catalog::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+    };
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{} is not a Cloudflare catalog omnifob can read; delete it to start over (tokens it tracks are then no longer cleaned up)",
+            file.display()
+        )
+    })
 }
 
 fn save_catalog(integration: &str, catalog: &Catalog) -> anyhow::Result<()> {
-    crate::files::write_private(&catalog_file(integration), serde_json::to_string(catalog)?)
+    let text = serde_json::to_string(catalog)?;
+    let file = catalog_file(integration);
+    let mut attempt = 1;
+    loop {
+        match crate::files::write_private(&file, &text) {
+            Err(e) if attempt < CATALOG_IO_ATTEMPTS => {
+                tracing::debug!("writing the Cloudflare catalog: {e:#}; trying again");
+                attempt += 1;
+                std::thread::sleep(CATALOG_IO_PAUSE);
+            }
+            result => return result,
+        }
+    }
 }
 
-/// How long to wait for another process updating the same catalog, which
-/// holds the lock only while it reads and writes the file.
-const CATALOG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long to wait for other processes updating the same catalog, each of
+/// which holds the lock only while it reads and writes the file.
+const CATALOG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Holds the catalog lock of an integration. Synchronous, and never held
-/// across an API call.
-fn lock_catalog(integration: &str) -> anyhow::Result<Option<store::Lock>> {
-    store::lock_blocking(
-        &format!("cloudflare-catalog-{integration}"),
-        CATALOG_LOCK_TIMEOUT,
-    )
+/// across an API call. Unlike renewal locks it fails rather than going
+/// ahead without the lock: an unguarded update can drop the token IDs
+/// another process tracked meanwhile, and those tokens are never cleaned up.
+fn lock_catalog(integration: &str) -> anyhow::Result<store::Lock> {
+    let name = format!("cloudflare-catalog-{integration}");
+    store::lock_blocking(&name, CATALOG_LOCK_TIMEOUT)?.with_context(|| {
+        format!(
+            "another omnifob process held the Cloudflare catalog lock of '{integration}' for {} s",
+            CATALOG_LOCK_TIMEOUT.as_secs()
+        )
+    })
 }
 
 /// Reads the catalog, lets `change` update it, and writes it back, under
-/// the integration's catalog lock.
+/// the integration's catalog lock. Fails, changing nothing, when the lock
+/// cannot be had or the stored catalog cannot be read.
 pub fn update_catalog(integration: &str, change: impl FnOnce(&mut Catalog)) -> anyhow::Result<()> {
     let _lock = lock_catalog(integration)?;
-    let mut catalog = load_catalog(integration);
+    let mut catalog = read_catalog(integration)?;
     let before = catalog.clone();
     change(&mut catalog);
     if catalog == before && catalog_file(integration).exists() {
@@ -1225,7 +1298,7 @@ pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
     if !from.exists() {
         return Ok(());
     }
-    let mut catalog = load_catalog(old);
+    let mut catalog = read_catalog(old)?;
     let prefix = format!("{old}/");
     catalog.minted = std::mem::take(&mut catalog.minted)
         .into_iter()
@@ -1235,7 +1308,7 @@ pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
         })
         .collect();
     save_catalog(new, &catalog)?;
-    std::fs::remove_file(&from).with_context(|| format!("removing {}", from.display()))
+    retried(|| std::fs::remove_file(&from)).with_context(|| format!("removing {}", from.display()))
 }
 
 /// Removes the stored catalog, for example after signing out.

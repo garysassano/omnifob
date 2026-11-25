@@ -1158,3 +1158,28 @@ async fn concurrent_catalog_updates_keep_every_tracked_token() {
     let catalog = SignedIn::load_catalog().unwrap();
     assert_eq!(catalog.minted.values().flatten().count(), 80);
 }
+
+#[tokio::test]
+async fn an_unreadable_catalog_is_never_replaced() {
+    let _cf = SignedIn::new("unreadable").await;
+    std::fs::create_dir_all(paths::state_dir()).unwrap();
+    std::fs::write(SignedIn::catalog_file(), "{ not json").unwrap();
+    let err = cloudflare::update_catalog("cf", |c| {
+        c.minted
+            .entry("cf/a/t".into())
+            .or_default()
+            .push("x".into());
+    })
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("delete it to start over"),
+        "{err:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(SignedIn::catalog_file()).unwrap(),
+        "{ not json",
+        "left as it was"
+    );
+    assert!(cloudflare::rename_catalog("cf", "cf2").is_err());
+    assert!(SignedIn::catalog_file().exists());
+}
