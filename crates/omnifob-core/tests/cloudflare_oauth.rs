@@ -10,30 +10,29 @@ use std::io::{Read, Write};
 use jiff::{SignedDuration, Timestamp};
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
 use omnifob_core::providers::cloudflare::{self, oauth as cloudflare_oauth};
-use omnifob_core::{Error, store};
+use omnifob_core::{Endpoints, Error, store};
 use serde_json::{Value, json};
 use support::Scratch;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// The tests share environment variables and the callback port, so they
-/// run one at a time.
+/// The sign-in's callback port is fixed, so the tests run one at a time.
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
-async fn setup() -> (Scratch, MockServer) {
+async fn setup() -> (Scratch, MutexGuard<'static, ()>, MockServer) {
     let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
-    // The in-memory store lives as long as the process: start signed out.
-    store::delete("cloudflare/cf/oauth").unwrap();
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_CLOUDFLARE_DASH", server.uri());
-        std::env::set_var("OMNIFOB_CLOUDFLARE_API", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-cf-oauth-test"), server)
+    let endpoints = Endpoints {
+        cloudflare_api: Some(server.uri()),
+        cloudflare_dash: Some(server.uri()),
+        ..Default::default()
+    };
+    (
+        Scratch::new("omnifob-cf-oauth-test", endpoints),
+        guard,
+        server,
+    )
 }
 
 fn config() -> CloudflareConfig {
@@ -122,7 +121,7 @@ async fn browser_login(
 
 #[tokio::test]
 async fn browser_sign_in_redeems_the_code_with_pkce() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
         .and(body_string_contains("grant_type=authorization_code"))
@@ -168,7 +167,7 @@ async fn browser_sign_in_redeems_the_code_with_pkce() {
 
 #[tokio::test]
 async fn a_sign_in_without_the_token_scope_is_refused() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
         .respond_with(tokens("access-1", "refresh-1", "memberships.read"))
@@ -182,7 +181,7 @@ async fn a_sign_in_without_the_token_scope_is_refused() {
 
 #[tokio::test]
 async fn an_expiring_access_token_is_renewed_and_the_refresh_token_rotated() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     signed_in("access-1", "refresh-1", SignedDuration::from_secs(30));
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
@@ -206,7 +205,7 @@ async fn an_expiring_access_token_is_renewed_and_the_refresh_token_rotated() {
 
 #[tokio::test]
 async fn a_passing_failure_keeps_the_sign_in() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
         .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
@@ -230,7 +229,7 @@ async fn a_passing_failure_keeps_the_sign_in() {
 
 #[tokio::test]
 async fn a_final_refusal_forgets_the_sign_in() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     signed_in("access-1", "refresh-1", SignedDuration::from_secs(-30));
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
@@ -252,7 +251,7 @@ async fn a_final_refusal_forgets_the_sign_in() {
 
 #[tokio::test]
 async fn an_api_call_renews_a_rejected_access_token_once() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     // Valid for an hour, but revoked at Cloudflare, which answers 403.
     signed_in("access-1", "refresh-1", SignedDuration::from_hours(1));
     Mock::given(method("GET"))
@@ -292,7 +291,7 @@ async fn an_api_call_renews_a_rejected_access_token_once() {
 
 #[tokio::test]
 async fn revoking_ends_both_tokens_at_cloudflare() {
-    let (_scratch, server) = setup().await;
+    let (_scratch, _serial, server) = setup().await;
     assert!(!cloudflare_oauth::revoke("cf", &config()).await.unwrap());
     signed_in("access-1", "refresh-1", SignedDuration::from_hours(1));
     Mock::given(method("POST"))

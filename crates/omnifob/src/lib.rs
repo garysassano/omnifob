@@ -113,12 +113,20 @@ struct App {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    // The library's context for the whole process: the standard files,
+    // keychain and endpoints from the environment, one HTTP client for
+    // this runtime, and a terminal prompt for MFA codes when someone can
+    // answer. Nothing has used the library yet, so the install takes.
+    let mut context = omnifob_core::Context::builder_from_env();
     if interactive() {
-        omnifob_core::prompt::set_mfa_prompt(|serial| {
+        context = context.mfa_prompt(|serial| {
             Ok(dialoguer::Input::<String>::new()
                 .with_prompt(format!("MFA code for {serial}"))
                 .interact_text_on(&Term::stderr())?)
         });
+    }
+    if context.build().install().is_err() {
+        tracing::debug!("the library's context was already chosen");
     }
     // Commands that need neither the config nor the profiles, so a broken
     // config.toml or profiles.json does not break every new shell's

@@ -88,12 +88,13 @@ pub fn scope_for(permission: &str) -> Option<&'static str> {
         .map(|(_, scope)| *scope)
 }
 
-/// The dashboard's OAuth endpoints; `OMNIFOB_CLOUDFLARE_DASH` overrides the
-/// host for testing.
+/// The dashboard's OAuth endpoints; the context's `cloudflare_dash`
+/// endpoint (`OMNIFOB_CLOUDFLARE_DASH`) overrides the host for testing.
 fn dash() -> String {
-    std::env::var("OMNIFOB_CLOUDFLARE_DASH")
-        .ok()
-        .filter(|v| !v.is_empty())
+    crate::Context::current()
+        .endpoints()
+        .cloudflare_dash
+        .clone()
         .unwrap_or_else(|| DASH.to_string())
 }
 

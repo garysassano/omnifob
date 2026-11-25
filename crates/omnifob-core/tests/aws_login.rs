@@ -10,28 +10,21 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use omnifob_core::config::{AwsLoginConfig, Config, Integration};
 use omnifob_core::providers::aws;
-use omnifob_core::{Error, Target, store};
+use omnifob_core::{Endpoints, Error, Target};
 use serde_json::{Value, json};
 use support::Scratch;
-use tokio::sync::Mutex;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-/// The tests share environment variables, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const IDENTITY: &str = "arn:aws:iam::123456789012:user/alice";
 
 async fn setup() -> (Scratch, MockServer) {
-    let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-login-test"), server)
+    let endpoints = Endpoints {
+        aws: Some(server.uri()),
+        ..Default::default()
+    };
+    (Scratch::new("omnifob-login-test", endpoints), server)
 }
 
 fn config() -> AwsLoginConfig {

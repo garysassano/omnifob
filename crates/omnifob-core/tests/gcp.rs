@@ -10,28 +10,21 @@ use std::io::{Read, Write};
 use base64::Engine;
 use omnifob_core::config::{Config, GcpConfig, Integration};
 use omnifob_core::providers::gcp;
-use omnifob_core::{Error, Target, store};
+use omnifob_core::{Endpoints, Error, Target};
 use serde_json::json;
 use support::Scratch;
-use tokio::sync::Mutex;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// The tests share environment variables, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
-
 async fn setup() -> (Scratch, MockServer) {
-    let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_GOOGLE_ENDPOINT", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-gcp-test"), server)
+    let endpoints = Endpoints {
+        google: Some(server.uri()),
+        ..Default::default()
+    };
+    (Scratch::new("omnifob-gcp-test", endpoints), server)
 }
 
 fn gcp_config(extra: &str) -> GcpConfig {

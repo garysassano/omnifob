@@ -1,5 +1,7 @@
 //! Cloudflare minting against a mock of the v4 API.
 
+mod support;
+
 use std::path::PathBuf;
 
 use jiff::Timestamp;
@@ -7,9 +9,9 @@ use omnifob_core::config::{CloudflareConfig, Config, Integration};
 use omnifob_core::providers::cloudflare::{
     self, Catalog, Client, Groups, mint, revoke_minted, start_session,
 };
-use omnifob_core::{paths, providers, store};
+use omnifob_core::{Endpoints, paths, providers, store};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -785,37 +787,22 @@ async fn a_session_makes_the_bootstrap_expire_and_ends_the_previous_one() {
     );
 }
 
-/// The tests that sign in share environment variables and the in-memory
-/// store, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
-
-/// A signed-in OAuth integration `cf` against a mock, with state in a scratch
-/// directory that is removed when this is dropped, even after a failure.
+/// A signed-in OAuth integration `cf` against a mock, in a context of its
+/// own (see [`Scratch`]).
 struct SignedIn {
-    _guard: MutexGuard<'static, ()>,
+    _scratch: Scratch,
     server: MockServer,
-    state: PathBuf,
     integration: Integration,
-}
-
-impl Drop for SignedIn {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.state);
-    }
 }
 
 impl SignedIn {
     async fn new(test: &str) -> Self {
-        let guard = SERIAL.lock().await;
-        store::use_memory_store().unwrap();
         let server = MockServer::start().await;
-        let state = std::env::temp_dir().join(format!("omnifob-cf-{test}-{}", std::process::id()));
-        // SAFETY: the tests that touch the environment run one at a time
-        // under SERIAL, and nothing else in this process reads it meanwhile.
-        unsafe {
-            std::env::set_var("OMNIFOB_CLOUDFLARE_API", server.uri());
-            std::env::set_var("XDG_STATE_HOME", &state);
-        }
+        let endpoints = Endpoints {
+            cloudflare_api: Some(server.uri()),
+            ..Default::default()
+        };
+        let scratch = Scratch::new(&format!("omnifob-cf-{test}"), endpoints);
         let integration =
             Config::parse("[integrations.cf]\ntype = \"cloudflare-oauth\"\nclient_id = \"x\"\n")
                 .unwrap()
@@ -834,9 +821,8 @@ impl SignedIn {
         )
         .unwrap();
         Self {
-            _guard: guard,
+            _scratch: scratch,
             server,
-            state,
             integration,
         }
     }
@@ -1139,7 +1125,10 @@ async fn concurrent_catalog_updates_keep_every_tracked_token() {
     SignedIn::save_catalog(&Catalog::default());
     let threads: Vec<_> = (0..8)
         .map(|i| {
+            // A thread starts outside the test's context.
+            let context = omnifob_core::Context::current();
             std::thread::spawn(move || {
+                let _context = context.enter();
                 for j in 0..10 {
                     cloudflare::update_catalog("cf", |c| {
                         c.minted

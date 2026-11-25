@@ -9,31 +9,26 @@ use std::io::{Read, Write};
 
 use omnifob_core::config::{AwsSsoConfig, Config, Integration};
 use omnifob_core::providers::aws::{self, sso::Flow};
-use omnifob_core::{Error, store};
+use omnifob_core::{Context, Endpoints, Error, store};
 use serde_json::{Value, json};
 use support::Scratch;
-use tokio::sync::Mutex;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-/// The tests share environment variables, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
-
 const START_URL: &str = "https://acme.awsapps.com/start";
 
 async fn setup() -> (Scratch, MockServer) {
-    let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
-    omnifob_core::prompt::set_mfa_prompt(|_| Ok("123456".to_string()));
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-aws-test"), server)
+    let endpoints = Endpoints {
+        aws: Some(server.uri()),
+        ..Default::default()
+    };
+    let context = Context::builder()
+        .endpoints(endpoints)
+        .mfa_prompt(|_| Ok("123456".to_string()));
+    (Scratch::with("omnifob-aws-test", context), server)
 }
 
 fn config() -> AwsSsoConfig {
@@ -368,14 +363,16 @@ async fn an_expired_token_that_cannot_be_renewed_now_does_not_ask_for_sign_in() 
 
 #[tokio::test]
 async fn an_unreachable_identity_center_keeps_the_session() {
-    let (_guard, server) = setup().await;
+    let (scratch, server) = setup().await;
     device_login(&server, "unreachable", 0).await;
     // Nothing listens on this port once the listener is dropped.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
-    // SAFETY: the tests run one at a time under SERIAL.
-    unsafe { std::env::set_var("OMNIFOB_AWS_ENDPOINT", url) };
+    let _unreachable = scratch.switch_endpoints(Endpoints {
+        aws: Some(url),
+        ..Default::default()
+    });
 
     let err = aws::sso::credentials("unreachable", &config(), "111111111111", "Admin")
         .await
@@ -695,13 +692,10 @@ async fn a_portal_call_refused_by_network_controls_is_not_retried() {
 
 #[tokio::test]
 async fn the_aws_cli_endpoint_variables_reach_a_vpc_endpoint() {
-    let (_guard, server) = setup().await;
-    // SAFETY: the tests run one at a time under SERIAL.
-    unsafe {
-        std::env::remove_var("OMNIFOB_AWS_ENDPOINT");
-        std::env::set_var("AWS_ENDPOINT_URL_SSO_OIDC", server.uri());
-        std::env::set_var("AWS_ENDPOINT_URL_SSO", server.uri());
-    }
+    let (scratch, server) = setup().await;
+    let _private = scratch.switch_endpoints(Endpoints::from_vars(|name| {
+        matches!(name, "AWS_ENDPOINT_URL_SSO_OIDC" | "AWS_ENDPOINT_URL_SSO").then(|| server.uri())
+    }));
     device_login(&server, "private", 3600).await;
     Mock::given(method("GET"))
         .and(path("/federation/credentials"))
@@ -710,13 +704,9 @@ async fn the_aws_cli_endpoint_variables_reach_a_vpc_endpoint() {
         .mount(&server)
         .await;
 
-    let result = aws::sso::credentials("private", &config(), "111111111111", "Admin").await;
-    // SAFETY: as above.
-    unsafe {
-        std::env::remove_var("AWS_ENDPOINT_URL_SSO_OIDC");
-        std::env::remove_var("AWS_ENDPOINT_URL_SSO");
-    }
-    result.unwrap();
+    aws::sso::credentials("private", &config(), "111111111111", "Admin")
+        .await
+        .unwrap();
 }
 
 fn sts_credentials(action: &str, access_key: &str) -> ResponseTemplate {

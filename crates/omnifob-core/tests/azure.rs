@@ -9,30 +9,23 @@ use std::io::{Read, Write};
 use base64::Engine;
 use omnifob_core::config::{AzureConfig, Config, Integration};
 use omnifob_core::providers::azure;
-use omnifob_core::{Error, Target, store};
+use omnifob_core::{Endpoints, Error, Target};
 use serde_json::json;
 use support::Scratch;
-use tokio::sync::Mutex;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// The tests share environment variables, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const HOME: &str = "11111111-1111-1111-1111-111111111111";
 const GUEST: &str = "22222222-2222-2222-2222-222222222222";
 const LOCKED: &str = "33333333-3333-3333-3333-333333333333";
 
 async fn setup() -> (Scratch, MockServer) {
-    let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_AZURE_ENDPOINT", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-azure-test"), server)
+    let endpoints = Endpoints {
+        azure: Some(server.uri()),
+        ..Default::default()
+    };
+    (Scratch::new("omnifob-azure-test", endpoints), server)
 }
 
 fn azure_config(extra: &str) -> AzureConfig {

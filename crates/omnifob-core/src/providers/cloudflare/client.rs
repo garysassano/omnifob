@@ -13,11 +13,13 @@ use crate::config::{CloudflareConfig, CloudflareTokenType};
 
 pub const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
-/// The API base URL; `OMNIFOB_CLOUDFLARE_API` overrides it for testing.
+/// The API base URL; the context's `cloudflare_api` endpoint
+/// (`OMNIFOB_CLOUDFLARE_API`) overrides it for testing.
 pub(super) fn api_base() -> String {
-    std::env::var("OMNIFOB_CLOUDFLARE_API")
-        .ok()
-        .filter(|v| !v.is_empty())
+    crate::Context::current()
+        .endpoints()
+        .cloudflare_api
+        .clone()
         .unwrap_or_else(|| API_BASE.to_string())
 }
 

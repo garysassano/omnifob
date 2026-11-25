@@ -15,7 +15,7 @@
 9. Console: `console.cloud.google.com/home/dashboard?project=<id>&authuser=<email>`. Google has no way to open the console as a service account.
 10. `fob logout`: `oauth2.googleapis.com/revoke` with the refresh token, as `gcloud auth revoke` does, then the token is deleted.
 
-`OMNIFOB_GOOGLE_ENDPOINT` sends every Google call to one URL; the tests in `crates/omnifob-core/tests/gcp.rs` point it at a mock.
+`OMNIFOB_GOOGLE_ENDPOINT` (in the library, a context's `Endpoints::google`) sends every Google call to one URL; the tests in `crates/omnifob-core/tests/gcp.rs` point it at a mock.
 
 ## Variables
 

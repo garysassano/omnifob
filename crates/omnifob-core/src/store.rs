@@ -13,63 +13,107 @@
 //! `test-plaintext-files:<absolute dir>` keeps secrets unencrypted in files
 //! (see [`test_files`]).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use anyhow::{Context, anyhow, bail};
-use keyring_core::{Entry, Error as KeyringError};
+use anyhow::{Context as _, bail};
+use keyring_core::{CredentialStore, Entry, Error as KeyringError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::Context;
+
 const SERVICE: &str = "omnifob";
 
-static BACKEND: OnceLock<Result<&'static str, String>> = OnceLock::new();
-
-/// Selects the platform store once; returns the name of the store in use.
-pub fn init() -> anyhow::Result<&'static str> {
-    BACKEND
-        .get_or_init(|| select().map_err(|e| format!("{e:#}")))
-        .clone()
-        .map_err(|e| anyhow!("no usable keychain: {e}"))
+/// Where a [`Context`] keeps secrets.
+#[derive(Debug, Clone)]
+pub enum Keychain {
+    /// The platform's: the macOS keychain, the Windows Credential Manager,
+    /// else the Secret Service, falling back to keyutils on Linux.
+    Native,
+    /// A store by the name `OMNIFOB_KEYRING` gives it: `keychain`,
+    /// `windows`, `secret-service`, `keyutils`, or, for tests of the command
+    /// line only, `test-plaintext-files:<absolute dir>` ([`test_files`]).
+    Named(String),
+    /// In memory, for tests: never touches the real keychain, and forgets
+    /// everything with the context.
+    Memory,
+    /// Any `keyring-core` store; `name` describes it in `fob status`.
+    Custom {
+        name: String,
+        store: Arc<CredentialStore>,
+    },
 }
 
-fn select() -> anyhow::Result<&'static str> {
-    let forced = std::env::var("OMNIFOB_KEYRING")
-        .ok()
-        .filter(|v| !v.is_empty());
-    match forced.as_deref() {
-        Some(name) => use_store(name).map(|_| leak(name)),
-        None => use_native(),
+impl Keychain {
+    /// The store `OMNIFOB_KEYRING` names, else the platform's.
+    pub fn from_env() -> Self {
+        match std::env::var("OMNIFOB_KEYRING") {
+            Ok(name) if !name.is_empty() => Self::Named(name),
+            _ => Self::Native,
+        }
     }
 }
 
-fn leak(name: &str) -> &'static str {
-    Box::leak(name.to_string().into_boxed_str())
+/// The store a context chose.
+pub(crate) struct Selected {
+    name: String,
+    store: Arc<CredentialStore>,
+    /// Whether long-lived values are also sealed with Windows DPAPI.
+    wsl: OnceLock<bool>,
+}
+
+impl Selected {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<CredentialStore> {
+        &self.store
+    }
+}
+
+pub(crate) fn select(keychain: &Keychain) -> anyhow::Result<Selected> {
+    let (name, store) = match keychain {
+        Keychain::Native => use_native()?,
+        Keychain::Named(name) => (name.clone(), use_store(name)?),
+        Keychain::Memory => (
+            "memory".to_string(),
+            keyring_core::mock::Store::new()? as Arc<CredentialStore>,
+        ),
+        Keychain::Custom { name, store } => (name.clone(), store.clone()),
+    };
+    Ok(Selected {
+        name,
+        store,
+        wsl: OnceLock::new(),
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn use_native() -> anyhow::Result<&'static str> {
-    use_store("keychain").map(|_| "keychain")
+fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
+    Ok(("keychain".to_string(), use_store("keychain")?))
 }
 
 #[cfg(target_os = "windows")]
-fn use_native() -> anyhow::Result<&'static str> {
-    use_store("windows").map(|_| "windows")
+fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
+    Ok(("windows".to_string(), use_store("windows")?))
 }
 
 #[cfg(target_os = "linux")]
-fn use_native() -> anyhow::Result<&'static str> {
+fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
+    let keyutils = || Ok(("keyutils".to_string(), use_store("keyutils")?));
     if !session_bus_may_exist(
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
     ) {
         tracing::debug!("no D-Bus session bus, so no Secret Service; using keyutils");
-        return use_store("keyutils").map(|_| "keyutils");
+        return keyutils();
     }
     match use_store("secret-service") {
-        Ok(()) => Ok("secret-service"),
+        Ok(store) => Ok(("secret-service".to_string(), store)),
         Err(e) => {
             tracing::debug!("Secret Service unavailable ({e:#}), using keyutils");
-            use_store("keyutils").map(|_| "keyutils")
+            keyutils()
         }
     }
 }
@@ -92,65 +136,64 @@ fn session_bus_may_exist(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn use_native() -> anyhow::Result<&'static str> {
-    use_store("secret-service").map(|_| "secret-service")
+fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
+    Ok(("secret-service".to_string(), use_store("secret-service")?))
 }
 
-fn use_store(name: &str) -> anyhow::Result<()> {
-    use keyring_core::set_default_store;
+fn use_store(name: &str) -> anyhow::Result<Arc<CredentialStore>> {
     if let Some(rest) = name.strip_prefix(test_files::NAME) {
         let dir = test_files::dir(rest)?;
-        set_default_store(test_files::Store::new(&dir)?);
-        eprintln!(
-            "fob: warning: OMNIFOB_KEYRING keeps secrets UNENCRYPTED in {}; it is for tests only",
+        let store = test_files::Store::new(&dir)?;
+        tracing::warn!(
+            "OMNIFOB_KEYRING keeps secrets UNENCRYPTED in {}; it is for tests only",
             dir.display()
         );
-        return Ok(());
+        return Ok(store as Arc<CredentialStore>);
     }
-    match name {
+    Ok(match name {
         #[cfg(target_os = "macos")]
-        "keychain" => set_default_store(apple_native_keyring_store::keychain::Store::new()?),
+        "keychain" => apple_native_keyring_store::keychain::Store::new()? as Arc<CredentialStore>,
         #[cfg(target_os = "windows")]
-        "windows" => set_default_store(windows_native_keyring_store::Store::new()?),
+        "windows" => windows_native_keyring_store::Store::new()? as Arc<CredentialStore>,
         #[cfg(all(unix, not(target_os = "macos")))]
         "secret-service" => {
-            let store = zbus_secret_service_keyring_store::Store::new()?;
-            set_default_store(store);
+            let store: Arc<CredentialStore> = zbus_secret_service_keyring_store::Store::new()?;
             // Creating the store succeeds without a running service, so probe it.
-            match Entry::new(SERVICE, "probe")?.get_password() {
+            match store.build(SERVICE, "probe", None)?.get_password() {
                 Ok(_) | Err(KeyringError::NoEntry) => {}
-                Err(e) => {
-                    keyring_core::unset_default_store();
-                    return Err(e.into());
-                }
+                Err(e) => return Err(e.into()),
             }
+            store
         }
         #[cfg(target_os = "linux")]
-        "keyutils" => set_default_store(linux_keyutils_keyring_store::Store::new()?),
+        "keyutils" => linux_keyutils_keyring_store::Store::new()? as Arc<CredentialStore>,
         other => bail!("keychain store '{other}' is not available on this platform"),
-    }
-    Ok(())
+    })
 }
 
-fn entry(key: &str) -> anyhow::Result<Entry> {
-    init()?;
-    Entry::new(SERVICE, key).with_context(|| format!("opening keychain entry '{key}'"))
+fn entry(store: &Selected, key: &str) -> anyhow::Result<Entry> {
+    store
+        .store
+        .build(SERVICE, key, None)
+        .with_context(|| format!("opening keychain entry '{key}'"))
 }
 
 /// Reads a value; `None` when nothing is stored under `key`.
 pub fn get<T: DeserializeOwned>(key: &str) -> anyhow::Result<Option<T>> {
-    let json = match entry(key)?.get_password() {
+    let cx = Context::current();
+    let store = cx.store()?;
+    let json = match entry(store, key)?.get_password() {
         Ok(json) => {
             // Values stored before persistence existed get persisted once.
-            if let Err(e) = wsl::write_if_missing(key, &json) {
+            if let Err(e) = wsl::write_if_missing(&cx, key, &json) {
                 tracing::warn!("could not persist '{key}' with Windows DPAPI: {e:#}");
             }
             json
         }
-        Err(KeyringError::NoEntry) => match wsl::read(key)? {
+        Err(KeyringError::NoEntry) => match wsl::read(&cx, key)? {
             // Restore what survived a reboot into the fast store.
             Some(json) => {
-                entry(key)?.set_password(&json)?;
+                entry(store, key)?.set_password(&json)?;
                 json
             }
             None => return Ok(None),
@@ -163,21 +206,23 @@ pub fn get<T: DeserializeOwned>(key: &str) -> anyhow::Result<Option<T>> {
 }
 
 pub fn set<T: Serialize>(key: &str, value: &T) -> anyhow::Result<()> {
+    let cx = Context::current();
     let json = serde_json::to_string(value)?;
-    entry(key)?
+    entry(cx.store()?, key)?
         .set_password(&json)
         .with_context(|| format!("writing keychain entry '{key}'"))?;
-    wsl::write(key, &json)
+    wsl::write(&cx, key, &json)
 }
 
 /// Deletes a value; returns whether anything was stored.
 pub fn delete(key: &str) -> anyhow::Result<bool> {
-    let in_keychain = match entry(key)?.delete_credential() {
+    let cx = Context::current();
+    let in_keychain = match entry(cx.store()?, key)?.delete_credential() {
         Ok(()) => true,
         Err(KeyringError::NoEntry) => false,
         Err(e) => return Err(e).with_context(|| format!("deleting keychain entry '{key}'")),
     };
-    Ok(wsl::delete(key)? || in_keychain)
+    Ok(wsl::delete(&cx, key)? || in_keychain)
 }
 
 /// Moves a value to another key; returns whether there was one.
@@ -192,17 +237,18 @@ pub fn rename(old: &str, new: &str) -> anyhow::Result<bool> {
 
 /// Describes where secrets are kept, for `fob status`.
 pub fn description() -> anyhow::Result<String> {
-    let store = init()?;
+    let cx = Context::current();
+    let store = &cx.store()?.name;
     if let Some(rest) = store.strip_prefix(test_files::NAME) {
         return Ok(format!(
             "unencrypted files in {} (tests only)",
             test_files::dir(rest)?.display()
         ));
     }
-    Ok(if wsl::enabled() {
+    Ok(if wsl::enabled(&cx) {
         format!(
             "{store}, persisted with Windows DPAPI in {}",
-            wsl::dir()?.display()
+            wsl::dir(&cx)?.display()
         )
     } else if store == "keyutils" {
         "keyutils (lost on reboot)".to_string()
@@ -217,40 +263,42 @@ pub fn description() -> anyhow::Result<String> {
 /// values are persisted; cached credentials are cheap to recreate. Set
 /// `OMNIFOB_WSL_DPAPI=0` to turn this off.
 mod wsl {
+    use anyhow::{Context as _, bail};
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
-    use std::sync::OnceLock;
 
-    use anyhow::{Context, bail};
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use crate::Context;
 
     const PROTECT: &str = "$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($b,$null,'CurrentUser'))";
     const UNPROTECT: &str = "$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'))";
 
-    pub fn enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
+    pub fn enabled(cx: &Context) -> bool {
+        let Ok(store) = cx.store() else {
+            return false;
+        };
+        *store.wsl.get_or_init(|| {
             cfg!(target_os = "linux")
-                && super::init().is_ok_and(|s| s == "keyutils")
-                && std::env::var("OMNIFOB_WSL_DPAPI").map_or(true, |v| v != "0")
+                && store.name == "keyutils"
+                && cx.wsl_dpapi()
                 && crate::platform::is_wsl()
                 && crate::platform::wsl_interop()
                 && crate::platform::on_path("powershell.exe")
         })
     }
 
-    pub fn dir() -> anyhow::Result<PathBuf> {
-        Ok(crate::paths::state_dir()?.join("vault"))
+    pub fn dir(cx: &Context) -> anyhow::Result<PathBuf> {
+        Ok(cx.state_dir()?.join("vault"))
     }
 
     fn persisted(key: &str) -> bool {
         !key.starts_with("credentials/")
     }
 
-    fn file(key: &str) -> anyhow::Result<PathBuf> {
-        Ok(dir()?.join(format!("{}.dpapi", crate::files::encode_key_filename(key))))
+    fn file(cx: &Context, key: &str) -> anyhow::Result<PathBuf> {
+        Ok(dir(cx)?.join(format!("{}.dpapi", crate::files::encode_key_filename(key))))
     }
 
     /// Runs a DPAPI script with base64 on stdin; returns base64 from stdout.
@@ -281,29 +329,29 @@ mod wsl {
     // `enabled`, so a cached credential lookup never needs to learn whether
     // Windows is reachable.
 
-    pub fn write(key: &str, json: &str) -> anyhow::Result<()> {
-        if !persisted(key) || !enabled() {
+    pub fn write(cx: &Context, key: &str, json: &str) -> anyhow::Result<()> {
+        if !persisted(key) || !enabled(cx) {
             return Ok(());
         }
         let sealed = dpapi(PROTECT, &BASE64.encode(json.as_bytes()))?;
         // The directory and file are the user's only: even sealed, the file
         // names give away integrations and profiles.
-        crate::files::create_private_dir(&crate::paths::state_dir()?)?;
-        crate::files::write_private(&file(key)?, sealed)
+        crate::files::create_private_dir(cx.state_dir()?)?;
+        crate::files::write_private(&file(cx, key)?, sealed)
     }
 
-    pub fn write_if_missing(key: &str, json: &str) -> anyhow::Result<()> {
-        if persisted(key) && !file(key)?.exists() && enabled() {
-            write(key, json)?;
+    pub fn write_if_missing(cx: &Context, key: &str, json: &str) -> anyhow::Result<()> {
+        if persisted(key) && !file(cx, key)?.exists() && enabled(cx) {
+            write(cx, key, json)?;
         }
         Ok(())
     }
 
-    pub fn read(key: &str) -> anyhow::Result<Option<String>> {
-        if !persisted(key) || !enabled() {
+    pub fn read(cx: &Context, key: &str) -> anyhow::Result<Option<String>> {
+        if !persisted(key) || !enabled(cx) {
             return Ok(None);
         }
-        let sealed = match std::fs::read_to_string(file(key)?) {
+        let sealed = match std::fs::read_to_string(file(cx, key)?) {
             Ok(sealed) => sealed,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -314,11 +362,11 @@ mod wsl {
         Ok(Some(String::from_utf8(plain)?))
     }
 
-    pub fn delete(key: &str) -> anyhow::Result<bool> {
-        if !persisted(key) || !enabled() {
+    pub fn delete(cx: &Context, key: &str) -> anyhow::Result<bool> {
+        if !persisted(key) || !enabled(cx) {
             return Ok(false);
         }
-        match std::fs::remove_file(file(key)?) {
+        match std::fs::remove_file(file(cx, key)?) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -357,7 +405,7 @@ mod wsl {
 /// only: `OMNIFOB_KEYRING=test-plaintext-files:<absolute dir>`.
 ///
 /// Tests run the `fob` binary, so each command is a new process and the
-/// in-memory store of [`use_memory_store`] would forget everything between
+/// in-memory store ([`Keychain::Memory`]) would forget everything between
 /// commands; this store keeps secrets where the next command finds them,
 /// without touching the real keychain. It does not protect them at all:
 /// every secret is written unencrypted, one file per key, named by
@@ -531,23 +579,6 @@ pub mod test_files {
             assert!(!path.exists());
             std::fs::remove_dir_all(&root).unwrap();
         }
-    }
-}
-
-/// Puts this process on an in-memory store, so tests never touch the real
-/// keychain. Must run before anything else uses the store.
-#[doc(hidden)]
-pub fn use_memory_store() -> anyhow::Result<()> {
-    let chosen = BACKEND.get_or_init(|| {
-        keyring_core::mock::Store::new()
-            .map(|store| keyring_core::set_default_store(store))
-            .map(|()| "memory")
-            .map_err(|e| e.to_string())
-    });
-    match chosen {
-        Ok("memory") => Ok(()),
-        Ok(other) => bail!("the {other} store was already chosen"),
-        Err(e) => bail!("{e}"),
     }
 }
 

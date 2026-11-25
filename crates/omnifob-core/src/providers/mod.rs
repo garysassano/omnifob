@@ -947,7 +947,10 @@ mod tests {
 
     #[test]
     fn profiles_that_go_away_lose_their_cached_credentials() {
-        store::use_memory_store().unwrap();
+        let _cx = crate::Context::builder()
+            .keychain(store::Keychain::Memory)
+            .build()
+            .enter();
         let profile = |integration: &str, account: &str| {
             Profile::new(
                 integration,
