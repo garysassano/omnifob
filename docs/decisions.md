@@ -214,7 +214,7 @@ Under an agent, `fob creds` in JSON, `fob env` and `fob console --print` (the UR
 
 Without an agent, the changes are messages and exit codes. An ambiguous query without a terminal lists how many profiles match and up to ten of them. The note about an integration that is not signed in, which appeared on every command, now appears for `fob list`, `fob export aws-config` and when no profile matches. The MFA hint names `fob exec <id> -- true` rather than `fob creds`, which would print the credentials. `fob exec` exits with 125 when fob fails and 126 or 127 when the command cannot be started, as `env` does, so a caller can tell fob's failures from the command's (a breaking change for scripts that checked for 1).
 
-A browser sign-in started by an agent keeps waiting for the full ten minutes rather than returning early, since the callback listener ends with the process and a later run would start over; the skill tells agents to give `fob login` a long timeout. The skill ships in `skills/omnifob` in the repository rather than in `.agents/skills`, which is for skills about developing omnifob, so other people can install it.
+A sign-in started by an agent keeps waiting until it times out (ten minutes for every browser sign-in, and until the code expires for a device flow: ten minutes for Identity Center, fifteen for Entra ID) rather than returning early, since the callback listener ends with the process and a later run would start over; the skill tells agents to give `fob login` a long timeout. The skill ships in `skills/omnifob` in the repository rather than in `.agents/skills`, which is for skills about developing omnifob, so other people can install it.
 
 ## 2026-11-18: Identity Center VPC endpoints and network controls
 

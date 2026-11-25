@@ -35,7 +35,7 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 
 ## When fob says no
 
-- "run `fob login <integration>`": the sign-in lapsed. Either ask the user to run it, or run `fob login <integration>` yourself with a 10-minute timeout and tell the user to approve the sign-in in the browser window that opens on their screen. If it is still valid, it returns at once without opening anything.
+- "run `fob login <integration>`": the sign-in lapsed. Either ask the user to run it, or run `fob login <integration>` yourself with a 15-minute timeout (a browser sign-in waits up to ten minutes, an Entra ID device code up to fifteen) and tell the user to approve the sign-in in the browser window that opens on their screen. If it is still valid, it returns at once without opening anything.
 - "name the profile by its full id": use one of the ids it lists. "this directory's default (...) is <id>": the user mapped the working directory to that profile; name it in full.
 - "the default profile of ... is not a profile": the user's `[directories]` entry is stale; tell them, and name a profile from `fob list`.
 - "is not open to agents": the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
