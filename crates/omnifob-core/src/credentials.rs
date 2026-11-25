@@ -26,6 +26,16 @@ pub struct Credentials {
     pub token_id: Option<String>,
 }
 
+/// Whether `name` is a portable environment variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`), the only kind omnifob puts into shell code.
+pub fn is_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Stands in for a secret value in `Debug` output.
 struct Redacted;
 
@@ -72,6 +82,16 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variable_names_are_portable() {
+        for ok in ["AWS_REGION", "_x", "a1", "Z"] {
+            assert!(is_var_name(ok), "{ok}");
+        }
+        for bad in ["", "1A", "A-B", "A B", "A;rm", "$(x)", "A=B", "É", "A,B"] {
+            assert!(!is_var_name(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn debug_names_the_variables_but_never_their_values() {

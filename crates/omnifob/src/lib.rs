@@ -159,7 +159,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     return Err(agent::refuse_to_print(&profile.id));
                 }
                 let creds = app.credentials(&profile, !no_cache, ttl).await?;
-                print!("{}", shell::export(shell, &profile.id, &creds, &previous));
+                print!("{}", shell::export(shell, &profile.id, &creds, &previous)?);
                 eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
             }
         }
