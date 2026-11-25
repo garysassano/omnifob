@@ -11,6 +11,7 @@ use crate::Profile;
 use crate::providers::aws_partition::Partition;
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Browsers, or profiles of one browser, that integrations open in,
@@ -26,6 +27,7 @@ pub struct Config {
 
 /// Limits on what a coding agent can get, under `[agent]`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Profile ids agents may get credentials for, as patterns in which `*`
@@ -104,6 +106,7 @@ fn matches_segment(pattern: &[u8], segment: &[u8]) -> bool {
 /// How to open a URL in one browser, or one profile of a browser, so that
 /// each integration's sign-in sessions stay in the profile it belongs to.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Browser {
     /// The program and its arguments, run without a shell; `{url}` in an
@@ -118,6 +121,7 @@ pub struct Browser {
 
 /// How a browser keeps AWS consoles apart, one per profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Isolation {
     /// A Chromium profile per fob profile (`--profile-directory`), in place
@@ -255,9 +259,23 @@ impl Integration {
     }
 }
 
+/// The schema of an integration is that of the table written in the config
+/// file, [`RawIntegration`], which it is converted from.
+#[cfg(test)]
+impl schemars::JsonSchema for Integration {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Integration".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        RawIntegration::json_schema(generator)
+    }
+}
+
 /// The `type` values as written in the config file. Both Cloudflare types
 /// share one configuration and differ only in how omnifob signs in.
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum RawIntegration {
     AwsSso(AwsSsoConfig),
@@ -320,6 +338,7 @@ impl TryFrom<RawIntegration> for Integration {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AwsSsoConfig {
     /// The AWS access portal URL, e.g. `https://acme.awsapps.com/start`.
@@ -349,6 +368,7 @@ pub struct AwsSsoConfig {
     /// a console session lasts as long as the role's credentials. Chained
     /// roles cannot take it.
     #[serde(default, with = "opt_duration")]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub console_duration: Option<SignedDuration>,
     /// The browser in `[browsers]` that this integration's sign-ins and
     /// consoles open in; by default the system's.
@@ -517,6 +537,7 @@ fn check_console_duration(key: &str, duration: Option<SignedDuration>) -> Result
 
 /// A role assumed with the credentials of an Identity Center role.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ChainedRole {
     /// Account of the Identity Center role to start from.
@@ -543,6 +564,7 @@ pub struct ChainedRole {
         skip_serializing_if = "Option::is_none",
         with = "opt_duration"
     )]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub duration: Option<SignedDuration>,
 }
 
@@ -599,6 +621,7 @@ impl ChainedRole {
 /// so `role_arn` is an IAM role ARN in a partition other than the source
 /// Region's, and `region` is in the partition of `role_arn`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CrossPartitionRole {
     /// Account of the Identity Center role that requests the token.
@@ -632,12 +655,14 @@ pub struct CrossPartitionRole {
         skip_serializing_if = "Option::is_none",
         with = "opt_duration"
     )]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub duration: Option<SignedDuration>,
 }
 
 /// The algorithm `GetWebIdentityToken` signs the token with
 /// (`SigningAlgorithm`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub enum SigningAlgorithm {
     /// ECDSA with P-384 and SHA-384, the one AWS's examples use.
     #[default]
@@ -833,6 +858,7 @@ fn check_session_name(name: &str) -> Result<(), String> {
 /// set), and assumes `roles` with that session, which STS counts as role
 /// chaining.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AwsIamConfig {
     /// Middle segment of the session profile's id; defaults to the account ID.
@@ -849,6 +875,7 @@ pub struct AwsIamConfig {
     /// Length of the user's session, 15 minutes to 36 hours; defaults to
     /// eight hours, a working day.
     #[serde(default, with = "opt_duration")]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub session_duration: Option<SignedDuration>,
     /// Roles assumed with the user's session, keyed by a label that becomes
     /// the middle of the profile id.
@@ -915,6 +942,7 @@ impl AwsIamConfig {
 /// user or a federated role), and omnifob keeps a refresh token that renews
 /// 15 minute credentials for up to 12 hours, with no access key stored.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AwsLoginConfig {
     /// The Region signed in through; the refresh token works only there. It
@@ -944,6 +972,7 @@ impl AwsLoginConfig {
 
 /// A role assumed with an IAM user's session.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IamRole {
     pub role_arn: String,
@@ -963,6 +992,7 @@ pub struct IamRole {
         skip_serializing_if = "Option::is_none",
         with = "opt_duration"
     )]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub duration: Option<SignedDuration>,
     /// How long `fob console` sessions last (`SessionDuration`), 15 minutes
     /// to 12 hours and shorter than the role's maximum session duration.
@@ -972,6 +1002,7 @@ pub struct IamRole {
         skip_serializing_if = "Option::is_none",
         with = "opt_duration"
     )]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub console_duration: Option<SignedDuration>,
 }
 
@@ -1027,6 +1058,7 @@ impl IamRole {
 /// signs in. Profiles are the account itself in each project, and service
 /// accounts it may impersonate.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GcpConfig {
     /// The projects to offer; by default every active project the account
@@ -1100,6 +1132,7 @@ fn check_service_account_email(key: &str, email: &str) -> Result<(), String> {
 /// A service account the signed-in account impersonates, which needs the
 /// Service Account Token Creator role on it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GcpServiceAccount {
     pub email: String,
@@ -1110,6 +1143,7 @@ pub struct GcpServiceAccount {
     /// organization policy `iam.allowServiceAccountCredentialLifetimeExtension`
     /// lists the account (then up to 12 hours).
     #[serde(default, with = "opt_duration")]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub lifetime: Option<SignedDuration>,
     /// Service accounts to go through, in order, when the account may only
     /// impersonate this one by way of others.
@@ -1142,6 +1176,7 @@ impl GcpServiceAccount {
 /// A Microsoft Entra ID account (`type = "azure"`), signed in the way
 /// `az login` signs in. Profiles are the account in each subscription.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AzureConfig {
     /// The tenant to sign in to (ID or domain); by default `organizations`,
@@ -1164,6 +1199,7 @@ fn default_sso_scopes() -> Vec<String> {
 
 /// Long-lived tokens for providers without short-lived credentials.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TokenConfig {
     /// A known provider: its variable names, token check and console URL.
@@ -1268,6 +1304,7 @@ fn check_var_name(key: &str, var: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CloudflareConfig {
     /// Account to mint tokens for. When omitted, every account the bootstrap
@@ -1284,6 +1321,7 @@ pub struct CloudflareConfig {
     pub token_type: CloudflareTokenType,
     /// Lifetime of minted tokens unless a template overrides it.
     #[serde(default = "default_cloudflare_ttl", with = "duration")]
+    #[cfg_attr(test, schemars(with = "String"))]
     pub ttl: SignedDuration,
     /// Extra templates, added to (or replacing) the built-in ones.
     #[serde(default)]
@@ -1297,6 +1335,7 @@ pub struct CloudflareConfig {
     /// token expire after this long, so it works like an SSO session: a
     /// stolen copy stops working, and a new one needs the dashboard sign-in.
     #[serde(default, with = "opt_duration")]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub session: Option<SignedDuration>,
     /// `cloudflare-oauth`: the OAuth client to sign in with.
     #[serde(default)]
@@ -1418,6 +1457,7 @@ fn check_ips(key: &str, ips: &[String]) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum CloudflareTokenType {
     /// Minted with a user-owned bootstrap token ("Create additional tokens").
@@ -1430,6 +1470,7 @@ pub enum CloudflareTokenType {
 /// A named set of permissions, written as they appear in the dashboard's API
 /// names (e.g. "Workers Scripts Write"), never as IDs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CloudflareTemplate {
     pub permissions: Vec<String>,
@@ -1438,6 +1479,7 @@ pub struct CloudflareTemplate {
     #[serde(default)]
     pub optional: Vec<String>,
     #[serde(default, with = "opt_duration")]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub ttl: Option<SignedDuration>,
     /// R2 buckets that bucket-level permissions ("Workers R2 Storage Bucket
     /// Item Write") apply to; "eu/name" for a bucket in a jurisdiction.
@@ -1684,7 +1726,13 @@ pub fn parse_duration(s: &str) -> anyhow::Result<SignedDuration> {
 
 mod duration {
     use jiff::SignedDuration;
-    use serde::{Deserialize, Deserializer};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Written the way it is read, as "1h" or "30m" (the schema's default).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn serialize<S: Serializer>(d: &SignedDuration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{d:#}"))
+    }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SignedDuration, D::Error> {
         let s = String::deserialize(d)?;
@@ -2832,5 +2880,69 @@ mod tests {
             let error = token(extra).unwrap_err();
             assert!(error.contains(message), "{extra}: {error}");
         }
+    }
+
+    /// The JSON Schema published for editors and taplo, generated from the
+    /// types the config is read into, so it cannot drift from them.
+    fn config_schema() -> String {
+        let schema = schemars::generate::SchemaSettings::draft07()
+            .into_generator()
+            .into_root_schema_for::<Config>();
+        let mut value = serde_json::to_value(&schema).unwrap();
+        without_null(&mut value);
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "$id".into(),
+            "https://raw.githubusercontent.com/garysassano/omnifob/main/schema/config.schema.json"
+                .into(),
+        );
+        object.insert("title".into(), "omnifob config.toml".into());
+        serde_json::to_string_pretty(&value).unwrap() + "\n"
+    }
+
+    /// Takes `null` out of a schema: TOML has none, and an optional key is
+    /// one that may be left out, which `required` already says.
+    fn without_null(value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::Object(object) => {
+                if object.get("default") == Some(&Value::Null) {
+                    object.remove("default");
+                }
+                if let Some(Value::Array(types)) = object.get_mut("type") {
+                    types.retain(|t| t != "null");
+                    if let [only] = types.as_slice() {
+                        let only = only.clone();
+                        object.insert("type".into(), only);
+                    }
+                }
+                if let Some(Value::Array(any)) = object.get_mut("anyOf") {
+                    any.retain(|s| s.get("type").is_none_or(|t| t != "null"));
+                    if let [only] = any.as_slice() {
+                        let only = only.as_object().cloned().unwrap_or_default();
+                        object.remove("anyOf");
+                        object.extend(only);
+                    }
+                }
+                object.values_mut().for_each(without_null);
+            }
+            Value::Array(items) => items.iter_mut().for_each(without_null),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_published_schema_matches_the_config() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/config.schema.json");
+        let schema = config_schema();
+        if std::env::var_os("OMNIFOB_WRITE_SCHEMA").is_some() {
+            std::fs::write(&path, &schema).unwrap();
+        }
+        let published = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            published.replace("\r\n", "\n") == schema,
+            "schema/config.schema.json is out of date; regenerate it with \
+             `OMNIFOB_WRITE_SCHEMA=1 cargo test -p omnifob-core --lib published_schema`"
+        );
     }
 }
