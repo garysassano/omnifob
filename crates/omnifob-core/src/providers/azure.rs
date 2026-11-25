@@ -31,7 +31,7 @@ use crate::oauth::{Loopback, Pkce};
 use crate::{Credentials, Error, Profile, Result, Target, store};
 
 /// The Azure CLI's client (`AZURE_CLI_CLIENT_ID` in `auth/constants.py`).
-const CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+pub const CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
 /// Resource Manager, as `az` asks for it (the double slash is right: the
 /// resource is `https://management.core.windows.net/`).
@@ -119,12 +119,16 @@ enum Exchange {
     Refused(OauthError),
 }
 
-async fn exchange(tenant: &str, form: &[(&str, &str)]) -> anyhow::Result<Exchange> {
-    let response = crate::http::client()
-        .post(format!("{}/token", authority(tenant)))
-        .form(form)
-        .send()
-        .await?;
+async fn exchange(
+    tenant: &str,
+    form: &[(&str, &str)],
+    client_session: Option<&str>,
+) -> anyhow::Result<Exchange> {
+    let mut request = crate::http::client().post(format!("{}/token", authority(tenant)));
+    if let Some(session) = client_session {
+        request = request.query(&[("client_session", session)]);
+    }
+    let response = request.form(form).send().await?;
     let status = response.status();
     let text = response.text().await?;
     if status.is_success() {
@@ -236,6 +240,7 @@ async fn browser_sign_in(
             ("code_verifier", &verifier),
             ("scope", SCOPE),
         ],
+        None,
     )
     .await?
     {
@@ -285,6 +290,7 @@ async fn device_sign_in(
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", &device.device_code),
             ],
+            None,
         )
         .await?;
         match polled {
@@ -321,29 +327,62 @@ fn drop_if_current(integration: &str, refresh_token: &str) {
     }
 }
 
-/// A Resource Manager token for `tenant`, from the refresh token; stores the
-/// rotated refresh token. A refusal particular to the tenant (MFA, conditional
-/// access) is an error for it alone; a refusal of the sign-in itself forgets
-/// it and asks for a new one.
+/// A Resource Manager token for `tenant`; see [`scope_token`].
+async fn arm_token(integration: &str, tenant: &str) -> Result<(String, Timestamp)> {
+    scope_token(integration, tenant, SCOPE).await
+}
+
+/// The scope that asks Entra ID for a token for `resource`, as the Azure
+/// CLI's `resource_to_scopes` writes it (`<resource>/.default`, so a
+/// resource that ends in a slash gets two), plus `offline_access`, so the
+/// refresh token keeps rotating.
+fn resource_scope(resource: &str) -> String {
+    format!("{resource}/.default offline_access")
+}
+
+/// A token for `resource` (Key Vault, Storage, Graph, an AKS cluster's
+/// server app) in `tenant`, from the stored sign-in; see [`scope_token`].
+/// The Azure CLI's client is pre-authorized for Azure's own resources.
+pub async fn resource_token(
+    integration: &str,
+    tenant: &str,
+    resource: &str,
+) -> Result<(String, Timestamp)> {
+    if resource.is_empty() || resource.chars().any(char::is_whitespace) {
+        return Err(anyhow!("'{resource}' is not a resource URI or app ID").into());
+    }
+    scope_token(integration, tenant, &resource_scope(resource)).await
+}
+
+/// A token for `scope` in `tenant`, from the refresh token; stores the
+/// rotated refresh token. A refusal particular to the tenant (MFA,
+/// conditional access) is an error for it alone; a refusal of the sign-in
+/// itself forgets it and asks for a new one.
 ///
 /// Entra ID keeps the previous refresh token valid after a rotation, so
 /// parallel commands lose nothing; the lock (which `login` takes too) keeps
 /// a rotated token from overwriting a sign-in stored meanwhile.
-async fn arm_token(integration: &str, tenant: &str) -> Result<(String, Timestamp)> {
+///
+/// For a coding agent with a session (`COPILOT_AGENT_SESSION_ID`), the
+/// request carries it as `client_session`, in the body and the query, as
+/// the Azure CLI sends it, so Entra ID marks the token as an agent's.
+async fn scope_token(integration: &str, tenant: &str, scope: &str) -> Result<(String, Timestamp)> {
     let _lock = store::lock(&lock_name(integration), TOKEN_LOCK_TIMEOUT).await?;
     let mut stored = stored(integration)?;
     let now = Timestamp::now();
-    let response = match exchange(
-        tenant,
-        &[
-            ("client_id", CLIENT_ID),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", &stored.refresh_token),
-            ("scope", SCOPE),
-        ],
-    )
-    .await?
-    {
+    let session = crate::Context::current()
+        .agent()
+        .and_then(|a| a.session_id.clone());
+    let mut form = vec![
+        ("client_id", CLIENT_ID),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", stored.refresh_token.as_str()),
+        ("scope", scope),
+    ];
+    if let Some(session) = &session {
+        form.push(("client_session", session));
+    }
+    let response = match exchange(tenant, &form, session.as_deref()).await? {
         Exchange::Ok(r) => r,
         Exchange::Refused(e) if e.error == "invalid_grant" && tenant == stored.tenant_id => {
             drop_if_current(integration, &stored.refresh_token);

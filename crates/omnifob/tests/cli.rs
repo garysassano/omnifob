@@ -91,11 +91,21 @@ impl Fob {
                 .any(|p| name.eq_ignore_ascii_case(p));
             // Agents' markers too, so the tests run alike under an agent.
             let agent = [
+                "AI_AGENT",
                 "CLAUDECODE",
                 "GEMINI_CLI",
                 "CURSOR_AGENT",
                 "CODEX_SANDBOX",
+                "CODEX_THREAD_ID",
                 "COPILOT_AGENT_SESSION_ID",
+                "COPILOT_CLI",
+                "OPENCODE",
+                "CRUSH",
+                "QWEN_CODE",
+                "CLINE_ACTIVE",
+                "GOOSE_TERMINAL",
+                "PI_CODING_AGENT",
+                "ANTIGRAVITY_AGENT",
             ]
             .contains(&&*name);
             if name.starts_with("AWS_")
@@ -746,6 +756,160 @@ fn exec_child(fob: &Fob, profile: &str, env: &[(&str, &str)], names: &[&str]) ->
         .lines()
         .filter_map(|l| l.split_once("child: ").map(|(_, v)| v.to_string()))
         .collect()
+}
+
+#[test]
+#[ignore = "run by exec_serves_aws_credentials_from_a_loopback_endpoint"]
+fn child_fetches_container_credentials() {
+    use std::io::{Read, Write};
+    let Ok(uri) = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI") else {
+        return;
+    };
+    let token = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN").unwrap();
+    println!(
+        "child: AWS_ACCESS_KEY_ID {}",
+        if std::env::var_os("AWS_ACCESS_KEY_ID").is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    let addr = uri
+        .strip_prefix("http://")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .unwrap()
+        .to_string();
+    println!("child: loopback {}", addr.starts_with("127.0.0.1:"));
+    let get = |authorization: &str| {
+        let mut s = std::net::TcpStream::connect(&addr).unwrap();
+        write!(
+            s,
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {authorization}\r\n\r\n"
+        )
+        .unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    let refused = get("guess");
+    println!("child: wrong token {}", refused.lines().next().unwrap());
+    let reply = get(&token);
+    println!("child: right token {}", reply.lines().next().unwrap());
+    let body: serde_json::Value =
+        serde_json::from_str(reply.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    println!(
+        "child: AccessKeyId {}",
+        body["AccessKeyId"].as_str().unwrap()
+    );
+    println!("child: AccountId {}", body["AccountId"].as_str().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_serves_aws_credentials_from_a_loopback_endpoint() {
+    let (fob, _server) = synced_portal("exec-server").await;
+    let me = std::env::current_exe().unwrap();
+    let output = fob
+        .command(&[
+            "exec",
+            "acme/dev/Admin",
+            "--server",
+            "--",
+            me.to_str().unwrap(),
+            "child_fetches_container_credentials",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AWS_ACCESS_KEY_ID", "stale")
+        .env("AWS_PROFILE", "stale")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let printed: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.split_once("child: ").map(|(_, v)| v))
+        .collect();
+    assert_eq!(
+        printed,
+        [
+            "AWS_ACCESS_KEY_ID unset",
+            "loopback true",
+            "wrong token HTTP/1.1 401 Unauthorized",
+            "right token HTTP/1.1 200 OK",
+            "AccessKeyId ASIA111111111111",
+            "AccountId 111111111111",
+        ]
+    );
+    // Only AWS profiles have one.
+    let output = fob.run(&["exec", "acme/dev/Admin", "--token-file", "--", "true"]);
+    assert_eq!(output.status.code(), Some(125));
+}
+
+/// kubectl's exec plugin output, which agents may run since kubectl reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn creds_write_an_eks_exec_credential() {
+    let (fob, _server) = synced_portal("k8s").await;
+    let output = fob
+        .command(&["creds", "acme/dev/Admin", "--format", "k8s-exec", "--cluster", "dev"])
+        .env("CLAUDECODE", "1")
+        .env(
+            "KUBERNETES_EXEC_INFO",
+            r#"{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1beta1","spec":{"interactive":false}}"#,
+        )
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["kind"], "ExecCredential");
+    assert_eq!(value["apiVersion"], "client.authentication.k8s.io/v1beta1");
+    assert!(
+        value["status"]["token"]
+            .as_str()
+            .unwrap()
+            .starts_with("k8s-aws-v1.")
+    );
+    assert!(value["status"]["expirationTimestamp"].is_string());
+    // The cluster is part of the token; Google's format is for Google.
+    let (_, stderr) = texts(&fob.run(&["creds", "acme/dev/Admin", "--format", "k8s-exec"]));
+    assert!(stderr.contains("--cluster"), "{stderr}");
+    let (_, stderr) = texts(&fob.run(&["creds", "acme/dev/Admin", "--format", "gcp-executable"]));
+    assert!(stderr.contains("Google Cloud profiles"), "{stderr}");
+}
+
+/// The audit log records what was handed out, under an agent too, and
+/// never a secret.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_audit_log_records_handouts_without_secrets() {
+    let (fob, _server) = synced_portal("audit").await;
+    let config = std::fs::read_to_string(fob.config_file()).unwrap();
+    std::fs::write(
+        fob.config_file(),
+        format!("[audit]\nenabled = true\n\n{config}"),
+    )
+    .unwrap();
+    fob.ok(&["creds", "acme/dev/Admin", "--format", "credential-process"]);
+    let output = fob.run_as_agent(&["exec", "acme/dev/Admin", "--", "fob-e2e-no-such-command"]);
+    assert_eq!(output.status.code(), Some(127));
+    let log = std::fs::read_to_string(fob.root.join("state/omnifob/audit.jsonl")).unwrap();
+    assert!(
+        !log.contains("role-session") && !log.contains("ASIA"),
+        "{log}"
+    );
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{log}");
+    assert_eq!(lines[0]["command"], "creds");
+    assert_eq!(lines[0]["via"], "credential-process");
+    assert_eq!(lines[0]["profile"], "acme/dev/Admin");
+    assert!(lines[0].get("agent").is_none());
+    assert_eq!(lines[1]["command"], "exec");
+    assert_eq!(lines[1]["agent"], "CLAUDECODE");
+    assert_eq!(lines[1]["expires_at"], "2100-01-01T00:00:00Z");
 }
 
 /// What an earlier `fob use` or another tool left in the shell does not

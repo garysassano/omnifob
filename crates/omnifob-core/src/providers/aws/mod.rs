@@ -26,3 +26,14 @@ pub(crate) fn service_endpoint(variable: &str) -> Option<String> {
         .aws_service(variable)
         .map(str::to_string)
 }
+
+/// The `RoleSessionName` of a role whose config names none: `omnifob`, or
+/// `omnifob-agent` for a coding agent, so CloudTrail tells the sessions
+/// agents started from the user's own.
+pub(crate) fn default_session_name() -> &'static str {
+    if crate::Context::current().agent().is_some() {
+        "omnifob-agent"
+    } else {
+        "omnifob"
+    }
+}

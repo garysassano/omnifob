@@ -35,6 +35,17 @@ use crate::{Credentials, Error, Profile, Result, Target, store};
 /// tracked in the catalog, so cleanup and revocation never rely on names.
 const TOKEN_NAME_PREFIX: &str = "omnifob";
 
+/// A minted token's name: `omnifob <template>`, or `omnifob-agent
+/// <template>` for a coding agent, so the dashboard and the audit log tell
+/// them apart.
+fn token_name(template: &str) -> String {
+    if crate::Context::current().agent().is_some() {
+        format!("{TOKEN_NAME_PREFIX}-agent {template}")
+    } else {
+        format!("{TOKEN_NAME_PREFIX} {template}")
+    }
+}
+
 /// Prefix of the names used before 0.3 (`omnifob:<profile>@<time>`); such
 /// tokens are still cleaned up and revoked.
 const LEGACY_NAME_PREFIX: &str = "omnifob:";
@@ -614,7 +625,7 @@ pub async fn mint(
     let now = now.round(Unit::Second)?;
     let expires_at = now.checked_add(ttl)?;
     let mut body = json!({
-        "name": format!("{TOKEN_NAME_PREFIX} {template_name}"),
+        "name": token_name(template_name),
         "policies": policies,
         "expires_on": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });

@@ -28,7 +28,7 @@ use anyhow::{Context, bail};
 use jiff::SignedDuration;
 use serde::Deserialize;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -41,6 +41,9 @@ pub struct Config {
     /// What commands run by a coding agent may use.
     #[serde(default)]
     pub agent: AgentConfig,
+    /// The local audit log of credentials handed out.
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 /// An identity source: something you sign in to once and that yields many

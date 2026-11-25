@@ -48,6 +48,19 @@ struct Inner {
     http: Option<reqwest::Client>,
     mfa: Option<Box<MfaPrompt>>,
     endpoints: Endpoints,
+    agent: Option<Agent>,
+}
+
+/// The coding agent whose command uses the library, which marks what it
+/// gets on the provider's side: AWS sessions named `omnifob-agent` where
+/// the config names none, Cloudflare tokens named `omnifob-agent
+/// <template>`, and Entra ID tokens tagged with the agent's session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Agent {
+    /// The agent's session, which Entra ID records in its tokens'
+    /// `xms_cli_sid` claim as the Azure CLI asks it to:
+    /// `COPILOT_AGENT_SESSION_ID`.
+    pub session_id: Option<String>,
 }
 
 impl std::fmt::Debug for Context {
@@ -58,6 +71,7 @@ impl std::fmt::Debug for Context {
             .field("keychain", &self.0.keychain)
             .field("mfa_prompt", &self.0.mfa.is_some())
             .field("endpoints", &self.0.endpoints)
+            .field("agent", &self.0.agent)
             .finish_non_exhaustive()
     }
 }
@@ -142,6 +156,7 @@ pub struct ContextBuilder {
     shared_http: bool,
     mfa: Option<Box<MfaPrompt>>,
     endpoints: Endpoints,
+    agent: Option<Agent>,
 }
 
 impl ContextBuilder {
@@ -188,6 +203,12 @@ impl ContextBuilder {
         self
     }
 
+    /// The coding agent the library works for, if any; see [`Agent`].
+    pub fn agent(mut self, agent: Option<Agent>) -> Self {
+        self.agent = agent;
+        self
+    }
+
     pub fn build(self) -> Context {
         let http = self
             .shared_http
@@ -201,6 +222,7 @@ impl ContextBuilder {
             http,
             mfa: self.mfa,
             endpoints: self.endpoints,
+            agent: self.agent,
         }))
     }
 }
@@ -240,6 +262,7 @@ impl Context {
             shared_http: true,
             mfa: None,
             endpoints: Endpoints::default(),
+            agent: None,
         }
     }
 
@@ -331,6 +354,11 @@ impl Context {
 
     pub fn endpoints(&self) -> &Endpoints {
         &self.0.endpoints
+    }
+
+    /// The coding agent the library works for, if any.
+    pub fn agent(&self) -> Option<&Agent> {
+        self.0.agent.as_ref()
     }
 
     /// The keychain this context chose, for another context to share: the

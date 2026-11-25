@@ -784,6 +784,71 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
 }
 
 #[tokio::test]
+async fn an_agent_s_role_sessions_are_named_for_it_unless_configured() {
+    let server = MockServer::start().await;
+    let context = Context::builder()
+        .endpoints(Endpoints {
+            aws: Some(server.uri()),
+            ..Default::default()
+        })
+        .agent(Some(omnifob_core::Agent::default()));
+    let _guard = Scratch::with("omnifob-aws-agent", context);
+    device_login(&server, "chain", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("RoleSessionName=omnifob-agent"))
+        .respond_with(sts_credentials("AssumeRole", "ASIAAGENT"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("RoleSessionName=me"))
+        .respond_with(sts_credentials("AssumeRole", "ASIAME"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let text = format!(
+        r#"
+        [integrations.chain]
+        type = "aws-sso"
+        start_url = "{START_URL}"
+        region = "eu-west-1"
+        [integrations.chain.chained.prod]
+        via_account_id = "111111111111"
+        via_role = "Admin"
+        role_arn = "arn:aws:iam::222222222222:role/Deploy"
+        [integrations.chain.chained.named]
+        via_account_id = "111111111111"
+        via_role = "Admin"
+        role_arn = "arn:aws:iam::222222222222:role/Named"
+        session_name = "me"
+        "#
+    );
+    let Integration::AwsSso(config) = Config::parse(&text)
+        .unwrap()
+        .integrations
+        .remove("chain")
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let creds = aws::sso::chained_credentials("chain", &config, "prod", "chain/prod/Deploy", None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAAGENT");
+    let creds = aws::sso::chained_credentials("chain", &config, "named", "chain/named/Named", None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAME");
+}
+
+#[tokio::test]
 async fn credentials_carry_the_account_id() {
     use omnifob_core::providers;
     use omnifob_core::{Profile, Target};

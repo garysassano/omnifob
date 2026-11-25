@@ -476,3 +476,111 @@ fn config_checks() {
         .contains("12h")
     );
 }
+
+fn id_token_until(exp: i64) -> String {
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        json!({ "email": "me@example.com", "iss": "https://accounts.google.com", "exp": exp })
+            .to_string(),
+    );
+    format!("h.{payload}.s")
+}
+
+#[tokio::test]
+async fn the_id_token_comes_from_renewal_and_is_reused_while_it_lasts() {
+    let (_guard, server) = setup().await;
+    let config = gcp_config("");
+    browser_login(&server, "g", &config).await;
+    let exp = jiff::Timestamp::now().as_second() + 3600;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "user-access-2",
+            "expires_in": 3599,
+            "id_token": id_token_until(exp),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The sign-in's ID token has no expiry, so it is renewed once.
+    let (token, expires) = gcp::id_token("g", &config).await.unwrap();
+    assert_eq!(token, id_token_until(exp));
+    assert_eq!(expires.as_second(), exp);
+    let (again, _) = gcp::id_token("g", &config).await.unwrap();
+    assert_eq!(again, token);
+}
+
+#[tokio::test]
+async fn the_adc_endpoint_hands_the_libraries_the_profiles_token() {
+    let (_guard, server) = setup().await;
+    let text = r#"
+        [integrations.g]
+        type = "gcp"
+        projects = ["proj-a"]
+    "#;
+    let config = Config::parse(text).unwrap();
+    let Integration::Gcp(gcp_config) = config.integration("g").unwrap().clone() else {
+        unreachable!()
+    };
+    browser_login(&server, "g", &gcp_config).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "user-access-2",
+            "expires_in": 3599,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let profile = omnifob_core::Profile::new(
+        "g",
+        "proj-a",
+        "user",
+        Target::Gcp {
+            project_id: "proj-a".into(),
+            project_name: "A".into(),
+        },
+    );
+    let mut provision = omnifob_core::provision::gcp_adc_endpoint(config, profile)
+        .await
+        .unwrap();
+    let file = std::path::PathBuf::from(&provision.set[0].1);
+    assert_eq!(provision.set[0].0, "GOOGLE_APPLICATION_CREDENTIALS");
+    let adc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(adc["type"], "external_account_authorized_user");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let token_url = adc["token_url"].as_str().unwrap().to_string();
+    let secret = adc["refresh_token"].as_str().unwrap().to_string();
+    assert!(token_url.starts_with("http://127.0.0.1:"), "{token_url}");
+    let task = provision.tasks.remove(0);
+    let http = reqwest::Client::new();
+    // As google-auth refreshes `external_account_authorized_user`.
+    let refresh = |token: String| {
+        http.post(&token_url)
+            .basic_auth("omnifob", Some("omnifob"))
+            .form(&[("grant_type", "refresh_token"), ("refresh_token", &token)])
+            .send()
+    };
+    let (wrong, good) = tokio::select! {
+        () = task => unreachable!(),
+        out = async {
+            let wrong = refresh("guess".into()).await.unwrap().status();
+            let good: serde_json::Value =
+                refresh(secret.clone()).await.unwrap().json().await.unwrap();
+            (wrong, good)
+        } => out,
+    };
+    assert_eq!(wrong, 400);
+    assert_eq!(good["access_token"], "user-access-2");
+    assert!(good["expires_in"].as_i64().unwrap() > 3000);
+    drop(provision);
+    assert!(!file.exists(), "the ADC file goes with the command");
+}

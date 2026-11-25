@@ -1,6 +1,9 @@
 //! `[agent]`: what commands run by a coding agent may use.
 
+use jiff::SignedDuration;
 use serde::Deserialize;
+
+use super::opt_duration;
 
 /// Limits on what a coding agent can get, under `[agent]`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -12,6 +15,18 @@ pub struct AgentConfig {
     /// `"acme/dev/*"` or `"*/*/ReadOnly"`. Unset, agents may use every profile.
     #[serde(default)]
     pub profiles: Option<Vec<String>>,
+    /// The longest lifetime of credentials an agent gets, e.g. "15m", for
+    /// profiles whose lifetime omnifob chooses (Cloudflare tokens, chained
+    /// and IAM users' roles, cross-partition roles, Google service
+    /// accounts). Longer ones are asked for with this lifetime and not
+    /// cached. At least 15 minutes, the shortest AWS session.
+    #[serde(default, with = "opt_duration")]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
+    pub max_ttl: Option<SignedDuration>,
+    /// Whether `fob exec` mints a Cloudflare token for each command an
+    /// agent runs and deletes it when the command ends, as `--revoke` does.
+    #[serde(default)]
+    pub auto_revoke: bool,
 }
 
 impl AgentConfig {
@@ -23,6 +38,13 @@ impl AgentConfig {
     }
 
     pub(super) fn validate(&self) -> Result<(), String> {
+        if let Some(ttl) = self.max_ttl
+            && ttl < SignedDuration::from_mins(15)
+        {
+            return Err(
+                "max_ttl: at least 15 minutes, the shortest session AWS hands out".to_string(),
+            );
+        }
         for pattern in self.profiles.iter().flatten() {
             if pattern.is_empty() || pattern.split('/').any(str::is_empty) {
                 return Err(format!(
@@ -32,6 +54,18 @@ impl AgentConfig {
         }
         Ok(())
     }
+}
+
+/// The local audit log, under `[audit]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Append a line to `audit.jsonl` in the state directory for every
+    /// credential handed out: when, which profile, which command, which
+    /// agent, until when. Never the credentials.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Whether `id` matches `pattern`, in which `*` matches any run of characters
@@ -89,6 +123,7 @@ mod tests {
     fn agent_profiles_match_patterns_within_segments() {
         let agent = |patterns: &[&str]| AgentConfig {
             profiles: Some(patterns.iter().map(|p| p.to_string()).collect()),
+            ..AgentConfig::default()
         };
         assert!(AgentConfig::default().allows("acme/prod/Admin"));
         let dev = agent(&["acme/dev/*", "*/*/ReadOnly"]);
@@ -111,6 +146,23 @@ mod tests {
         assert!(!agent(&["a/b/c"]).allows("a/b"));
     }
 
+    #[test]
+    fn max_ttl_is_at_least_an_aws_session() {
+        let config = |ttl: &str| {
+            crate::Config::parse(&format!(
+                "[agent]\nmax_ttl = \"{ttl}\"\nauto_revoke = true\n"
+            ))
+        };
+        let parsed = config("15m").unwrap();
+        assert_eq!(
+            parsed.agent.max_ttl,
+            Some(jiff::SignedDuration::from_mins(15))
+        );
+        assert!(parsed.agent.auto_revoke);
+        let e = config("10m").unwrap_err().to_string();
+        assert!(e.contains("at least 15 minutes"), "{e}");
+    }
+
     /// A pattern with many `*`s against a long near-miss would take years
     /// with backtracking that tries every split.
     #[test]
@@ -119,6 +171,7 @@ mod tests {
         let id = format!("{}/x", "a".repeat(5000));
         let agent = AgentConfig {
             profiles: Some(vec![pattern.clone()]),
+            ..AgentConfig::default()
         };
         let started = std::time::Instant::now();
         assert!(!agent.allows(&id));

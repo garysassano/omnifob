@@ -176,7 +176,8 @@ pub struct ChainedRole {
     /// Name of the Identity Center role (permission set) to start from.
     pub via_role: String,
     pub role_arn: String,
-    /// `RoleSessionName`; defaults to "omnifob".
+    /// `RoleSessionName`; defaults to "omnifob", or "omnifob-agent" for
+    /// sessions a coding agent starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,7 +276,8 @@ pub struct CrossPartitionRole {
     /// How the token is signed; ES384 unless set.
     #[serde(default)]
     pub signing_algorithm: SigningAlgorithm,
-    /// `RoleSessionName`; defaults to "omnifob".
+    /// `RoleSessionName`; defaults to "omnifob", or "omnifob-agent" for
+    /// sessions a coding agent starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     /// Session length, 15 minutes to the destination role's maximum (at most
@@ -347,9 +349,12 @@ impl CrossPartitionRole {
             .unwrap_or_else(|| portal.default_source_region())
     }
 
-    /// `RoleSessionName`: `session_name`, else "omnifob".
+    /// `RoleSessionName`: `session_name`, else "omnifob" ("omnifob-agent"
+    /// for a coding agent).
     pub fn session_name(&self) -> &str {
-        self.session_name.as_deref().unwrap_or("omnifob")
+        self.session_name
+            .as_deref()
+            .unwrap_or(crate::providers::aws::default_session_name())
     }
 
     /// The session length to ask for: `duration`, else one hour.
@@ -607,7 +612,8 @@ impl AwsLoginConfig {
 #[serde(deny_unknown_fields)]
 pub struct IamRole {
     pub role_arn: String,
-    /// `RoleSessionName`; defaults to "omnifob".
+    /// `RoleSessionName`; defaults to "omnifob", or "omnifob-agent" for
+    /// sessions a coding agent starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

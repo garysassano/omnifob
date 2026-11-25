@@ -435,3 +435,121 @@ async fn an_ended_sign_in_asks_for_a_new_one() {
         "the dead sign-in is forgotten"
     );
 }
+
+/// Runs `future` while `task` serves, as `fob exec` does with its command.
+async fn while_serving<T>(
+    task: omnifob_core::provision::Task,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::select! {
+        () = task => unreachable!("the endpoint never ends"),
+        out = future => out,
+    }
+}
+
+#[tokio::test]
+async fn the_managed_identity_endpoint_mints_for_any_resource_with_its_secret() {
+    let (_guard, server) = setup().await;
+    device_login(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{HOME}/oauth2/v2.0/token")))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains(
+            "scope=https%3A%2F%2Fvault.azure.net%2F.default+offline_access",
+        ))
+        .respond_with(tokens("vault-1", "refresh-2"))
+        // Kept per resource while it lasts: one exchange for two requests.
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut provision =
+        omnifob_core::provision::azure_identity_endpoint("work".to_string(), HOME.to_string())
+            .await
+            .unwrap();
+    let vars: HashMap<_, _> = provision.set.iter().cloned().collect();
+    let endpoint = vars["IDENTITY_ENDPOINT"].clone();
+    let secret = vars["IDENTITY_HEADER"].clone();
+    assert!(endpoint.starts_with("http://127.0.0.1:"), "{endpoint}");
+    assert!(provision.remove.contains(&"AZURE_CLIENT_ID".to_string()));
+    let task = provision.tasks.remove(0);
+    let http = reqwest::Client::new();
+    let get = |header: Option<&str>, query: &[(&str, &str)]| {
+        let mut request = http.get(&endpoint).query(query);
+        if let Some(h) = header {
+            request = request.header("X-IDENTITY-HEADER", h);
+        }
+        request.send()
+    };
+    let resource = [
+        ("resource", "https://vault.azure.net"),
+        ("api-version", "2019-08-01"),
+    ];
+    let (wrong, missing, user_assigned, first, second) = while_serving(task, async {
+        let wrong = get(Some("guess"), &resource).await.unwrap().status();
+        let missing = get(None, &resource).await.unwrap().status();
+        let user_assigned = get(
+            Some(&secret),
+            &[("resource", "https://vault.azure.net"), ("client_id", "x")],
+        )
+        .await
+        .unwrap()
+        .status();
+        let first: serde_json::Value = get(Some(&secret), &resource)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let second: serde_json::Value = get(Some(&secret), &resource)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (wrong, missing, user_assigned, first, second)
+    })
+    .await;
+    assert_eq!(wrong, 401);
+    assert_eq!(missing, 401);
+    assert_eq!(user_assigned, 400);
+    assert_eq!(first["access_token"], "vault-1");
+    assert_eq!(first["resource"], "https://vault.azure.net");
+    assert_eq!(first["token_type"], "Bearer");
+    let expires_on: i64 = first["expires_on"].as_str().unwrap().parse().unwrap();
+    assert!(expires_on > jiff::Timestamp::now().as_second() + 3000);
+    assert_eq!(second["access_token"], "vault-1");
+}
+
+#[tokio::test]
+async fn an_agent_session_reaches_entra_id_as_the_azure_cli_sends_it() {
+    let server = MockServer::start().await;
+    let endpoints = Endpoints {
+        azure: Some(server.uri()),
+        ..Default::default()
+    };
+    let _guard = Scratch::with(
+        "omnifob-azure-agent",
+        omnifob_core::Context::builder()
+            .endpoints(endpoints)
+            .agent(Some(omnifob_core::Agent {
+                session_id: Some("session-7".to_string()),
+            })),
+    );
+    device_login(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{HOME}/oauth2/v2.0/token")))
+        .and(query_param("client_session", "session-7"))
+        .and(body_string_contains("client_session=session-7"))
+        .and(body_string_contains(
+            "scope=6dae42f8-4368-4678-94ff-3960e28e3630%2F.default+offline_access",
+        ))
+        .respond_with(tokens("aks-1", "refresh-2"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (token, _) = azure::resource_token("work", HOME, omnifob_core::provision::AKS_SERVER_APP)
+        .await
+        .unwrap();
+    assert_eq!(token, "aks-1");
+    assert!(azure::resource_token("work", HOME, "a b").await.is_err());
+}

@@ -12,7 +12,7 @@ use omnifob_core::providers::cloudflare::{
 use omnifob_core::{Endpoints, paths, providers, store};
 use serde_json::{Value, json};
 use support::Scratch;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const ACCOUNT: &str = "acct123";
@@ -284,6 +284,45 @@ async fn account_tokens_use_account_endpoints() {
     .await
     .unwrap();
     assert_eq!(creds.env["CLOUDFLARE_API_TOKEN"], "acct-secret");
+}
+
+#[tokio::test]
+async fn tokens_minted_for_an_agent_say_so_in_their_name() {
+    let server = MockServer::start().await;
+    let _scratch = Scratch::with(
+        "omnifob-cf-agent-name",
+        omnifob_core::Context::builder().agent(Some(omnifob_core::Agent::default())),
+    );
+    let base = format!("/accounts/{ACCOUNT}/tokens");
+    Mock::given(method("GET"))
+        .and(path(format!("{base}/permission_groups")))
+        .respond_with(ok(permission_groups()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(base.clone()))
+        .and(body_partial_json(json!({ "name": "omnifob-agent t" })))
+        .respond_with(ok(json!({ "value": "acct-secret" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!([])))
+        .mount(&server)
+        .await;
+    let client = Client::new(server.uri(), "bootstrap");
+    mint(
+        &client,
+        &config("account", r#""Zone Read""#),
+        "cf/a/t",
+        ACCOUNT,
+        "t",
+        now(),
+        &mut Catalog::default(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

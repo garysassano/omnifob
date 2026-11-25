@@ -272,6 +272,58 @@ pub async fn credentials(
     Ok(with_aws_account(config, profile, fresh))
 }
 
+/// The lifetime omnifob asks for when it gets a profile's credentials, for
+/// the profiles whose lifetime it chooses and that take `ttl`: Cloudflare
+/// tokens, chained, cross-partition and IAM users' roles, IAM user sessions
+/// without MFA (with MFA, each new session asks for a code), and Google
+/// service accounts. `None` for the others, whose provider sets it.
+pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::SignedDuration> {
+    use jiff::SignedDuration;
+    let hour = SignedDuration::from_hours(1);
+    match (
+        config.integration(&profile.integration).ok()?,
+        &profile.target,
+    ) {
+        (Integration::Cloudflare(c), Target::Cloudflare { template, .. }) => Some(
+            c.templates
+                .get(template)
+                .and_then(|t| t.ttl)
+                .unwrap_or(c.ttl),
+        ),
+        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
+            Some(c.chained.get(label)?.duration.unwrap_or(hour))
+        }
+        (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
+            Some(c.cross_partition.get(label)?.duration_or_default())
+        }
+        (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
+            Some(c.roles.get(label)?.duration.unwrap_or(hour))
+        }
+        (Integration::AwsIam(c), Target::AwsIamSession { .. }) if c.mfa_serial.is_none() => {
+            Some(c.session_duration.unwrap_or(SignedDuration::from_hours(8)))
+        }
+        (Integration::Gcp(c), Target::GcpServiceAccount { label, .. }) => {
+            Some(c.service_accounts.get(label)?.lifetime.unwrap_or(hour))
+        }
+        _ => None,
+    }
+}
+
+/// The `ttl` to ask for so credentials last at most `max`: `max` when the
+/// requested or chosen lifetime is longer, else the requested `ttl`. A
+/// profile whose provider sets the lifetime keeps it.
+pub fn capped_ttl(
+    config: &Config,
+    profile: &Profile,
+    ttl: Option<jiff::SignedDuration>,
+    max: jiff::SignedDuration,
+) -> Option<jiff::SignedDuration> {
+    match ttl.or_else(|| chosen_lifetime(config, profile)) {
+        Some(lifetime) if lifetime > max && chosen_lifetime(config, profile).is_some() => Some(max),
+        _ => ttl,
+    }
+}
+
 /// The account an AWS profile's credentials belong to, as the profile states
 /// it: the account of an Identity Center role and an IAM user's session, and
 /// the role ARN's account, recorded at discovery, for chained,
