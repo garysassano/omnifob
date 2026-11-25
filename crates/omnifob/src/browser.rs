@@ -10,7 +10,7 @@ use omnifob_core::{Config, Profile};
 pub(crate) fn open(config: &Config, name: &str, url: &str) -> anyhow::Result<()> {
     match config.browser_for(name)? {
         Some(browser) => run(browser.command_for(url)),
-        None => Ok(open::that(url)?),
+        None => open_default(url),
     }
 }
 
@@ -20,7 +20,23 @@ pub(crate) fn open(config: &Config, name: &str, url: &str) -> anyhow::Result<()>
 pub(crate) fn open_console(config: &Config, profile: &Profile, url: &str) -> anyhow::Result<()> {
     match config.browser_for(&profile.integration)? {
         Some(browser) => run(browser.console_command_for(url, profile)),
-        None => Ok(open::that(url)?),
+        None => open_default(url),
+    }
+}
+
+/// Opens `url` in the system's default browser without waiting for it. On
+/// WSL without a Linux opener (`wslview`, `xdg-open`), Windows' default
+/// browser opens it through `explorer.exe`, which takes the URL as one
+/// argument (unlike `cmd.exe /c start`, which reads `&` as a command
+/// separator).
+fn open_default(url: &str) -> anyhow::Result<()> {
+    match open::that_detached(url) {
+        Ok(()) => Ok(()),
+        Err(e) if omnifob_core::platform::is_wsl() => {
+            tracing::debug!("no Linux browser opener ({e}); trying explorer.exe");
+            run(("explorer.exe", vec![url.to_string()]))
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
