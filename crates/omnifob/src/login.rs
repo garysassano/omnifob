@@ -391,27 +391,50 @@ impl App {
         }
     }
 
-    pub(crate) async fn logout(&mut self, name: &str) -> anyhow::Result<()> {
-        let integration = self.config.integration(name)?.clone();
-        let accounts: Vec<String> = self
+    /// The Cloudflare accounts integration `name`'s profiles are in.
+    pub(crate) fn cloudflare_accounts(&self, name: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
             .cache
             .integrations
             .get(name)
-            .map(|s| {
-                let mut ids: Vec<String> = s
-                    .profiles
-                    .iter()
-                    .filter_map(|p| match &p.target {
-                        omnifob_core::Target::Cloudflare { account_id, .. } => {
-                            Some(account_id.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                ids.dedup();
-                ids
+            .into_iter()
+            .flat_map(|s| &s.profiles)
+            .filter_map(|p| match &p.target {
+                omnifob_core::Target::Cloudflare { account_id, .. } => Some(account_id.clone()),
+                _ => None,
             })
-            .unwrap_or_default();
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Signs out of every configured integration, going on past one that
+    /// fails and reporting the failures at the end.
+    pub(crate) async fn logout_all(&mut self) -> anyhow::Result<()> {
+        let names: Vec<String> = self.config.integrations.keys().cloned().collect();
+        if names.is_empty() {
+            bail!(
+                "no integrations configured in {}",
+                omnifob_core::paths::config_file().display()
+            );
+        }
+        let mut failed = Vec::new();
+        for name in &names {
+            if let Err(e) = self.logout(name).await {
+                eprintln!("fob: signing out of '{name}': {e:#}");
+                failed.push(name.as_str());
+            }
+        }
+        if !failed.is_empty() {
+            bail!("could not sign out of {}", failed.join(", "));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn logout(&mut self, name: &str) -> anyhow::Result<()> {
+        let integration = self.config.integration(name)?.clone();
+        let accounts = self.cloudflare_accounts(name);
         // Signing out also ends the access omnifob handed out.
         match providers::revoke_all(name, &integration, &accounts).await {
             Ok(0) | Err(Error::NeedsLogin { .. }) => {}
@@ -447,14 +470,11 @@ impl App {
         if let Some(synced) = self.cache.integrations.get(name) {
             providers::forget_credentials(&synced.profiles);
         }
-        eprintln!(
-            "fob: {}",
-            if existed {
-                "signed out"
-            } else {
-                "was not signed in"
-            }
-        );
+        if existed {
+            eprintln!("fob: signed out of '{name}'");
+        } else {
+            eprintln!("fob: '{name}' was not signed in");
+        }
         Ok(())
     }
 }

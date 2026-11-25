@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
+use omnifob_core::history::{self, History};
 use omnifob_core::profile::ProfileCache;
 use omnifob_core::{Config, paths};
 
@@ -13,9 +14,13 @@ use crate::shell::Shell;
     name = "fob",
     version,
     about = "One sign-in for every cloud: short-lived credentials for AWS (Identity Center, IAM users and console sign-in), Google Cloud, Azure and Cloudflare, and stored tokens for the rest",
-    after_help = "Config: $OMNIFOB_CONFIG or ~/.config/omnifob/config.toml"
+    after_help = "Config: --config, $OMNIFOB_CONFIG or ~/.config/omnifob/config.toml"
 )]
 pub(crate) struct Cli {
+    /// The config file, instead of $OMNIFOB_CONFIG or
+    /// ~/.config/omnifob/config.toml (passed on to the commands fob runs)
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -55,16 +60,33 @@ pub(crate) enum Command {
         /// The integration; without it, pick one from a list
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integration: Option<String>,
+        /// Sign out of every configured integration
+        #[arg(long, conflicts_with = "integration")]
+        all: bool,
     },
     /// Show integrations and whether you are signed in
-    Status,
+    Status {
+        /// Print JSON, for scripts and status bars
+        #[arg(long)]
+        json: bool,
+    },
     /// Check that sign-ins work, or that a profile's credentials do (never signs in)
     Check {
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
+        /// Check this integration's sign-in only; repeat for more
+        #[arg(
+            long,
+            conflicts_with = "profile",
+            add = ArgValueCandidates::new(integration_candidates)
+        )]
+        integration: Vec<String>,
         /// Print nothing; only the exit status tells whether everything works
         #[arg(long, short)]
         quiet: bool,
+        /// Print the results as JSON
+        #[arg(long, conflicts_with = "quiet")]
+        json: bool,
     },
     /// Rename an integration, keeping its sign-in and discovered profiles
     Rename {
@@ -80,7 +102,9 @@ pub(crate) enum Command {
     /// List profiles, optionally filtered
     #[command(visible_alias = "ls")]
     List {
-        query: Option<String>,
+        /// Words that the profiles must match, as other commands take them
+        #[arg(add = ArgValueCandidates::new(profile_candidates))]
+        query: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -127,6 +151,10 @@ pub(crate) enum Command {
         /// Print the URL instead of opening it
         #[arg(long)]
         print: bool,
+        /// Copy the URL to the clipboard instead of opening it (over SSH,
+        /// to your local terminal's clipboard)
+        #[arg(long, conflicts_with = "print")]
+        copy: bool,
         /// How long the console session lasts, 15m to 12h, e.g. "8h"
         /// (Identity Center roles and IAM users' roles; overrides
         /// `console_duration`)
@@ -159,6 +187,10 @@ pub(crate) enum Command {
     Revoke {
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
+        /// Every profile: deletes every token omnifob minted and clears every
+        /// cached credential
+        #[arg(long, conflicts_with = "profile")]
+        all: bool,
     },
     /// Switch the current shell to a profile (needs the shell integration from `fob activate`)
     Use {
@@ -228,7 +260,10 @@ pub(crate) enum CloudflareCommand {
         filter: Option<String>,
     },
     /// List templates and their permissions
-    Templates { integration: String },
+    Templates {
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        integration: String,
+    },
     /// Create a template: pick services and their access level from the
     /// account's permissions, or name the permissions with --permission
     AddTemplate {
@@ -240,6 +275,21 @@ pub(crate) enum CloudflareCommand {
         /// repeat for more. Without it, fob asks interactively.
         #[arg(long = "permission", short)]
         permissions: Vec<String>,
+        /// A permission added when the account offers it and skipped
+        /// otherwise; repeat for more
+        #[arg(long = "optional")]
+        optional: Vec<String>,
+        /// An R2 bucket that bucket-level permissions apply to ("eu/name" in
+        /// a jurisdiction); repeat for more
+        #[arg(long = "r2-bucket")]
+        r2_buckets: Vec<String>,
+        /// Also hand out R2's S3-compatible credentials
+        #[arg(long)]
+        s3: bool,
+        /// An IP address or CIDR range the tokens work from, instead of the
+        /// integration's `ips`; repeat for more
+        #[arg(long = "ip")]
+        ips: Vec<String>,
         /// Lifetime of the template's tokens, e.g. "30m" (default: the integration's)
         #[arg(long, value_parser = parse_ttl)]
         ttl: Option<jiff::SignedDuration>,
@@ -263,13 +313,16 @@ pub(crate) fn parse_ttl(s: &str) -> anyhow::Result<jiff::SignedDuration> {
     omnifob_core::config::parse_duration(s)
 }
 
-/// Profile ids for shell completion, with the provider kind as a hint.
+/// Profile ids for shell completion, recently used ones first, with the
+/// provider kind as a hint.
 pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
     let Ok(cache) = ProfileCache::load(&profiles_file()) else {
         return Vec::new();
     };
-    cache
-        .all()
+    let mut profiles: Vec<_> = cache.all().collect();
+    History::load(&history::file()).sort_recent_first(&mut profiles, |p| p.id.as_str());
+    profiles
+        .into_iter()
         .map(|p| {
             let kind = match p.target {
                 omnifob_core::Target::Aws { .. } => "aws",

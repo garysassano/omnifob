@@ -69,13 +69,13 @@ impl App {
     }
 
     /// Writes a new Cloudflare template to the config and syncs, so its
-    /// profiles can be used at once.
+    /// profiles can be used at once. `template` holds what the command line
+    /// gave; without permissions, they are picked interactively.
     pub(crate) async fn add_template(
         &mut self,
         integration: &str,
         name: &str,
-        permissions: Vec<String>,
-        ttl: Option<jiff::SignedDuration>,
+        mut template: omnifob_core::config::CloudflareTemplate,
         replace: bool,
     ) -> anyhow::Result<()> {
         // Before signing in or picking permissions, which the name would waste.
@@ -95,7 +95,7 @@ impl App {
         let groups = self
             .with_login(|| cloudflare::permission_groups(integration, &config))
             .await?;
-        let permissions = if permissions.is_empty() {
+        let permissions = if template.permissions.is_empty() {
             if !interactive() {
                 bail!(
                     "name the permissions with --permission, or run this in a terminal to pick them"
@@ -105,7 +105,7 @@ impl App {
         } else {
             // Check the names now rather than at the first mint, and store
             // them as Cloudflare spells them.
-            cloudflare::resolve_permissions(&permissions, &groups)?
+            cloudflare::resolve_permissions(&template.permissions, &groups)?
                 .into_iter()
                 .map(|g| g.name.clone())
                 .collect()
@@ -119,11 +119,9 @@ impl App {
             );
         }
 
-        let template = omnifob_core::config::CloudflareTemplate {
-            permissions,
-            ttl,
-            ..Default::default()
-        };
+        // Optional permissions are kept as given: an account that does not
+        // offer one now may later, which is what they are for.
+        template.permissions = permissions;
         let path = paths::config_file();
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -142,6 +140,9 @@ impl App {
         );
         for permission in &template.permissions {
             eprintln!("       {permission}");
+        }
+        for permission in &template.optional {
+            eprintln!("       {permission} (when available)");
         }
         self.sync(&[integration.to_string()]).await
     }

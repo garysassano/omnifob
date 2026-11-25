@@ -59,6 +59,13 @@ pub fn main() -> ExitCode {
     .init();
 
     let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
+    if let Some(path) = &cli.config {
+        // Through the variable, so every reader of the config (and `fob
+        // renew`, which fob starts) uses the same file.
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        // SAFETY: no other thread exists yet; the runtime starts below.
+        unsafe { std::env::set_var("OMNIFOB_CONFIG", path) };
+    }
     // One thread: concurrent work (`fob check`, `fob sync`) is all waiting
     // on the network, and a worker per core would only cost start-up time.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -106,13 +113,43 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 .interact_text_on(&Term::stderr())?)
         });
     }
+    // Commands that need neither the config nor the profiles, so a broken
+    // config.toml or profiles.json does not break every new shell's
+    // `fob activate`, or `fob unuse`.
+    match &cli.command {
+        Command::Activate { shell } => {
+            print!("{}", shell::activate(*shell));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Env {
+            shell, unset: true, ..
+        } => {
+            let previous = std::env::var("OMNIFOB_VARS").unwrap_or_default();
+            let previous: Vec<&str> = previous.split(',').filter(|v| !v.is_empty()).collect();
+            print!("{}", shell::unset(*shell, &previous));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Use { .. } | Command::Unuse if agent::active() => {
+            bail!(
+                "each command an agent runs starts in a new shell, so `fob use` cannot carry over; run commands as `fob exec <profile> -- <command>`"
+            );
+        }
+        Command::Use { .. } | Command::Unuse => {
+            let shell = Shell::detect();
+            bail!(
+                "`fob use` and `fob unuse` change the current shell, which needs the shell integration. Add this to your shell's startup file:\n  {}",
+                shell::activation_line(shell)
+            );
+        }
+        _ => {}
+    }
     // `fob rename` has to open a config with a name the rule refuses, to fix it.
     let config = if matches!(cli.command, Command::Rename { .. }) {
         Config::load_allowing_any_names(&paths::config_file())?
     } else {
         Config::load(&paths::config_file())?
     };
-    let cache = ProfileCache::load(&profiles_file())?;
+    let cache = load_profiles(&cli.command)?;
     let mut app = App { config, cache };
 
     match cli.command {
@@ -136,17 +173,32 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             .await?;
             app.sync(std::slice::from_ref(&integration)).await?;
         }
-        Command::Logout { integration } => {
+        Command::Logout { all: true, .. } => app.logout_all().await?,
+        Command::Logout { integration, .. } => {
             let integration = app.pick_integration(integration.as_deref(), "logout")?;
             app.logout(&integration).await?;
         }
-        Command::Status => app.status()?,
-        Command::Check { profile, quiet } => {
-            return app.check(query(&profile).as_deref(), quiet).await;
+        Command::Status { json } => app.status(json)?,
+        Command::Check {
+            profile,
+            integration,
+            quiet,
+            json,
+        } => {
+            let output = if json {
+                status::Output::Json
+            } else if quiet {
+                status::Output::Quiet
+            } else {
+                status::Output::Text
+            };
+            return app
+                .check(query(&profile).as_deref(), &integration, output)
+                .await;
         }
         Command::Rename { old, new } => app.rename(&old, &new)?,
         Command::Sync { integrations } => app.sync(&integrations).await?,
-        Command::List { query, json } => app.list(query.as_deref(), json).await?,
+        Command::List { query: words, json } => app.list(query(&words).as_deref(), json).await?,
         Command::Env {
             profile,
             shell,
@@ -154,19 +206,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             no_cache,
             ttl,
         } => {
+            debug_assert!(!unset, "handled before loading the config");
             let previous = std::env::var("OMNIFOB_VARS").unwrap_or_default();
             let previous: Vec<&str> = previous.split(',').filter(|v| !v.is_empty()).collect();
-            if unset {
-                print!("{}", shell::unset(shell, &previous));
-            } else {
-                let profile = app.select(query(&profile).as_deref()).await?;
-                if agent::active() {
-                    return Err(agent::refuse_to_print(&profile.id));
-                }
-                let creds = app.credentials(&profile, !no_cache, ttl).await?;
-                print!("{}", shell::export(shell, &profile.id, &creds, &previous)?);
-                eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
+            let profile = app.select(query(&profile).as_deref()).await?;
+            if agent::active() {
+                return Err(agent::refuse_to_print(&profile.id));
             }
+            let creds = app.credentials(&profile, !no_cache, ttl).await?;
+            print!("{}", shell::export(shell, &profile.id, &creds, &previous)?);
+            eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
         }
         Command::Exec {
             profile,
@@ -194,6 +243,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Console {
             profile,
             print,
+            copy,
             duration,
             service,
             region,
@@ -203,7 +253,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 service,
                 region,
             };
-            app.console(query(&profile).as_deref(), print, &options)
+            let action = if print {
+                console::Action::Print
+            } else if copy {
+                console::Action::Copy
+            } else {
+                console::Action::Open
+            };
+            app.console(query(&profile).as_deref(), action, &options)
                 .await?
         }
         Command::Creds {
@@ -221,28 +278,31 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let creds = app.credentials(&profile, !no_cache, ttl).await?;
             println!("{}", creds_output(&profile, &creds, format)?);
         }
-        Command::Revoke { profile } => app.revoke(query(&profile).as_deref()).await?,
-        Command::Use { .. } | Command::Unuse if agent::active() => {
-            bail!(
-                "each command an agent runs starts in a new shell, so `fob use` cannot carry over; run commands as `fob exec <profile> -- <command>`"
-            );
+        Command::Revoke { all: true, .. } => app.revoke_all().await?,
+        Command::Revoke { profile, .. } => app.revoke(query(&profile).as_deref()).await?,
+        Command::Use { .. } | Command::Unuse | Command::Activate { .. } => {
+            unreachable!("handled before loading the config")
         }
-        Command::Use { .. } | Command::Unuse => {
-            let shell = Shell::detect();
-            bail!(
-                "`fob use` and `fob unuse` change the current shell, which needs the shell integration. Add this to your shell's startup file:\n  {}",
-                shell::activation_line(shell)
-            );
-        }
-        Command::Activate { shell } => print!("{}", shell::activate(shell)),
         Command::Cloudflare(CloudflareCommand::AddTemplate {
             integration,
             name,
             permissions,
+            optional,
+            r2_buckets,
+            s3,
+            ips,
             ttl,
             replace,
         }) => {
-            app.add_template(&integration, &name, permissions, ttl, replace)
+            let template = omnifob_core::config::CloudflareTemplate {
+                permissions,
+                optional,
+                ttl,
+                r2_buckets,
+                s3,
+                ips: (!ips.is_empty()).then_some(ips),
+            };
+            app.add_template(&integration, &name, template, replace)
                 .await?
         }
         Command::Cloudflare(command) => app.cloudflare(command).await?,
@@ -261,6 +321,35 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Renew { profile } => app.renew(&profile).await?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Loads `profiles.json` for the commands that use it. Those that discover
+/// profiles anyway (and rewrite the file), or only report on it, carry on
+/// from no profiles when it cannot be read, so a corrupt file can be fixed
+/// with `fob sync`. Commands that never look at profiles do not read it.
+fn load_profiles(command: &Command) -> anyhow::Result<ProfileCache> {
+    let tolerant = match command {
+        Command::Import(_)
+        | Command::Cloudflare(CloudflareCommand::Permissions { .. })
+        | Command::Cloudflare(CloudflareCommand::Templates { .. }) => {
+            return Ok(ProfileCache::default());
+        }
+        Command::Check { profile, .. } if profile.is_empty() => {
+            return Ok(ProfileCache::default());
+        }
+        Command::Login { .. }
+        | Command::Sync { .. }
+        | Command::Status { .. }
+        | Command::Logout { .. } => true,
+        _ => false,
+    };
+    match ProfileCache::load(&profiles_file()) {
+        Err(e) if tolerant => {
+            eprintln!("fob: ignoring the discovered profiles: {e:#}");
+            Ok(ProfileCache::default())
+        }
+        other => other,
+    }
 }
 
 /// Joins profile words into one query; `None` when no words were given.

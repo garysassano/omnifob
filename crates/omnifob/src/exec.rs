@@ -83,6 +83,42 @@ impl App {
         status
     }
 
+    /// Revokes everything omnifob handed out: deletes the tokens every
+    /// Cloudflare integration minted, and clears every profile's cached
+    /// credentials. Sign-ins stay.
+    pub(crate) async fn revoke_all(&mut self) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        let mut deleted = 0;
+        for (name, integration) in &self.config.integrations {
+            if !matches!(integration, omnifob_core::Integration::Cloudflare(_)) {
+                continue;
+            }
+            let accounts = self.cloudflare_accounts(name);
+            match providers::revoke_all(name, integration, &accounts).await {
+                Ok(n) => deleted += n,
+                // Not signing in just for this: `fob logout` deleted them
+                // when the sign-in ended, unless it lapsed on its own.
+                Err(omnifob_core::Error::NeedsLogin { .. }) => eprintln!(
+                    "fob: '{name}' is not signed in, so its tokens were not deleted; `fob login {name}` and run this again"
+                ),
+                Err(e) => {
+                    eprintln!("fob: deleting the tokens of '{name}': {e:#}");
+                    failed.push(name.as_str());
+                }
+            }
+        }
+        let profiles: Vec<&Profile> = self.cache.all().collect();
+        providers::forget_credentials(profiles.iter().copied());
+        eprintln!(
+            "fob: deleted {deleted} token(s) and cleared the cache of {} profile(s); other credentials already handed out stay valid until they expire",
+            profiles.len()
+        );
+        if !failed.is_empty() {
+            anyhow::bail!("could not delete the tokens of {}", failed.join(", "));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn revoke(&mut self, query: Option<&str>) -> anyhow::Result<()> {
         let profile = self.select(query).await?;
         let revoked = self

@@ -478,6 +478,9 @@ async fn sync_and_list() {
     assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
     let (stdout, _) = fob.ok(&["ls", "prod"]);
     assert_eq!(lines(&stdout), ["acme/prod/Admin"]);
+    // Several words, as every other profile command takes them.
+    let (stdout, _) = fob.ok(&["list", "prod", "admin"]);
+    assert_eq!(lines(&stdout), ["acme/prod/Admin"]);
     let (stdout, _) = fob.ok(&["list", "--json"]);
     let profiles: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(profiles[0]["id"], "acme/dev/Admin");
@@ -1024,4 +1027,199 @@ browser = "work"
         std::fs::read_to_string(&out).unwrap(),
         "https://console.example.test/home?a=1&b=two words"
     );
+}
+
+/// A broken config.toml or profiles.json must not break the shell's
+/// start-up (`fob activate`) or `fob unuse`, and `fob sync` rewrites a
+/// corrupt profiles.json.
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_commands_work_with_a_broken_config() {
+    let (fob, _server) = synced_portal("broken").await;
+    let profiles = fob.root.join("state").join("omnifob").join("profiles.json");
+    std::fs::write(&profiles, "{ not json").unwrap();
+    // Status reports, and sync starts over from no profiles.
+    let (stdout, stderr) = fob.ok(&["status"]);
+    assert!(
+        stderr.contains("ignoring the discovered profiles"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("0 profiles"), "{stdout}");
+    fob.fails(&["list"]);
+    fob.ok(&["sync"]);
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
+
+    std::fs::write(&profiles, "{ not json").unwrap();
+    fob.write_config("[integrations.acme\nbroken");
+    let (stdout, _) = fob.ok(&["activate", "bash"]);
+    assert!(stdout.contains("fob()"), "{stdout}");
+    let output = fob
+        .command(&["env", "--shell", "bash", "--unset"])
+        .env("OMNIFOB_VARS", "AWS_REGION")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("unset AWS_REGION\n"), "{stdout}");
+    let stderr = fob.fails(&["use", "acme/prod/Admin"]);
+    assert!(stderr.contains("needs the shell integration"), "{stderr}");
+    // Commands that need the config still say what is wrong with it.
+    let stderr = fob.fails(&["list"]);
+    assert!(stderr.contains("parsing"), "{stderr}");
+}
+
+/// `--config` stands in for `OMNIFOB_CONFIG`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_config_flag_names_the_config_file() {
+    let (fob, _server) = synced_portal("config-flag").await;
+    let elsewhere = fob.root.join("elsewhere.toml");
+    std::fs::rename(fob.config_file(), &elsewhere).unwrap();
+    let (stdout, _) = fob.ok(&["status"]);
+    assert!(stdout.contains("No integrations configured"), "{stdout}");
+    let (stdout, _) = fob.ok(&["status", "--config", elsewhere.to_str().unwrap()]);
+    assert!(stdout.starts_with("Secrets: "), "{stdout}");
+    assert!(
+        stdout.contains("acme  aws-sso  signed in until 2100-01-01"),
+        "{stdout}"
+    );
+}
+
+/// `fob status --json` and `fob check --json` for scripts and status bars,
+/// and `fob check --integration` for one sign-in.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_and_check_print_json() {
+    let (fob, _server) = synced_portal("json").await;
+    let mut config = portal_config("acme");
+    config.push_str(&portal_config("other").replace("acme.awsapps.com", "other.awsapps.com"));
+    fob.write_config(&config);
+
+    let output = fob
+        .command(&["status", "--json"])
+        .env("OMNIFOB_PROFILE", "acme/prod/Admin")
+        .env("OMNIFOB_EXPIRES_AT", "2100-01-01T00:00:00Z")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    let status: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["active_profile"], "acme/prod/Admin");
+    assert_eq!(status["active_expires_at"], "2100-01-01T00:00:00Z");
+    let integrations = status["integrations"].as_array().unwrap();
+    assert_eq!(integrations[0]["name"], "acme");
+    assert_eq!(integrations[0]["type"], "aws-sso");
+    assert_eq!(integrations[0]["signed_in"], true);
+    assert_eq!(integrations[0]["profiles"], 2);
+    assert!(integrations[0]["synced_at"].is_string());
+    assert_eq!(integrations[1]["name"], "other");
+    assert_eq!(integrations[1]["signed_in"], false);
+    assert!(integrations[1]["synced_at"].is_null());
+
+    // The text form: aligned columns, the active profile and sync age.
+    let output = fob
+        .command(&["status"])
+        .env("OMNIFOB_PROFILE", "acme/prod/Admin")
+        .output()
+        .unwrap();
+    let (stdout, _) = texts(&output);
+    assert!(
+        stdout.contains("Active in this shell: acme/prod/Admin\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("acme   aws-sso  signed in until"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("other  aws-sso  signed out, 0 profiles, not synced"),
+        "{stdout}"
+    );
+
+    let output = fob.run(&["check", "--json"]);
+    assert!(!output.status.success());
+    let checked: Value = serde_json::from_str(&texts(&output).0).unwrap();
+    assert_eq!(checked[0]["integration"], "acme");
+    assert_eq!(checked[0]["ok"], true);
+    assert_eq!(checked[1]["integration"], "other");
+    assert_eq!(checked[1]["ok"], false);
+    assert!(
+        checked[1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("fob login other")
+    );
+
+    let (stdout, _) = fob.ok(&["check", "--integration", "acme"]);
+    assert_eq!(lines(&stdout).len(), 1, "{stdout}");
+    assert!(stdout.starts_with("ok   acme: "), "{stdout}");
+    let stderr = fob.fails(&["check", "--integration", "nope"]);
+    assert!(stderr.contains("nope"), "{stderr}");
+
+    // The mock has no STS, so the profile's check fails, in JSON too.
+    let output = fob.run(&["check", "acme/prod/Admin", "--json"]);
+    assert!(!output.status.success());
+    let checked: Value = serde_json::from_str(&texts(&output).0).unwrap();
+    assert_eq!(checked[0]["profile"], "acme/prod/Admin");
+    assert_eq!(checked[0]["ok"], false);
+}
+
+/// Under an agent, `fob list` shows every profile but marks the ones
+/// `[agent] profiles` keeps from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_sees_which_profiles_are_closed_to_it() {
+    let (fob, _server) = synced_portal("agent-list").await;
+    let mut config = portal_config("acme");
+    config.push_str("\n[agent]\nprofiles = [\"acme/dev/*\"]\n");
+    fob.write_config(&config);
+    let output = fob.run_as_agent(&["list"]);
+    let (stdout, _) = texts(&output);
+    assert_eq!(
+        lines(&stdout),
+        ["acme/dev/Admin", "acme/prod/Admin (not open to agents)"]
+    );
+    assert!(!stdout.contains("OMNIFOB_AGENT"), "{stdout}");
+    let output = fob.run_as_agent(&["list", "--json"]);
+    let profiles: Value = serde_json::from_str(&texts(&output).0).unwrap();
+    assert_eq!(profiles[0]["open_to_agents"], true);
+    assert_eq!(profiles[1]["open_to_agents"], false);
+    // People see the list as it is.
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
+    let (stdout, _) = fob.ok(&["list", "--json"]);
+    assert!(!stdout.contains("open_to_agents"), "{stdout}");
+}
+
+/// `fob revoke --all` clears every cached credential; `fob logout --all`
+/// signs out of every integration and goes on past those not signed in.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_and_logout_all() {
+    let (fob, server) = synced_portal("all").await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    for profile in ["acme/dev/Admin", "acme/prod/Admin"] {
+        fob.ok(&["creds", profile, "--format", "credential-process"]);
+        assert!(fob.secret(&format!("credentials/{profile}")).exists());
+    }
+    let (_, stderr) = fob.ok(&["revoke", "--all"]);
+    assert!(
+        stderr.contains("deleted 0 token(s) and cleared the cache of 2 profile(s)"),
+        "{stderr}"
+    );
+    for profile in ["acme/dev/Admin", "acme/prod/Admin"] {
+        assert!(!fob.secret(&format!("credentials/{profile}")).exists());
+    }
+    fob.fails(&["revoke", "--all", "acme/dev/Admin"]);
+
+    let mut config = portal_config("acme");
+    config.push_str(&portal_config("other").replace("acme.awsapps.com", "other.awsapps.com"));
+    fob.write_config(&config);
+    let (_, stderr) = fob.ok(&["logout", "--all"]);
+    assert!(stderr.contains("fob: signed out of 'acme'"), "{stderr}");
+    assert!(
+        stderr.contains("fob: 'other' was not signed in"),
+        "{stderr}"
+    );
+    assert!(!fob.secret("aws-sso/acme/token").exists());
 }
