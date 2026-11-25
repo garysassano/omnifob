@@ -313,11 +313,46 @@ type = "command"
 create_command = "fob creds cf/personal/workers --format fnox"
 ```
 
+#### SDKs that read no token from the environment
+
+`fob exec` also serves the credentials the way each cloud's SDKs look for them when no variable will do, from an endpoint on `127.0.0.1` that lives as long as the command and answers only requests carrying its random secret:
+
+- **Azure**: an Azure profile's command gets a managed identity endpoint, as App Service runs one (`IDENTITY_ENDPOINT` and `IDENTITY_HEADER`). The Azure Identity libraries' `DefaultAzureCredential` and `ManagedIdentityCredential` then get tokens for any resource (Resource Manager, Key Vault, Storage, Graph) from your sign-in, without `~/.azure`. Variables that would make them pick another credential (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `MSI_ENDPOINT`, ...) are removed. The `az` CLI uses it only after `az login --identity`, which writes `~/.azure`, so it keeps its own sign-in.
+- **Google Cloud**: a Google profile's command gets Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, a private file deleted afterwards) whose token URL is the endpoint, so the client libraries get the profile's token and come back for a new one when it nears its end. The file holds the endpoint's secret, not a Google token. `--token-file` gives gcloud its token in a private file (`CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`) that fob rewrites before the token expires, so a long-running script's gcloud calls keep working.
+- **AWS**: with `--server`, the command gets a container credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI` and `AWS_CONTAINER_AUTHORIZATION_TOKEN`) instead of the key variables, and the SDKs and the AWS CLI fetch renewed credentials from it, so a dev server or an IDE started with `fob exec --server` outlives a one-hour session.
+
+`--no-server` turns the Azure and Google endpoints off.
+
+```sh
+fob exec work/prod/user -- python deploy.py              # DefaultAzureCredential works
+fob exec google/proj-a/user -- go run ./cmd/importer     # ADC works
+fob exec acme/dev/Admin --server -- code .               # renewed for the IDE's lifetime
+```
+
+#### Kubernetes
+
+`fob creds --format k8s-exec` writes the `ExecCredential` a kubectl exec plugin returns: for an AWS profile an EKS token (`--cluster <name>`, made as `aws eks get-token` makes it, in the profile's Region or `--region`), for a Google profile its access token (GKE), and for an Azure profile an Entra ID token for AKS's server application, as `kubelogin` asks for it. It answers in the `apiVersion` kubectl asks for.
+
+```yaml
+users:
+  - name: eks-dev
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1
+        command: fob
+        args: [creds, acme/dev/Admin, --format, k8s-exec, --cluster, dev]
+        interactiveMode: Never
+```
+
+#### Google executable-sourced credentials
+
+Google's executable-sourced credentials take a third-party token and exchange it at Google's STS through a workload identity pool; they cannot take an access token. `fob creds <google profile> --format gcp-executable` prints the executable response with your account's Google ID token, and `fob export gcp-adc <profile> --audience <provider>` writes an ADC file that runs it, for a workload identity pool provider that trusts `https://accounts.google.com` (with the OAuth client's ID as an allowed audience); a service account profile adds impersonation of that account. The file holds no token, and the libraries run fob only with `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1`. Without such a pool, `fob exec` above is the way to give the libraries your token.
+
 ### With coding agents
 
-Coding agents run each command in a new shell with no one at the terminal, and whatever a command prints lands in the agent's context and its saved transcripts. fob recognises them by the variables they set (`CLAUDECODE`, `CODEX_SANDBOX`, `GEMINI_CLI`, `CURSOR_AGENT`, `COPILOT_AGENT_SESSION_ID`; set `OMNIFOB_AGENT=1` for another agent, or `OMNIFOB_AGENT=0` to turn this off) and then:
+Coding agents run each command in a new shell with no one at the terminal, and whatever a command prints lands in the agent's context and its saved transcripts. fob recognises them by the variables they set (`AI_AGENT`, which several agents set, and `CLAUDECODE`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`, `GEMINI_CLI`, `CURSOR_AGENT`, `COPILOT_AGENT_SESSION_ID`, `COPILOT_CLI`, `OPENCODE`, `CRUSH`, `QWEN_CODE`, `CLINE_ACTIVE`, `GOOSE_TERMINAL`, `PI_CODING_AGENT`, `ANTIGRAVITY_AGENT`; set `OMNIFOB_AGENT=1` for another agent, such as Aider or Windsurf, which set none, or `OMNIFOB_AGENT=0` to turn this off) and then:
 
-- Does not print credentials: `fob creds` (JSON), `fob env` and `fob console --print` refuse and point to `fob exec`. `--format credential-process` and `--format fnox` still work, because the AWS SDKs and fnox run them inside the agent's commands and read the output themselves.
+- Does not print credentials: `fob creds` (JSON), `fob env` and `fob console --print` refuse and point to `fob exec`. `--format credential-process`, `fnox`, `k8s-exec` and `gcp-executable` still work, because the AWS SDKs, fnox, kubectl and Google's libraries run them inside the agent's commands and read the output themselves.
 - Never prompts, and takes a profile only by its full id (`fob list` shows them, marking those `[agent] profiles` keeps from agents with `(not open to agents)`, or `"open_to_agents": false` with `--json`), so a command does what it says and permission rules can match it.
 - Hands out only the profiles `[agent] profiles` allows, when it is set:
 
@@ -326,9 +361,29 @@ Coding agents run each command in a new shell with no one at the terminal, and w
   profiles = ["acme/dev/*", "*/*/ReadOnly"]   # `*` matches within one segment
   ```
 
+- Marks what agents get on the provider's side: AWS roles whose config names no `session_name` get the session name `omnifob-agent` (instead of `omnifob`), so CloudTrail tells them apart; minted Cloudflare tokens are named `omnifob-agent <template>`; and under GitHub Copilot's agent, Entra ID tokens carry its session (`COPILOT_AGENT_SESSION_ID`) as the Azure CLI sends it, which Entra ID records in the token. Credentials cached before the agent asked keep their original marks.
+- Optionally shortens and revokes what agents get:
+
+  ```toml
+  [agent]
+  max_ttl = "15m"      # at most this long, where omnifob picks the lifetime (not cached)
+  auto_revoke = true   # `fob exec` on a Cloudflare profile acts as `--revoke`
+  ```
+
+  `max_ttl` applies to Cloudflare tokens, chained, cross-partition and IAM users' roles, IAM user sessions without MFA and Google service accounts; the provider sets the lifetime of Identity Center roles, Google accounts' and Azure tokens, and console sign-in credentials.
+
 An agent gets credentials with `fob exec acme/dev/ReadOnly -- aws s3 ls`, or through AWS profiles from `fob export aws-config`, which work without fob in the command. When a sign-in lapses, the agent can ask you to run `fob login <integration>`, or run it itself: the browser opens on your screen for you to approve. Let the agent run `fob exec` per command rather than starting the agent itself inside `fob exec`, which would put the credentials in the environment of every command it runs.
 
 This guards against accidents, not against the agent, which runs as you; the harness's sandbox and permission rules are the boundary. [`skills/omnifob`](skills/omnifob/SKILL.md) is a skill that teaches agents the above; install it with your agent's skill tooling, for example `npx skills add garysassano/omnifob`.
+
+### Audit log
+
+```toml
+[audit]
+enabled = true
+```
+
+appends one JSON line to `~/.local/state/omnifob/audit.jsonl` for every credential fob hands out: the time, command, profile, integration, the agent's marker variable when an agent ran it, how it was handed over (`env`, `credential-process`, `aws-container`, `azure-identity`, `gcp-adc`, `k8s-exec`, `console`, ...), when it expires and a minted Cloudflare token's ID. Never a secret. The file is private and only grows; rotate or delete it as you like.
 
 ## Where secrets live
 

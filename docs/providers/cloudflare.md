@@ -90,3 +90,7 @@ Checked live with a private client, two to four accounts approved on one consent
 - `invalid_grant`, `invalid_client` and `unauthorized_client` from the token endpoint end the sign-in: it is deleted if it still holds the refused refresh token, and `fob login` is asked for. Anything else (the network, a 5xx, another refusal) keeps it: the access token is handed out while it lasts, and once expired the call fails with a hint to run `fob login` if it persists.
 - An API call answered 401, or 403 with error 10000 ("Authentication error"), renews the access token and is sent once more, since a token replaced by another process's renewal or revoked stops working before its time. Other 403s (a missing permission, code 9109) are not retried. Which code a replaced token gets has not been seen live; the mock tests use 403 with 10000.
 - The callback waits up to ten minutes, as for every provider.
+
+## Agents (2026-11-25)
+
+Tokens minted for a coding agent are named `omnifob-agent <template>` instead of `omnifob <template>`, so the dashboard's token list shows which ones agents got. Cleanup and revocation go by the catalog's IDs, not names, so both kinds are cleaned up alike. `[agent] auto_revoke = true` mints a token per agent command and deletes it when the command ends.

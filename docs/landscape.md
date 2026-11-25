@@ -68,7 +68,7 @@ Not every tool reads environment variables:
 - Oracle: config profile plus token and key files.
 - Kubernetes: exec credential plugins returning `ExecCredential` JSON with an expiry.
 
-So omnifob needs **provisioners** beyond environment variables: temporary files cleaned up after `exec`, credential-process style helpers per ecosystem, and possibly a local metadata endpoint. 1Password's shell plugins solve the same problem per tool.
+So omnifob needs **provisioners** beyond environment variables: temporary files cleaned up after `exec`, credential-process style helpers per ecosystem, and possibly a local metadata endpoint. 1Password's shell plugins solve the same problem per tool. Done on 2026-11-25: loopback endpoints during `fob exec` (AWS container credentials, an Azure managed identity, a Google ADC token endpoint), gcloud's token file, Kubernetes exec credentials and Google executable-sourced credentials; see [research](research.md#provisioners-and-agent-markers-2026-11-25).
 
 ### Precedence works in omnifob's favour
 

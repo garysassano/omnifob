@@ -20,6 +20,8 @@ fob keeps the user's sign-ins and hands out short-lived credentials per profile.
 
    Each of your commands starts in a new shell, so put `fob exec` on every command that needs credentials.
 
+   Azure and Google profiles also give the command a local endpoint their SDKs use (`DefaultAzureCredential`, Google's Application Default Credentials), so code that uses those SDKs works under `fob exec` without `az login` or `gcloud auth application-default login`. For a long-running AWS command (a dev server), `fob exec <profile> --server -- <command>` serves renewed credentials to the SDKs.
+
 3. Pick the least-privileged profile that does the job (a read-only role to look, a deploy role to deploy). Ask before using an admin or production profile the user did not name.
 
 For AWS, profiles exported with `fob export aws-config` work without fob in the command: `aws s3 ls --profile fob-acme-dev-ReadOnly`, or `AWS_PROFILE` for tools and SDKs. Check `~/.aws/config` for `fob-` profiles before assuming they exist; do not run `fob export aws-config --write` unless asked.
@@ -28,7 +30,7 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 
 ## Never
 
-- Print credentials: no `fob creds` (except `--format credential-process` or `--format fnox` inside the config of a tool that reads it), `fob env`, `fob use` or `fob console --print`, and no `env`, `printenv` or `echo $AWS_SECRET_ACCESS_KEY` inside `fob exec`. Under an agent, fob refuses the first ones; that refusal is not something to work around.
+- Print credentials: no `fob creds` (except `--format credential-process`, `fnox`, `k8s-exec` or `gcp-executable` inside the config of a tool that reads it), `fob env`, `fob use` or `fob console --print`, and no `env`, `printenv` or `echo $AWS_SECRET_ACCESS_KEY` inside `fob exec`. Under an agent, fob refuses the first ones; that refusal is not something to work around.
 - Change the user's setup unprompted: `fob login --force`, `fob logout`, `fob revoke`, `fob rename`, `fob import ... --write`, `fob export ... --write`, `fob cf add-template`, or edits to `~/.config/omnifob/config.toml` (including its `[agent]` section).
 
 ## When fob says no

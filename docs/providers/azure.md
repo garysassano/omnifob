@@ -27,4 +27,12 @@ Azure's tools take no access token from the environment: the CLI, the Azure Iden
 | `ARM_SUBSCRIPTION_ID`, `ARM_TENANT_ID`     | Terraform's and OpenTofu's `azurerm` providers           |
 | `AZURE_ACCESS_TOKEN`                       | Nothing standard: `curl -H "Authorization: Bearer $..."` |
 
-Feeding `az` and the SDKs a token would need a local endpoint that answers like a managed identity (`IDENTITY_ENDPOINT` and `IDENTITY_HEADER`), which omnifob does not run.
+## Managed identity endpoint
+
+During `fob exec` for an Azure profile, fob answers like App Service's managed identity endpoint (Microsoft Learn, "Managed identities for App Service", read 2026-11-25): `IDENTITY_ENDPOINT` is `http://127.0.0.1:<port>/msi/token` and `IDENTITY_HEADER` a random secret that each request must send back as `X-IDENTITY-HEADER`, compared in constant time. `GET ?resource=<uri>&api-version=2019-08-01` answers `{access_token, expires_on (seconds, as a string), resource, token_type: Bearer, client_id}`. The token is minted from the stored sign-in for `<resource>/.default offline_access` in the subscription's tenant, the scope the Azure CLI's `resource_to_scopes` writes, and kept per resource while it has more than 15 minutes left. A request for a user-assigned identity (`client_id`, `principal_id`, `object_id`, `mi_res_id`) is refused. The Azure Identity libraries pick App Service when `IDENTITY_ENDPOINT` and `IDENTITY_HEADER` are set without `IDENTITY_SERVER_THUMBPRINT` (Service Fabric) or `IMDS_ENDPOINT` (Arc), so those, the older `MSI_ENDPOINT` and `MSI_SECRET`, and the variables of the credentials `DefaultAzureCredential` tries first (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_FEDERATED_TOKEN_FILE`, ...) are removed from the command. `az` uses a managed identity only after `az login --identity`, which writes `~/.azure`, so fob does not change what `az` does. `--no-server` turns it off.
+
+AKS: `fob creds --format k8s-exec` asks for the AKS server application `6dae42f8-4368-4678-94ff-3960e28e3630`, as `kubelogin` does.
+
+## Agent sessions
+
+The Azure CLI (`azure/cli/core/auth/agentic_session.py` and `msal_credentials.py`, read 2026-11-25) reads `COPILOT_AGENT_SESSION_ID` and, outside the broker, sends it as `client_session` in the token request's body and query; with the broker it also sends the claims challenge `{"access_token": {"xms_cli_sid": {"values": [<id>]}}}`. Entra ID then marks the tokens as an agent's, for Conditional Access, Defender and Purview. omnifob makes the same refresh-token requests as the non-broker path, so under an agent with that variable it sends `client_session` the same way, for every token (Resource Manager, the managed identity endpoint, AKS).
