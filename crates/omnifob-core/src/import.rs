@@ -462,7 +462,7 @@ pub fn aws_import(text: &str) -> AwsImport {
             f.chained.insert(label, role);
             continue;
         }
-        if let Some(other) = source_keys.and_then(|k| other_source(k)) {
+        if let Some(other) = source_keys.and_then(other_source) {
             skip(
                 name,
                 format!(
