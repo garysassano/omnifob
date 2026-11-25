@@ -43,9 +43,19 @@ This installs two names for the same binary: `fob` for daily use and `omnifob` f
 
 ## Configure
 
-Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections with their `sso_registration_scopes`, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID, region, `mfa_serial` and `duration_seconds`), and prints matching integrations; `--write` appends them to the config. Roles assumed from a profile with an IAM user's access key become an `aws-iam` integration with those roles; the key itself is never read, so run `fob login <name>` afterwards to store it. Profiles it cannot import (a role assumed from another assumed role, a `credential_process` source, a `duration_seconds` AWS would refuse) are listed with the reason.
+Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM Identity Center portal your `~/.aws/config` profiles use (standard `sso_*` keys, `sso-session` sections with their `sso_registration_scopes`, granted's keys) and the roles chained from them (`role_arn` + `source_profile`, with session name, external ID, region, `mfa_serial` and `duration_seconds`), and prints matching integrations; `--write` appends them to the config. Roles assumed from a profile with an IAM user's access key become an `aws-iam` integration with those roles; the key itself is never read, so run `fob login <name>` afterwards to store it. A profile `aws login` signed in (`login_session`) becomes an `aws-login` integration, which `fob login <name>` signs in again, since the AWS CLI's cached tokens are not read. Profiles it cannot import (a role assumed from another assumed role, a `credential_process` source, a `duration_seconds` AWS would refuse, a role ARN or Region the config would refuse) are listed with the reason.
 
 Integration names may contain only letters, digits, `.`, `_` and `-`, and may not start with `-`. A config with another name is refused with a pointer to `fob rename "<old name>" <new-name>`, which still works on it.
+
+Every key is checked when the config loads, and an error names the key: Regions, account IDs, role ARNs and their partitions, session names and lengths, `https://` start URLs, service account emails, Cloudflare template names, IP ranges and lifetimes (more than five minutes, when omnifob would mint the token again), token presets and variable names, and configured roles whose labels would give two profiles one id.
+
+The config has a JSON Schema, [schema/config.schema.json](schema/config.schema.json), for completion and checks in editors and [taplo](https://taplo.tamasfe.dev). Name it on the first line of the config:
+
+```toml
+#:schema https://raw.githubusercontent.com/garysassano/omnifob/main/schema/config.schema.json
+```
+
+Then `taplo check ~/.config/omnifob/config.toml` checks the file, and editors with the Even Better TOML extension (which uses taplo) complete keys and show their descriptions. The schema knows the keys and their types; the checks above that need more than that (partitions, clashing ids) still run when omnifob loads the config.
 
 `~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`, or `--config <path>` on any command, which has to name an existing file except for `fob import aws --write`):
 
@@ -180,6 +190,10 @@ verify_url = "https://api.example.com/me"     # optional: must answer 2xx for th
 console = "https://console.example.com"
 ```
 
+A `secrets` table replaces the preset's secrets and the fixed variables that come with them (`UNIKRAFT_PROFILE_ENV` for unikraft), so set those under `vars` if you still want them.
+
+`fob login` and `fob check` check the token with the provider where it has a call for that: a bearer token for most presets, Scaleway's secret key in `X-Auth-Token` (looking up its own access key, as `scw init` does), and Upstash's API key with `UPSTASH_EMAIL` as HTTP Basic credentials. A token the provider refuses (401 or 403) is reported as rejected; a provider that cannot be reached or answers 5xx is reported as not checked, so try again later. Fly.io tokens are not checked, since Fly.io has no call that every token, app-scoped deploy tokens included, may make.
+
 `fob login <name>` asks for each secret. An integration with a single secret also takes it from the clipboard (`--from-clipboard`, which refuses an empty clipboard, text with whitespace and URLs) or from stdin (`--token-stdin`).
 
 ### Browsers
@@ -222,7 +236,7 @@ isolate = "firefox-container"   # a container per fob profile, through the Grant
 fob login acme            # browser sign-in (kept while it still works), then discovers profiles
 fob login                 # pick the integration from a fuzzy list (fob logout too)
 fob login acme --force    # sign in again even though the stored sign-in works
-fob login acme --device-code   # approve with a code on another device (automatic over SSH)
+fob login acme --device-code   # approve with a code on another device (automatic over SSH and without a display)
 fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...
 fob list prod admin       # only the profiles those words match
 fob exec prod admin -- aws s3 ls
@@ -320,7 +334,7 @@ This guards against accidents, not against the agent, which runs as you; the har
 
 SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentials are kept in the OS keychain under the service `omnifob`: Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux. Where no Secret Service runs (WSL, servers), the kernel keyring is used, straight away when there is no D-Bus session bus; it forgets everything on reboot. On WSL, long-lived secrets are therefore also written to `~/.local/state/omnifob/vault`, encrypted with Windows DPAPI for your Windows user, and restored after a reboot (`OMNIFOB_WSL_DPAPI=0` turns this off). `OMNIFOB_KEYRING` forces a store; `fob status` shows which one is in use.
 
-Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json`. If it cannot be read, `fob sync` and `fob login` start over from no profiles and rewrite it, and `fob status` and `fob logout` carry on with a warning. On Linux and macOS the state directory and the vault are readable by you only (`0700`, files `0600`), and every file in them is replaced atomically, so a concurrent `fob` never reads half of one.
+Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json` (`$XDG_STATE_HOME/omnifob`). Without a home directory, set `XDG_STATE_HOME` and `OMNIFOB_CONFIG` (or `XDG_CONFIG_HOME`): omnifob then refuses to start rather than keep its files in the current directory. If it cannot be read, `fob sync` and `fob login` start over from no profiles and rewrite it, and `fob status` and `fob logout` carry on with a warning. On Linux and macOS the state directory and the vault are readable by you only (`0700`, files `0600`), and every file in them is replaced atomically, so a concurrent `fob` never reads half of one.
 
 Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. Credentials asked for with `--ttl` are not cached, so the next command gets the configured lifetime again. `fob sync` deletes the cached credentials of profiles that went away. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache; `fob revoke --all` does it for every profile, leaving the sign-ins. A renewal in the background is skipped for a chained role with `mfa_serial`, which needs a code each session; the next command that needs one asks for it. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
 
