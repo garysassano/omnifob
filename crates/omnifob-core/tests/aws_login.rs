@@ -193,7 +193,9 @@ async fn browser_sign_in_redeems_the_code_with_a_dpop_proof() {
         }
     );
 
-    let creds = aws_login::credentials("browser", &config(), false).await.unwrap();
+    let creds = aws_login::credentials("browser", &config(), false)
+        .await
+        .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAFIRST");
     assert_eq!(creds.env["AWS_SESSION_TOKEN"], "session");
     assert_eq!(creds.env["AWS_REGION"], "eu-central-1");
@@ -240,7 +242,9 @@ async fn a_pasted_code_signs_in_from_another_device() {
     )
     .await
     .unwrap();
-    let creds = aws_login::credentials("remote", &config(), false).await.unwrap();
+    let creds = aws_login::credentials("remote", &config(), false)
+        .await
+        .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAREMOTE");
 }
 
@@ -261,7 +265,9 @@ async fn expiring_credentials_are_renewed_with_the_same_key() {
         .mount(&server)
         .await;
 
-    let creds = aws_login::credentials("renew", &config(), false).await.unwrap();
+    let creds = aws_login::credentials("renew", &config(), false)
+        .await
+        .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIASECOND");
     let requests = server.received_requests().await.unwrap();
     assert_eq!(dpop_key(&requests[0]), dpop_key(&requests[1]));
@@ -272,7 +278,9 @@ async fn expiring_credentials_are_renewed_with_the_same_key() {
         .respond_with(token("ASIATHIRD", "refresh-3", 900))
         .mount(&server)
         .await;
-    let creds = aws_login::credentials("renew", &config(), false).await.unwrap();
+    let creds = aws_login::credentials("renew", &config(), false)
+        .await
+        .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIASECOND", "still fresh");
 }
 

@@ -158,7 +158,11 @@ async fn browser_sign_in_redeems_the_code_with_pkce() {
     assert_eq!(stored["refresh_token"], "refresh-1");
     assert_eq!(
         cloudflare_oauth::granted_scopes("cf").unwrap().unwrap(),
-        ["account-api-tokens.write", "memberships.read", "offline_access"]
+        [
+            "account-api-tokens.write",
+            "memberships.read",
+            "offline_access"
+        ]
     );
 }
 

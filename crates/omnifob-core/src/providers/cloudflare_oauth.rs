@@ -320,7 +320,10 @@ fn lock_name(integration: &str) -> String {
 fn load(integration: &str) -> Result<Stored> {
     let stored: Stored =
         store::get(&token_key(integration))?.ok_or_else(|| Error::not_signed_in(integration))?;
-    if stored.session_ends.is_some_and(|end| end <= Timestamp::now()) {
+    if stored
+        .session_ends
+        .is_some_and(|end| end <= Timestamp::now())
+    {
         return Err(Error::needs_login(
             integration,
             format!("the Cloudflare session of '{integration}' ended"),

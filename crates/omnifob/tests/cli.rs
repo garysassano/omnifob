@@ -855,11 +855,7 @@ fn export_gives_console_sign_in_profiles_their_region() {
         "session_token": "session",
         "expires_at": "2100-01-01T00:00:00Z",
     });
-    std::fs::write(
-        fob.secret("aws-login/console/session"),
-        session.to_string(),
-    )
-    .unwrap();
+    std::fs::write(fob.secret("aws-login/console/session"), session.to_string()).unwrap();
     fob.ok(&["sync"]);
     let (stdout, _) = fob.ok(&["export", "aws-config"]);
     assert!(

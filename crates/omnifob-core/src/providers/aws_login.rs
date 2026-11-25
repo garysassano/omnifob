@@ -580,7 +580,10 @@ fn identity_name(arn: &str) -> &str {
 /// Whether the stored session was signed in through the configured Region:
 /// its refresh token renews only there. `false` when none is stored.
 pub fn session_matches(integration: &str, config: &AwsLoginConfig) -> anyhow::Result<bool> {
-    Ok(store::get::<Session>(&session_key(integration))?.is_some_and(|s| s.region == config.region))
+    Ok(
+        store::get::<Session>(&session_key(integration))?
+            .is_some_and(|s| s.region == config.region),
+    )
 }
 
 /// Whether a session is stored, and until when its credentials last.

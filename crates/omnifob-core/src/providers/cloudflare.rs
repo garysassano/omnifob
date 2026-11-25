@@ -222,7 +222,11 @@ impl Client {
 
     /// A client with the access token of `integration`'s browser sign-in,
     /// renewed once if Cloudflare rejects it.
-    async fn for_sign_in(base: String, integration: &str, config: &CloudflareConfig) -> Result<Self> {
+    async fn for_sign_in(
+        base: String,
+        integration: &str,
+        config: &CloudflareConfig,
+    ) -> Result<Self> {
         let token = super::cloudflare_oauth::access_token(integration, config).await?;
         Ok(Self {
             oauth: Some(std::sync::Arc::new((
@@ -267,7 +271,9 @@ impl Client {
             {
                 // An access token can stop working before its time (rotated
                 // by another renewal, or revoked); one renewal is worth a try.
-                tracing::debug!("{method} {path}: Cloudflare rejected the access token; renewing it");
+                tracing::debug!(
+                    "{method} {path}: Cloudflare rejected the access token; renewing it"
+                );
                 let (integration, config) = &**oauth;
                 let fresh =
                     super::cloudflare_oauth::renew_rejected(integration, config, &token).await?;
@@ -736,7 +742,9 @@ pub async fn login(
         None => None,
     };
     store::set(&bootstrap_key(integration), &token.trim())?;
-    update_catalog(integration, |c| c.bootstrap = Some(Bootstrap { id, expires_at }))?;
+    update_catalog(integration, |c| {
+        c.bootstrap = Some(Bootstrap { id, expires_at })
+    })?;
     Ok(expires_at)
 }
 
@@ -1331,14 +1339,22 @@ pub async fn mint(
         );
     }
     // A name missing from a stored catalog may be a product added since.
-    let selected = match select(&template, groups_in(&catalog.permission_groups, &key), token_type) {
+    let selected = match select(
+        &template,
+        groups_in(&catalog.permission_groups, &key),
+        token_type,
+    ) {
         Ok(selected) => selected,
         Err(_) if !fetched_now(catalog) => {
             fetch(
                 catalog,
                 client.permission_groups(token_type, account_id).await?,
             );
-            select(&template, groups_in(&catalog.permission_groups, &key), token_type)?
+            select(
+                &template,
+                groups_in(&catalog.permission_groups, &key),
+                token_type,
+            )?
         }
         Err(e) => return Err(e),
     };

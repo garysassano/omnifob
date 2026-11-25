@@ -532,7 +532,10 @@ mod tests {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], loopback.port()));
         let state = pkce.state.clone();
         let browser = std::thread::spawn(move || {
-            request(addr, &format!("GET /cb?code=c1&state={state} HTTP/1.1\r\n\r\n"))
+            request(
+                addr,
+                &format!("GET /cb?code=c1&state={state} HTTP/1.1\r\n\r\n"),
+            )
         });
         let code = loopback.code("/cb", &pkce.state, "X").await.unwrap();
         assert_eq!(code, "c1");
