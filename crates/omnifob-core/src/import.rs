@@ -8,6 +8,9 @@ pub struct AwsImport {
     pub portals: Vec<AwsPortal>,
     /// IAM users whose access keys roles are assumed with.
     pub iam_users: Vec<AwsIamUser>,
+    /// Console sign-ins made with `aws login` (`login_session`), which
+    /// become `aws-login` integrations.
+    pub logins: Vec<AwsLogin>,
     /// Profiles that could not be imported, with the reason.
     pub skipped: Vec<SkippedProfile>,
 }
@@ -48,6 +51,18 @@ pub struct AwsIamUser {
     /// Roles assumed with the user's session, keyed by a label made from the
     /// profile name.
     pub roles: BTreeMap<String, crate::config::IamRole>,
+}
+
+/// A profile that `aws login` signed in (`login_session` with no role),
+/// which becomes an `aws-login` integration. Its tokens stay in the AWS
+/// CLI's cache, which is not read: `fob login` signs in again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsLogin {
+    /// Suggested integration name, made from the profile name.
+    pub name: String,
+    pub profile: String,
+    /// The profile's `region`, the one signed in through.
+    pub region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +142,65 @@ fn parse_ini(text: &str) -> Vec<(String, BTreeMap<String, String>)> {
     sections
 }
 
+/// Sections by name, their keys merged.
+type Sections = BTreeMap<String, BTreeMap<String, String>>;
+
+/// The profiles and `sso-session` sections of a config file, as the AWS
+/// SDKs' shared-config parsers read them: `[profile <name>]` and
+/// `[sso-session <name>]` take any whitespace after the prefix (a tab too),
+/// a header with no whitespace there (`[profilefoo]`, `[sso-session-x]`)
+/// is ignored, and `[default]` is the default profile unless a `[profile
+/// default]` section exists, which then wins. A section that appears twice
+/// is merged, later keys replacing earlier ones, as the Rust, Go and
+/// JavaScript SDKs do (botocore refuses the file instead).
+fn sections(text: &str) -> (Sections, Sections) {
+    let parsed = parse_ini(text);
+    let explicit_default = parsed
+        .iter()
+        .any(|(name, _)| section_name(name) == Some(("profile", "default")));
+    let (mut profiles, mut sessions) = (Sections::new(), Sections::new());
+    for (header, keys) in parsed {
+        let into = match section_name(&header) {
+            Some(("profile", name)) => profiles.entry(name.to_string()),
+            Some(("sso-session", name)) => sessions.entry(name.to_string()),
+            None if header == "default" && !explicit_default => {
+                profiles.entry("default".to_string())
+            }
+            _ => continue,
+        };
+        into.or_default().extend(keys);
+    }
+    (profiles, sessions)
+}
+
+/// `("profile", name)` or `("sso-session", name)` for a section header with
+/// that prefix, whitespace, and a name.
+fn section_name(header: &str) -> Option<(&str, &str)> {
+    let (prefix, name) = header.split_once(char::is_whitespace)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match prefix {
+        "profile" => Some(("profile", name)),
+        "sso-session" => Some(("sso-session", name)),
+        _ => None,
+    }
+}
+
+/// `base` slugged, or with `-2`, `-3`... when `taken` already has it, so two
+/// profile names that slug alike (`Prod`, `prod`) get labels of their own.
+fn unique_label<V>(taken: &BTreeMap<String, V>, base: &str) -> String {
+    let base = crate::profile::slug(base);
+    let mut label = base.clone();
+    let mut n = 1;
+    while taken.contains_key(&label) {
+        n += 1;
+        label = format!("{base}-{n}");
+    }
+    label
+}
+
 /// The line up to a `#` or `;` that follows whitespace, trimmed.
 fn strip_comment(line: &str) -> &str {
     let mut after_space = false;
@@ -149,10 +223,7 @@ struct SsoRef {
     role_name: Option<String>,
 }
 
-fn sso_ref(
-    keys: &BTreeMap<String, String>,
-    sessions: &BTreeMap<&str, &BTreeMap<String, String>>,
-) -> Option<SsoRef> {
+fn sso_ref(keys: &BTreeMap<String, String>, sessions: &Sections) -> Option<SsoRef> {
     let get = |k: &str| keys.get(k).cloned();
     let (start_url, sso_region, session_name, scopes) = if let Some(session) =
         keys.get("sso_session")
@@ -224,31 +295,21 @@ fn duration(
 /// Finds every Identity Center portal referenced by profiles in an AWS
 /// config file (`sso_session` references, inline `sso_start_url` and
 /// `sso_region`, granted's `granted_sso_*` keys), the roles chained from
-/// them through `role_arn` and `source_profile`, and the roles assumed from
+/// them through `role_arn` and `source_profile`, the roles assumed from
 /// profiles with an IAM user's access key, which become `aws-iam`
-/// integrations.
+/// integrations, and the console sign-ins of `aws login`
+/// (`login_session`), which become `aws-login` integrations.
 ///
 /// A source profile with neither Identity Center keys, a role, nor another
 /// credential source (`credential_process`, `credential_source`,
 /// `web_identity_token_file`, `login_session`) is taken to hold an access
 /// key, here or in the credentials file, which is not read.
+///
+/// Everything imported gets the checks the config gets when it loads, so
+/// a role or Region that would make the config invalid is skipped with the
+/// reason instead.
 pub fn aws_import(text: &str) -> AwsImport {
-    let sections = parse_ini(text);
-    let sessions: BTreeMap<&str, &BTreeMap<String, String>> = sections
-        .iter()
-        .filter_map(|(name, keys)| Some((name.strip_prefix("sso-session")?.trim(), keys)))
-        .collect();
-    let profiles: BTreeMap<&str, &BTreeMap<String, String>> = sections
-        .iter()
-        .filter_map(|(name, keys)| {
-            let profile = if name == "default" {
-                "default"
-            } else {
-                name.strip_prefix("profile ")?.trim()
-            };
-            Some((profile, keys))
-        })
-        .collect();
+    let (profiles, sessions) = sections(text);
 
     #[derive(Default)]
     struct Found {
@@ -273,10 +334,23 @@ pub fn aws_import(text: &str) -> AwsImport {
         }
         f
     }
+    // Why a portal cannot be imported, checked as the config would.
+    fn portal_problem(sso: &SsoRef) -> Option<String> {
+        if let Err(e) = crate::config::check_https_url("sso_start_url", &sso.start_url) {
+            return Some(e);
+        }
+        crate::providers::aws_partition::check_region_name(&sso.sso_region)
+            .err()
+            .map(|e| format!("sso_region: {e:#}"))
+    }
     // Roles assumed from an IAM user's profile, by that profile, with the
     // `mfa_serial` each names.
     type IamRoles = Vec<(String, crate::config::IamRole, Option<String>)>;
     let mut iam: BTreeMap<String, IamRoles> = BTreeMap::new();
+    let mut logins: Vec<AwsLogin> = Vec::new();
+    // The login_session and Region of each imported sign-in, to import one
+    // identity once.
+    let mut signed_in: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut skip = |profile: &str, reason: String| {
         skipped.push(SkippedProfile {
@@ -287,6 +361,13 @@ pub fn aws_import(text: &str) -> AwsImport {
 
     for (name, keys) in &profiles {
         if let Some(sso) = sso_ref(keys, &sessions) {
+            if let Some(why) = portal_problem(&sso) {
+                skip(
+                    name,
+                    format!("its Identity Center settings are not valid: {why}"),
+                );
+                continue;
+            }
             let f = entry(&mut found, &sso);
             f.profiles += 1;
             if let Some(region) = keys.get("region") {
@@ -295,21 +376,61 @@ pub fn aws_import(text: &str) -> AwsImport {
             continue;
         }
         let Some(role_arn) = keys.get("role_arn") else {
+            if let Some(session) = keys.get("login_session") {
+                let Some(region) = keys.get("region") else {
+                    skip(
+                        name,
+                        "it signs in with `aws login` but has no region, the Region AWS Sign-In renews in".into(),
+                    );
+                    continue;
+                };
+                if let Err(e) = crate::providers::aws_partition::check_region_name(region) {
+                    skip(name, format!("its region: {e:#}"));
+                    continue;
+                }
+                let identity = (session.clone(), region.clone());
+                if let Some(first) = signed_in.get(&identity) {
+                    skip(
+                        name,
+                        format!(
+                            "it signs in as the same identity in the same Region as profile '{first}'"
+                        ),
+                    );
+                    continue;
+                }
+                signed_in.insert(identity, name.clone());
+                logins.push(AwsLogin {
+                    name: crate::profile::slug(name),
+                    profile: name.clone(),
+                    region: region.clone(),
+                });
+            }
             continue;
         };
         let Some(source) = keys.get("source_profile") else {
-            if let Some(other) = other_source(keys) {
-                skip(
+            match other_source(keys) {
+                Some(other) => skip(
                     name,
                     format!(
                         "it gets its source credentials through {other}, which omnifob cannot import"
                     ),
-                );
+                ),
+                None => skip(
+                    name,
+                    "it has a role_arn but no source_profile or credential_source to assume it with".into(),
+                ),
             }
             continue;
         };
         let source_keys = profiles.get(source.as_str());
         if let Some(sso) = source_keys.and_then(|k| sso_ref(k, &sessions)) {
+            if let Some(why) = portal_problem(&sso) {
+                skip(
+                    name,
+                    format!("its source profile's Identity Center settings are not valid: {why}"),
+                );
+                continue;
+            }
             let f = entry(&mut found, &sso);
             f.profiles += 1;
             let (Some(account_id), Some(role_name)) = (&sso.account_id, &sso.role_name) else {
@@ -323,23 +444,22 @@ pub fn aws_import(text: &str) -> AwsImport {
                 );
                 continue;
             };
-            if let Err(why) = crate::config::check_chained_role_arn(role_arn, &sso.sso_region) {
+            let role = crate::config::ChainedRole {
+                via_account_id: account_id.clone(),
+                via_role: role_name.clone(),
+                role_arn: role_arn.clone(),
+                session_name: keys.get("role_session_name").cloned(),
+                external_id: keys.get("external_id").cloned(),
+                region: keys.get("region").cloned(),
+                mfa_serial: keys.get("mfa_serial").cloned(),
+                duration,
+            };
+            if let Err(why) = role.validate(&sso.sso_region) {
                 skip(name, why);
                 continue;
             }
-            f.chained.insert(
-                crate::profile::slug(name),
-                crate::config::ChainedRole {
-                    via_account_id: account_id.clone(),
-                    via_role: role_name.clone(),
-                    role_arn: role_arn.clone(),
-                    session_name: keys.get("role_session_name").cloned(),
-                    external_id: keys.get("external_id").cloned(),
-                    region: keys.get("region").cloned(),
-                    mfa_serial: keys.get("mfa_serial").cloned(),
-                    duration,
-                },
-            );
+            let label = unique_label(&f.chained, name);
+            f.chained.insert(label, role);
             continue;
         }
         if let Some(other) = source_keys.and_then(|k| other_source(k)) {
@@ -411,6 +531,9 @@ pub fn aws_import(text: &str) -> AwsImport {
             let default_region = f
                 .regions
                 .into_iter()
+                .filter(|(region, _)| {
+                    crate::providers::aws_partition::check_region_name(region).is_ok()
+                })
                 .max_by_key(|(region, count)| (*count, std::cmp::Reverse(region.clone())))
                 .map(|(region, _)| region);
             AwsPortal {
@@ -428,6 +551,16 @@ pub fn aws_import(text: &str) -> AwsImport {
         .into_iter()
         .filter_map(|(profile, roles)| {
             let source = profiles.get(profile.as_str());
+            let region = source.and_then(|k| k.get("region").cloned());
+            if let Some(Err(e)) = region
+                .as_deref()
+                .map(crate::providers::aws_partition::check_region_name)
+            {
+                for (name, _, _) in &roles {
+                    skip(name, format!("its source profile '{profile}' has a region that is not valid: {e:#}"));
+                }
+                return None;
+            }
             let mfa_serial = source
                 .and_then(|k| k.get("mfa_serial").cloned())
                 .or_else(|| roles.iter().find_map(|(_, _, mfa)| mfa.clone()));
@@ -442,25 +575,47 @@ pub fn aws_import(text: &str) -> AwsImport {
                     );
                     continue;
                 }
-                kept.insert(crate::profile::slug(&name), role);
+                if let Err(why) = role.validate(region.as_deref()) {
+                    skip(&name, why);
+                    continue;
+                }
+                kept.insert(unique_label(&kept, &name), role);
             }
             if kept.is_empty() {
                 return None;
             }
             Some(AwsIamUser {
                 name: unique(&profile),
-                region: source.and_then(|k| k.get("region").cloned()),
+                region,
                 mfa_serial,
                 profile,
                 roles: kept,
             })
         })
         .collect();
+    let logins = logins
+        .into_iter()
+        .map(|login| AwsLogin {
+            name: unique(&login.name),
+            ..login
+        })
+        .collect();
     AwsImport {
         portals,
         iam_users,
+        logins,
         skipped,
     }
+}
+
+/// TOML for an `aws-login` integration, ready to append to the config
+/// file. `fob login` signs it in: the AWS CLI's cached tokens are not read.
+pub fn aws_login_toml(login: &AwsLogin) -> String {
+    format!(
+        "[integrations.{}]\ntype = \"aws-login\"\nregion = {}\n",
+        toml_key(&login.name),
+        toml_str(&login.region)
+    )
 }
 
 /// A name for a portal without an `sso-session` name: the subdomain of an
@@ -607,18 +762,34 @@ pub fn credential_process_program(path: &str, windows: bool) -> anyhow::Result<S
 /// per AWS profile, named `<prefix><integration>-<account>-<role>`.
 /// `regions` maps profile ids to the region to set; `program` is `fob`, or
 /// the path from [`credential_process_program`].
+///
+/// Flattening `/` to `-` can give two ids one name (`a-b/c/d` and
+/// `a/b-c/d`). The first profile keeps the name and the others are left
+/// out, returned as clashes: a suffix would depend on the order of the
+/// profiles, so a later sync could point a name at another account.
 pub fn aws_config_block(
     profiles: &[&crate::Profile],
     prefix: &str,
     regions: &BTreeMap<String, String>,
     program: &str,
-) -> String {
+) -> (String, Vec<ExportClash>) {
     let mut out = format!("{AWS_BLOCK_BEGIN}\n");
+    let mut named: BTreeMap<String, &str> = BTreeMap::new();
+    let mut clashes = Vec::new();
     for p in profiles {
         if !p.target.is_aws() {
             continue;
         }
         let name = format!("{prefix}{}", p.id.replace('/', "-"));
+        if let Some(first) = named.get(&name) {
+            clashes.push(ExportClash {
+                name,
+                kept: first.to_string(),
+                left_out: p.id.clone(),
+            });
+            continue;
+        }
+        named.insert(name.clone(), &p.id);
         out.push_str(&format!(
             "[profile {name}]\ncredential_process = {program} creds {} --format credential-process\n",
             p.id
@@ -630,24 +801,53 @@ pub fn aws_config_block(
     }
     out.push_str(AWS_BLOCK_END);
     out.push('\n');
-    out
+    (out, clashes)
 }
 
-/// Replaces omnifob's block in an AWS config file, or appends one.
+/// Two profiles whose ids give the same AWS profile name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportClash {
+    /// The AWS profile name.
+    pub name: String,
+    /// The profile that has it.
+    pub kept: String,
+    /// The profile left out of the block.
+    pub left_out: String,
+}
+
+/// Replaces omnifob's block in an AWS config file, or appends one. A file
+/// with Windows line endings (`\r\n`) keeps them, the block included.
 pub fn replace_aws_block(existing: &str, block: &str) -> String {
-    match (existing.find(AWS_BLOCK_BEGIN), existing.find(AWS_BLOCK_END)) {
-        (Some(start), Some(end)) if end > start => {
+    let crlf = existing.contains("\r\n");
+    let block = if crlf {
+        block.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        block.to_string()
+    };
+    let newline = if crlf { "\r\n" } else { "\n" };
+    let end = existing.find(AWS_BLOCK_BEGIN).and_then(|start| {
+        let from = start + AWS_BLOCK_BEGIN.len();
+        existing[from..]
+            .find(AWS_BLOCK_END)
+            .map(|end| (start, from + end))
+    });
+    match end {
+        Some((start, end)) => {
             let after = &existing[end + AWS_BLOCK_END.len()..];
-            let after = after.strip_prefix('\n').unwrap_or(after);
+            let after = after
+                .strip_prefix("\r\n")
+                .or_else(|| after.strip_prefix('\n'))
+                .unwrap_or(after);
             format!("{}{block}{after}", &existing[..start])
         }
-        _ => {
-            let sep = if existing.is_empty() || existing.ends_with("\n\n") {
+        None => {
+            let blank = format!("{newline}{newline}");
+            let sep = if existing.is_empty() || existing.ends_with(&blank) {
                 ""
             } else if existing.ends_with('\n') {
-                "\n"
+                newline
             } else {
-                "\n\n"
+                &blank
             };
             format!("{existing}{sep}{block}")
         }
@@ -1221,13 +1421,13 @@ credential_process = /usr/bin/creds
             },
         );
         let regions = BTreeMap::from([("acme/prod/Admin".to_string(), "eu-west-1".to_string())]);
-        let block = aws_config_block(&[&p], "fob-", &regions, "fob");
+        let (block, _) = aws_config_block(&[&p], "fob-", &regions, "fob");
         assert!(block.contains("[profile fob-acme-prod-Admin]"));
         assert!(block.contains(
             "credential_process = fob creds acme/prod/Admin --format credential-process"
         ));
         assert!(block.contains("region = eu-west-1"));
-        let absolute = aws_config_block(&[&p], "fob-", &regions, "\"/opt/my tools/fob\"");
+        let (absolute, _) = aws_config_block(&[&p], "fob-", &regions, "\"/opt/my tools/fob\"");
         assert!(absolute.contains(
             "credential_process = \"/opt/my tools/fob\" creds acme/prod/Admin --format credential-process"
         ));
@@ -1239,7 +1439,7 @@ credential_process = /usr/bin/creds
         assert_eq!(once, twice, "rewriting is idempotent");
 
         let mine = format!("{once}[profile mine]\nregion = eu-north-1\n");
-        let empty = aws_config_block(&[], "fob-", &regions, "fob");
+        let (empty, _) = aws_config_block(&[], "fob-", &regions, "fob");
         let shrunk = replace_aws_block(&mine, &empty);
         assert!(
             shrunk.contains("[profile mine]"),
@@ -1253,6 +1453,273 @@ credential_process = /usr/bin/creds
         assert_eq!(
             normalize_start_url(" https://Acme.AWSApps.com/start/ "),
             "https://acme.awsapps.com/start"
+        );
+    }
+
+    #[test]
+    fn section_prefixes_need_whitespace() {
+        let import = aws_import(
+            "[sso-session-foo]\nsso_start_url = https://wrong.awsapps.com/start\nsso_region = eu-west-1\n\
+             [sso-session\tacme]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = eu-west-1\n\
+             [profile\ttabbed]\nsso_session = acme\nsso_account_id = 111111111111\nsso_role_name = Admin\n\
+             [profilefoo]\nsso_session = acme\n\
+             [profile foo-session]\nsso_session = foo\n",
+        );
+        assert_eq!(import.portals.len(), 1, "{import:#?}");
+        assert_eq!(import.portals[0].name, "acme");
+        // Only `tabbed` counts: `[profilefoo]` is no profile, and `foo` no session.
+        assert_eq!(import.portals[0].profiles, 1);
+        let (profiles, sessions) = sections("[profile\t x ]\n[profile]\n[sso-session ]\n");
+        assert_eq!(profiles.keys().collect::<Vec<_>>(), ["x"]);
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn repeated_sections_merge_and_profile_default_wins() {
+        let (profiles, _) = sections(
+            "[default]\nregion = us-east-1\noutput = json\n\
+             [profile a]\nregion = eu-west-1\nrole_arn = x\n\
+             [profile b]\nregion = eu-north-1\n\
+             [profile  a]\nregion = eu-west-2\n\
+             [profile default]\nregion = eu-central-1\n",
+        );
+        assert_eq!(profiles["a"]["region"], "eu-west-2", "later keys win");
+        assert_eq!(profiles["a"]["role_arn"], "x", "earlier keys stay");
+        assert_eq!(profiles["default"]["region"], "eu-central-1");
+        assert!(
+            !profiles["default"].contains_key("output"),
+            "[default] is ignored next to [profile default]"
+        );
+        let (profiles, _) = sections("[default]\nregion = us-east-1\n");
+        assert_eq!(profiles["default"]["region"], "us-east-1");
+
+        // A role whose keys are split over two sections is imported whole.
+        let import = aws_import(
+            "[profile p]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = us-east-1\n\
+             sso_account_id = 111111111111\nsso_role_name = Admin\n\
+             [profile deploy]\nrole_arn = arn:aws:iam::222222222222:role/Deploy\n\
+             [profile deploy]\nsource_profile = p\n",
+        );
+        assert!(
+            import.portals[0].chained.contains_key("deploy"),
+            "{import:#?}"
+        );
+    }
+
+    #[test]
+    fn aws_login_profiles_become_aws_login_integrations() {
+        let import = aws_import(
+            "[profile console]\nlogin_session = arn:aws:iam::111111111111:user/me\nregion = eu-west-1\n\
+             [profile Console]\nlogin_session = arn:aws:iam::111111111111:user/me\nregion = eu-west-1\n\
+             [profile elsewhere]\nlogin_session = arn:aws:iam::111111111111:user/me\nregion = us-east-1\n\
+             [profile no-region]\nlogin_session = arn:aws:iam::111111111111:user/me\n\
+             [profile bad-region]\nlogin_session = arn:aws:iam::111111111111:user/me\nregion = eu_west_1\n\
+             [profile from-login]\nrole_arn = arn:aws:iam::222222222222:role/R\nsource_profile = console\n\
+             [profile no-source]\nrole_arn = arn:aws:iam::222222222222:role/R\n",
+        );
+        let logins: Vec<(&str, &str, &str)> = import
+            .logins
+            .iter()
+            .map(|l| (l.name.as_str(), l.profile.as_str(), l.region.as_str()))
+            .collect();
+        assert_eq!(
+            logins,
+            [
+                ("console", "Console", "eu-west-1"),
+                ("elsewhere", "elsewhere", "us-east-1")
+            ]
+        );
+        let skipped = skipped(&import);
+        assert!(
+            skipped["console"].contains("same identity in the same Region as profile 'Console'"),
+            "{skipped:?}"
+        );
+        assert!(skipped["no-region"].contains("no region"), "{skipped:?}");
+        assert!(
+            skipped["bad-region"].contains("not an AWS Region name"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped["from-login"].contains("login_session"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped["no-source"].contains("no source_profile or credential_source"),
+            "{skipped:?}"
+        );
+
+        let toml = aws_login_toml(&import.logins[0]);
+        assert_eq!(
+            toml,
+            "[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n"
+        );
+        let all: String = import
+            .logins
+            .iter()
+            .map(aws_login_toml)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = crate::Config::parse(&all).unwrap();
+        assert!(matches!(
+            config.integrations["elsewhere"],
+            crate::Integration::AwsLogin(_)
+        ));
+    }
+
+    #[test]
+    fn profile_names_that_slug_alike_get_labels_of_their_own() {
+        let import = aws_import(
+            "[profile p]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = us-east-1\n\
+             sso_account_id = 111111111111\nsso_role_name = Admin\n\
+             [profile Prod]\nrole_arn = arn:aws:iam::222222222222:role/Deploy\nsource_profile = p\n\
+             [profile prod]\nrole_arn = arn:aws:iam::333333333333:role/Deploy\nsource_profile = p\n\
+             [profile keys]\nregion = eu-west-1\n\
+             [profile Ops]\nrole_arn = arn:aws:iam::444444444444:role/Ops\nsource_profile = keys\n\
+             [profile ops]\nrole_arn = arn:aws:iam::555555555555:role/Ops\nsource_profile = keys\n",
+        );
+        let chained = &import.portals[0].chained;
+        assert_eq!(chained.keys().collect::<Vec<_>>(), ["prod", "prod-2"]);
+        assert_eq!(
+            chained["prod"].role_arn,
+            "arn:aws:iam::222222222222:role/Deploy"
+        );
+        assert_eq!(
+            chained["prod-2"].role_arn,
+            "arn:aws:iam::333333333333:role/Deploy"
+        );
+        let roles = &import.iam_users[0].roles;
+        assert_eq!(roles.keys().collect::<Vec<_>>(), ["ops", "ops-2"]);
+        let toml = format!(
+            "{}\n{}",
+            aws_portal_toml(&import.portals[0]),
+            aws_iam_user_toml(&import.iam_users[0])
+        );
+        assert!(crate::Config::parse(&toml).is_ok(), "{toml}");
+    }
+
+    #[test]
+    fn what_the_config_would_refuse_is_skipped_with_the_reason() {
+        let import = aws_import(
+            "[profile p]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = us-east-1\n\
+             sso_account_id = 111111111111\nsso_role_name = Admin\n\
+             [profile bad-region]\nrole_arn = arn:aws:iam::222222222222:role/R\nsource_profile = p\nregion = eu_west_1\n\
+             [profile bad-session]\nrole_arn = arn:aws:iam::222222222222:role/R\nsource_profile = p\nrole_session_name = a b\n\
+             [profile http-portal]\nsso_start_url = http://acme.awsapps.com/start\nsso_region = us-east-1\n\
+             [profile odd-portal]\nsso_start_url = https://odd.awsapps.com/start\nsso_region = mars-1#\n\
+             [profile keys]\nregion = us-east-1\n\
+             [profile bad-arn]\nrole_arn = arn:aws:iam::2222:role/R\nsource_profile = keys\n\
+             [profile gov-from-commercial]\nrole_arn = arn:aws-us-gov:iam::222222222222:role/R\nsource_profile = keys\n\
+             [profile ok]\nrole_arn = arn:aws:iam::222222222222:role/R\nsource_profile = keys\n\
+             [profile odd-keys]\nregion = nowhere\n\
+             [profile from-odd-keys]\nrole_arn = arn:aws:iam::222222222222:role/R\nsource_profile = odd-keys\n",
+        );
+        let skipped = skipped(&import);
+        for (profile, reason) in [
+            (
+                "bad-region",
+                "region: 'eu_west_1' is not an AWS Region name",
+            ),
+            ("bad-session", "session_name 'a b'"),
+            (
+                "http-portal",
+                "sso_start_url 'http://acme.awsapps.com/start' must be an https:// URL",
+            ),
+            (
+                "odd-portal",
+                "sso_region: 'mars-1#' is not an AWS Region name",
+            ),
+            ("bad-arn", "the account must be 12 digits"),
+            ("gov-from-commercial", "AssumeRole cannot cross partitions"),
+            (
+                "from-odd-keys",
+                "its source profile 'odd-keys' has a region that is not valid",
+            ),
+        ] {
+            assert!(
+                skipped.get(profile).is_some_and(|r| r.contains(reason)),
+                "{profile}: {skipped:?}"
+            );
+        }
+        assert_eq!(import.portals.len(), 1);
+        assert_eq!(import.iam_users.len(), 1);
+        assert_eq!(import.iam_users[0].roles.keys().collect::<Vec<_>>(), ["ok"]);
+        let toml: String = import
+            .portals
+            .iter()
+            .map(aws_portal_toml)
+            .chain(import.iam_users.iter().map(aws_iam_user_toml))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(crate::Config::parse(&toml).is_ok(), "{toml}");
+    }
+
+    #[test]
+    fn exported_names_that_clash_keep_the_first_profile() {
+        let role = |integration: &str, account: &str| {
+            crate::Profile::new(
+                integration,
+                account,
+                "d",
+                crate::Target::Aws {
+                    account_id: "111111111111".into(),
+                    account_name: account.into(),
+                    role_name: "d".into(),
+                },
+            )
+        };
+        let (first, second, other) = (role("a-b", "c"), role("a", "b-c"), role("x", "y"));
+        let (block, clashes) =
+            aws_config_block(&[&first, &second, &other], "fob-", &BTreeMap::new(), "fob");
+        assert_eq!(block.matches("[profile fob-a-b-c-d]").count(), 1, "{block}");
+        assert!(block.contains("creds a-b/c/d "));
+        assert!(!block.contains("creds a/b-c/d "));
+        assert!(block.contains("[profile fob-x-y-d]"));
+        assert_eq!(
+            clashes,
+            [ExportClash {
+                name: "fob-a-b-c-d".into(),
+                kept: "a-b/c/d".into(),
+                left_out: "a/b-c/d".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_block_is_found_after_its_start_and_crlf_files_stay_crlf() {
+        let block = format!("{AWS_BLOCK_BEGIN}\n[profile fob-a]\nregion = x\n\n{AWS_BLOCK_END}\n");
+        // An END line above the block (a copy, a note) is not the block's end.
+        let existing = format!(
+            "# {AWS_BLOCK_END} was here\n[default]\n\n{AWS_BLOCK_BEGIN}\n[profile old]\n{AWS_BLOCK_END}\n[profile mine]\n"
+        );
+        let replaced = replace_aws_block(&existing, &block);
+        assert_eq!(
+            replaced,
+            format!("# {AWS_BLOCK_END} was here\n[default]\n\n{block}[profile mine]\n")
+        );
+
+        let crlf = existing.replace('\n', "\r\n");
+        let replaced = replace_aws_block(&crlf, &block);
+        assert_eq!(
+            replaced,
+            format!(
+                "# {AWS_BLOCK_END} was here\r\n[default]\r\n\r\n{}[profile mine]\r\n",
+                block.replace('\n', "\r\n")
+            )
+        );
+        assert!(
+            !replaced.replace("\r\n", "").contains('\n'),
+            "no bare newline: {replaced:?}"
+        );
+        assert_eq!(replace_aws_block(&replaced, &block), replaced, "idempotent");
+
+        // Appended to a CRLF file without a block.
+        let appended = replace_aws_block("[default]\r\nregion = x\r\n", &block);
+        assert_eq!(
+            appended,
+            format!(
+                "[default]\r\nregion = x\r\n\r\n{}",
+                block.replace('\n', "\r\n")
+            )
         );
     }
 }

@@ -1299,3 +1299,62 @@ async fn revoke_and_logout_all() {
     );
     assert!(!fob.secret("aws-sso/acme/token").exists());
 }
+
+#[test]
+fn import_brings_in_console_sign_ins_and_skips_what_the_config_would_refuse() {
+    let fob = Fob::new("import-aws");
+    fob.write_config("[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n");
+    std::fs::write(
+        fob.aws_config(),
+        "[profile p]\r\nsso_start_url = https://acme.awsapps.com/start\r\nsso_region = us-east-1\r\n\
+         sso_account_id = 111111111111\r\nsso_role_name = Admin\r\n\
+         [profile Deploy]\r\nrole_arn = arn:aws:iam::222222222222:role/Deploy\r\nsource_profile = p\r\n\
+         [profile deploy]\r\nrole_arn = arn:aws:iam::333333333333:role/Deploy\r\nsource_profile = p\r\n\
+         [profile typo]\r\nrole_arn = arn:aws:iam::2222:role/Deploy\r\nsource_profile = p\r\n\
+         [profile console]\r\nlogin_session = arn:aws:iam::111111111111:user/me\r\nregion = eu-west-1\r\n\
+         [profile laptop]\r\nlogin_session = arn:aws:iam::111111111111:user/me\r\nregion = us-west-2\r\n",
+    )
+    .unwrap();
+    let (stdout, stderr) = fob.ok(&["import", "aws"]);
+    assert!(stderr.contains("skipped profile 'typo'"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "profile 'console' (an `aws login` sign-in) is already configured as 'console'"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "profile 'laptop' (an `aws login` sign-in) as aws-login 'laptop' in us-west-2"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("[integrations.laptop]\ntype = \"aws-login\"\nregion = \"us-west-2\"\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("chained.\"deploy\"]") && stdout.contains("chained.\"deploy-2\"]"),
+        "{stdout}"
+    );
+
+    let (_, stderr) = fob.ok(&["import", "aws", "--write"]);
+    assert!(
+        stderr.contains("`fob login laptop` to sign in through omnifob"),
+        "{stderr}"
+    );
+    let config = omnifob_core::Config::load(&fob.config_file()).unwrap();
+    assert!(matches!(
+        config.integrations["laptop"],
+        omnifob_core::Integration::AwsLogin(_)
+    ));
+    let omnifob_core::Integration::AwsSso(portal) = &config.integrations["acme"] else {
+        panic!("{:?}", config.integrations.keys());
+    };
+    assert_eq!(
+        portal.chained.keys().collect::<Vec<_>>(),
+        ["deploy", "deploy-2"]
+    );
+    let (_, stderr) = fob.ok(&["import", "aws"]);
+    assert!(stderr.contains("nothing new to import"), "{stderr}");
+}

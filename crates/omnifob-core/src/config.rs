@@ -461,7 +461,7 @@ fn check_account_id(key: &str, value: &str) -> Result<(), String> {
 }
 
 /// Fails unless `value` is an `https://` URL with a host, naming the key.
-fn check_https_url(key: &str, value: &str) -> Result<(), String> {
+pub(crate) fn check_https_url(key: &str, value: &str) -> Result<(), String> {
     let url = parse_url(key, value)?;
     if url.scheme() != "https" {
         return Err(format!("{key} '{value}' must be an https:// URL"));
