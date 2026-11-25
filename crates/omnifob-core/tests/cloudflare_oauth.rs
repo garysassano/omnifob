@@ -249,12 +249,12 @@ async fn a_final_refusal_forgets_the_sign_in() {
 #[tokio::test]
 async fn an_api_call_renews_a_rejected_access_token_once() {
     let (_scratch, server) = setup().await;
-    // Valid for an hour, but revoked at Cloudflare.
+    // Valid for an hour, but revoked at Cloudflare, which answers 403.
     signed_in("access-1", "refresh-1", SignedDuration::from_hours(1));
     Mock::given(method("GET"))
         .and(path("/accounts"))
         .and(header("authorization", "Bearer access-1"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
             "success": false,
             "errors": [{ "code": 10000, "message": "Authentication error" }],
             "result": null,

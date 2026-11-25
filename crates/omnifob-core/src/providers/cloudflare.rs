@@ -260,12 +260,13 @@ impl Client {
                 .await
                 .with_context(|| format!("{method} {path}"))?;
             let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                && !renewed
+            let text = response.text().await?;
+            if !renewed
                 && let Some(oauth) = &self.oauth
+                && rejects_token(status, &text)
             {
-                // An access token can stop working before its time; one
-                // renewal is worth a try.
+                // An access token can stop working before its time (rotated
+                // by another renewal, or revoked); one renewal is worth a try.
                 tracing::debug!("{method} {path}: Cloudflare rejected the access token; renewing it");
                 let (integration, config) = &**oauth;
                 let fresh =
@@ -274,7 +275,7 @@ impl Client {
                 renewed = true;
                 continue;
             }
-            break (status, response.text().await?);
+            break (status, text);
         };
         let envelope: Envelope<T> = serde_json::from_str(&text).with_context(|| {
             format!(
@@ -356,6 +357,22 @@ impl Client {
         );
         self.get_all(&path).await
     }
+}
+
+/// Whether an answer says the token itself is not accepted: 401, or 403
+/// with error 10000 ("Authentication error"), which Cloudflare answers for
+/// an access token that was revoked or replaced. Other 403s (a missing
+/// permission) are not about the token.
+fn rejects_token(status: reqwest::StatusCode, body: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Errors {
+        #[serde(default)]
+        errors: Vec<ApiMessage>,
+    }
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+            && serde_json::from_str::<Errors>(body)
+                .is_ok_and(|b| b.errors.iter().any(|e| e.code == 10000))
 }
 
 /// The start of a response body that is not the API's JSON, such as an
@@ -1594,6 +1611,19 @@ pub fn console_url(account_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_authentication_errors_reject_the_token() {
+        use reqwest::StatusCode;
+        let error = |code: i64| {
+            json!({ "success": false, "errors": [{ "code": code, "message": "m" }] }).to_string()
+        };
+        assert!(rejects_token(StatusCode::UNAUTHORIZED, ""));
+        assert!(rejects_token(StatusCode::FORBIDDEN, &error(10000)));
+        assert!(!rejects_token(StatusCode::FORBIDDEN, &error(9109)));
+        assert!(!rejects_token(StatusCode::FORBIDDEN, "<html>"));
+        assert!(!rejects_token(StatusCode::BAD_REQUEST, &error(10000)));
+    }
 
     #[test]
     fn catalog_changes_merge_into_what_others_stored_meanwhile() {
