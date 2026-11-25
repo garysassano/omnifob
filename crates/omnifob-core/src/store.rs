@@ -211,8 +211,7 @@ mod wsl {
             cfg!(target_os = "linux")
                 && super::init().is_ok_and(|s| s == "keyutils")
                 && std::env::var("OMNIFOB_WSL_DPAPI").map_or(true, |v| v != "0")
-                && std::fs::read_to_string("/proc/version")
-                    .is_ok_and(|v| v.to_lowercase().contains("microsoft"))
+                && crate::platform::is_wsl()
                 && Command::new("powershell.exe")
                     .arg("-?")
                     // WSL drains an inherited stdin into the Windows process,
@@ -234,15 +233,7 @@ mod wsl {
     }
 
     fn file(key: &str) -> PathBuf {
-        let mut name = String::new();
-        for b in key.bytes() {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
-                name.push(b as char);
-            } else {
-                name.push_str(&format!("%{b:02X}"));
-            }
-        }
-        dir().join(format!("{name}.dpapi"))
+        dir().join(format!("{}.dpapi", crate::files::encode_key_filename(key)))
     }
 
     /// Runs a DPAPI script with base64 on stdin; returns base64 from stdout.
@@ -274,16 +265,10 @@ mod wsl {
             return Ok(());
         }
         let sealed = dpapi(PROTECT, &BASE64.encode(json.as_bytes()))?;
-        let path = file(key);
-        std::fs::create_dir_all(dir())?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, sealed)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+        // The directory and file are the user's only: even sealed, the file
+        // names give away integrations and profiles.
+        crate::files::create_private_dir(&crate::paths::state_dir())?;
+        crate::files::write_private(&file(key), sealed)
     }
 
     pub fn write_if_missing(key: &str, json: &str) -> anyhow::Result<()> {
@@ -354,21 +339,19 @@ mod wsl {
 /// in-memory store of [`use_memory_store`] would forget everything between
 /// commands; this store keeps secrets where the next command finds them,
 /// without touching the real keychain. It does not protect them at all:
-/// every secret is written unencrypted, one file per key, named after the
-/// key with every byte outside `[A-Za-z0-9._-]` written as `%XX` (so
-/// `aws-sso/acme/token` is `aws-sso%2Facme%2Ftoken`). To keep it from being
+/// every secret is written unencrypted, one file per key, named by
+/// [`crate::files::encode_key_filename`] (so `aws-sso/acme/token` is
+/// `aws-sso%2Facme%2Ftoken`). To keep it from being
 /// chosen by accident, it needs an absolute directory, says so on stderr
 /// whenever it is used, and on Unix creates the directory `0700` and the
 /// files `0600`. Never use it for real credentials.
 pub mod test_files {
     use std::any::Any;
     use std::collections::HashMap;
-    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use anyhow::{Context, bail};
+    use anyhow::bail;
     use keyring_core::api::{CredentialApi, CredentialStoreApi};
     use keyring_core::{Credential, Entry, Error, Result};
 
@@ -393,19 +376,6 @@ pub mod test_files {
         Ok(dir)
     }
 
-    /// A file name for `key`.
-    pub fn file_name(key: &str) -> String {
-        let mut name = String::new();
-        for b in key.bytes() {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
-                name.push(b as char);
-            } else {
-                name.push_str(&format!("%{b:02X}"));
-            }
-        }
-        name
-    }
-
     #[derive(Debug)]
     pub struct Store {
         dir: PathBuf,
@@ -413,16 +383,7 @@ pub mod test_files {
 
     impl Store {
         pub fn new(dir: &Path) -> anyhow::Result<Arc<Self>> {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            builder
-                .create(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            crate::files::create_private_dir(dir)?;
             Ok(Arc::new(Self {
                 dir: dir.to_path_buf(),
             }))
@@ -447,7 +408,7 @@ pub mod test_files {
             Ok(Entry::new_with_credential(Arc::new(File {
                 service: service.to_string(),
                 user: user.to_string(),
-                path: self.dir.join(file_name(user)),
+                path: self.dir.join(crate::files::encode_key_filename(user)),
             })))
         }
 
@@ -471,27 +432,8 @@ pub mod test_files {
         /// Writes a temporary file and renames it over the old one, so a
         /// command reading at the same time never sees half a secret.
         fn set_secret(&self, secret: &[u8]) -> Result<()> {
-            let dir = self.path.parent().unwrap_or(Path::new("."));
-            // Unique within this process, and the process id across them.
-            static WRITES: AtomicU64 = AtomicU64::new(0);
-            let n = WRITES.fetch_add(1, Ordering::Relaxed);
-            let tmp = dir.join(format!(".{}-{n}.tmp", std::process::id()));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let written = options.open(&tmp).and_then(|mut file| {
-                file.write_all(secret)?;
-                drop(file);
-                std::fs::rename(&tmp, &self.path)
-            });
-            if written.is_err() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            written.map_err(platform)
+            crate::files::write_private(&self.path, secret)
+                .map_err(|e| Error::PlatformFailure(e.into()))
         }
 
         fn get_secret(&self) -> Result<Vec<u8>> {
@@ -597,9 +539,8 @@ pub struct Lock(#[allow(dead_code)] std::fs::File);
 /// another process holds it that long, so the caller can go ahead unguarded
 /// rather than hang.
 pub async fn lock(name: &str, timeout: std::time::Duration) -> anyhow::Result<Option<Lock>> {
-    let dir = crate::paths::state_dir().join("locks");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join(format!("{}.lock", lock_file_name(name)));
+    let dir = lock_dir()?;
+    let path = dir.join(lock_file_name(name));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -624,20 +565,41 @@ pub async fn lock(name: &str, timeout: std::time::Duration) -> anyhow::Result<Op
     }
 }
 
-/// A file name for a lock: letters, digits, `-`, `_` and `.` kept, the rest `_`.
-fn lock_file_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// The directory of lock files, `locks` in the state directory, created
+/// private if missing.
+pub fn lock_dir() -> anyhow::Result<std::path::PathBuf> {
+    let state = crate::paths::state_dir();
+    crate::files::create_private_dir(&state)?;
+    let dir = state.join("locks");
+    crate::files::create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// The file name of the lock called `name`: `<name>.lock`, with `name`
+/// encoded by [`crate::files::encode_key_filename`] so distinct names never
+/// share a lock.
+pub fn lock_file_name(name: &str) -> String {
+    format!("{}.lock", crate::files::encode_key_filename(name))
 }
 
 /// Key for the cached credentials of a profile.
 pub fn credentials_key(profile_id: &str) -> String {
     format!("credentials/{profile_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn distinct_lock_names_never_share_a_file() {
+        assert_eq!(super::lock_file_name("aws-sso-acme"), "aws-sso-acme.lock");
+        assert_eq!(
+            super::lock_file_name("credentials-acme/111111111111/Admin"),
+            "credentials-acme%2F111111111111%2FAdmin.lock"
+        );
+        // With `_` for every other character these were one lock.
+        assert_ne!(
+            super::lock_file_name("credentials-a/b_c/d"),
+            super::lock_file_name("credentials-a/b/c_d")
+        );
+    }
 }

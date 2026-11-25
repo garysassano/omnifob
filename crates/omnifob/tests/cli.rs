@@ -55,15 +55,8 @@ impl Fob {
 
     /// The store's file for a keychain key, as the test store names it.
     fn secret(&self, key: &str) -> PathBuf {
-        let mut name = String::new();
-        for b in key.bytes() {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
-                name.push(b as char);
-            } else {
-                name.push_str(&format!("%{b:02X}"));
-            }
-        }
-        self.keyring().join(name)
+        self.keyring()
+            .join(omnifob_core::files::encode_key_filename(key))
     }
 
     /// Stores an Identity Center sign-in for `integration`, valid until 2100,
@@ -501,6 +494,31 @@ async fn credential_process_output_names_the_account() {
     assert_eq!(value["AccountId"], "222222222222");
     // Cached under the profile.
     assert!(fob.secret("credentials/acme/prod/Admin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_is_private_and_locks_are_named_by_the_whole_profile_id() {
+    let (fob, _server) = synced_portal("state").await;
+    fob.ok(&["creds", "acme/prod/Admin"]);
+    let state = fob.root.join("state").join("omnifob");
+    assert!(
+        entries(&state.join("locks")).contains(&"credentials-acme%2Fprod%2FAdmin.lock".to_string()),
+        "{:?}",
+        entries(&state.join("locks"))
+    );
+    assert!(
+        !entries(&state).iter().any(|name| name.ends_with(".tmp")),
+        "{:?}",
+        entries(&state)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&state.join("locks")), 0o700);
+        assert_eq!(mode(&state.join("profiles.json")), 0o600);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

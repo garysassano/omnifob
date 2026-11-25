@@ -1,7 +1,7 @@
 //! Background renewal: `fob renew`, which fob starts detached when cached
 //! credentials near their end.
 
-use omnifob_core::{paths, providers};
+use omnifob_core::{providers, store};
 
 use crate::App;
 
@@ -55,19 +55,7 @@ pub(crate) struct RenewalLock(std::path::PathBuf);
 
 impl RenewalLock {
     fn acquire(profile_id: &str) -> anyhow::Result<Option<Self>> {
-        let dir = paths::state_dir().join("locks");
-        std::fs::create_dir_all(&dir)?;
-        let name: String = profile_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let path = dir.join(format!("renew-{name}.lock"));
+        let path = store::lock_dir()?.join(store::lock_file_name(&format!("renew-{profile_id}")));
         for _ in 0..2 {
             match std::fs::OpenOptions::new()
                 .write(true)

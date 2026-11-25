@@ -930,12 +930,7 @@ fn load_catalog(integration: &str) -> Catalog {
 }
 
 fn save_catalog(integration: &str, catalog: &Catalog) -> anyhow::Result<()> {
-    let path = catalog_file(integration);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, serde_json::to_string(catalog)?)?;
-    Ok(())
+    crate::files::write_private(&catalog_file(integration), serde_json::to_string(catalog)?)
 }
 
 /// Mints a token for the template and cleans up expired omnifob tokens.
