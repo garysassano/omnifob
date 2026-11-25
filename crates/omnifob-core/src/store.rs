@@ -212,15 +212,8 @@ mod wsl {
                 && super::init().is_ok_and(|s| s == "keyutils")
                 && std::env::var("OMNIFOB_WSL_DPAPI").map_or(true, |v| v != "0")
                 && crate::platform::is_wsl()
-                && Command::new("powershell.exe")
-                    .arg("-?")
-                    // WSL drains an inherited stdin into the Windows process,
-                    // even unread, so input piped to `fob exec` would be lost.
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok()
+                && crate::platform::wsl_interop()
+                && crate::platform::on_path("powershell.exe")
         })
     }
 
@@ -260,8 +253,12 @@ mod wsl {
         Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
 
+    // Each function checks `persisted` (and, below, the file) before
+    // `enabled`, so a cached credential lookup never needs to learn whether
+    // Windows is reachable.
+
     pub fn write(key: &str, json: &str) -> anyhow::Result<()> {
-        if !enabled() || !persisted(key) {
+        if !persisted(key) || !enabled() {
             return Ok(());
         }
         let sealed = dpapi(PROTECT, &BASE64.encode(json.as_bytes()))?;
@@ -272,14 +269,14 @@ mod wsl {
     }
 
     pub fn write_if_missing(key: &str, json: &str) -> anyhow::Result<()> {
-        if enabled() && persisted(key) && !file(key).exists() {
+        if persisted(key) && !file(key).exists() && enabled() {
             write(key, json)?;
         }
         Ok(())
     }
 
     pub fn read(key: &str) -> anyhow::Result<Option<String>> {
-        if !enabled() || !persisted(key) {
+        if !persisted(key) || !enabled() {
             return Ok(None);
         }
         let sealed = match std::fs::read_to_string(file(key)) {
@@ -294,7 +291,7 @@ mod wsl {
     }
 
     pub fn delete(key: &str) -> anyhow::Result<bool> {
-        if !enabled() {
+        if !persisted(key) || !enabled() {
             return Ok(false);
         }
         match std::fs::remove_file(file(key)) {
