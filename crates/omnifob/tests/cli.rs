@@ -1,8 +1,11 @@
 //! End-to-end tests: each runs the built `fob` binary against its own
 //! scratch config, state directory and plaintext test store
-//! (`OMNIFOB_KEYRING=test-plaintext-files:<dir>`), with every AWS call sent to
-//! a local mock (`OMNIFOB_AWS_ENDPOINT`). Nothing touches the real keychain,
-//! a browser or the network beyond localhost, so the tests run in parallel.
+//! (`OMNIFOB_KEYRING=test-plaintext-files:<dir>`), with every provider call
+//! sent to a local mock (`OMNIFOB_AWS_ENDPOINT`, `OMNIFOB_AZURE_ENDPOINT`,
+//! `OMNIFOB_GOOGLE_ENDPOINT`, `OMNIFOB_CLOUDFLARE_API` and `_DASH`). Nothing
+//! touches the real keychain, a browser or the network beyond localhost, so
+//! the tests run in parallel; browser sign-ins are answered on fob's
+//! loopback listener as the browser would.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -18,6 +21,9 @@ const START_URL: &str = "https://acme.awsapps.com/start";
 struct Fob {
     root: PathBuf,
     endpoint: Option<String>,
+    /// Variables set for every command, such as the endpoints of providers
+    /// other than AWS.
+    vars: Vec<(String, String)>,
 }
 
 impl Fob {
@@ -28,7 +34,51 @@ impl Fob {
         Self {
             root,
             endpoint: None,
+            vars: Vec::new(),
         }
+    }
+
+    /// Sets `name` to `value` for every command.
+    fn with_var(mut self, name: &str, value: &str) -> Self {
+        self.vars.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// Stores `value` under the keychain key `key`, as a provider would.
+    fn put_secret(&self, key: &str, value: &Value) {
+        std::fs::create_dir_all(self.keyring()).unwrap();
+        std::fs::write(self.secret(key), value.to_string()).unwrap();
+    }
+
+    /// Runs fob with `stdin` as its input, expecting success; returns
+    /// stdout and stderr.
+    fn ok_with_stdin(&self, args: &[&str], stdin: &str) -> (String, String) {
+        let output = self.run_with_stdin(args, stdin);
+        let (stdout, stderr) = texts(&output);
+        assert!(
+            output.status.success(),
+            "fob {args:?} failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        (stdout, stderr)
+    }
+
+    /// Runs fob with `stdin` as its input.
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        use std::io::Write;
+        let mut child = self
+            .command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
 
     /// Sends every AWS call to `server`.
@@ -108,8 +158,17 @@ impl Fob {
                 "ANTIGRAVITY_AGENT",
             ]
             .contains(&&*name);
+            // Where a browser sign-in opens is decided from these.
+            let remote =
+                ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "CODESPACES"].contains(&&*name);
             if name.starts_with("AWS_")
                 || name.starts_with("OMNIFOB_")
+                || name.starts_with("AZURE_")
+                || name.starts_with("ARM_")
+                || name.starts_with("GOOGLE_")
+                || name.starts_with("CLOUDSDK_")
+                || name.starts_with("CLOUDFLARE_")
+                || remote
                 || name == "COMPLETE"
                 || proxy
                 || agent
@@ -130,6 +189,7 @@ impl Fob {
         if let Some(endpoint) = &self.endpoint {
             cmd.env("OMNIFOB_AWS_ENDPOINT", endpoint);
         }
+        cmd.envs(self.vars.iter().map(|(k, v)| (k, v)));
         cmd
     }
 
@@ -1759,4 +1819,1070 @@ fn import_brings_in_console_sign_ins_and_skips_what_the_config_would_refuse() {
     );
     let (_, stderr) = fob.ok(&["import", "aws"]);
     assert!(stderr.contains("nothing new to import"), "{stderr}");
+}
+
+// Providers other than IAM Identity Center, each against a mock of its
+// APIs: sign-in, discovery, `fob exec`, `fob console` and sign-out.
+
+/// Decodes `application/x-www-form-urlencoded` text.
+fn form_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// The decoded pairs of a URL's query, or of a form body.
+fn pairs(text: &str) -> std::collections::HashMap<String, String> {
+    let query = text.split_once('?').map_or(text, |(_, q)| q);
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (form_decode(k), form_decode(v)))
+        .collect()
+}
+
+/// Whether a sign-in opens a browser on this machine here: not in a
+/// container, where fob signs in with a code instead.
+fn browser_is_here() -> bool {
+    !["/.dockerenv", "/run/.containerenv"]
+        .iter()
+        .any(|p| Path::new(p).exists())
+}
+
+/// What a browser sign-in left: fob's exit status and output, and the
+/// authorize URL's query.
+struct SignedInThroughBrowser {
+    status: std::process::ExitStatus,
+    stderr: String,
+    query: std::collections::HashMap<String, String>,
+}
+
+/// Runs `fob <args>` (a browser sign-in, with `--no-browser` so nothing
+/// opens), and answers it as the browser does once the user approved: it
+/// calls the loopback redirect with `code=code-1`, the `state`, and
+/// `extra`.
+fn browser_sign_in(fob: &Fob, args: &[&str], extra: &str) -> SignedInThroughBrowser {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut child = fob
+        .command(args)
+        // A display to open the browser on, as far as fob can tell.
+        .env("BROWSER", "true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut seen = String::new();
+    let url = loop {
+        let mut line = String::new();
+        if stderr.read_line(&mut line).unwrap() == 0 {
+            let _ = child.kill();
+            panic!("fob {args:?} printed no sign-in URL:\n{seen}");
+        }
+        seen.push_str(&line);
+        if let Some(url) = line
+            .split_whitespace()
+            .find(|w| w.starts_with("http") && w.contains("redirect_uri="))
+        {
+            break url.to_string();
+        }
+    };
+    let query = pairs(&url);
+    let redirect = &query["redirect_uri"];
+    let rest = redirect
+        .split_once("://")
+        .map_or(redirect.as_str(), |(_, r)| r);
+    let (authority, callback) = rest.split_once('/').unwrap_or((rest, ""));
+    let port: u16 = authority.rsplit(':').next().unwrap().parse().unwrap();
+    let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        socket,
+        "GET /{callback}?code=code-1&state={}{extra} HTTP/1.1\r\nHost: x\r\n\r\n",
+        query["state"]
+    )
+    .unwrap();
+    let mut reply = String::new();
+    socket.read_to_string(&mut reply).unwrap();
+    assert!(reply.contains("Sign-in approved"), "{reply}");
+    stderr.read_to_string(&mut seen).unwrap();
+    SignedInThroughBrowser {
+        status: child.wait().unwrap(),
+        stderr: seen,
+        query,
+    }
+}
+
+/// An STS response to `action` carrying `result`.
+fn sts(action: &str, result: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/xml")
+        .set_body_string(format!(
+            r#"<{action}Response xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><{action}Result>{result}</{action}Result><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></{action}Response>"#
+        ))
+}
+
+/// STS and the federation endpoint: the IAM user `me` in 123456789012, its
+/// session `ASIASESSION`, roles `ASIAROLE`, and console sign-in tokens.
+async fn mount_sts(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/federation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "SigninToken": "signin-1" })),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(|r: &Request| {
+            let body = pairs(&String::from_utf8_lossy(&r.body));
+            let credentials = |key: &str| {
+                format!("<Credentials><AccessKeyId>{key}</AccessKeyId><SecretAccessKey>s</SecretAccessKey><SessionToken>t</SessionToken><Expiration>2100-01-01T00:00:00Z</Expiration></Credentials>")
+            };
+            match body.get("Action").map(String::as_str) {
+                Some("GetCallerIdentity") => sts(
+                    "GetCallerIdentity",
+                    "<Arn>arn:aws:iam::123456789012:user/me</Arn><UserId>AIDAEXAMPLE</UserId><Account>123456789012</Account>",
+                ),
+                Some("GetSessionToken") => sts("GetSessionToken", &credentials("ASIASESSION")),
+                Some("AssumeRole") => sts(
+                    "AssumeRole",
+                    &format!(
+                        "{}<AssumedRoleUser><AssumedRoleId>AROA:omnifob</AssumedRoleId><Arn>arn:aws:sts::222222222222:assumed-role/Deploy/omnifob</Arn></AssumedRoleUser>",
+                        credentials("ASIAROLE")
+                    ),
+                ),
+                _ => ResponseTemplate::new(400),
+            }
+        })
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_iam_user_signs_in_from_stdin_and_runs_commands() {
+    let server = MockServer::start().await;
+    mount_sts(&server).await;
+    let fob = Fob::new("aws-iam").with_server(&server);
+    fob.write_config(
+        r#"[integrations.legacy]
+type = "aws-iam"
+region = "eu-west-1"
+
+[integrations.legacy.roles.prod]
+role_arn = "arn:aws:iam::222222222222:role/Deploy"
+"#,
+    );
+    // The clipboard holds one value at most; the key has two.
+    let stderr = fob.fails(&["login", "legacy", "--from-clipboard"]);
+    assert!(stderr.contains("pipe both to --token-stdin"), "{stderr}");
+    let (_, stderr) = fob.ok_with_stdin(
+        &["login", "legacy", "--token-stdin"],
+        "AKIAEXAMPLE\n  long-term-secret\n",
+    );
+    assert!(stderr.contains("legacy: 2 profiles"), "{stderr}");
+    assert!(fob.secret("aws-iam/legacy/key").exists());
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(
+        lines(&stdout),
+        ["legacy/123456789012/session", "legacy/prod/Deploy"]
+    );
+
+    let printed = exec_child(
+        &fob,
+        "legacy/prod/Deploy",
+        &[],
+        &["AWS_ACCESS_KEY_ID", "AWS_ACCOUNT_ID", "AWS_REGION"],
+    );
+    assert_eq!(
+        printed,
+        [
+            "AWS_ACCESS_KEY_ID=ASIAROLE",
+            "AWS_ACCOUNT_ID=222222222222",
+            "AWS_REGION=eu-west-1"
+        ]
+    );
+    let printed = exec_child(
+        &fob,
+        "legacy/123456789012/session",
+        &[],
+        &["AWS_ACCESS_KEY_ID"],
+    );
+    assert_eq!(printed, ["AWS_ACCESS_KEY_ID=ASIASESSION"]);
+    // The long-term key is never handed out.
+    let (stdout, _) = fob.ok(&["creds", "legacy/123456789012/session"]);
+    assert!(!stdout.contains("AKIAEXAMPLE"), "{stdout}");
+
+    let (stdout, _) = fob.ok(&["console", "legacy/prod/Deploy", "--print"]);
+    assert!(stdout.contains("SigninToken=signin-1"), "{stdout}");
+
+    let (_, stderr) = fob.ok(&["logout", "legacy"]);
+    assert!(stderr.contains("signed out of 'legacy'"), "{stderr}");
+    assert!(!fob.secret("aws-iam/legacy/key").exists());
+    let stderr = fob.fails(&["exec", "legacy/prod/Deploy", "--no-cache", "--", "true"]);
+    assert!(stderr.contains("fob login legacy"), "{stderr}");
+}
+
+/// AWS Sign-In's token endpoint: a code gives `ASIALOGIN1`, each refresh
+/// `ASIALOGIN2`, both for an hour.
+async fn mount_aws_sign_in(server: &MockServer) {
+    let id_token = {
+        use base64::Engine;
+        let encode = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        format!(
+            "{}.{}.",
+            encode(r#"{"alg":"none"}"#),
+            encode(r#"{"sub":"arn:aws:iam::123456789012:user/alice"}"#)
+        )
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/token"))
+        .respond_with(move |r: &Request| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            let key = match body["grantType"].as_str() {
+                Some("authorization_code") => "ASIALOGIN1",
+                _ => "ASIALOGIN2",
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": {
+                    "accessKeyId": key,
+                    "secretAccessKey": "secret",
+                    "sessionToken": "session",
+                },
+                "tokenType": "aws_sigv4",
+                "expiresIn": 3600,
+                "refreshToken": "refresh-1",
+                "idToken": id_token,
+            }))
+        })
+        .mount(server)
+        .await;
+}
+
+async fn token_requests(server: &MockServer, grant: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.url.path() == "/v1/token"
+                && serde_json::from_slice::<Value>(&r.body).unwrap()["grantType"] == grant
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_console_sign_in_signs_in_in_the_browser_and_renews() {
+    if !browser_is_here() {
+        return;
+    }
+    let server = MockServer::start().await;
+    mount_aws_sign_in(&server).await;
+    mount_sts(&server).await;
+    let fob = Fob::new("aws-login").with_server(&server);
+    fob.write_config("[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n");
+    let stderr = fob.fails(&["login", "console", "--token-stdin"]);
+    assert!(stderr.contains("it takes no token"), "{stderr}");
+
+    let signed_in = browser_sign_in(&fob, &["login", "console", "--no-browser"], "");
+    assert!(signed_in.status.success(), "{}", signed_in.stderr);
+    assert_eq!(
+        signed_in.query["client_id"],
+        "arn:aws:signin:::devtools/same-device"
+    );
+    assert!(
+        signed_in
+            .stderr
+            .contains("signed in to AWS as arn:aws:iam::123456789012:user/alice"),
+        "{}",
+        signed_in.stderr
+    );
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["console/123456789012/alice"]);
+    let profile = "console/123456789012/alice";
+    let printed = exec_child(&fob, profile, &[], &["AWS_ACCESS_KEY_ID", "AWS_REGION"]);
+    assert_eq!(
+        printed,
+        ["AWS_ACCESS_KEY_ID=ASIALOGIN1", "AWS_REGION=eu-west-1"]
+    );
+
+    // Background renewal refreshes the sign-in's credentials with its
+    // refresh token and DPoP key, and the next command gets them.
+    assert_eq!(token_requests(&server, "refresh_token").await, 0);
+    fob.ok(&["renew", profile]);
+    assert_eq!(token_requests(&server, "refresh_token").await, 1);
+    let printed = exec_child(&fob, profile, &[], &["AWS_ACCESS_KEY_ID"]);
+    assert_eq!(printed, ["AWS_ACCESS_KEY_ID=ASIALOGIN2"]);
+
+    let (stdout, _) = fob.ok(&["console", profile, "--print"]);
+    assert!(stdout.contains("SigninToken=signin-1"), "{stdout}");
+    // A working sign-in is kept.
+    let (_, stderr) = fob.ok(&["login", "console", "--no-browser"]);
+    assert!(!stderr.contains("signed in to AWS"), "{stderr}");
+    assert_eq!(token_requests(&server, "authorization_code").await, 1);
+
+    fob.ok(&["logout", "console"]);
+    assert!(!fob.secret("aws-login/console/session").exists());
+}
+
+fn unsigned_jwt(claims: &Value) -> String {
+    use base64::Engine;
+    let encode = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+    format!(
+        "{}.{}.s",
+        encode(r#"{"alg":"none"}"#),
+        encode(&claims.to_string())
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_google_account_signs_in_in_the_browser_and_runs_commands() {
+    if !browser_is_here() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let id_token = unsigned_jwt(&json!({ "email": "me@example.com", "sub": "1" }));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "user-access-1",
+            "expires_in": 3599,
+            "refresh_token": "refresh-1",
+            "id_token": id_token,
+            "scope": "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform",
+            "token_type": "Bearer",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "projects": [{ "projectId": "proj-a" }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/revoke"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fob = Fob::new("gcp").with_var("OMNIFOB_GOOGLE_ENDPOINT", &server.uri());
+    fob.write_config("[integrations.g]\ntype = \"gcp\"\n");
+
+    let signed_in = browser_sign_in(&fob, &["login", "g", "--no-browser"], "&scope=x");
+    assert!(signed_in.status.success(), "{}", signed_in.stderr);
+    assert!(
+        signed_in
+            .stderr
+            .contains("signed in to Google as me@example.com"),
+        "{}",
+        signed_in.stderr
+    );
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["g/proj-a/user"]);
+
+    let printed = exec_child(
+        &fob,
+        "g/proj-a/user",
+        &[],
+        &[
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_CORE_PROJECT",
+            "GOOGLE_CLOUD_PROJECT",
+        ],
+    );
+    assert_eq!(
+        printed,
+        [
+            "CLOUDSDK_AUTH_ACCESS_TOKEN=user-access-1",
+            "CLOUDSDK_CORE_PROJECT=proj-a",
+            "GOOGLE_CLOUD_PROJECT=proj-a"
+        ]
+    );
+    let (stdout, _) = fob.ok(&["console", "g/proj-a/user", "--print"]);
+    assert!(
+        stdout.starts_with("https://console.cloud.google.com/") && stdout.contains("proj-a"),
+        "{stdout}"
+    );
+
+    let (_, stderr) = fob.ok(&["logout", "g"]);
+    assert!(stderr.contains("signed out of 'g'"), "{stderr}");
+    assert!(!fob.secret("gcp/g/oauth").exists());
+}
+
+const TENANT: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Entra ID and Resource Manager: a device-flow sign-in that is approved
+/// on the second poll, one tenant and one subscription.
+async fn mount_azure(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/organizations/oauth2/v2.0/devicecode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "dev-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://microsoft.com/devicelogin",
+            "expires_in": 60,
+            "interval": 0,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("device_code=dev-1"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "authorization_pending",
+        })))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    let id_token = unsigned_jwt(&json!({ "preferred_username": "me@contoso.com", "tid": TENANT }));
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex("/oauth2/v2.0/token$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token_type": "Bearer",
+            "access_token": "arm-1",
+            "expires_in": 3599,
+            "refresh_token": "refresh-1",
+            "id_token": id_token,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tenants"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "tenantId": TENANT }],
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/subscriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "subscriptionId": "sub-a", "displayName": "Prod", "state": "Enabled" }],
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entra_id_account_signs_in_with_a_code_and_runs_commands() {
+    let server = MockServer::start().await;
+    mount_azure(&server).await;
+    let fob = Fob::new("azure").with_var("OMNIFOB_AZURE_ENDPOINT", &server.uri());
+    fob.write_config("[integrations.work]\ntype = \"azure\"\n");
+    let stderr = fob.fails(&["login", "work", "--token-stdin"]);
+    assert!(stderr.contains("it takes no token"), "{stderr}");
+
+    let (_, stderr) = fob.ok(&["login", "work", "--device-code", "--no-browser"]);
+    assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
+    assert!(
+        stderr.contains("signed in to Entra ID as me@contoso.com"),
+        "{stderr}"
+    );
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["work/prod/user"]);
+
+    let printed = exec_child(
+        &fob,
+        "work/prod/user",
+        &[],
+        &[
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_TENANT_ID",
+            "ARM_SUBSCRIPTION_ID",
+        ],
+    );
+    assert_eq!(
+        printed,
+        [
+            "AZURE_SUBSCRIPTION_ID=sub-a",
+            format!("AZURE_TENANT_ID={TENANT}").as_str(),
+            "ARM_SUBSCRIPTION_ID=sub-a"
+        ]
+    );
+    let (stdout, _) = fob.ok(&["console", "work/prod/user", "--print"]);
+    assert!(stdout.contains("portal.azure.com"), "{stdout}");
+    let (_, stderr) = fob.ok(&["check", "--integration", "work"]);
+    assert!(!stderr.contains("FAIL"), "{stderr}");
+
+    fob.ok(&["logout", "work"]);
+    assert!(!fob.secret("azure/work/oauth").exists());
+}
+
+const CF_ACCOUNT: &str = "acct123";
+
+/// The Cloudflare API and dashboard: one account, "Acme", whose bootstrap
+/// token `boot` may mint tokens there; each minted token is `minted-<n>`,
+/// and listed until it is deleted.
+async fn mount_cloudflare(server: &MockServer) {
+    let minted = std::sync::atomic::AtomicUsize::new(0);
+    let live = std::sync::Mutex::new(Vec::<String>::new());
+    Mock::given(wiremock::matchers::any())
+        .respond_with(move |r: &Request| {
+            let p = r.url.path();
+            let ok = |result: Value| {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": result,
+                    "result_info": { "page": 1, "total_pages": 1 }
+                }))
+            };
+            match (r.method.as_str(), p) {
+                ("POST", "/oauth2/token") => ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "oauth-access-2",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "refresh_token": "oauth-refresh-2",
+                    "scope": "account-api-tokens.write workers-scripts.write",
+                })),
+                ("POST", "/oauth2/revoke") => ResponseTemplate::new(200),
+                ("GET", "/accounts") => ok(json!([{ "id": CF_ACCOUNT, "name": "Acme" }])),
+                ("GET", "/zones") => ok(json!([])),
+                ("GET", p) if p.ends_with("/tokens/permission_groups") => ok(json!([
+                    { "id": "g-workers", "name": "Workers Scripts Write", "scopes": ["com.cloudflare.api.account"] },
+                    { "id": "g-pages", "name": "Pages Write", "scopes": ["com.cloudflare.api.account"] },
+                    { "id": "g-dns", "name": "DNS Write", "scopes": ["com.cloudflare.api.account.zone"] },
+                ])),
+                ("GET", p) if p.ends_with("/tokens/verify") => {
+                    ok(json!({ "id": "boot", "status": "active" }))
+                }
+                ("GET", p) if p.ends_with("/tokens/boot") => ok(json!({
+                    "id": "boot",
+                    "policies": [{ "resources": { format!("com.cloudflare.api.account.{CF_ACCOUNT}"): "*" } }]
+                })),
+                ("GET", p) if p.ends_with("/tokens") => {
+                    let live = live.lock().unwrap();
+                    let tokens: Vec<Value> = live
+                        .iter()
+                        .map(|id| json!({ "id": id, "name": "omnifob dev", "status": "active" }))
+                        .collect();
+                    ok(json!(tokens))
+                }
+                ("POST", p) if p.ends_with("/tokens") => {
+                    let n = minted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    live.lock().unwrap().push(format!("minted-{n}"));
+                    ok(json!({ "id": format!("minted-{n}"), "value": format!("minted-secret-{n}") }))
+                }
+                ("DELETE", p) if p.contains("/tokens/") => {
+                    let id = p.rsplit('/').next().unwrap();
+                    live.lock().unwrap().retain(|t| t != id);
+                    ok(json!({ "id": id }))
+                }
+                _ => ResponseTemplate::new(404).set_body_json(json!({
+                    "success": false,
+                    "errors": [{ "code": 7003, "message": format!("no route for {p}") }],
+                })),
+            }
+        })
+        .mount(server)
+        .await;
+}
+
+/// The IDs of the tokens deleted at `server`.
+async fn deleted_tokens(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE")
+        .map(|r| r.url.path().rsplit('/').next().unwrap().to_string())
+        .collect()
+}
+
+fn cloudflare_fob(name: &str, server: &MockServer) -> Fob {
+    let fob = Fob::new(name)
+        .with_var("OMNIFOB_CLOUDFLARE_API", &server.uri())
+        .with_var("OMNIFOB_CLOUDFLARE_DASH", &server.uri());
+    fob.write_config(
+        r#"[integrations.cf]
+type = "cloudflare-token"
+
+[integrations.cf.templates.dev]
+permissions = ["Workers Scripts Write"]
+"#,
+    );
+    fob
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cloudflare_token_signs_in_from_stdin_and_mints_per_command() {
+    let server = MockServer::start().await;
+    mount_cloudflare(&server).await;
+    let fob = cloudflare_fob("cf-token", &server);
+    fob.ok_with_stdin(&["login", "cf", "--token-stdin"], "boot-secret\n");
+    assert!(fob.secret("cloudflare/cf/bootstrap").exists());
+    let (stdout, _) = fob.ok(&["list", "cf", "dev"]);
+    assert_eq!(lines(&stdout), ["cf/acme/dev"]);
+
+    let printed = exec_child(
+        &fob,
+        "cf/acme/dev",
+        &[],
+        &["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
+    );
+    assert_eq!(
+        printed,
+        [
+            "CLOUDFLARE_API_TOKEN=minted-secret-1",
+            format!("CLOUDFLARE_ACCOUNT_ID={CF_ACCOUNT}").as_str()
+        ]
+    );
+    let (stdout, _) = fob.ok(&["console", "cf/acme/dev", "--print"]);
+    assert_eq!(
+        stdout.trim(),
+        format!("https://dash.cloudflare.com/{CF_ACCOUNT}")
+    );
+
+    // `--revoke` mints a token for the command alone and deletes it after,
+    // whatever the command's exit status.
+    let output = fob.run(&[
+        "exec",
+        "cf/acme/dev",
+        "--revoke",
+        "--",
+        FOB,
+        "nonsense-command",
+    ]);
+    let (_, stderr) = texts(&output);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("fob: revoked the token for cf/acme/dev"),
+        "{stderr}"
+    );
+    assert_eq!(deleted_tokens(&server).await, ["minted-2"]);
+    // The cached token was left alone.
+    let printed = exec_child(&fob, "cf/acme/dev", &[], &["CLOUDFLARE_API_TOKEN"]);
+    assert_eq!(printed, ["CLOUDFLARE_API_TOKEN=minted-secret-1"]);
+
+    let (_, stderr) = fob.ok(&["revoke", "cf/acme/dev"]);
+    assert!(stderr.contains("cf/acme/dev"), "{stderr}");
+    assert_eq!(deleted_tokens(&server).await, ["minted-2", "minted-1"]);
+    fob.ok(&["logout", "cf"]);
+    assert!(!fob.secret("cloudflare/cf/bootstrap").exists());
+}
+
+/// `fob exec --revoke` deletes the token when fob is stopped with SIGTERM,
+/// which it passes on to the command, and after Ctrl-C, which the terminal
+/// sends to both.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_revokes_the_token_when_stopped() {
+    let server = MockServer::start().await;
+    mount_cloudflare(&server).await;
+    let fob = cloudflare_fob("cf-signals", &server);
+    fob.ok_with_stdin(&["login", "cf", "--token-stdin"], "boot-secret\n");
+    for (n, signal) in [(1, libc::SIGTERM), (2, libc::SIGINT)] {
+        use std::os::unix::process::CommandExt;
+        let started = fob.root.join(format!("started-{n}"));
+        let script = format!("echo > '{}'; exec sleep 30", started.display());
+        let child = fob
+            .command(&["exec", "cf/acme/dev", "--revoke", "--", "sh", "-c", &script])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: plain kill(2) calls on the child and its process group.
+        if signal == libc::SIGTERM {
+            unsafe { libc::kill(pid, signal) };
+        } else {
+            unsafe { libc::kill(-pid, signal) };
+        }
+        let output = child.wait_with_output().unwrap();
+        let (_, stderr) = texts(&output);
+        assert_eq!(output.status.code(), Some(128 + signal), "{stderr}");
+        assert!(
+            stderr.contains("fob: revoked the token for cf/acme/dev"),
+            "{stderr}"
+        );
+        assert_eq!(
+            deleted_tokens(&server).await.last().map(String::as_str),
+            Some(format!("minted-{n}").as_str())
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cloudflare_templates_are_listed_and_added() {
+    let server = MockServer::start().await;
+    mount_cloudflare(&server).await;
+    let fob = cloudflare_fob("cf-templates", &server);
+    fob.ok_with_stdin(&["login", "cf", "--token-stdin"], "boot-secret\n");
+
+    let (stdout, _) = fob.ok(&["cf", "permissions", "cf"]);
+    assert!(
+        stdout.contains("Workers Scripts Write") && stdout.contains("Pages Write"),
+        "{stdout}"
+    );
+    let (stdout, _) = fob.ok(&["cf", "permissions", "cf", "pages"]);
+    assert!(
+        stdout.contains("Pages Write") && !stdout.contains("Workers"),
+        "{stdout}"
+    );
+    let (stdout, _) = fob.ok(&["cf", "templates", "cf"]);
+    assert!(
+        stdout.contains("dev") && stdout.contains("Workers Scripts Write"),
+        "{stdout}"
+    );
+
+    let stderr = fob.fails(&["cf", "add-template", "cf", "site", "-p", "No Such Write"]);
+    assert!(stderr.contains("No Such Write"), "{stderr}");
+    fob.ok(&[
+        "cf",
+        "add-template",
+        "cf",
+        "site",
+        "-p",
+        "Pages Write",
+        "--optional",
+        "DNS Write",
+        "--ttl",
+        "30m",
+    ]);
+    let config = omnifob_core::Config::load(&fob.config_file()).unwrap();
+    let omnifob_core::Integration::Cloudflare(cf) = &config.integrations["cf"] else {
+        panic!("{:?}", config.integrations.keys());
+    };
+    let site = &cf.templates["site"];
+    assert_eq!(site.permissions, ["Pages Write"]);
+    assert_eq!(site.optional, ["DNS Write"]);
+    // The new template is a profile at once, and a second one of that name
+    // needs --replace.
+    let (stdout, _) = fob.ok(&["list", "cf", "site"]);
+    assert_eq!(lines(&stdout), ["cf/acme/site"]);
+    let stderr = fob.fails(&["cf", "add-template", "cf", "site", "-p", "Pages Write"]);
+    assert!(stderr.contains("--replace"), "{stderr}");
+    fob.ok(&[
+        "cf",
+        "add-template",
+        "cf",
+        "site",
+        "-p",
+        "Workers Scripts Write",
+        "--replace",
+    ]);
+    let (stdout, _) = fob.ok(&["cf", "templates", "cf"]);
+    assert!(
+        stdout.contains("site (1h): Workers Scripts Write\n"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cloudflare_browser_sign_in_mints_and_signs_out() {
+    let server = MockServer::start().await;
+    mount_cloudflare(&server).await;
+    let fob = Fob::new("cf-oauth")
+        .with_var("OMNIFOB_CLOUDFLARE_API", &server.uri())
+        .with_var("OMNIFOB_CLOUDFLARE_DASH", &server.uri());
+    fob.write_config(
+        r#"[integrations.cf]
+type = "cloudflare-oauth"
+client_id = "client-1"
+
+[integrations.cf.templates.dev]
+permissions = ["Workers Scripts Write"]
+"#,
+    );
+    let stderr = fob.fails(&["login", "cf", "--token-stdin"]);
+    assert!(stderr.contains("it takes no token"), "{stderr}");
+    // As `fob login` leaves it, with an access token that has expired.
+    fob.put_secret(
+        "cloudflare/cf/oauth",
+        &json!({
+            "access_token": "oauth-access-1",
+            "expires_at": "2000-01-01T00:00:00Z",
+            "refresh_token": "oauth-refresh-1",
+            "scopes": ["account-api-tokens.write", "workers-scripts.write"],
+        }),
+    );
+    fob.ok(&["sync"]);
+    let (stdout, _) = fob.ok(&["list", "cf", "dev"]);
+    assert_eq!(lines(&stdout), ["cf/acme/dev"]);
+    let printed = exec_child(&fob, "cf/acme/dev", &[], &["CLOUDFLARE_API_TOKEN"]);
+    assert_eq!(printed, ["CLOUDFLARE_API_TOKEN=minted-secret-1"]);
+    // The access token was renewed, and minting used the new one.
+    let requests = server.received_requests().await.unwrap();
+    let mint = requests
+        .iter()
+        .find(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/tokens"))
+        .unwrap();
+    assert_eq!(
+        mint.headers.get("authorization").unwrap(),
+        "Bearer oauth-access-2"
+    );
+    let (stdout, _) = fob.ok(&["console", "cf/acme/dev", "--print"]);
+    assert_eq!(
+        stdout.trim(),
+        format!("https://dash.cloudflare.com/{CF_ACCOUNT}")
+    );
+
+    fob.ok(&["logout", "cf"]);
+    assert!(!fob.secret("cloudflare/cf/oauth").exists());
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().any(|r| r.url.path() == "/oauth2/revoke"),
+        "the sign-in was not revoked"
+    );
+}
+
+/// A token integration checked at a mock of its provider.
+fn token_fob(name: &str, server: &MockServer) -> Fob {
+    let fob = Fob::new(name);
+    fob.write_config(&format!(
+        r#"[integrations.tok]
+type = "token"
+verify_url = "{}/me"
+console = "https://console.example.test/"
+
+[integrations.tok.secrets]
+token = ["EXAMPLE_TOKEN"]
+"#,
+        server.uri()
+    ));
+    fob
+}
+
+async fn mount_token_check(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/me"))
+        .respond_with(|r: &Request| {
+            let ok = r
+                .headers
+                .get("authorization")
+                .is_some_and(|v| v.to_str().unwrap().starts_with("Bearer good"));
+            ResponseTemplate::new(if ok { 200 } else { 401 })
+        })
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_signs_in_from_stdin_and_is_checked() {
+    let server = MockServer::start().await;
+    mount_token_check(&server).await;
+    let fob = token_fob("token", &server);
+    let output = fob.run_with_stdin(&["login", "tok", "--token-stdin"], "");
+    assert!(!output.status.success());
+    let (_, stderr) = texts(&output);
+    assert!(stderr.contains("missing a value for 'token'"), "{stderr}");
+    fob.ok_with_stdin(&["login", "tok", "--token-stdin"], "good-1\n");
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["tok/default/token"]);
+    let printed = exec_child(&fob, "tok/default/token", &[], &["EXAMPLE_TOKEN"]);
+    assert_eq!(printed, ["EXAMPLE_TOKEN=good-1"]);
+    let (stdout, _) = fob.ok(&["console", "tok/default/token", "--print"]);
+    assert_eq!(stdout.trim(), "https://console.example.test/");
+
+    // `fob check` in its forms: a sign-in, a profile, and quietly.
+    let (stdout, _) = fob.ok(&["check"]);
+    assert!(stdout.contains("ok   tok"), "{stdout}");
+    let (stdout, _) = fob.ok(&["check", "tok/default/token"]);
+    assert!(stdout.contains("tok/default/token"), "{stdout}");
+    // Nothing but the test store's warning.
+    let quiet = |(stdout, stderr): (String, String)| {
+        let stderr: Vec<String> = stderr
+            .lines()
+            .filter(|l| !l.contains("UNENCRYPTED"))
+            .map(str::to_string)
+            .collect();
+        (stdout, stderr)
+    };
+    assert_eq!(quiet(fob.ok(&["check", "-q"])), (String::new(), vec![]));
+    // The provider stops taking the token: the check fails, quietly too.
+    let rejected = fob.secret("token/tok/secrets");
+    std::fs::write(&rejected, r#"{"token":"revoked"}"#).unwrap();
+    let output = fob.run(&["check", "-q"]);
+    assert!(!output.status.success());
+    assert_eq!(quiet(texts(&output)), (String::new(), vec![]));
+    let output = fob.run(&["check"]);
+    assert!(!output.status.success());
+    assert!(
+        texts(&output).0.contains("FAIL tok"),
+        "{:?}",
+        texts(&output)
+    );
+    // A rejected token is not stored.
+    let output = fob.run_with_stdin(&["login", "tok", "--token-stdin"], "revoked-2\n");
+    let (_, stderr) = texts(&output);
+    assert!(!output.status.success());
+    assert!(stderr.contains("the token was rejected (401"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&rejected).unwrap(),
+        r#"{"token":"revoked"}"#
+    );
+
+    fob.ok(&["logout", "tok"]);
+    assert!(!rejected.exists());
+}
+
+/// `--from-clipboard` reads the token with the platform's clipboard tool,
+/// here a stand-in on PATH.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_signs_in_from_the_clipboard() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start().await;
+    mount_token_check(&server).await;
+    let fob = token_fob("clipboard", &server);
+    let bin = fob.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let clip = fob.root.join("clip");
+    for tool in ["pbpaste", "wl-paste"] {
+        let path = bin.join(tool);
+        std::fs::write(&path, format!("#!/bin/sh\ncat '{}'\n", clip.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The clipboard tool alone, not Windows' through WSL interop.
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let login = |text: &str| {
+        std::fs::write(&clip, text).unwrap();
+        fob.command(&["login", "tok", "--from-clipboard"])
+            .env("PATH", &path)
+            .output()
+            .unwrap()
+    };
+    let output = login("good-2\n");
+    assert!(output.status.success(), "{:?}", texts(&output));
+    let printed = exec_child(&fob, "tok/default/token", &[], &["EXAMPLE_TOKEN"]);
+    assert_eq!(printed, ["EXAMPLE_TOKEN=good-2"]);
+    let output = login("");
+    assert!(!output.status.success());
+    let output = login("rejected");
+    assert!(!output.status.success());
+    assert!(
+        texts(&output).1.contains("the token was rejected"),
+        "{:?}",
+        texts(&output)
+    );
+}
+
+/// `fob env` prints each shell's code, `--unset` removes what the active
+/// profile set, and `fob activate` defines `fob use` for each shell.
+#[tokio::test(flavor = "multi_thread")]
+async fn env_and_activate_speak_each_shell() {
+    let server = MockServer::start().await;
+    mount_token_check(&server).await;
+    let fob = token_fob("shells", &server);
+    fob.ok_with_stdin(&["login", "tok", "--token-stdin"], "good-1\n");
+    let env = |shell: &str| fob.ok(&["env", "tok/default/token", "--shell", shell]).0;
+    for shell in ["bash", "zsh"] {
+        let code = env(shell);
+        assert!(code.contains("export EXAMPLE_TOKEN='good-1'"), "{code}");
+        assert!(
+            code.contains("export OMNIFOB_PROFILE='tok/default/token'"),
+            "{code}"
+        );
+    }
+    let code = env("fish");
+    assert!(code.contains("set -gx EXAMPLE_TOKEN 'good-1'"), "{code}");
+    let code = env("powershell");
+    assert!(code.contains("$Env:EXAMPLE_TOKEN = 'good-1'"), "{code}");
+
+    let unset = |shell: &str| {
+        let output = fob
+            .command(&["env", "--unset", "--shell", shell])
+            .env("OMNIFOB_VARS", "EXAMPLE_TOKEN,OMNIFOB_PROFILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", texts(&output));
+        texts(&output).0
+    };
+    let code = unset("bash");
+    assert!(code.contains("unset EXAMPLE_TOKEN"), "{code}");
+    let code = unset("fish");
+    assert!(code.contains("set -e EXAMPLE_TOKEN"), "{code}");
+    let code = unset("powershell");
+    assert!(code.contains("Remove-Item"), "{code}");
+    assert!(code.contains("EXAMPLE_TOKEN"), "{code}");
+
+    for (shell, defines) in [
+        ("bash", "fob()"),
+        ("zsh", "fob()"),
+        ("fish", "function fob"),
+        ("powershell", "function fob"),
+    ] {
+        let (code, _) = fob.ok(&["activate", shell]);
+        assert!(code.contains(defines), "{shell}: {code}");
+    }
+}
+
+/// `fob renew`, which fob starts in the background: one renewal of a
+/// profile at a time, the others returning at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn renewals_of_one_profile_do_not_overlap() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("renew").with_server(&server);
+    fob.write_config(&portal_config("acme"));
+    fob.sign_in("acme");
+    mount_portal(&server, &[("111111111111", "Dev")]).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "roleCredentials": {
+                        "accessKeyId": "ASIARENEWED",
+                        "secretAccessKey": "role-secret",
+                        "sessionToken": "role-session",
+                        "expiration": 4_102_444_800_000i64,
+                    }
+                }))
+                .set_delay(std::time::Duration::from_secs(2)),
+        )
+        .mount(&server)
+        .await;
+    fob.ok(&["sync"]);
+    let renewals: Vec<_> = (0..3)
+        .map(|_| {
+            fob.command(&["renew", "acme/dev/Admin"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for renewal in renewals {
+        let output = renewal.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", texts(&output));
+    }
+    let fetched = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/federation/credentials")
+        .count();
+    assert_eq!(fetched, 1);
+    // The renewal filled the cache, which the next command uses.
+    assert!(fob.secret("credentials/acme/dev/Admin").exists());
+    let (stdout, _) = fob.ok(&["creds", "acme/dev/Admin", "--format", "credential-process"]);
+    assert!(stdout.contains("ASIARENEWED"), "{stdout}");
+    // A profile that is gone is nothing to renew.
+    fob.ok(&["renew", "acme/gone/Admin"]);
 }
