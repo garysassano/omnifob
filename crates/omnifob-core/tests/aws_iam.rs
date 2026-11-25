@@ -1,12 +1,15 @@
 //! IAM users' access keys against a mock of STS. Secrets go to an in-memory
 //! store, never the keychain.
 
+mod support;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use omnifob_core::config::{AwsIamConfig, Config, Integration};
 use omnifob_core::providers::{self, aws_iam};
 use omnifob_core::{Profile, Target, store};
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{body_string_contains, header_regex, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -16,7 +19,7 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 /// How often the MFA prompt was asked.
 static MFA_PROMPTS: AtomicUsize = AtomicUsize::new(0);
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     omnifob_core::prompt::set_mfa_prompt(|_| {
@@ -24,14 +27,12 @@ async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
         Ok("654321".to_string())
     });
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-iam-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-iam-test"), server)
 }
 
 fn config(extra: &str) -> AwsIamConfig {

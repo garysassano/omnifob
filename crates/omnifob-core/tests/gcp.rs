@@ -2,6 +2,8 @@
 //! Google's OAuth, Resource Manager and IAM Credentials APIs. Secrets go to
 //! an in-memory store, never the keychain.
 
+mod support;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -10,7 +12,8 @@ use omnifob_core::config::{Config, GcpConfig, Integration};
 use omnifob_core::providers::gcp;
 use omnifob_core::{Error, Target, store};
 use serde_json::json;
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };
@@ -19,18 +22,16 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// The tests share environment variables, so they run one at a time.
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-gcp-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_GOOGLE_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-gcp-test"), server)
 }
 
 fn gcp_config(extra: &str) -> GcpConfig {

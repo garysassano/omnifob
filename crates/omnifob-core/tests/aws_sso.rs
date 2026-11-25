@@ -2,6 +2,8 @@
 //! the OIDC and portal APIs. Secrets go to an in-memory store, never the
 //! keychain.
 
+mod support;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -9,7 +11,8 @@ use omnifob_core::config::{AwsSsoConfig, Config, Integration};
 use omnifob_core::providers::aws_sso::{self, Flow};
 use omnifob_core::{Error, store};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };
@@ -20,19 +23,17 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const START_URL: &str = "https://acme.awsapps.com/start";
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     omnifob_core::prompt::set_mfa_prompt(|_| Ok("123456".to_string()));
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-aws-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-aws-test"), server)
 }
 
 fn config() -> AwsSsoConfig {

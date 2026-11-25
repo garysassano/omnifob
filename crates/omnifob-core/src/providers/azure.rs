@@ -20,7 +20,6 @@
 //! `az`), so profiles export the subscription and tenant for them, and the
 //! raw Resource Manager token as `AZURE_ACCESS_TOKEN` for `curl` and scripts.
 
-use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -28,7 +27,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AzureConfig;
-use crate::oauth::{pkce, random_string, wait_for_code};
+use crate::oauth::{Loopback, Pkce};
 use crate::{Credentials, Error, Profile, Result, Target, store};
 
 /// The Azure CLI's client (`AZURE_CLI_CLIENT_ID` in `auth/constants.py`).
@@ -39,8 +38,6 @@ const CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const SCOPE: &str = "https://management.core.windows.net//.default offline_access openid profile";
 
 const ARM_API_VERSION: &str = "2022-12-01";
-
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn login_host() -> String {
     std::env::var("OMNIFOB_AZURE_ENDPOINT")
@@ -75,6 +72,9 @@ struct Stored {
     username: String,
     /// The tenant the account signed in to.
     tenant_id: String,
+    /// The configured `tenant` signed in with; `None` for `organizations`.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +186,7 @@ pub async fn login(
             .context("Entra ID returned no refresh token")?,
         username: username.clone(),
         tenant_id: claims.tid,
+        tenant: config.tenant.clone(),
     };
     store::set(&token_key(integration), &stored)?;
     Ok(username)
@@ -195,12 +196,14 @@ async fn browser_sign_in(
     tenant: &str,
     show: impl FnOnce(SignInPrompt),
 ) -> anyhow::Result<TokenResponse> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .context("listening on 127.0.0.1 for the sign-in callback")?;
+    let loopback = Loopback::bind(0)?;
     // MSAL's redirect for public clients: `localhost`, any port, no path.
-    let redirect_uri = format!("http://localhost:{}", listener.local_addr()?.port());
-    let (verifier, challenge) = pkce()?;
-    let state = random_string(16)?;
+    let redirect_uri = format!("http://localhost:{}", loopback.port());
+    let Pkce {
+        verifier,
+        challenge,
+        state,
+    } = Pkce::new()?;
     let mut url = reqwest::Url::parse(&format!("{}/authorize", authority(tenant)))?;
     url.query_pairs_mut()
         .append_pair("client_id", CLIENT_ID)
@@ -215,10 +218,7 @@ async fn browser_sign_in(
         url: url.as_str(),
         user_code: None,
     });
-    let code = tokio::task::spawn_blocking(move || {
-        wait_for_code(&listener, "/", &state, CALLBACK_TIMEOUT, "Azure")
-    })
-    .await??;
+    let code = loopback.code("/", &state, "Azure").await?;
     match exchange(
         tenant,
         &[
@@ -346,6 +346,16 @@ async fn arm_token(integration: &str, tenant: &str) -> Result<(String, Timestamp
 
 pub fn is_signed_in(integration: &str) -> anyhow::Result<bool> {
     Ok(store::get::<Stored>(&token_key(integration))?.is_some())
+}
+
+/// Whether the stored sign-in was made for the configured tenant (or the
+/// tenant is the one it signed in to). `false` when none is stored.
+pub fn session_matches(integration: &str, config: &AzureConfig) -> anyhow::Result<bool> {
+    Ok(
+        store::get::<Stored>(&token_key(integration))?.is_some_and(|s| {
+            s.tenant == config.tenant || config.tenant.as_deref() == Some(s.tenant_id.as_str())
+        }),
+    )
 }
 
 pub fn account(integration: &str) -> anyhow::Result<Option<String>> {

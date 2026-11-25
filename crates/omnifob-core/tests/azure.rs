@@ -1,6 +1,8 @@
 //! Entra ID sign-in and Resource Manager discovery against a mock. Secrets go
 //! to an in-memory store, never the keychain.
 
+mod support;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -9,7 +11,8 @@ use omnifob_core::config::{AzureConfig, Config, Integration};
 use omnifob_core::providers::azure;
 use omnifob_core::{Error, Target, store};
 use serde_json::json;
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -20,18 +23,16 @@ const HOME: &str = "11111111-1111-1111-1111-111111111111";
 const GUEST: &str = "22222222-2222-2222-2222-222222222222";
 const LOCKED: &str = "33333333-3333-3333-3333-333333333333";
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-azure-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_AZURE_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-azure-test"), server)
 }
 
 fn azure_config(extra: &str) -> AzureConfig {

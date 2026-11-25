@@ -22,15 +22,12 @@
 //! and service accounts are impersonated through the IAM Credentials API's
 //! `generateAccessToken`, as `gcloud --impersonate-service-account` does.
 
-use std::net::TcpListener;
-use std::time::Duration;
-
 use anyhow::{Context, anyhow, bail};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{GcpConfig, GcpServiceAccount};
-use crate::oauth::{pkce, random_string, wait_for_code};
+use crate::oauth::{Loopback, Pkce};
 use crate::{Credentials, Error, Profile, Result, Target, store};
 
 /// The Cloud SDK's OAuth client (`CLOUDSDK_CLIENT_ID` and
@@ -50,8 +47,6 @@ const USERINFO_EMAIL: &str = "https://www.googleapis.com/auth/userinfo.email";
 
 /// Where Google's page shows the code to paste, for Google's own clients.
 const PASTE_REDIRECT: &str = "https://sdk.cloud.google.com/authcode.html";
-
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Reuse a stored access token for omnifob's own calls while it has this long
 /// left.
@@ -187,14 +182,16 @@ pub async fn login(
              client; sign in on a machine with a browser, or drop client_id"
         );
     }
-    let (verifier, challenge) = pkce()?;
-    let state = random_string(16)?;
+    let Pkce {
+        verifier,
+        challenge,
+        state,
+    } = Pkce::new()?;
 
     let (code, redirect_uri) = if browser_here {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .context("listening on 127.0.0.1 for the sign-in callback")?;
+        let loopback = Loopback::bind(0)?;
         // gcloud's redirect: `localhost`, any port, the root path.
-        let redirect_uri = format!("http://localhost:{}/", listener.local_addr()?.port());
+        let redirect_uri = format!("http://localhost:{}/", loopback.port());
         show(&authorize_url(
             client_id,
             &redirect_uri,
@@ -202,10 +199,7 @@ pub async fn login(
             &challenge,
             false,
         ));
-        let code = tokio::task::spawn_blocking(move || {
-            wait_for_code(&listener, "/", &state, CALLBACK_TIMEOUT, "Google")
-        })
-        .await??;
+        let code = loopback.code("/", &state, "Google").await?;
         (code, redirect_uri)
     } else {
         show(&authorize_url(
@@ -378,6 +372,13 @@ async fn access_token(integration: &str, config: &GcpConfig) -> Result<String> {
 
 pub fn is_signed_in(integration: &str) -> anyhow::Result<bool> {
     Ok(store::get::<Stored>(&token_key(integration))?.is_some())
+}
+
+/// Whether the stored sign-in belongs to the configured OAuth client: its
+/// refresh token renews only with that one. `false` when none is stored.
+pub fn session_matches(integration: &str, config: &GcpConfig) -> anyhow::Result<bool> {
+    Ok(store::get::<Stored>(&token_key(integration))?
+        .is_some_and(|s| s.client_id == client(config).0))
 }
 
 /// The signed-in account's email.

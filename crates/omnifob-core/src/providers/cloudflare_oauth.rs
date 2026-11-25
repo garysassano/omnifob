@@ -8,15 +8,12 @@
 //! 2026-10-09: an OAuth access token can create and delete account tokens in
 //! every account approved on the consent page).
 
-use std::net::TcpListener;
-use std::time::Duration;
-
 use anyhow::{Context, bail};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::config::CloudflareConfig;
-use crate::oauth::{pkce, random_string, wait_for_code};
+use crate::oauth::{Loopback, Pkce};
 use crate::{Error, Result, store};
 
 const DASH: &str = "https://dash.cloudflare.com";
@@ -24,10 +21,7 @@ const DASH: &str = "https://dash.cloudflare.com";
 /// Where Cloudflare sends the browser back to. It must match a redirect URL
 /// registered for the OAuth client.
 pub const REDIRECT_URI: &str = "http://localhost:8977/callback";
-const CALLBACK_ADDR: &str = "127.0.0.1:8977";
-
-/// How long `fob login` waits for the consent page to be answered.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const CALLBACK_PORT: u16 = 8977;
 
 /// Renew the access token this long before it expires.
 const RENEW_MARGIN: SignedDuration = SignedDuration::from_secs(60);
@@ -192,13 +186,12 @@ pub async fn login(
     show: impl FnOnce(&str),
 ) -> anyhow::Result<Option<Timestamp>> {
     let client_id = client_id(integration, config)?;
-    let listener = TcpListener::bind(CALLBACK_ADDR).with_context(|| {
-        format!(
-            "listening on {CALLBACK_ADDR} for the sign-in callback; is another sign-in running?"
-        )
-    })?;
-    let (verifier, challenge) = pkce()?;
-    let state = random_string(16)?;
+    let loopback = Loopback::bind(CALLBACK_PORT)?;
+    let Pkce {
+        verifier,
+        challenge,
+        state,
+    } = Pkce::new()?;
     show(&authorize_url(
         &client_id,
         &scopes(config),
@@ -206,16 +199,7 @@ pub async fn login(
         &challenge,
     ));
 
-    let code = tokio::task::spawn_blocking(move || {
-        wait_for_code(
-            &listener,
-            "/callback",
-            &state,
-            CALLBACK_TIMEOUT,
-            "Cloudflare",
-        )
-    })
-    .await??;
+    let code = loopback.code("/callback", &state, "Cloudflare").await?;
 
     let now = Timestamp::now();
     let response = exchange(&[

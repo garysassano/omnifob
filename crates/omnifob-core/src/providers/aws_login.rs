@@ -13,7 +13,6 @@
 //! and renewed under a lock shared by every omnifob process, since each
 //! refresh returns a new refresh token.
 
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,9 +44,6 @@ const CROSS_DEVICE_CLIENT: &str = "arn:aws:signin:::devtools/cross-device";
 /// Where AWS Sign-In sends the browser back to, as the AWS CLI listens.
 const CALLBACK_PATH: &str = "/oauth/callback";
 
-/// How long `fob login` waits for the browser sign-in to be approved.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// Credentials expiring within this window are renewed before use, as the
 /// AWS CLI does.
 const REFRESH_WINDOW: SignedDuration = SignedDuration::from_mins(5);
@@ -76,6 +72,11 @@ struct Session {
     secret_access_key: String,
     session_token: String,
     expires_at: Timestamp,
+    /// When AWS Sign-In issued the credentials, so their lifetime is known
+    /// to background renewal. Missing in sessions stored before omnifob
+    /// recorded it.
+    #[serde(default)]
+    issued_at: Option<Timestamp>,
 }
 
 fn session_key(integration: &str) -> String {
@@ -235,16 +236,15 @@ pub async fn login(
     paste: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     let base = base_url(&config.region).await?;
-    let (verifier, challenge) = oauth::pkce()?;
-    let state = oauth::random_string(16)?;
+    let oauth::Pkce {
+        verifier,
+        challenge,
+        state,
+    } = oauth::Pkce::new()?;
 
     let (client_id, code, redirect_uri) = if browser_here {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .context("listening on 127.0.0.1 for the sign-in callback")?;
-        let redirect_uri = format!(
-            "http://127.0.0.1:{}{CALLBACK_PATH}",
-            listener.local_addr()?.port()
-        );
+        let loopback = oauth::Loopback::bind(0)?;
+        let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", loopback.port());
         show(&authorize_url(
             &base,
             SAME_DEVICE_CLIENT,
@@ -252,11 +252,7 @@ pub async fn login(
             &state,
             &challenge,
         ));
-        let expected = state.clone();
-        let code = tokio::task::spawn_blocking(move || {
-            oauth::wait_for_code(&listener, CALLBACK_PATH, &expected, CALLBACK_TIMEOUT, "AWS")
-        })
-        .await??;
+        let code = loopback.code(CALLBACK_PATH, &state, "AWS").await?;
         (SAME_DEVICE_CLIENT, code, redirect_uri)
     } else {
         let redirect_uri = format!("{base}/v1/sessions/confirmation");
@@ -408,6 +404,7 @@ fn from_token(
         secret_access_key: String::new(),
         session_token: String::new(),
         expires_at: now,
+        issued_at: None,
     });
     Ok(Session {
         refresh_token,
@@ -417,6 +414,7 @@ fn from_token(
         expires_at: now
             .saturating_add(SignedDuration::from_secs(token.expires_in().into()))
             .unwrap_or(Timestamp::MAX),
+        issued_at: Some(now),
         ..base
     })
 }
@@ -441,15 +439,24 @@ fn drop_if_current(integration: &str, refresh_token: &str) {
 }
 
 /// The session with credentials good for a while, renewed if needed.
-async fn current(integration: &str) -> Result<Session> {
-    let session = load(integration)?;
-    if fresh(&session, Timestamp::now()) {
-        return Ok(session);
+/// `renew` renews it even then, for callers that want credentials of the
+/// full lifetime (`fob renew`, `--no-cache`, `fob console`): without it, a
+/// background renewal would get back the credentials it is replacing.
+///
+/// Renewal runs under a lock shared by every omnifob process, since each
+/// refresh spends the refresh token. A session that changed while waiting
+/// for the lock was just renewed by another process, and is used as it is.
+async fn current(integration: &str, renew: bool) -> Result<Session> {
+    let seen = load(integration)?;
+    if !renew && fresh(&seen, Timestamp::now()) {
+        return Ok(seen);
     }
     let _lock = store::lock(&format!("aws-login-{integration}"), REFRESH_LOCK_TIMEOUT).await?;
     let session = load(integration)?;
     let now = Timestamp::now();
-    if fresh(&session, now) {
+    let renewed_meanwhile =
+        session.refresh_token != seen.refresh_token || session.expires_at != seen.expires_at;
+    if (renew && renewed_meanwhile) || (!renew && fresh(&session, now)) {
         return Ok(session);
     }
 
@@ -513,10 +520,14 @@ async fn current(integration: &str) -> Result<Session> {
 }
 
 /// The signed-in identity's credentials, renewed when they are about to
-/// expire. They always last 15 minutes from the last renewal, so `--ttl`
-/// has nothing to shorten.
-pub async fn credentials(integration: &str, config: &AwsLoginConfig) -> Result<Credentials> {
-    let session = current(integration).await?;
+/// expire, or always with `renew`. They always last 15 minutes from the last
+/// renewal, so `--ttl` has nothing to shorten.
+pub async fn credentials(
+    integration: &str,
+    config: &AwsLoginConfig,
+    renew: bool,
+) -> Result<Credentials> {
+    let session = current(integration, renew).await?;
     let mut env = std::collections::BTreeMap::new();
     let mut put = |k: &str, v: &str| {
         env.insert(k.to_string(), v.to_string());
@@ -531,6 +542,7 @@ pub async fn credentials(integration: &str, config: &AwsLoginConfig) -> Result<C
     Ok(Credentials {
         env,
         expires_at: Some(session.expires_at),
+        issued_at: session.issued_at,
         ..Default::default()
     })
 }
@@ -565,6 +577,12 @@ fn identity_name(arn: &str) -> &str {
     }
 }
 
+/// Whether the stored session was signed in through the configured Region:
+/// its refresh token renews only there. `false` when none is stored.
+pub fn session_matches(integration: &str, config: &AwsLoginConfig) -> anyhow::Result<bool> {
+    Ok(store::get::<Session>(&session_key(integration))?.is_some_and(|s| s.region == config.region))
+}
+
 /// Whether a session is stored, and until when its credentials last.
 pub fn session(integration: &str) -> anyhow::Result<Option<Timestamp>> {
     Ok(store::get::<Session>(&session_key(integration))?.map(|s| s.expires_at))
@@ -576,7 +594,7 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
 
 /// Checks that the sign-in works; says whom it belongs to.
 pub async fn check(integration: &str, config: &AwsLoginConfig) -> Result<String> {
-    let creds = credentials(integration, config).await?;
+    let creds = credentials(integration, config, false).await?;
     let identity = aws_sso::caller_identity(&creds, &config.region).await?;
     Ok(format!("signed in as {}", identity.arn))
 }

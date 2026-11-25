@@ -1,6 +1,8 @@
 //! AWS console sign-in (`aws login`) against a mock of AWS Sign-In. Secrets
 //! go to an in-memory store, never the keychain.
 
+mod support;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -10,7 +12,8 @@ use omnifob_core::config::{AwsLoginConfig, Config, Integration};
 use omnifob_core::providers::aws_login;
 use omnifob_core::{Error, Target, store};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -19,18 +22,16 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const IDENTITY: &str = "arn:aws:iam::123456789012:user/alice";
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-login-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-login-test"), server)
 }
 
 fn config() -> AwsLoginConfig {
@@ -122,6 +123,7 @@ async fn browser_login(server: &MockServer, integration: &str, expires_in: i64) 
         .expect(1)
         .mount(server)
         .await;
+    let mut browser = None;
     let identity = aws_login::login(
         integration,
         &config(),
@@ -137,7 +139,7 @@ async fn browser_login(server: &MockServer, integration: &str, expires_in: i64) 
             assert_eq!(redirect.path(), "/oauth/callback");
             let state = query["state"].clone();
             // The browser signs in and AWS Sign-In redirects back.
-            std::thread::spawn(move || {
+            browser = Some(std::thread::spawn(move || {
                 let mut s =
                     std::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).unwrap();
                 write!(
@@ -147,13 +149,17 @@ async fn browser_login(server: &MockServer, integration: &str, expires_in: i64) 
                 .unwrap();
                 let mut reply = String::new();
                 s.read_to_string(&mut reply).unwrap();
-            });
+                reply
+            }));
         },
         || unreachable!("nothing is pasted with a browser here"),
     )
     .await
     .unwrap();
     assert_eq!(identity, IDENTITY);
+    // Joined, so a failure in the browser's thread fails the test.
+    let reply = browser.expect("the browser was opened").join().unwrap();
+    assert!(reply.contains("Sign-in approved"), "{reply}");
 }
 
 #[tokio::test]
@@ -187,7 +193,7 @@ async fn browser_sign_in_redeems_the_code_with_a_dpop_proof() {
         }
     );
 
-    let creds = aws_login::credentials("browser", &config()).await.unwrap();
+    let creds = aws_login::credentials("browser", &config(), false).await.unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAFIRST");
     assert_eq!(creds.env["AWS_SESSION_TOKEN"], "session");
     assert_eq!(creds.env["AWS_REGION"], "eu-central-1");
@@ -234,7 +240,7 @@ async fn a_pasted_code_signs_in_from_another_device() {
     )
     .await
     .unwrap();
-    let creds = aws_login::credentials("remote", &config()).await.unwrap();
+    let creds = aws_login::credentials("remote", &config(), false).await.unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAREMOTE");
 }
 
@@ -255,7 +261,7 @@ async fn expiring_credentials_are_renewed_with_the_same_key() {
         .mount(&server)
         .await;
 
-    let creds = aws_login::credentials("renew", &config()).await.unwrap();
+    let creds = aws_login::credentials("renew", &config(), false).await.unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIASECOND");
     let requests = server.received_requests().await.unwrap();
     assert_eq!(dpop_key(&requests[0]), dpop_key(&requests[1]));
@@ -266,8 +272,73 @@ async fn expiring_credentials_are_renewed_with_the_same_key() {
         .respond_with(token("ASIATHIRD", "refresh-3", 900))
         .mount(&server)
         .await;
-    let creds = aws_login::credentials("renew", &config()).await.unwrap();
+    let creds = aws_login::credentials("renew", &config(), false).await.unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIASECOND", "still fresh");
+}
+
+#[tokio::test]
+async fn renewing_refreshes_credentials_that_are_still_fresh() {
+    let (_guard, server) = setup().await;
+    // Fresh for the whole test: only a forced renewal reaches AWS Sign-In.
+    browser_login(&server, "forced", 900).await;
+    let stored = aws_login::credentials("forced", &config(), false)
+        .await
+        .unwrap();
+    assert_eq!(stored.env["AWS_ACCESS_KEY_ID"], "ASIAFIRST");
+    let first_issued = stored.issued_at.expect("the issue time is recorded");
+    assert_eq!(
+        stored.expires_at.unwrap().duration_since(first_issued),
+        jiff::SignedDuration::from_mins(15)
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/token"))
+        .and(body_partial_json(json!({
+            "grantType": "refresh_token",
+            "refreshToken": "refresh-1",
+        })))
+        .respond_with(token("ASIARENEWED", "refresh-2", 900))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let renewed = aws_login::credentials("forced", &config(), true)
+        .await
+        .unwrap();
+    assert_eq!(renewed.env["AWS_ACCESS_KEY_ID"], "ASIARENEWED");
+    assert!(renewed.issued_at.unwrap() >= first_issued);
+    // The renewed session is the stored one now.
+    let again = aws_login::credentials("forced", &config(), false)
+        .await
+        .unwrap();
+    assert_eq!(again.env["AWS_ACCESS_KEY_ID"], "ASIARENEWED");
+}
+
+#[tokio::test]
+async fn a_sign_in_is_kept_only_for_its_region_and_ttl_is_refused() {
+    let (_guard, server) = setup().await;
+    browser_login(&server, "kept", 900).await;
+    assert!(aws_login::session_matches("kept", &config()).unwrap());
+    let moved = AwsLoginConfig {
+        region: "us-east-1".into(),
+        ..config()
+    };
+    assert!(!aws_login::session_matches("kept", &moved).unwrap());
+    assert!(!aws_login::session_matches("nobody", &config()).unwrap());
+
+    let full = Config {
+        integrations: [("kept".to_string(), Integration::AwsLogin(config()))].into(),
+        ..Config::default()
+    };
+    let profile = aws_login::discover("kept", &config()).unwrap().remove(0);
+    let err = omnifob_core::providers::credentials(
+        &full,
+        &profile,
+        true,
+        Some(jiff::SignedDuration::from_mins(5)),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("--ttl does not apply"), "{err}");
 }
 
 #[tokio::test]
@@ -281,7 +352,7 @@ async fn an_ended_sign_in_asks_for_a_new_one_and_is_forgotten() {
         .mount(&server)
         .await;
 
-    let err = aws_login::credentials("ended", &config())
+    let err = aws_login::credentials("ended", &config(), false)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
@@ -300,7 +371,7 @@ async fn a_server_error_during_renewal_keeps_the_sign_in() {
         .mount(&server)
         .await;
 
-    let err = aws_login::credentials("outage", &config())
+    let err = aws_login::credentials("outage", &config(), false)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Other(_)), "{err}");

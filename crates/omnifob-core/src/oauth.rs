@@ -22,6 +22,68 @@ pub fn browser_is_elsewhere() -> bool {
     remote || container
 }
 
+/// How long a browser sign-in waits for the consent page to be answered,
+/// for every provider.
+pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// What one authorization code request needs to be safe: a PKCE verifier,
+/// its S256 challenge, and a `state` the callback must carry back.
+pub struct Pkce {
+    pub verifier: String,
+    pub challenge: String,
+    pub state: String,
+}
+
+impl Pkce {
+    pub fn new() -> anyhow::Result<Self> {
+        let (verifier, challenge) = pkce()?;
+        Ok(Self {
+            verifier,
+            challenge,
+            state: random_string(16)?,
+        })
+    }
+}
+
+/// A listener on 127.0.0.1 for one browser sign-in's redirect (RFC 8252).
+pub struct Loopback {
+    listener: TcpListener,
+    port: u16,
+}
+
+impl Loopback {
+    /// Listens on `port` of 127.0.0.1, or on a free port with 0.
+    pub fn bind(port: u16) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| {
+            if port == 0 {
+                "listening on 127.0.0.1 for the sign-in callback".to_string()
+            } else {
+                format!(
+                    "listening on 127.0.0.1:{port} for the sign-in callback; is another sign-in running?"
+                )
+            }
+        })?;
+        let port = listener.local_addr()?.port();
+        Ok(Self { listener, port })
+    }
+
+    /// The port listened on, for the redirect URI.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Waits up to [`CALLBACK_TIMEOUT`] for the callback on `path` with
+    /// `state`, off the async runtime's threads, and returns the code. See
+    /// [`wait_for_code`].
+    pub async fn code(self, path: &str, state: &str, provider: &str) -> anyhow::Result<String> {
+        let (path, state, provider) = (path.to_string(), state.to_string(), provider.to_string());
+        tokio::task::spawn_blocking(move || {
+            wait_for_code(&self.listener, &path, &state, CALLBACK_TIMEOUT, &provider)
+        })
+        .await?
+    }
+}
+
 /// A PKCE verifier and its S256 challenge.
 pub fn pkce() -> anyhow::Result<(String, String)> {
     let verifier = random_string(48)?;
@@ -115,8 +177,8 @@ pub fn wait_for_code(
         let now = Instant::now();
         if now >= deadline {
             bail!(
-                "the sign-in was not completed within {} minutes",
-                timeout.as_secs() / 60
+                "the sign-in was not completed within {}",
+                describe_wait(timeout)
             );
         }
         let mut busy = false;
@@ -177,6 +239,17 @@ pub fn wait_for_code(
         if !busy {
             std::thread::sleep(POLL);
         }
+    }
+}
+
+/// A wait in whole minutes, or in seconds when shorter than one.
+fn describe_wait(timeout: Duration) -> String {
+    match timeout.as_secs() {
+        0 => format!("{} ms", timeout.as_millis()),
+        1 => "1 second".to_string(),
+        secs @ 2..60 => format!("{secs} seconds"),
+        60..120 => "1 minute".to_string(),
+        secs => format!("{} minutes", secs / 60),
     }
 }
 
@@ -440,7 +513,30 @@ mod tests {
         let err = wait_for_code(&listener, "/callback", "s", Duration::from_millis(200), "X")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not completed"), "{err}");
+        assert!(err.contains("not completed within 200 ms"), "{err}");
+    }
+
+    #[test]
+    fn waits_are_described_in_their_unit() {
+        assert_eq!(describe_wait(Duration::from_secs(1)), "1 second");
+        assert_eq!(describe_wait(Duration::from_secs(30)), "30 seconds");
+        assert_eq!(describe_wait(Duration::from_secs(90)), "1 minute");
+        assert_eq!(describe_wait(CALLBACK_TIMEOUT), "10 minutes");
+    }
+
+    #[tokio::test]
+    async fn the_loopback_returns_the_code_of_its_callback() {
+        let pkce = Pkce::new().unwrap();
+        assert_eq!(pkce.challenge, challenge(&pkce.verifier));
+        let loopback = Loopback::bind(0).unwrap();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], loopback.port()));
+        let state = pkce.state.clone();
+        let browser = std::thread::spawn(move || {
+            request(addr, &format!("GET /cb?code=c1&state={state} HTTP/1.1\r\n\r\n"))
+        });
+        let code = loopback.code("/cb", &pkce.state, "X").await.unwrap();
+        assert_eq!(code, "c1");
+        assert!(browser.join().unwrap().contains("200"));
     }
 
     /// Sends a request on a new connection and returns the reply. Times out
