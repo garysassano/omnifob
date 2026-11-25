@@ -240,6 +240,7 @@ pub async fn role_credentials(
     }
     // The role's credentials outlive the session they came from (tried
     // live), so the duration is not shortened to what is left of it.
+    let cached = fresh_session(integration).is_some();
     let session = session_credentials(integration, config, profile_id, None).await?;
     let region = role.region.as_deref().or(config.region.as_deref());
     let request = RoleRequest {
@@ -251,7 +252,44 @@ pub async fn role_credentials(
         duration,
         profile_id,
     };
-    Ok(aws_sso::assume_role(&session, &request, sts_region(config), region).await?)
+    match aws_sso::assume_role(&session, &request, sts_region(config), region).await {
+        // A kept session that STS no longer takes (revoked, or the clock
+        // was off): start a new one once, which may ask for an MFA code.
+        Err(e) if cached && e.downcast_ref::<aws_sso::CredentialsRejected>().is_some() => {
+            tracing::debug!("starting a new session: STS refused the kept one: {e:#}");
+            forget_session_if_current(integration, &session).await?;
+            let session = session_credentials(integration, config, profile_id, None).await?;
+            Ok(aws_sso::assume_role(&session, &request, sts_region(config), region).await?)
+        }
+        result => Ok(result?),
+    }
+}
+
+/// Forgets the kept session if it is still `session`, under the lock that
+/// starting one takes, so a session another process just started stays.
+async fn forget_session_if_current(integration: &str, session: &Credentials) -> Result<()> {
+    let _lock = store::lock(&format!("aws-iam-{integration}"), SESSION_LOCK_TIMEOUT).await?;
+    let kept = store::get::<Credentials>(&session_key(integration))
+        .ok()
+        .flatten();
+    let token = |c: &Credentials| c.env.get("AWS_SESSION_TOKEN").cloned();
+    if kept.is_some_and(|kept| token(&kept) == token(session)) {
+        store::delete(&session_key(integration))?;
+    }
+    Ok(())
+}
+
+/// The `Name` of a federated console session: the IAM user's name, so
+/// CloudTrail shows who signed in, cut to the 32 characters
+/// `GetFederationToken` takes. User names and `Name` allow the same
+/// characters; a name shorter than `Name`'s two is padded with `-fob`.
+fn federation_name(user_arn: &str) -> String {
+    let user = user_arn.rsplit('/').next().unwrap_or_default();
+    let mut name: String = user.chars().take(32).collect();
+    if name.chars().count() < 2 {
+        name.push_str("-fob");
+    }
+    name
 }
 
 /// A console sign-in URL for the user. Session credentials cannot sign in to
@@ -272,6 +310,7 @@ pub async fn console_url(
     service: Option<&str>,
 ) -> Result<String> {
     let key = stored_key(integration)?;
+    let user = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
     let duration = config
         .session_duration
         .unwrap_or(DEFAULT_SESSION)
@@ -281,7 +320,7 @@ pub async fn console_url(
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
     let response = aws_sso::sts_client(&key_credentials(&key), sts_region(config))?
         .get_federation_token()
-        .name("omnifob")
+        .name(federation_name(&user.arn))
         .policy(allow_all)
         .duration_seconds(aws_sso::whole_seconds(duration)?)
         .send()
@@ -300,4 +339,21 @@ pub async fn console_url(
         session_duration: None,
     };
     Ok(aws_sso::console_url(&creds, &request).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn federated_sessions_are_named_after_the_user() {
+        assert_eq!(federation_name("arn:aws:iam::123456789012:user/me"), "me");
+        assert_eq!(
+            federation_name("arn:aws:iam::123456789012:user/team/jane.doe@example.com"),
+            "jane.doe@example.com"
+        );
+        let long = format!("arn:aws:iam::123456789012:user/{}", "a".repeat(64));
+        assert_eq!(federation_name(&long), "a".repeat(32));
+        assert_eq!(federation_name("arn:aws:iam::123456789012:user/x"), "x-fob");
+    }
 }

@@ -11,15 +11,34 @@ use anyhow::{Context, bail};
 use base64::Engine;
 
 /// Whether this looks like a remote or container session, where a browser
-/// cannot reach a loopback listener here (Granted makes the same check).
+/// cannot reach a loopback listener here (Granted makes the same check), or
+/// a Linux session with no display, where no browser can open: a text
+/// console, a server, a container without the host's display. WSL opens
+/// the Windows browser, so it never counts as headless, and neither does a
+/// session whose `BROWSER` names a browser (a text one, say).
 pub fn browser_is_elsewhere() -> bool {
+    let set = |v: &str| std::env::var_os(v).is_some_and(|v| !v.is_empty());
     let remote = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "CODESPACES"]
         .iter()
-        .any(|v| std::env::var_os(v).is_some_and(|v| !v.is_empty()));
+        .any(|v| set(v));
     let container = ["/.dockerenv", "/run/.containerenv"]
         .iter()
         .any(|p| std::path::Path::new(p).exists());
-    remote || container
+    let display = set("DISPLAY") || set("WAYLAND_DISPLAY") || set("BROWSER");
+    remote
+        || container
+        || headless(
+            cfg!(target_os = "linux"),
+            crate::platform::is_wsl(),
+            display,
+        )
+}
+
+/// Whether a session has no display to open a browser on: Linux other than
+/// WSL, with neither `DISPLAY` nor `WAYLAND_DISPLAY` (nor `BROWSER`).
+/// macOS and Windows always have one.
+fn headless(linux: bool, wsl: bool, display: bool) -> bool {
+    linux && !wsl && !display
 }
 
 /// How long a browser sign-in waits for the consent page to be answered,
@@ -468,6 +487,17 @@ fn parse_callback(query: &str, state: &str, provider: &str) -> Option<anyhow::Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_linux_without_a_display_is_headless() {
+        assert!(super::headless(true, false, false));
+        assert!(!super::headless(true, false, true), "a display");
+        assert!(
+            !super::headless(true, true, false),
+            "WSL opens Windows' browser"
+        );
+        assert!(!super::headless(false, false, false), "macOS and Windows");
+    }
+
     use super::*;
 
     #[test]

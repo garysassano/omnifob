@@ -377,3 +377,71 @@ async fn key(config: &Config, profile: &Profile, ttl: Option<jiff::SignedDuratio
         .unwrap();
     creds.env["AWS_ACCESS_KEY_ID"].clone()
 }
+
+/// A kept session that STS refuses is replaced once, and the role assumed
+/// with the new one.
+#[tokio::test]
+async fn a_refused_session_is_started_again_once() {
+    let (_guard, server) = setup().await;
+    let (config, session, role) = whole_config("refused");
+    login(&server, "refused", &integration(&config, "refused")).await;
+    // The kept session, refused as expired although it looks fresh.
+    mock_sts(&server, "GetSessionToken", 28_800, "ASIAOLDSESSION").await;
+    assert_eq!(key(&config, &session, None).await, "ASIAOLDSESSION");
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=AssumeRole"))
+        .and(header_regex("authorization", "Credential=ASIAOLDSESSION/"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(
+                    r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>ExpiredToken</Code><Message>The security token included in the request is expired</Message></Error><RequestId>1</RequestId></ErrorResponse>"#,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mock_sts(&server, "GetSessionToken", 28_800, "ASIANEWSESSION").await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=AssumeRole"))
+        .and(header_regex("authorization", "Credential=ASIANEWSESSION/"))
+        .respond_with(sts(
+            "AssumeRole",
+            &format!(
+                "{}<AssumedRoleUser><AssumedRoleId>AROA:omnifob</AssumedRoleId><Arn>arn:aws:sts::222222222222:assumed-role/Deploy/omnifob</Arn></AssumedRoleUser>",
+                temporary("ASIAROLE")
+            ),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(key(&config, &role, None).await, "ASIAROLE");
+    // The new session is the one kept (past the profile's own cache).
+    let kept = providers::credentials(&config, &session, false, None)
+        .await
+        .unwrap();
+    assert_eq!(kept.env["AWS_ACCESS_KEY_ID"], "ASIANEWSESSION");
+}
+
+/// `AWS_ENDPOINT_URL_STS` sends STS calls to a VPC endpoint, as it does for
+/// the AWS CLI.
+#[tokio::test]
+async fn sts_calls_follow_aws_endpoint_url_sts() {
+    let (_guard, server) = setup().await;
+    // SAFETY: the tests run one at a time under SERIAL.
+    unsafe {
+        std::env::remove_var("OMNIFOB_AWS_ENDPOINT");
+        std::env::set_var("AWS_ENDPOINT_URL_STS", server.uri());
+    }
+    let config = config("");
+    mock_identity(&server).await;
+    let result = aws_iam::login("sts-endpoint", &config, "AKIAEXAMPLE", "secret").await;
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var("AWS_ENDPOINT_URL_STS");
+    }
+    assert_eq!(result.unwrap(), "arn:aws:iam::123456789012:user/me");
+}

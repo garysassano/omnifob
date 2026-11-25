@@ -160,10 +160,15 @@ const OIDC_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_SSO_OIDC";
 /// The variable the AWS CLI and SDKs read for the portal's endpoint.
 const PORTAL_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_SSO";
 
-/// Where to send the calls of one Identity Center API: `OMNIFOB_AWS_ENDPOINT`,
-/// else the service's own variable (`AWS_ENDPOINT_URL_SSO_OIDC` or
-/// `AWS_ENDPOINT_URL_SSO`), which points the AWS CLI at a VPC endpoint whose
-/// private DNS is off, unless `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` is `true`.
+/// The variable the AWS CLI and SDKs read for STS's endpoint, a VPC
+/// endpoint without private DNS for example.
+const STS_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_STS";
+
+/// Where to send the calls of one AWS API: `OMNIFOB_AWS_ENDPOINT`, else the
+/// service's own variable (`AWS_ENDPOINT_URL_SSO_OIDC`, `AWS_ENDPOINT_URL_SSO`,
+/// `AWS_ENDPOINT_URL_STS` or `AWS_ENDPOINT_URL_SIGNIN`), which points the AWS
+/// CLI at a VPC endpoint whose private DNS is off, unless
+/// `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` is `true`.
 /// The global `AWS_ENDPOINT_URL` is not read: it usually points the command
 /// `fob exec` runs at a local emulator, which cannot sign anyone in.
 pub(crate) fn service_endpoint(variable: &str) -> Option<String> {
@@ -217,9 +222,21 @@ fn oidc_client(region: &str) -> aws_sdk_ssooidc::Client {
     aws_sdk_ssooidc::Client::from_conf(config.build())
 }
 
+/// How many times a portal call is tried before a throttling or transient
+/// error fails it, against the SDK's default of three: `fob sync` lists the
+/// roles of every account, which throttles on organizations with hundreds.
+const PORTAL_MAX_ATTEMPTS: u32 = 8;
+
+/// The portal's client, with adaptive retries: besides backing off, the
+/// client slows down once Identity Center throttles it, as the AWS CLI's
+/// `retry_mode = adaptive` does.
 fn portal_client(region: &str) -> aws_sdk_sso::Client {
     let mut config = aws_sdk_sso::Config::builder()
         .region(aws_sdk_sso::config::Region::new(region.to_string()))
+        .retry_config(
+            aws_sdk_sso::config::retry::RetryConfig::adaptive()
+                .with_max_attempts(PORTAL_MAX_ATTEMPTS),
+        )
         .behavior_version(aws_sdk_sso::config::BehaviorVersion::latest());
     if let Some(url) = service_endpoint(PORTAL_ENDPOINT_VARIABLE) {
         config = config.endpoint_url(url);
@@ -507,7 +524,7 @@ pub async fn end_session(integration: &str, config: &AwsSsoConfig) -> anyhow::Re
         .access_token(&token.access_token)
         .send()
         .await
-        .map_err(|e| anyhow!("{}", DisplayErrorContext(&e)))?;
+        .map_err(|e| anyhow!("{}", describe(&e)))?;
     Ok(true)
 }
 
@@ -881,7 +898,9 @@ async fn list_roles(
         .map_err(|e| portal_error("listing accounts", e))?;
 
     let per_account = futures::stream::iter(accounts.iter().map(|account| async move {
-        let account_id = account.account_id().unwrap_or_default();
+        let account_id = account.account_id().ok_or_else(|| {
+            PortalError::Other(anyhow!("the portal listed an account without its ID"))
+        })?;
         let roles = portal
             .list_account_roles()
             .access_token(token)
@@ -898,8 +917,14 @@ async fn list_roles(
             account.account_name().unwrap_or(account_id).to_string(),
             roles
                 .iter()
-                .map(|r| r.role_name().unwrap_or_default().to_string())
-                .collect(),
+                .map(|r| {
+                    r.role_name().map(str::to_string).ok_or_else(|| {
+                        PortalError::Other(anyhow!(
+                            "the portal listed a role without its name in account {account_id}"
+                        ))
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
         ))
     }))
     .buffer_unordered(ROLE_LISTING_CONCURRENCY)
@@ -980,17 +1005,25 @@ pub async fn credentials(
     let mut put = |k: &str, v: &str| {
         env.insert(k.to_string(), v.to_string());
     };
+    let missing =
+        |what: &str| format!("IAM Identity Center returned role credentials without {what}");
     put(
         "AWS_ACCESS_KEY_ID",
-        creds.access_key_id().unwrap_or_default(),
+        creds
+            .access_key_id()
+            .with_context(|| missing("an access key ID"))?,
     );
     put(
         "AWS_SECRET_ACCESS_KEY",
-        creds.secret_access_key().unwrap_or_default(),
+        creds
+            .secret_access_key()
+            .with_context(|| missing("a secret access key"))?,
     );
     put(
         "AWS_SESSION_TOKEN",
-        creds.session_token().unwrap_or_default(),
+        creds
+            .session_token()
+            .with_context(|| missing("a session token"))?,
     );
     put("AWS_CREDENTIAL_EXPIRATION", &expires_at.to_string());
     if let Some(region) = &config.default_region {
@@ -1416,7 +1449,7 @@ pub(crate) fn sts_client(creds: &Credentials, region: &str) -> anyhow::Result<aw
         .region(aws_sdk_sts::config::Region::new(region.to_string()))
         .credentials_provider(provider)
         .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest());
-    if let Some(url) = endpoint_override() {
+    if let Some(url) = service_endpoint(STS_ENDPOINT_VARIABLE) {
         config = config.endpoint_url(url);
     }
     Ok(aws_sdk_sts::Client::from_conf(config.build()))
@@ -1429,7 +1462,7 @@ fn unsigned_sts_client(region: &str) -> aws_sdk_sts::Client {
     let mut config = aws_sdk_sts::Config::builder()
         .region(aws_sdk_sts::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest());
-    if let Some(url) = endpoint_override() {
+    if let Some(url) = service_endpoint(STS_ENDPOINT_VARIABLE) {
         config = config.endpoint_url(url);
     }
     aws_sdk_sts::Client::from_conf(config.build())
@@ -1486,6 +1519,13 @@ pub async fn check(integration: &str, config: &AwsSsoConfig) -> Result<String> {
     Ok(format!("session valid for {}", config.start_url))
 }
 
+/// STS refused the credentials a call was signed with, as expired
+/// (`ExpiredToken`) or unknown (`InvalidClientTokenId`, a revoked session):
+/// new ones may work where retrying these cannot.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CredentialsRejected(pub String);
+
 pub(crate) async fn assume_role(
     source: &Credentials,
     request: &RoleRequest<'_>,
@@ -1505,11 +1545,19 @@ pub(crate) async fn assume_role(
             .token_code(crate::prompt::mfa_code(serial, request.profile_id)?);
     }
     let assumed = call.send().await.map_err(|e| {
-        anyhow!(
+        let message = format!(
             "assuming {}: {}",
             request.role_arn,
             aws_sdk_sts::error::DisplayErrorContext(&e)
-        )
+        );
+        if matches!(
+            sts_code(e.code()),
+            Some("ExpiredToken" | "InvalidClientTokenId")
+        ) {
+            anyhow::Error::new(CredentialsRejected(message))
+        } else {
+            anyhow!(message)
+        }
     })?;
     from_sts(
         assumed.credentials().context("no credentials returned")?,
@@ -1764,8 +1812,8 @@ mod tests {
     #[tokio::test]
     async fn web_identity_tokens_are_requested_from_the_regional_endpoint() {
         assert!(
-            endpoint_override().is_none(),
-            "OMNIFOB_AWS_ENDPOINT must be unset for this test"
+            service_endpoint(STS_ENDPOINT_VARIABLE).is_none(),
+            "OMNIFOB_AWS_ENDPOINT and AWS_ENDPOINT_URL_STS must be unset for this test"
         );
         let mut creds = Credentials::default();
         for (k, v) in [
@@ -1804,8 +1852,8 @@ mod tests {
     #[tokio::test]
     async fn the_exchange_goes_to_the_destination_region_unsigned() {
         assert!(
-            endpoint_override().is_none(),
-            "OMNIFOB_AWS_ENDPOINT must be unset for this test"
+            service_endpoint(STS_ENDPOINT_VARIABLE).is_none(),
+            "OMNIFOB_AWS_ENDPOINT and AWS_ENDPOINT_URL_STS must be unset for this test"
         );
         let config = crate::Config::parse(
             r#"
