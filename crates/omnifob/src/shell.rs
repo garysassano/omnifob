@@ -231,7 +231,10 @@ mod tests {
             let err = export(shell, "p", &creds(&[("X;id", "v")]), &[])
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("not a valid environment variable name"), "{err}");
+            assert!(
+                err.contains("not a valid environment variable name"),
+                "{err}"
+            );
         }
     }
 

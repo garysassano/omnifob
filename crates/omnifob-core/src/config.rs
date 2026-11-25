@@ -56,21 +56,49 @@ impl AgentConfig {
 }
 
 /// Whether `id` matches `pattern`, in which `*` matches any run of characters
-/// other than `/`.
+/// other than `/`: both have the same number of `/`-separated segments, and
+/// each segment matches its pattern segment.
 fn matches_pattern(pattern: &str, id: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == id,
-        Some((literal, rest)) => {
-            let Some(after) = id.strip_prefix(literal) else {
-                return false;
-            };
-            // Let `*` take 0, 1, ... characters, up to the end of the segment.
-            let segment_end = after.find('/').unwrap_or(after.len());
-            (0..=segment_end)
-                .filter(|&n| after.is_char_boundary(n))
-                .any(|n| matches_pattern(rest, &after[n..]))
+    let (mut patterns, mut segments) = (pattern.split('/'), id.split('/'));
+    loop {
+        match (patterns.next(), segments.next()) {
+            (None, None) => return true,
+            (Some(p), Some(s)) if matches_segment(p.as_bytes(), s.as_bytes()) => {}
+            _ => return false,
         }
     }
+}
+
+/// Wildcard matching of one segment in at most `pattern × segment` steps,
+/// never exponential: on a mismatch only the last `*` seen takes one more
+/// character, since letting an earlier one take more cannot help. Comparing bytes is
+/// the same as comparing characters, since `*` is ASCII and a literal never
+/// starts inside another character's UTF-8 encoding.
+fn matches_segment(pattern: &[u8], segment: &[u8]) -> bool {
+    let (mut p, mut s) = (0, 0);
+    // The last `*` seen, and where in the segment its match ends.
+    let mut star: Option<(usize, usize)> = None;
+    while s < segment.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, s));
+                p += 1;
+            }
+            Some(&c) if c == segment[s] => {
+                p += 1;
+                s += 1;
+            }
+            _ => match star {
+                Some((star_p, star_s)) => {
+                    star = Some((star_p, star_s + 1));
+                    p = star_p + 1;
+                    s = star_s + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'*')
 }
 
 /// How to open a URL in one browser, or one profile of a browser, so that
@@ -2140,6 +2168,28 @@ mod tests {
         assert!(agent(&["acme/d*v/Ad*"]).allows("acme/dev/Admin"));
         assert!(agent(&["acme/dév/*"]).allows("acme/dév/Admin"));
         assert!(!agent(&[]).allows("acme/dev/Admin"));
+        assert!(agent(&["*"]).allows("x"));
+        assert!(!agent(&["*"]).allows("x/y"));
+        assert!(agent(&["a/**/c"]).allows("a//c"));
+        assert!(agent(&["a/*b*/c"]).allows("a/abba/c"));
+        assert!(!agent(&["a/*b*/c"]).allows("a/aaa/c"));
+        assert!(!agent(&["a/b"]).allows("a/b/c"));
+        assert!(!agent(&["a/b/c"]).allows("a/b"));
+    }
+
+    /// A pattern with many `*`s against a long near-miss would take years
+    /// with backtracking that tries every split.
+    #[test]
+    fn agent_patterns_never_backtrack_exponentially() {
+        let pattern = format!("{}b/x", "*a".repeat(30));
+        let id = format!("{}/x", "a".repeat(5000));
+        let agent = AgentConfig {
+            profiles: Some(vec![pattern.clone()]),
+        };
+        let started = std::time::Instant::now();
+        assert!(!agent.allows(&id));
+        assert!(agent.allows(&format!("{}b/x", "a".repeat(5000))));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
