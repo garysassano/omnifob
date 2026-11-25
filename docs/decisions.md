@@ -399,3 +399,11 @@ What it does not protect against:
 - The file names, which name integrations and profiles, as the DPAPI files on WSL do.
 
 There is no passphrase change or recovery yet: a forgotten passphrase means deleting the directory and signing in again. The vault is opt-in, and the native keychains stay the default wherever one exists.
+
+## 2026-11-25: CI checks Markdown, YAML and the shell script, and caches Cargo outside releases
+
+AGENTS.md asked for `biome format` and the repository has one shell script (`docs/tools/refresh.sh`), but nothing checked either, so a PR could drift from both. A `lint` job runs `biome check .` with the Biome version that `biome.json`'s `$schema` names (2.6.9), so the CLI and the config schema agree, and `shellcheck docs/tools/refresh.sh`. It runs only on the top PR of a stack, like the other jobs, since every layer's tree is in the top one.
+
+The `check` and `msrv` jobs restore and save Cargo's registry and `target/` with `Swatinem/rust-cache`, pinned by commit like every action, which shortens PR feedback. `build.yml`, which builds the release binaries that get provenance attestations, stays without any cache: a cache another workflow run wrote could put build output into a release that its attestation then vouches for. The release-build job in CI calls that same workflow, so it is uncached too.
+
+The end-to-end tests now cover every provider through the `fob` binary, against mocks of each provider's API set through the endpoint variables. Browser sign-ins are answered on fob's own loopback listener, as the browser would after the user approved, with `BROWSER` set so a headless Linux runner counts as having a display; they are skipped in containers, where fob signs in with a code instead. `--from-clipboard` is tested on Unix with a stand-in clipboard tool on `PATH`, and `fob exec --revoke` on SIGTERM and Ctrl-C (SIGINT to the process group) on Unix only, since Windows has neither signal.
