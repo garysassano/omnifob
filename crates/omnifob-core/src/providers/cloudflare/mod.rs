@@ -133,8 +133,8 @@ fn r2_s3_env(
     token: &str,
     r2_buckets: &[String],
 ) -> BTreeMap<String, String> {
-    use sha2::Digest;
-    let secret: String = sha2::Sha256::digest(token.as_bytes())
+    let secret: String = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, token.as_bytes())
+        .as_ref()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();

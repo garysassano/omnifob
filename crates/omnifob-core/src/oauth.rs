@@ -112,14 +112,14 @@ pub fn pkce() -> anyhow::Result<(String, String)> {
 
 /// The S256 challenge of a verifier: base64url of its SHA-256, unpadded.
 pub fn challenge(verifier: &str) -> String {
-    use sha2::Digest;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier))
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
 /// `bytes` random bytes as unpadded base64url, for verifiers and `state`.
 pub fn random_string(bytes: usize) -> anyhow::Result<String> {
     let mut buf = vec![0u8; bytes];
-    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("no system randomness: {e}"))?;
+    aws_lc_rs::rand::fill(&mut buf).map_err(|_| anyhow::anyhow!("no system randomness"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
 
@@ -565,6 +565,18 @@ mod tests {
         assert_eq!(describe_wait(Duration::from_secs(30)), "30 seconds");
         assert_eq!(describe_wait(Duration::from_secs(90)), "1 minute");
         assert_eq!(describe_wait(CALLBACK_TIMEOUT), "10 minutes");
+    }
+
+    /// The example of RFC 7636, appendix B.
+    #[test]
+    fn challenges_are_s256_as_rfc_7636_shows() {
+        assert_eq!(
+            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        let a = random_string(32).unwrap();
+        assert_eq!(a.len(), 43);
+        assert_ne!(a, random_string(32).unwrap());
     }
 
     #[tokio::test]

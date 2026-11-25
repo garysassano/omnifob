@@ -12,6 +12,18 @@ readme = "README.md"
 keywords = ["aws", "sso", "credentials", "keychain", "cli"]
 rust-version = "1.94.1"
 
+# Every crate opts in with `lints.workspace = true`. omnifob-core also denies
+# printing (`clippy::print_stdout`, `clippy::print_stderr`) in its `lib.rs`:
+# a library returns what it has to say, so nothing it holds can reach a
+# terminal or a log by accident.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 # Release binaries: thin LTO and one codegen unit make them smaller and a
 # little faster at the cost of a longer build; symbols are stripped. Panics
 # still unwind, so a panic prints its message and runs destructors.
