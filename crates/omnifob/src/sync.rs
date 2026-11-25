@@ -6,7 +6,7 @@ use dialoguer::console::Term;
 use jiff::Timestamp;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::SyncedProfiles;
-use omnifob_core::{Error, Profile, paths, providers};
+use omnifob_core::{Error, Integration, Profile, paths, providers};
 
 use crate::{App, agent, interactive, profiles_file};
 
@@ -23,26 +23,52 @@ impl App {
                 paths::config_file().display()
             );
         }
+        let integrations = names
+            .iter()
+            .map(|name| Ok((name.clone(), self.config.integration(name)?.clone())))
+            .collect::<anyhow::Result<Vec<(String, Integration)>>>()?;
         let before: Vec<Profile> = self
             .cache
             .integrations
             .values()
             .flat_map(|synced| synced.profiles.iter().cloned())
             .collect();
-        for name in &names {
-            let integration = self.config.integration(name)?.clone();
-            let profiles = self
-                .with_login(|| providers::discover(name, &integration))
-                .await
-                .with_context(|| format!("syncing '{name}'"))?;
-            eprintln!("fob: {name}: {} profiles", profiles.len());
-            self.cache.integrations.insert(
-                name.clone(),
-                SyncedProfiles {
-                    synced_at: Timestamp::now(),
-                    profiles,
+        // Every integration is discovered at once. The ones that need a new
+        // sign-in then sign in one at a time, since each may open a browser
+        // or ask in the terminal.
+        let discovered = futures::future::join_all(
+            integrations
+                .iter()
+                .map(|(name, integration)| providers::discover(name, integration)),
+        )
+        .await;
+        let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+        for ((name, integration), result) in integrations.iter().zip(discovered) {
+            let result = match result {
+                Err(Error::NeedsLogin {
+                    integration: login,
+                    reason,
+                }) if interactive() => match self.sign_in_again(&login, &reason).await {
+                    Ok(()) => providers::discover(name, integration)
+                        .await
+                        .map_err(anyhow::Error::from),
+                    Err(e) => Err(e),
                 },
-            );
+                other => other.map_err(anyhow::Error::from),
+            };
+            match result {
+                Ok(profiles) => {
+                    eprintln!("fob: {name}: {} profiles", profiles.len());
+                    self.cache.integrations.insert(
+                        name.clone(),
+                        SyncedProfiles {
+                            synced_at: Timestamp::now(),
+                            profiles,
+                        },
+                    );
+                }
+                Err(e) => failures.push((name.clone(), e)),
+            }
         }
         // Drop profiles of integrations removed from the config.
         self.cache
@@ -54,7 +80,22 @@ impl App {
             &before,
             self.cache.integrations.values().flat_map(|s| &s.profiles),
         );
-        Ok(())
+        // The integrations that synced are saved; the others keep their old
+        // profiles and are reported last, so none of them scrolls away.
+        match failures.as_slice() {
+            [] => Ok(()),
+            [(name, e)] => Err(anyhow::anyhow!("syncing '{name}': {e:#}")),
+            _ => {
+                for (name, e) in &failures {
+                    eprintln!("fob: syncing '{name}': {e:#}");
+                }
+                bail!(
+                    "{} of {} integrations did not sync",
+                    failures.len(),
+                    integrations.len()
+                )
+            }
+        }
     }
 
     /// Discovers the profiles of integrations never synced. One that cannot
@@ -73,9 +114,19 @@ impl App {
         if missing.is_empty() {
             return Ok(skipped);
         }
-        for name in &missing {
-            let integration = self.config.integration(name)?.clone();
-            match providers::discover(name, &integration).await {
+        let integrations = missing
+            .iter()
+            .map(|name| self.config.integration(name))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let discovered = futures::future::join_all(
+            missing
+                .iter()
+                .zip(&integrations)
+                .map(|(name, integration)| providers::discover(name, integration)),
+        )
+        .await;
+        for (name, result) in missing.iter().zip(discovered) {
+            match result {
                 Ok(profiles) => {
                     eprintln!("fob: {name}: {} profiles", profiles.len());
                     self.cache.integrations.insert(

@@ -1926,6 +1926,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dialoguer",
+ "futures",
  "jiff",
  "libc",
  "omnifob-core",
