@@ -241,6 +241,7 @@ fn describe(
         SignIn::Token => match integration {
             Integration::Cloudflare(_) => "signed in (bootstrap token)".to_string(),
             Integration::AwsIam(_) => "signed in (access key)".to_string(),
+            Integration::Command(_) => "runs a program; nothing stored".to_string(),
             Integration::Gcp(_) | Integration::Azure(_) => match account {
                 Some(email) => format!("signed in as {email}, renews automatically"),
                 None => "signed in".to_string(),

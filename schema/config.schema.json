@@ -177,6 +177,21 @@
         }
       ]
     },
+    "CommandFormat": {
+      "description": "What a `command` integration's program prints.",
+      "oneOf": [
+        {
+          "const": "omnifob",
+          "description": "`{\"env\": {\"NAME\": \"value\", ...}, \"expires_at\": \"<RFC 3339>\"}`, with\n`expires_at` optional; other keys are ignored.",
+          "type": "string"
+        },
+        {
+          "const": "credential-process",
+          "description": "The AWS `credential_process` format (`Version` 1, `AccessKeyId`,\n`SecretAccessKey`, optional `SessionToken`, `Expiration` and\n`AccountId`), exported as the AWS variables.",
+          "type": "string"
+        }
+      ]
+    },
     "ContainerColor": {
       "description": "The colours Firefox containers come in, as Granted Containers takes them.",
       "enum": [
@@ -332,11 +347,15 @@
           "type": "string"
         },
         "duration": {
-          "description": "Session length, 15 minutes to 1 hour (STS counts a role assumed with\nthe user's `GetSessionToken` session as role chaining, which it caps\nat one hour); defaults to one hour.",
+          "description": "Session length, 15 minutes to 1 hour (STS counts a role assumed with\nthe user's `GetSessionToken` session as role chaining, which it caps\nat one hour), or to 12 hours with `no_session`; defaults to one hour.",
           "type": "string"
         },
         "external_id": {
           "type": "string"
+        },
+        "no_session": {
+          "description": "Assume the role with the access key itself rather than the user's\nsession, as aws-vault's `--no-session` does: not role chaining, so\n`duration` may be up to 12 hours (and up to the role's maximum\nsession duration). The user's `mfa_serial` code is then asked for\neach new session of this role, and the key signs each `AssumeRole`.",
+          "type": "boolean"
         },
         "region": {
           "description": "Region exported for this role; defaults to the integration's.",
@@ -480,6 +499,14 @@
             "region": {
               "description": "The Region signed in through; the refresh token works only there. It\nis also exported as `AWS_REGION` unless `default_region` is set.",
               "type": "string"
+            },
+            "roles": {
+              "additionalProperties": {
+                "$ref": "#/definitions/LoginRole"
+              },
+              "default": {},
+              "description": "Roles assumed with the console sign-in's credentials, keyed by a\nlabel that becomes the middle of the profile id. STS counts these as\nrole chaining, so they last at most an hour.",
+              "type": "object"
             },
             "type": {
               "const": "aws-login",
@@ -747,6 +774,64 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An external program that prints credentials (`type = \"command\"`), such\nas saml2aws, gimme-aws-creds, okta-aws-cli, AWS IAM Roles Anywhere's\n`credential_process` helper or an in-house script. It is run without a\nshell, its stderr passes through to the terminal (so it can prompt or\nreport), and its stdout is read as credentials: omnifob's own JSON\n(`{\"env\": {...}, \"expires_at\": \"<RFC 3339>\"}`, as `fob creds` prints)\nor the AWS `credential_process` format. Credentials with an expiry are\ncached until then; credentials without one are fetched for each use.",
+          "properties": {
+            "account": {
+              "description": "Middle segment of the profile id; defaults to \"default\".",
+              "type": "string"
+            },
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's consoles open in;\nby default the system's.",
+              "type": "string"
+            },
+            "command": {
+              "description": "The program and its arguments, run without a shell. The program is a\nname looked up on `PATH`, an absolute path or one under `~/`.\n`{ttl_seconds}` in an argument becomes the lifetime asked for, which\nneeds `ttl`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "console": {
+              "description": "URL `fob console` opens; there is none by default.",
+              "type": "string"
+            },
+            "format": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CommandFormat"
+                }
+              ],
+              "description": "What the program prints: `omnifob` (the default) or\n`credential-process`."
+            },
+            "name": {
+              "description": "Last segment of the profile id; defaults to the program's file name.",
+              "type": "string"
+            },
+            "region": {
+              "description": "Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` with\n`credential-process` output.",
+              "type": "string"
+            },
+            "timeout": {
+              "description": "How long the program may run before it is stopped, 1 second to 10\nminutes; defaults to 2 minutes, enough for a browser sign-in.",
+              "type": "string"
+            },
+            "ttl": {
+              "description": "The lifetime to ask the program for, which makes it take `--ttl` and\n`[agent] max_ttl`: passed as `{ttl_seconds}` in `command` and as\n`OMNIFOB_TTL_SECONDS` in its environment. Unset, the program picks\nthe lifetime and `--ttl` is refused.",
+              "type": "string"
+            },
+            "type": {
+              "const": "command",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "command"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -764,6 +849,38 @@
           "type": "string"
         }
       ]
+    },
+    "LoginRole": {
+      "additionalProperties": false,
+      "description": "A role assumed with the credentials of a console sign-in\n(`[integrations.<name>.roles.<label>]` of an `aws-login` integration).",
+      "properties": {
+        "duration": {
+          "description": "Session length, 15 minutes to 1 hour (AWS caps role-chaining\nsessions at one hour); defaults to one hour.",
+          "type": "string"
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "mfa_serial": {
+          "description": "MFA device the role's trust policy requires; a code is asked for\neach new session.",
+          "type": "string"
+        },
+        "region": {
+          "description": "Region exported for this role; defaults to the integration's.",
+          "type": "string"
+        },
+        "role_arn": {
+          "type": "string"
+        },
+        "session_name": {
+          "description": "`RoleSessionName`; defaults to \"omnifob\", or \"omnifob-agent\" for\nsessions a coding agent starts.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role_arn"
+      ],
+      "type": "object"
     },
     "SigningAlgorithm": {
       "description": "The algorithm `GetWebIdentityToken` signs the token with\n(`SigningAlgorithm`).",

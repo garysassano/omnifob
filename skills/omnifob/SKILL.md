@@ -40,6 +40,7 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 - "the default profile of ... is not a profile": the user's `[directories]` entry is stale; tell them, and name a profile from `fob list`.
 - "is not open to agents": the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
 - "needs a code from the MFA device": ask the user to run the `fob exec ... -- true` command it names in their terminal, then retry.
+- "the encrypted vault ... is locked": the user keeps secrets in an encrypted vault that has not been unlocked since boot. Ask them to run any `fob` command (`fob status`) in their terminal to enter the passphrase, then retry; never ask for the passphrase or set `OMNIFOB_VAULT_PASSPHRASE` yourself.
 - `fob login` printing a URL and a code instead of opening a browser: this session looks remote, in a container or (on Linux) without a display. Pass both to the user to approve on any device, and keep the command running until it returns.
 - "parsing .../config.toml" followed by a key (`chained.prod: duration must be...`): the config is invalid. Tell the user which key and why; do not edit the config yourself.
 - "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.

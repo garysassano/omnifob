@@ -8,6 +8,7 @@ mod aws;
 mod azure;
 mod browser;
 mod cloudflare;
+mod command;
 mod edit;
 mod gcp;
 mod token;
@@ -17,6 +18,7 @@ pub use self::aws::*;
 pub use self::azure::*;
 pub use self::browser::*;
 pub use self::cloudflare::*;
+pub use self::command::*;
 pub use self::edit::*;
 pub use self::gcp::*;
 pub use self::token::*;
@@ -65,6 +67,7 @@ pub enum Integration {
     /// Either Cloudflare type; `CloudflareConfig::sign_in` says which.
     Cloudflare(CloudflareConfig),
     Token(TokenConfig),
+    Command(CommandConfig),
 }
 
 impl Integration {
@@ -80,6 +83,7 @@ impl Integration {
                 CloudflareSignIn::Oauth => "cloudflare-oauth",
             },
             Integration::Token(_) => "token",
+            Integration::Command(_) => "command",
         }
     }
 
@@ -93,6 +97,7 @@ impl Integration {
             Integration::Azure(c) => c.browser.as_deref(),
             Integration::Cloudflare(c) => c.browser.as_deref(),
             Integration::Token(c) => c.browser.as_deref(),
+            Integration::Command(c) => c.browser.as_deref(),
         }
     }
 }
@@ -124,6 +129,7 @@ enum RawIntegration {
     CloudflareToken(CloudflareConfig),
     CloudflareOauth(CloudflareConfig),
     Token(TokenConfig),
+    Command(CommandConfig),
 }
 
 impl TryFrom<RawIntegration> for Integration {
@@ -151,6 +157,10 @@ impl TryFrom<RawIntegration> for Integration {
             RawIntegration::Token(c) => {
                 c.validate()?;
                 Integration::Token(c)
+            }
+            RawIntegration::Command(c) => {
+                c.validate()?;
+                Integration::Command(c)
             }
             RawIntegration::CloudflareToken(c) => {
                 if c.client_id.is_some() || c.scopes.is_some() {

@@ -743,6 +743,120 @@ async fn a_directory_picks_its_default_profile() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_command_integration_runs_its_program_and_caches_by_expiry() {
+    let (fob, server) = synced_portal("command").await;
+    // `fob creds` itself is the helper: it runs on every platform and
+    // prints the AWS credential_process format.
+    let mut config = portal_config("acme");
+    config.push_str(&format!(
+        "\n[integrations.wrapped]\ntype = \"command\"\ncommand = ['{FOB}', \"creds\", \"acme/prod/Admin\", \"--format\", \"credential-process\", \"--no-cache\"]\nformat = \"credential-process\"\nregion = \"eu-west-1\"\n"
+    ));
+    fob.write_config(&config);
+    let stderr = fob.ok(&["login", "wrapped"]).1;
+    assert!(stderr.contains("has nothing to sign in to"), "{stderr}");
+    let (list, _) = fob.ok(&["list", "wrapped"]);
+    assert!(list.contains("wrapped/default/fob"), "{list}");
+    let fetches = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/federation/credentials")
+            .count()
+    };
+    let before = fetches().await;
+    for _ in 0..2 {
+        let (stdout, _) = fob.ok(&["creds", "wrapped/default/fob"]);
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["env"]["AWS_ACCESS_KEY_ID"], "ASIA222222222222");
+        assert_eq!(value["env"]["AWS_ACCOUNT_ID"], "222222222222");
+        assert_eq!(value["env"]["AWS_REGION"], "eu-west-1");
+        assert_eq!(value["expires_at"], "2100-01-01T00:00:00Z");
+    }
+    // The program ran once; the second call came from the cache.
+    assert_eq!(fetches().await, before + 1);
+    let stderr = fob.fails(&["creds", "wrapped/default/fob", "--ttl", "30m"]);
+    assert!(stderr.contains("set `ttl` on 'wrapped'"), "{stderr}");
+}
+
+#[test]
+fn the_encrypted_vault_keeps_secrets_sealed_with_a_passphrase() {
+    let fob = Fob::new("vault");
+    fob.write_config(
+        "[integrations.t]\ntype = \"token\"\n[integrations.t.secrets]\nkey = [\"MY_KEY\"]\n",
+    );
+    let vault = fob.root.join("vault");
+    let run = |args: &[&str], passphrase: Option<&str>, stdin: Option<&str>| {
+        use std::io::Write;
+        let mut cmd = fob.command(args);
+        cmd.env(
+            "OMNIFOB_KEYRING",
+            format!("encrypted-file:{}", vault.display()),
+        )
+        .env("OMNIFOB_VAULT_KEY_CACHE", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        if let Some(p) = passphrase {
+            cmd.env("OMNIFOB_VAULT_PASSPHRASE", p);
+        }
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.unwrap_or_default().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let pass = Some("a vault passphrase");
+    let output = run(
+        &["login", "t", "--token-stdin"],
+        pass,
+        Some("vault-secret-123"),
+    );
+    assert!(output.status.success(), "{:?}", texts(&output));
+    let output = run(&["creds", "t/default/token"], pass, None);
+    assert!(output.status.success(), "{:?}", texts(&output));
+    assert!(texts(&output).0.contains("vault-secret-123"));
+    let names = entries(&vault);
+    assert!(names.contains(&"vault.json".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"token%2Ft%2Fsecrets.sealed".to_string()),
+        "{names:?}"
+    );
+    for name in &names {
+        let bytes = std::fs::read(vault.join(name)).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("vault-secret"),
+            "{name}"
+        );
+    }
+    let status = texts(&run(&["status"], pass, None)).0;
+    assert!(
+        status.contains("files encrypted with a passphrase in"),
+        "{status}"
+    );
+
+    let stderr = texts(&run(
+        &["creds", "t/default/token"],
+        Some("another passphrase"),
+        None,
+    ))
+    .1;
+    assert!(stderr.contains("wrong passphrase"), "{stderr}");
+    // Without a terminal or a passphrase, the vault stays locked.
+    let output = run(&["creds", "t/default/token"], None, None);
+    assert!(!output.status.success());
+    assert!(
+        texts(&output).1.contains("is locked"),
+        "{:?}",
+        texts(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn exec_tells_its_own_failures_from_the_command() {
     let (fob, _server) = synced_portal("exec-status").await;
     let status = |args: &[&str]| fob.run(args).status.code();

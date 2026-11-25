@@ -89,6 +89,20 @@ impl App {
             );
         }
         match integration {
+            Integration::Command(config) => {
+                if token_stdin || from_clipboard {
+                    bail!("'{name}' runs a program for its credentials; it takes no token");
+                }
+                eprintln!(
+                    "fob: '{name}' has nothing to sign in to: it runs {} whenever its credentials are needed",
+                    config
+                        .command
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                );
+                return Ok(());
+            }
             Integration::AwsSso(config) => {
                 if token_stdin || from_clipboard {
                     bail!("'{name}' signs in through IAM Identity Center; it takes no token");

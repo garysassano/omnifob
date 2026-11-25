@@ -94,8 +94,18 @@ pub(crate) fn export_aws_config(
                 return Some((p.id.clone(), region));
             }
             if let Integration::AwsLogin(c) = integration {
-                let region = c.default_region.as_deref().unwrap_or(&c.region);
-                return Some((p.id.clone(), region.to_string()));
+                let region = match &p.target {
+                    omnifob_core::Target::AwsLoginRole { label, .. } => {
+                        c.roles.get(label).and_then(|r| r.region.clone())
+                    }
+                    _ => None,
+                }
+                .or_else(|| c.default_region.clone())
+                .unwrap_or_else(|| c.region.clone());
+                return Some((p.id.clone(), region));
+            }
+            if let Integration::Command(c) = integration {
+                return Some((p.id.clone(), c.region.clone()?));
             }
             let Integration::AwsSso(c) = integration else {
                 return None;

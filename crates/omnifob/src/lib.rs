@@ -121,11 +121,27 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // answer. Nothing has used the library yet, so the install takes.
     let mut context = omnifob_core::Context::builder_from_env().agent(agent::context_agent());
     if interactive() {
-        context = context.mfa_prompt(|serial| {
-            Ok(dialoguer::Input::<String>::new()
-                .with_prompt(format!("MFA code for {serial}"))
-                .interact_text_on(&Term::stderr())?)
-        });
+        context = context
+            .mfa_prompt(|serial| {
+                Ok(dialoguer::Input::<String>::new()
+                    .with_prompt(format!("MFA code for {serial}"))
+                    .interact_text_on(&Term::stderr())?)
+            })
+            .passphrase_prompt(|request| {
+                let vault = request.vault.display();
+                let mut prompt = dialoguer::Password::new();
+                if request.new {
+                    eprintln!(
+                        "fob: creating an encrypted vault in {vault}; it opens only with this passphrase, which omnifob cannot recover"
+                    );
+                    prompt = prompt
+                        .with_prompt("New vault passphrase")
+                        .with_confirmation("Repeat it", "the passphrases differ");
+                } else {
+                    prompt = prompt.with_prompt(format!("Passphrase for the vault in {vault}"));
+                }
+                Ok(prompt.interact_on(&Term::stderr())?)
+            });
     }
     if context.build().install().is_err() {
         tracing::debug!("the library's context was already chosen");

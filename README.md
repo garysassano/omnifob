@@ -117,6 +117,11 @@ role_arn = "arn:aws:iam::222222222222:role/Admin"
 duration = "45m"               # optional, 15m to 1h (default 1h)
 console_duration = "8h"        # optional: `fob console` session length, 15m to 12h
 
+[integrations.legacy.roles.batch]  # profile id: legacy/batch/Batch
+role_arn = "arn:aws:iam::222222222222:role/Batch"
+no_session = true              # assumed with the key itself, as aws-vault --no-session:
+duration = "12h"               # up to 12h, with an MFA code for each new session
+
 # Console credentials, as `aws login` gets them: the browser picks a console
 # session (an IAM user, root or a federated role), and no access key is stored.
 # Profile id: console/<account ID>/<user, root or role name>.
@@ -124,6 +129,10 @@ console_duration = "8h"        # optional: `fob console` session length, 15m to 
 type = "aws-login"
 region = "eu-central-1"        # the Region signed in through; also AWS_REGION
 default_region = "eu-west-1"   # optional: AWS_REGION instead of region
+
+[integrations.console.roles.audit]  # profile id: console/audit/Audit, assumed with the
+role_arn = "arn:aws:iam::333333333333:role/Audit"   # console credentials: role chaining,
+duration = "1h"                # so 15m to 1h (default 1h)
 
 # A Google account, signed in like `gcloud auth login` (with gcloud's OAuth client).
 # Profile ids: google/<project>/user, and google/<label>/<name> per service account.
@@ -195,6 +204,21 @@ A `secrets` table replaces the preset's secrets and the fixed variables that com
 `fob login` and `fob check` check the token with the provider where it has a call for that: a bearer token for most presets, Scaleway's secret key in `X-Auth-Token` (looking up its own access key, as `scw init` does), and Upstash's API key with `UPSTASH_EMAIL` as HTTP Basic credentials. A token the provider refuses (401 or 403) is reported as rejected; a provider that cannot be reached or answers 5xx is reported as not checked, so try again later. Fly.io tokens are not checked, since Fly.io has no call that every token, app-scoped deploy tokens included, may make.
 
 `fob login <name>` asks for each secret. An integration with a single secret also takes it from the clipboard (`--from-clipboard`, which refuses an empty clipboard, text with whitespace and URLs) or from stdin (`--token-stdin`).
+
+Any program that prints credentials becomes a profile with `type = "command"`: saml2aws, gimme-aws-creds, okta-aws-cli, IAM Roles Anywhere's `credential_process` helper or an in-house script.
+
+```toml
+[integrations.okta]
+type = "command"
+command = ["okta-aws-cli", "web", "--format", "process-credentials", "--session-duration", "{ttl_seconds}"]
+format = "credential-process"   # the AWS credential_process JSON; default "omnifob"
+ttl = "1h"                      # optional: what {ttl_seconds} and OMNIFOB_TTL_SECONDS ask for
+region = "eu-west-1"            # optional, with credential-process: AWS_REGION
+timeout = "5m"                  # optional, 1s to 10m (default 2m)
+account = "prod"                # optional: profile id okta/prod/okta-aws-cli
+```
+
+The program runs without a shell, so arguments need no quoting and nothing in them is expanded; it is a name on `PATH`, an absolute path or one under `~/`. It keeps the terminal's stdin and stderr, so it can prompt and report, gets `OMNIFOB_PROFILE`, and is stopped after `timeout`. Its stdout is read as omnifob's JSON (`{"env": {"NAME": "value"}, "expires_at": "<RFC 3339>"}`, as `fob creds` prints it; `expires_at` is optional) or, with `format = "credential-process"`, the AWS format, which makes an AWS profile. Credentials with an expiry are cached until five minutes before it; credentials without one are fetched for every use. omnifob never prints the program's output, not even when it cannot read it. Without `ttl`, the program chooses the lifetime and `--ttl` is refused; with it, `--ttl` and `[agent] max_ttl` change what is asked for. `fob login` has nothing to do for these integrations, and `fob check` runs the program once.
 
 ### Browsers
 
@@ -417,6 +441,8 @@ appends one JSON line to `~/.local/state/omnifob/audit.jsonl` for every credenti
 ## Where secrets live
 
 SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentials are kept in the OS keychain under the service `omnifob`: Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux. Where no Secret Service runs (WSL, servers), the kernel keyring is used, straight away when there is no D-Bus session bus; it forgets everything on reboot. On WSL, long-lived secrets are therefore also written to `~/.local/state/omnifob/vault`, encrypted with Windows DPAPI for your Windows user, and restored after a reboot (`OMNIFOB_WSL_DPAPI=0` turns this off). `OMNIFOB_KEYRING` forces a store; `fob status` shows which one is in use.
+
+On a machine without a keychain that survives reboots (a headless Linux server, a container with a mounted state directory), `OMNIFOB_KEYRING=encrypted-file` keeps the secrets in files encrypted with a passphrase instead, in `~/.local/state/omnifob/encrypted` (or `encrypted-file:<absolute dir>`). The first command that stores a secret asks for a new passphrase (at least 12 characters), and the passphrase is asked again only after a reboot: the key derived from it is kept in the kernel keyring until then (`OMNIFOB_VAULT_KEY_CACHE=0` asks every time). Scripts and services pass it in `OMNIFOB_VAULT_PASSPHRASE`. Each secret is encrypted with AES-256-GCM under a key derived with PBKDF2-HMAC-SHA256 (600,000 iterations); the passphrase cannot be recovered, and forgetting it means signing in to every integration again after deleting the directory. What this protects against, and what not, is in [docs/decisions.md](docs/decisions.md).
 
 Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json` (`$XDG_STATE_HOME/omnifob`). Without a home directory, set `XDG_STATE_HOME` and `OMNIFOB_CONFIG` (or `XDG_CONFIG_HOME`): omnifob then refuses to start rather than keep its files in the current directory. If it cannot be read, `fob sync` and `fob login` start over from no profiles and rewrite it, and `fob status` and `fob logout` carry on with a warning. On Linux and macOS the state directory and the vault are readable by you only (`0700`, files `0600`), and every file in them is replaced atomically, so a concurrent `fob` never reads half of one.
 

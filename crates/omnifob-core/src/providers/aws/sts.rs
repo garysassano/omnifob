@@ -34,6 +34,10 @@ pub(crate) const SESSION_MIN: SignedDuration = SignedDuration::from_mins(15);
 /// AWS caps sessions of roles assumed with role credentials at one hour.
 pub(crate) const CHAINED_MAX: SignedDuration = SignedDuration::from_hours(1);
 
+/// The longest role session AWS allows, when the role's maximum session
+/// duration allows it.
+pub(crate) const ROLE_MAX: SignedDuration = SignedDuration::from_hours(12);
+
 /// An STS `AssumeRole` call.
 pub(crate) struct RoleRequest<'a> {
     pub role_arn: &'a str,

@@ -437,3 +437,81 @@ async fn sts_calls_follow_aws_endpoint_url_sts() {
     let result = aws::iam::login("sts-endpoint", &config, "AKIAEXAMPLE", "secret").await;
     assert_eq!(result.unwrap(), "arn:aws:iam::123456789012:user/me");
 }
+
+#[tokio::test]
+async fn a_no_session_role_is_assumed_with_the_key_for_up_to_twelve_hours() {
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let (_guard, server) = setup_counting_prompts(prompts.clone()).await;
+    let text = r#"
+        [integrations.legacy]
+        type = "aws-iam"
+        region = "eu-west-1"
+        mfa_serial = "arn:aws:iam::123456789012:mfa/me"
+
+        [integrations.legacy.roles.prod]
+        role_arn = "arn:aws:iam::222222222222:role/Deploy"
+        duration = "12h"
+        no_session = true
+        "#;
+    let config = integration(&Config::parse(text).unwrap(), "legacy");
+    login(&server, "nosession", &config).await;
+    // No session is started: the key signs AssumeRole and sends the code.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetSessionToken"))
+        .respond_with(sts("GetSessionToken", &temporary("ASIASESSION")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=AssumeRole"))
+        .and(body_string_contains("DurationSeconds=43200"))
+        .and(body_string_contains("SerialNumber=arn%3Aaws%3Aiam%3A%3A123456789012%3Amfa%2Fme"))
+        .and(body_string_contains("TokenCode=654321"))
+        .and(header_regex("authorization", "Credential=AKIAEXAMPLE/"))
+        .respond_with(sts(
+            "AssumeRole",
+            &format!(
+                "{}<AssumedRoleUser><AssumedRoleId>AROA:omnifob</AssumedRoleId><Arn>arn:aws:sts::222222222222:assumed-role/Deploy/omnifob</Arn></AssumedRoleUser>",
+                temporary("ASIAROLE")
+            ),
+        ))
+        .expect(2)
+        .mount(&server)
+        .await;
+    for _ in 0..2 {
+        let creds =
+            aws::iam::role_credentials("nosession", &config, "prod", "nosession/prod/Deploy", None)
+                .await
+                .unwrap();
+        assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAROLE");
+    }
+    // Each new session of the role asks for a code.
+    assert_eq!(prompts.load(Ordering::SeqCst), 2);
+    let err = aws::iam::role_credentials(
+        "nosession",
+        &config,
+        "prod",
+        "nosession/prod/Deploy",
+        Some(jiff::SignedDuration::from_hours(13)),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("15 minutes to 12 hours"), "{err}");
+
+    for (role, message) in [
+        (
+            "duration = \"13h\"\nno_session = true",
+            "between 15m and 12h",
+        ),
+        ("duration = \"2h\"", "set no_session = true"),
+    ] {
+        let text = format!(
+            "[integrations.x]\ntype = \"aws-iam\"\n[integrations.x.roles.prod]\nrole_arn = \"arn:aws:iam::222222222222:role/Deploy\"\n{role}\n"
+        );
+        let error = format!("{:#}", Config::parse(&text).unwrap_err());
+        assert!(error.contains(message), "{role}: {error}");
+    }
+}

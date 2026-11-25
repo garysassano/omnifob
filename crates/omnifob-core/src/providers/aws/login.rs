@@ -554,22 +554,87 @@ pub async fn credentials(
     })
 }
 
-/// The one profile: the signed-in console identity, named after it
-/// (`<user>`, `root`, or the role name of an assumed role).
+/// The signed-in console identity, named after it (`<user>`, `root`, or
+/// the role name of an assumed role), and one profile per configured role.
 pub fn discover(integration: &str, config: &AwsLoginConfig) -> Result<Vec<Profile>> {
     let session = load(integration)?;
     let account = config
         .account
         .clone()
         .unwrap_or_else(|| session.account_id.clone());
-    Ok(vec![Profile::new(
+    let mut profiles = vec![Profile::new(
         integration,
         &account,
         &slug(identity_name(&session.login_session)),
         Target::AwsLogin {
             account_id: session.account_id,
         },
-    )])
+    )];
+    for (label, role) in &config.roles {
+        let profile = Profile::new(
+            integration,
+            label,
+            role.role_name(),
+            Target::AwsLoginRole {
+                label: label.clone(),
+                account_id: role.account_id().map(str::to_string),
+            },
+        );
+        if profile.id == profiles[0].id {
+            return Err(anyhow::anyhow!(
+                "the role '{label}' of '{integration}' would be {}, the signed-in identity's profile; give it another label in [integrations.{integration}.roles]",
+                profile.id
+            )
+            .into());
+        }
+        profiles.push(profile);
+    }
+    Ok(profiles)
+}
+
+/// A role assumed with the console sign-in's credentials, which STS counts
+/// as role chaining: 15 minutes to an hour. `ttl` overrides its `duration`.
+pub async fn role_credentials(
+    integration: &str,
+    config: &AwsLoginConfig,
+    label: &str,
+    profile_id: &str,
+    ttl: Option<jiff::SignedDuration>,
+) -> Result<Credentials> {
+    use super::sts::{self, CHAINED_MAX, RoleRequest, SESSION_MIN};
+    let role = config.roles.get(label).ok_or_else(|| {
+        anyhow::anyhow!("no role '{label}' in integration '{integration}'; run `fob sync`")
+    })?;
+    let duration = ttl.or(role.duration).unwrap_or(CHAINED_MAX);
+    if !(SESSION_MIN..=CHAINED_MAX).contains(&duration) {
+        return Err(anyhow::anyhow!(
+            "a role assumed with console sign-in credentials lasts 15 minutes to 1 hour: STS counts it as role chaining"
+        )
+        .into());
+    }
+    let request = RoleRequest {
+        role_arn: &role.role_arn,
+        session_name: role.session_name.as_deref(),
+        external_id: role.external_id.as_deref(),
+        mfa_serial: role.mfa_serial.as_deref(),
+        duration,
+        profile_id,
+    };
+    let region = role
+        .region
+        .as_deref()
+        .or(config.default_region.as_deref())
+        .unwrap_or(&config.region);
+    let source = credentials(integration, config, false).await?;
+    match sts::assume_role(&source, &request, &config.region, Some(region)).await {
+        // Kept credentials STS no longer takes: renew them once.
+        Err(e) if e.downcast_ref::<sts::CredentialsRejected>().is_some() => {
+            tracing::debug!("renewing the console sign-in's credentials: {e:#}");
+            let source = credentials(integration, config, true).await?;
+            Ok(sts::assume_role(&source, &request, &config.region, Some(region)).await?)
+        }
+        result => Ok(result?),
+    }
 }
 
 /// A short name for an identity ARN: the user name of `user/…/name`, the

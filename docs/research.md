@@ -40,7 +40,8 @@ Each was read from a shallow clone of its repository.
 - Refreshes 15 minutes before expiry (matching the AWS CLI). A refresh token is single use, so on a failed refresh it re-reads the cache before deleting anything, in case another process refreshed first.
 - A 401 from GetRoleCredentials drops the cached token and retries once.
 - `exec`, `export`, `login` (console) and a local ECS/EC2 metadata server.
-- **Taken:** the refresh window, the default scope, 401 handling.
+- `--no-session` assumes a role with the access key itself instead of a `GetSessionToken` session, so the role is not chained and may last up to 12 hours, at the cost of an MFA code per role session.
+- **Taken:** the refresh window, the default scope, 401 handling, and `--no-session` as `no_session = true` on an `aws-iam` role.
 
 ### Leapp (Noovolari/leapp, TypeScript)
 
@@ -110,7 +111,7 @@ The 15 tools marked "to study" in [tools/](tools/README.md), read for the specif
 
 ### Extensibility and multi-tool patterns
 
-- **awsume**: a plugin system (pluggy hooks) for collecting profiles and fetching credentials. A lighter equivalent for omnifob: a `command` integration, where any program that prints credentials as JSON becomes a profile, covering saml2aws, gimme-aws-creds and in-house scripts without in-process plugins.
+- **awsume**: a plugin system (pluggy hooks) for collecting profiles and fetching credentials. A lighter equivalent for omnifob: a `command` integration, where any program that prints credentials as JSON becomes a profile, covering saml2aws, gimme-aws-creds and in-house scripts without in-process plugins. **Taken:** `type = "command"`, reading omnifob's JSON or the AWS `credential_process` format, the latter as the AWS SDKs read it (`Version` 1, `Expiration` optional, `AccountId` as in the CLI's newer output).
 - **secretenv**: a "three-file model": the repository commits only alias names, and each machine maps aliases to real backends. For omnifob this solves naming a profile from a project, since profile ids contain each person's own integration names.
 - **gh**: several accounts per host with `gh auth switch`; `gh auth token` for other tools; acts as git's credential helper.
 - **Azure Developer CLI**: can hand sign-in to `az` (`auth.useAzCliAuth`) instead of duplicating it; supports letting official CLIs own sign-in for Azure and Google.

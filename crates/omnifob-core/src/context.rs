@@ -28,6 +28,20 @@ use crate::store::{self, Keychain};
 /// Asks for a code from the MFA device whose ARN it is given.
 pub type MfaPrompt = dyn Fn(&str) -> anyhow::Result<String> + Send + Sync;
 
+/// Asks for the passphrase of the encrypted file vault
+/// (`OMNIFOB_KEYRING=encrypted-file`); see [`PassphraseRequest`].
+pub type PassphrasePrompt = dyn Fn(&PassphraseRequest) -> anyhow::Result<String> + Send + Sync;
+
+/// What a [`PassphrasePrompt`] is asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassphraseRequest {
+    /// The vault's directory.
+    pub vault: PathBuf,
+    /// Whether the vault is being created, so the passphrase is new: a
+    /// prompt should ask for it twice.
+    pub new: bool,
+}
+
 /// See the [module](self) documentation. Cloning is cheap: clones share
 /// the keychain, the HTTP client and its connections.
 #[derive(Clone)]
@@ -47,8 +61,29 @@ struct Inner {
     /// runtime that opened it.
     http: Option<reqwest::Client>,
     mfa: Option<Box<MfaPrompt>>,
+    vault: VaultUnlock,
     endpoints: Endpoints,
     agent: Option<Agent>,
+}
+
+/// How the encrypted file vault gets its key: a passphrase given up front
+/// (`OMNIFOB_VAULT_PASSPHRASE`), else the prompt, and whether the derived
+/// key is kept in the kernel keyring until reboot.
+#[derive(Clone)]
+pub(crate) struct VaultUnlock {
+    pub(crate) passphrase: Option<String>,
+    pub(crate) prompt: Option<Arc<PassphrasePrompt>>,
+    pub(crate) cache_key: bool,
+}
+
+impl Default for VaultUnlock {
+    fn default() -> Self {
+        Self {
+            passphrase: None,
+            prompt: None,
+            cache_key: true,
+        }
+    }
 }
 
 /// The coding agent whose command uses the library, which marks what it
@@ -70,6 +105,9 @@ impl std::fmt::Debug for Context {
             .field("state_dir", &self.0.state_dir)
             .field("keychain", &self.0.keychain)
             .field("mfa_prompt", &self.0.mfa.is_some())
+            .field("vault_passphrase", &self.0.vault.passphrase.is_some())
+            .field("vault_prompt", &self.0.vault.prompt.is_some())
+            .field("vault_key_cache", &self.0.vault.cache_key)
             .field("endpoints", &self.0.endpoints)
             .field("agent", &self.0.agent)
             .finish_non_exhaustive()
@@ -155,6 +193,7 @@ pub struct ContextBuilder {
     wsl_dpapi: bool,
     shared_http: bool,
     mfa: Option<Box<MfaPrompt>>,
+    vault: VaultUnlock,
     endpoints: Endpoints,
     agent: Option<Agent>,
 }
@@ -197,6 +236,34 @@ impl ContextBuilder {
         self
     }
 
+    /// Who answers when the encrypted file vault needs its passphrase. The
+    /// library never reads a terminal itself; without a prompt or
+    /// [`vault_passphrase`](Self::vault_passphrase), a locked vault fails,
+    /// saying how to unlock it.
+    pub fn passphrase_prompt(
+        mut self,
+        prompt: impl Fn(&PassphraseRequest) -> anyhow::Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.vault.prompt = Some(Arc::new(prompt));
+        self
+    }
+
+    /// The encrypted file vault's passphrase, for automation; it is used
+    /// before any prompt. `OMNIFOB_VAULT_PASSPHRASE`.
+    pub fn vault_passphrase(mut self, passphrase: Option<String>) -> Self {
+        self.vault.passphrase = passphrase.filter(|p| !p.is_empty());
+        self
+    }
+
+    /// Whether the key derived from the vault's passphrase is kept in the
+    /// kernel keyring (Linux keyutils) until reboot, so the passphrase is
+    /// asked once per boot rather than once per command. On unless set;
+    /// `OMNIFOB_VAULT_KEY_CACHE=0` turns it off.
+    pub fn vault_key_cache(mut self, on: bool) -> Self {
+        self.vault.cache_key = on;
+        self
+    }
+
     /// Where provider calls go instead of the providers' own hosts.
     pub fn endpoints(mut self, endpoints: Endpoints) -> Self {
         self.endpoints = endpoints;
@@ -221,6 +288,7 @@ impl ContextBuilder {
             wsl_dpapi: self.wsl_dpapi,
             http,
             mfa: self.mfa,
+            vault: self.vault,
             endpoints: self.endpoints,
             agent: self.agent,
         }))
@@ -261,6 +329,7 @@ impl Context {
             wsl_dpapi: true,
             shared_http: true,
             mfa: None,
+            vault: VaultUnlock::default(),
             endpoints: Endpoints::default(),
             agent: None,
         }
@@ -269,13 +338,17 @@ impl Context {
     /// A builder with what the environment sets, as the command line reads
     /// it: the files from `OMNIFOB_CONFIG` and the XDG variables
     /// ([`crate::paths`]), the keychain from `OMNIFOB_KEYRING`,
-    /// `OMNIFOB_WSL_DPAPI`, and [`Endpoints::from_env`].
+    /// `OMNIFOB_WSL_DPAPI`, the vault's `OMNIFOB_VAULT_PASSPHRASE` and
+    /// `OMNIFOB_VAULT_KEY_CACHE`, and [`Endpoints::from_env`].
     pub fn builder_from_env() -> ContextBuilder {
         let mut builder = Self::builder();
         builder.config_file = crate::paths::standard_config_file().map_err(|e| format!("{e:#}"));
         builder.state_dir = crate::paths::standard_state_dir().map_err(|e| format!("{e:#}"));
         builder.keychain = Keychain::from_env();
         builder.wsl_dpapi = std::env::var("OMNIFOB_WSL_DPAPI").map_or(true, |v| v != "0");
+        builder = builder
+            .vault_passphrase(std::env::var("OMNIFOB_VAULT_PASSPHRASE").ok())
+            .vault_key_cache(std::env::var("OMNIFOB_VAULT_KEY_CACHE").map_or(true, |v| v != "0"));
         builder.endpoints = Endpoints::from_env();
         builder
     }
@@ -379,11 +452,15 @@ impl Context {
         self.0.wsl_dpapi
     }
 
+    pub(crate) fn vault_unlock(&self) -> &VaultUnlock {
+        &self.0.vault
+    }
+
     /// The keychain, chosen on first use.
     pub(crate) fn store(&self) -> anyhow::Result<&store::Selected> {
         self.0
             .store
-            .get_or_init(|| store::select(&self.0.keychain).map_err(|e| format!("{e:#}")))
+            .get_or_init(|| store::select(self, &self.0.keychain).map_err(|e| format!("{e:#}")))
             .as_ref()
             .map_err(|e| anyhow!("no usable keychain: {e}"))
     }

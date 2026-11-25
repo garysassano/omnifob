@@ -28,7 +28,7 @@ pub mod serve;
 pub mod store;
 
 pub use config::{Config, Integration};
-pub use context::{Agent, Context, Endpoints};
+pub use context::{Agent, Context, Endpoints, PassphraseRequest};
 pub use credentials::Credentials;
 pub use profile::{Profile, Target};
 

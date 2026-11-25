@@ -512,6 +512,7 @@ pub fn aws_import(text: &str) -> AwsImport {
                 region: keys.get("region").cloned(),
                 duration,
                 console_duration: None,
+                no_session: false,
             },
             keys.get("mfa_serial").cloned(),
         ));

@@ -4,6 +4,7 @@
 pub mod aws;
 pub mod azure;
 pub mod cloudflare;
+pub mod command;
 pub mod gcp;
 pub mod token;
 
@@ -45,6 +46,7 @@ async fn discover_unchecked(name: &str, integration: &Integration) -> Result<Vec
             Ok(profiles)
         }
         Integration::Token(config) => Ok(token::discover(name, config)),
+        Integration::Command(config) => Ok(command::discover(name, config)),
     }
 }
 
@@ -97,6 +99,8 @@ pub fn logout(name: &str, integration: &Integration) -> anyhow::Result<bool> {
         Integration::Azure(_) => azure::logout(name),
         Integration::Cloudflare(_) => cloudflare::logout(name),
         Integration::Token(_) => token::logout(name),
+        // Nothing is stored but cached credentials, which logout clears.
+        Integration::Command(_) => Ok(false),
     }
 }
 
@@ -150,6 +154,8 @@ pub fn sign_in(name: &str, integration: &Integration) -> anyhow::Result<SignIn> 
                 SignIn::SignedOut
             }
         }
+        // Nothing to sign in to: the program is run when needed.
+        Integration::Command(_) => SignIn::Token,
         Integration::Token(_) => {
             if token::has_secrets(name)? {
                 SignIn::Token
@@ -216,6 +222,14 @@ pub async fn credentials(
                 "--ttl does not apply to console sign-in credentials: AWS Sign-In always issues them for 15 minutes"
             )
             .into()),
+            Target::Command { .. } if chosen_lifetime(config, profile).is_none() => {
+                return Err(anyhow::anyhow!(
+                    "--ttl does not apply to {}: set `ttl` on '{}' if its program takes a lifetime",
+                    profile.id,
+                    profile.integration
+                )
+                .into());
+            }
             _ => {}
         }
     }
@@ -264,7 +278,11 @@ pub async fn credentials(
     // The cache holds credentials of the configured lifetime only: a `ttl`
     // request must not leave its shorter (or longer) ones for the next call.
     // New credentials without `ttl`, as `fob console` gets, replace it.
+    // A program's credentials without an expiry are fetched for each use:
+    // omnifob cannot tell when they stop working.
+    let cacheable = fresh.expires_at.is_some() || !matches!(profile.target, Target::Command { .. });
     if ttl.is_none()
+        && cacheable
         && let Err(e) = store::set(&key, &fresh)
     {
         tracing::warn!("could not cache credentials: {e:#}");
@@ -274,11 +292,11 @@ pub async fn credentials(
 
 /// The lifetime omnifob asks for when it gets a profile's credentials, for
 /// the profiles whose lifetime it chooses and that take `ttl`: Cloudflare
-/// tokens, chained, cross-partition and IAM users' roles, IAM user sessions
-/// and chained roles without MFA (with MFA, each new session asks for a
-/// code, and an agent's capped request, which is not cached, would ask
-/// every time), and Google service accounts. `None` for the others, whose
-/// provider sets it.
+/// tokens, chained, cross-partition, IAM users' and console sign-ins' roles,
+/// IAM user sessions and chained roles without MFA (with MFA, each new
+/// session asks for a code, and an agent's capped request, which is not
+/// cached, would ask every time), Google service accounts, and programs
+/// given a `ttl`. `None` for the others, whose provider sets it.
 pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::SignedDuration> {
     use jiff::SignedDuration;
     let hour = SignedDuration::from_hours(1);
@@ -311,6 +329,10 @@ pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::Signe
         (Integration::Gcp(c), Target::GcpServiceAccount { label, .. }) => {
             Some(c.service_accounts.get(label)?.lifetime.unwrap_or(hour))
         }
+        (Integration::AwsLogin(c), Target::AwsLoginRole { label, .. }) => {
+            Some(c.roles.get(label)?.duration.unwrap_or(hour))
+        }
+        (Integration::Command(c), Target::Command { .. }) => c.ttl,
         _ => None,
     }
 }
@@ -351,6 +373,10 @@ fn aws_account_id<'a>(config: &'a Config, profile: &'a Profile) -> Option<&'a st
         | Target::AwsIamRole {
             account_id: Some(account_id),
             ..
+        }
+        | Target::AwsLoginRole {
+            account_id: Some(account_id),
+            ..
         } => Some(account_id),
         Target::AwsChained { label, .. } => match config.integration(&profile.integration) {
             Ok(Integration::AwsSso(c)) => c.chained.get(label).and_then(|role| role.account_id()),
@@ -358,6 +384,10 @@ fn aws_account_id<'a>(config: &'a Config, profile: &'a Profile) -> Option<&'a st
         },
         Target::AwsIamRole { label, .. } => match config.integration(&profile.integration) {
             Ok(Integration::AwsIam(c)) => c.roles.get(label).and_then(|role| role.account_id()),
+            _ => None,
+        },
+        Target::AwsLoginRole { label, .. } => match config.integration(&profile.integration) {
+            Ok(Integration::AwsLogin(c)) => c.roles.get(label).and_then(|role| role.account_id()),
             _ => None,
         },
         _ => None,
@@ -410,6 +440,12 @@ async fn fetch(
         }
         (Integration::AwsLogin(c), Target::AwsLogin { .. }) => {
             aws::login::credentials(&profile.integration, c, renew).await?
+        }
+        (Integration::AwsLogin(c), Target::AwsLoginRole { label, .. }) => {
+            aws::login::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
+        }
+        (Integration::Command(c), Target::Command { .. }) => {
+            command::credentials(&profile.integration, c, &profile.id, ttl.or(c.ttl)).await?
         }
         (Integration::Gcp(c), Target::Gcp { project_id, .. }) => {
             gcp::user_credentials(&profile.integration, c, project_id).await?
@@ -515,6 +551,14 @@ fn aws_console_partition(
             .get(label)
             .with_context(|| format!("no role '{label}' in integration '{name}'; run `fob sync`"))?
             .partition(),
+        (Integration::AwsLogin(c), Target::AwsLoginRole { label, .. }) => c
+            .roles
+            .get(label)
+            .with_context(|| format!("no role '{label}' in integration '{name}'; run `fob sync`"))?
+            .partition(),
+        (Integration::Command(c), Target::Command { aws: true }) => {
+            Partition::of_region(c.region.as_deref().unwrap_or("us-east-1"))
+        }
         (Integration::AwsSso(c), _) => Partition::of_region(&c.region),
         (Integration::AwsIam(c), _) => Partition::of_region(aws::iam::sts_region(c)),
         (Integration::AwsLogin(c), _) => aws::login::partition(c),
@@ -593,6 +637,14 @@ fn console_session_duration(
              endpoint refuses SessionDuration for credentials from role chaining, so it lasts \
              as long as the role's credentials (`duration`, at most an hour)"
         ),
+        (_, Target::AwsLoginRole { .. }) if options.duration.is_some() => anyhow::bail!(
+            "a console sign-in role's console session cannot be given a length: the AWS \
+             federation endpoint refuses SessionDuration for credentials from role chaining, so \
+             it lasts as long as the role's credentials (`duration`, at most an hour)"
+        ),
+        // Whatever the program's credentials are, the federation endpoint
+        // decides whether it takes a length for them.
+        (Integration::Command(_), Target::Command { .. }) => options.duration,
         (_, Target::AwsLogin { .. }) if options.duration.is_some() => anyhow::bail!(
             "a console sign-in's own console session cannot be given a length: its \
              credentials are not from AssumeRole, which the AWS federation endpoint takes \
@@ -695,7 +747,10 @@ pub async fn console_url(
             };
             aws::console::console_url(creds, &request).await?
         }
-        (Integration::AwsLogin(c), target @ Target::AwsLogin { .. }) => {
+        (
+            Integration::AwsLogin(c),
+            target @ (Target::AwsLogin { .. } | Target::AwsLoginRole { .. }),
+        ) => {
             let request = aws::console::ConsoleRequest {
                 partition: aws_console_partition(&profile.integration, integration, target)?,
                 home_region: Some(&c.region),
@@ -722,6 +777,30 @@ pub async fn console_url(
         (Integration::Cloudflare(_), Target::Cloudflare { account_id, .. }) => {
             cloudflare::console_url(account_id)
         }
+        (Integration::Command(c), Target::Command { aws }) => match command::console_url(c) {
+            Some(url) => url,
+            None if *aws => {
+                let request = aws::console::ConsoleRequest {
+                    partition: aws_console_partition(
+                        &profile.integration,
+                        integration,
+                        &profile.target,
+                    )?,
+                    home_region: c.region.as_deref(),
+                    region: region.or(c.region.as_deref()),
+                    service,
+                    session_duration,
+                };
+                aws::console::console_url(creds, &request).await?
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "no console URL known for '{}'; set `console` in its config",
+                    profile.integration
+                )
+                .into());
+            }
+        },
         (Integration::Token(c), Target::Token {}) => token::console_url(c)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "no console URL known for '{}'; set `console` in its config",
@@ -831,6 +910,7 @@ pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<Stri
         Integration::Azure(_) => azure::check(name).await,
         Integration::Cloudflare(config) => cloudflare::check(name, config).await,
         Integration::Token(config) => token::check(name, config).await,
+        Integration::Command(config) => command::check(name, config).await,
     }
 }
 
@@ -876,10 +956,25 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 aws::sts::caller_identity(&creds, &region).await?.arn
             ))
         }
-        (Integration::AwsLogin(c), Target::AwsLogin { .. }) => Ok(format!(
+        (Integration::Command(c), Target::Command { aws: true }) => Ok(format!(
             "acts as {}",
-            aws::sts::caller_identity(&creds, &c.region).await?.arn
+            aws::sts::caller_identity(&creds, c.region.as_deref().unwrap_or("us-east-1"))
+                .await?
+                .arn
         )),
+        (Integration::Command(_), Target::Command { aws: false }) => {
+            let names: Vec<&str> = creds.env.keys().map(String::as_str).collect();
+            Ok(format!(
+                "the program printed {} (not checked with a provider)",
+                names.join(", ")
+            ))
+        }
+        (Integration::AwsLogin(c), Target::AwsLogin { .. } | Target::AwsLoginRole { .. }) => {
+            Ok(format!(
+                "acts as {}",
+                aws::sts::caller_identity(&creds, &c.region).await?.arn
+            ))
+        }
         (Integration::Gcp(_), Target::Gcp { .. } | Target::GcpServiceAccount { .. }) => {
             gcp::check_token(&creds).await
         }
@@ -960,6 +1055,7 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
             &format!("token/{old}/secrets"),
             &format!("token/{new}/secrets"),
         ),
+        Integration::Command(_) => Ok(false),
     }
 }
 
