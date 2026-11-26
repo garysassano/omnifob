@@ -86,7 +86,8 @@ impl Flow {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Not `Debug`: it holds the tokens and the client secret.
+#[derive(Clone, Serialize, Deserialize)]
 struct SsoToken {
     start_url: String,
     region: String,
@@ -105,8 +106,9 @@ impl SsoToken {
     }
 }
 
-/// omnifob's OIDC client registration with Identity Center.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// omnifob's OIDC client registration with Identity Center. Not `Debug`: it
+/// holds the client secret.
+#[derive(Clone, Serialize, Deserialize)]
 struct Registration {
     client_id: String,
     client_secret: String,

@@ -269,6 +269,120 @@ async fn discovery_walks_tenants_and_skips_refusing_ones() {
     );
 }
 
+/// Subscription lists overlap, merge in tenant order, and a guest tenant
+/// whose list fails is skipped rather than failing the whole discovery.
+#[tokio::test]
+async fn discovery_lists_tenants_together_and_skips_failing_lists() {
+    const FAILING: &str = "44444444-4444-4444-4444-444444444444";
+    let (_guard, server) = setup().await;
+    device_login(&server).await;
+    for (tenant, used, access, rotated) in [
+        (HOME, "refresh-1", "home-2", "refresh-2"),
+        (GUEST, "refresh-2", "guest-1", "refresh-3"),
+        (FAILING, "refresh-3", "failing-1", "refresh-4"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(format!("/{tenant}/oauth2/v2.0/token")))
+            .and(body_string_contains(format!("refresh_token={used}")))
+            .respond_with(tokens(access, rotated))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/tenants"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "tenantId": HOME }, { "tenantId": GUEST }, { "tenantId": FAILING }],
+        })))
+        .mount(&server)
+        .await;
+    let delay = std::time::Duration::from_millis(1000);
+    for (token, subs) in [
+        (
+            "home-2",
+            json!([{ "subscriptionId": "sub-a", "displayName": "Prod" }]),
+        ),
+        (
+            "guest-1",
+            json!([{ "subscriptionId": "sub-a", "displayName": "Prod" },
+                   { "subscriptionId": "sub-c", "displayName": "Partner" }]),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/subscriptions"))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "value": subs }))
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/subscriptions"))
+        .and(header("authorization", "Bearer failing-1"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let started = std::time::Instant::now();
+    let profiles = azure::discover("work", &azure_config("")).await.unwrap();
+    let elapsed = started.elapsed();
+    let found: Vec<_> = profiles
+        .iter()
+        .map(|p| match &p.target {
+            Target::Azure { tenant_id, .. } => (p.id.as_str(), tenant_id.as_str()),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [("work/prod/user", HOME), ("work/partner/user", GUEST)]
+    );
+    assert!(
+        elapsed < delay * 2,
+        "the lists did not overlap: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_next_link_to_another_host_is_not_followed() {
+    let (_guard, server) = setup().await;
+    let elsewhere = MockServer::start().await;
+    device_login(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{HOME}/oauth2/v2.0/token")))
+        .respond_with(tokens("home-2", "refresh-2"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tenants"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "tenantId": HOME }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/subscriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "subscriptionId": "sub-a", "displayName": "Prod" }],
+            "nextLink": format!("{}/subscriptions?$skiptoken=2", elsewhere.uri()),
+        })))
+        .mount(&server)
+        .await;
+
+    let err = azure::discover("work", &azure_config(""))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nextLink"), "{err}");
+    assert!(
+        elsewhere.received_requests().await.unwrap().is_empty(),
+        "the token went to another host"
+    );
+}
+
 #[tokio::test]
 async fn credentials_name_the_subscription_and_tenant() {
     let (_guard, server) = setup().await;

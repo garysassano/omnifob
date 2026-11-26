@@ -66,7 +66,9 @@ pub fn keys(integration: &str) -> Vec<String> {
     vec![token_key(integration)]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What the keychain keeps for a signed-in integration. Not `Debug`: it holds
+/// the refresh token.
+#[derive(Clone, Serialize, Deserialize)]
 struct Stored {
     refresh_token: String,
     username: String,
@@ -401,8 +403,9 @@ pub async fn check(integration: &str) -> Result<String> {
     Ok(format!("signed in as {}", stored.username))
 }
 
-/// GETs every page of a Resource Manager list.
+/// GETs every page of a Resource Manager list, all with one client.
 async fn arm_list<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
     token: &str,
     path: &str,
 ) -> anyhow::Result<Vec<T>> {
@@ -420,11 +423,7 @@ async fn arm_list<T: serde::de::DeserializeOwned>(
         arm_host()
     ));
     while let Some(url) = next {
-        let response = crate::http::client()
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await?;
+        let response = http.get(&url).bearer_auth(token).send().await?;
         let status = response.status();
         if !status.is_success() {
             bail!(
@@ -440,9 +439,37 @@ async fn arm_list<T: serde::de::DeserializeOwned>(
         }
         let page: Page<T> = response.json().await?;
         items.extend(page.value);
-        next = page.next_link.filter(|l| !l.is_empty());
+        next = match page.next_link.filter(|l| !l.is_empty()) {
+            Some(link) => Some(same_origin(&link, &arm_host())?),
+            None => None,
+        };
     }
     Ok(items)
+}
+
+/// Checks that a `nextLink` points at Resource Manager itself (the same
+/// scheme, host and port as `arm`) before the bearer token is sent to it, so
+/// a tampered or unexpected answer cannot send the token elsewhere.
+fn same_origin(link: &str, arm: &str) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(link)
+        .with_context(|| format!("Resource Manager gave an invalid nextLink: {link}"))?;
+    let arm = reqwest::Url::parse(arm).with_context(|| format!("invalid endpoint {arm}"))?;
+    let origin = |u: &reqwest::Url| {
+        (
+            u.scheme().to_owned(),
+            u.host_str().map(str::to_ascii_lowercase),
+            u.port_or_known_default(),
+        )
+    };
+    if origin(&url) != origin(&arm) {
+        bail!(
+            "Resource Manager's nextLink leaves {}: not following {}://{}",
+            arm.origin().ascii_serialization(),
+            url.scheme(),
+            url.host_str().unwrap_or_default()
+        );
+    }
+    Ok(url.into())
 }
 
 #[derive(Deserialize)]
@@ -455,8 +482,18 @@ struct Subscription {
 }
 
 /// One profile per subscription, in every tenant that grants a token.
+///
+/// Tenants are worked on together: each one's token is obtained in tenant
+/// order, one exchange at a time (each rotates the refresh token, and
+/// `arm_token` holds the integration's lock), while the subscription lists
+/// of the tenants that already have a token are fetched meanwhile. Results
+/// are merged in tenant order, so a subscription reachable from two tenants
+/// keeps the first, as `az` does. A tenant other than the home tenant that
+/// refuses a token or fails to list its subscriptions is skipped with a
+/// warning.
 pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Profile>> {
     let stored = stored(integration)?;
+    let http = crate::http::client();
     let (home_token, _) = arm_token(integration, &stored.tenant_id).await?;
     let tenants: Vec<String> = if config.tenant.is_some() {
         vec![stored.tenant_id.clone()]
@@ -466,28 +503,48 @@ pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Pro
         struct Tenant {
             tenant_id: String,
         }
-        arm_list::<Tenant>(&home_token, "/tenants")
+        arm_list::<Tenant>(&http, &home_token, "/tenants")
             .await?
             .into_iter()
             .map(|t| t.tenant_id)
             .collect()
     };
 
-    let mut profiles: Vec<Profile> = Vec::new();
-    for tenant in tenants {
-        let token = if tenant == stored.tenant_id {
-            home_token.clone()
-        } else {
-            match arm_token(integration, &tenant).await {
-                Ok((token, _)) => token,
-                Err(e @ Error::NeedsLogin { .. }) => return Err(e),
+    // Taken in tenant order: `join_all` polls the futures in order, and a
+    // Tokio mutex hands itself out first come, first served.
+    let exchanges = tokio::sync::Mutex::new(());
+    let per_tenant = futures::future::join_all(tenants.iter().map(|tenant| {
+        let (http, home_token, exchanges) = (&http, &home_token, &exchanges);
+        let home = *tenant == stored.tenant_id;
+        async move {
+            let token = if home {
+                home_token.clone()
+            } else {
+                let _turn = exchanges.lock().await;
+                match arm_token(integration, tenant).await {
+                    Ok((token, _)) => token,
+                    Err(e @ Error::NeedsLogin { .. }) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!("skipping tenant {tenant}: {e}");
+                        return Ok(Vec::new());
+                    }
+                }
+            };
+            match arm_list::<Subscription>(http, &token, "/subscriptions").await {
+                Ok(subs) => Ok(subs),
+                Err(e) if home => Err(e.into()),
                 Err(e) => {
-                    tracing::warn!("skipping tenant {tenant}: {e}");
-                    continue;
+                    tracing::warn!("skipping tenant {tenant}: {e:#}");
+                    Ok(Vec::new())
                 }
             }
-        };
-        for sub in arm_list::<Subscription>(&token, "/subscriptions").await? {
+        }
+    }))
+    .await;
+
+    let mut profiles: Vec<Profile> = Vec::new();
+    for (tenant, subs) in tenants.iter().zip(per_tenant) {
+        for sub in subs? {
             let wanted = config.subscriptions.as_ref().is_none_or(|ids| {
                 ids.iter()
                     .any(|id| id.eq_ignore_ascii_case(&sub.subscription_id))
@@ -579,6 +636,26 @@ mod tests {
         let c = claims(&format!("h.{payload}.s")).unwrap();
         assert_eq!(c.preferred_username.as_deref(), Some("me@contoso.com"));
         assert_eq!(c.tid, "t-1");
+    }
+
+    #[test]
+    fn next_links_must_stay_on_resource_manager() {
+        let arm = "https://management.azure.com";
+        let ok = "https://Management.Azure.com:443/subscriptions?api-version=1&$skiptoken=2";
+        assert!(same_origin(ok, arm).is_ok());
+        for bad in [
+            "http://management.azure.com/subscriptions",
+            "https://management.azure.com:8443/subscriptions",
+            "https://evil.example/subscriptions",
+            "https://management.azure.com.evil.example/subscriptions",
+            "https://user@evil.example/subscriptions",
+            "/subscriptions?page=2",
+        ] {
+            assert!(same_origin(bad, arm).is_err(), "{bad}");
+        }
+        // A test endpoint keeps its own port.
+        assert!(same_origin("http://127.0.0.1:4000/x", "http://127.0.0.1:4000").is_ok());
+        assert!(same_origin("http://127.0.0.1:4001/x", "http://127.0.0.1:4000").is_err());
     }
 
     #[test]

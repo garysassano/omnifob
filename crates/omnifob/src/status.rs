@@ -38,8 +38,16 @@ impl App {
                     paths::config_file().display()
                 );
             }
-            for (name, integration) in &self.config.integrations {
-                match providers::check_sign_in(name, integration).await {
+            // All at once, reported in config order.
+            let results = futures::future::join_all(
+                self.config
+                    .integrations
+                    .iter()
+                    .map(|(name, integration)| providers::check_sign_in(name, integration)),
+            )
+            .await;
+            for (name, result) in self.config.integrations.keys().zip(results) {
+                match result {
                     Ok(detail) => report(true, name, &detail),
                     Err(e) => {
                         failed = true;

@@ -95,8 +95,9 @@ pub fn keys(integration: &str) -> Vec<String> {
     vec![token_key(integration)]
 }
 
-/// What the keychain keeps for a signed-in integration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What the keychain keeps for a signed-in integration. Not `Debug`: it holds
+/// the tokens.
+#[derive(Clone, Serialize, Deserialize)]
 struct Stored {
     refresh_token: String,
     access_token: String,
@@ -455,10 +456,12 @@ struct TokenInfo {
     azp: Option<String>,
 }
 
+/// Asks Google whom an access token belongs to. The token goes in a POST
+/// form body, never the URL, so it stays out of proxy logs and error messages.
 async fn token_info(access_token: &str) -> anyhow::Result<TokenInfo> {
     let response = crate::http::client()
-        .get(url(Endpoint::TokenInfo))
-        .query(&[("access_token", access_token)])
+        .post(url(Endpoint::TokenInfo))
+        .form(&[("access_token", access_token)])
         .send()
         .await?;
     if !response.status().is_success() {
@@ -511,10 +514,11 @@ async fn list_projects_with(token: &str) -> anyhow::Result<Vec<Project>> {
         #[serde(default)]
         next_page_token: Option<String>,
     }
+    let http = crate::http::client();
     let mut projects = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
-        let mut request = crate::http::client()
+        let mut request = http
             .get(url(Endpoint::Projects))
             .bearer_auth(token)
             .query(&[("filter", "lifecycleState:ACTIVE")]);

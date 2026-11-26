@@ -1,7 +1,9 @@
 //! Shell code generation: exporting credentials and the `fob use` wrapper.
 
+use anyhow::bail;
 use clap::ValueEnum;
 use omnifob_core::Credentials;
+use omnifob_core::credentials::is_var_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Shell {
@@ -52,11 +54,17 @@ fn remove(shell: Shell, name: &str) -> String {
     }
 }
 
+/// The variable names in `OMNIFOB_VARS` (a previous `fob use`'s list) that
+/// are safe to put into shell code. The value comes from the environment, so
+/// anything that is not a plain variable name is skipped: written into
+/// `unset {name}` and passed to `eval`, it would run as a command.
+fn previous_names<'a>(previous: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
+    previous.iter().copied().filter(|name| is_var_name(name))
+}
+
 /// Removes the variables a previous `fob use` set, plus omnifob's own markers.
 pub fn unset(shell: Shell, previous: &[&str]) -> String {
-    previous
-        .iter()
-        .copied()
+    previous_names(previous)
         .chain(["OMNIFOB_PROFILE", "OMNIFOB_VARS"])
         .map(|name| remove(shell, name))
         .collect()
@@ -64,10 +72,19 @@ pub fn unset(shell: Shell, previous: &[&str]) -> String {
 
 /// Exports `creds`, first removing variables of the previous profile that
 /// this one does not set, so nothing stale (like `AWS_REGION`) lingers.
-pub fn export(shell: Shell, profile_id: &str, creds: &Credentials, previous: &[&str]) -> String {
-    let mut out: String = previous
-        .iter()
-        .filter(|name| !creds.env.contains_key(**name))
+/// Refuses credentials with a variable name that is not
+/// `[A-Za-z_][A-Za-z0-9_]*`, which the shell would read as code.
+pub fn export(
+    shell: Shell,
+    profile_id: &str,
+    creds: &Credentials,
+    previous: &[&str],
+) -> anyhow::Result<String> {
+    if let Some(bad) = creds.env.keys().find(|name| !is_var_name(name)) {
+        bail!("`{bad}` is not a valid environment variable name ([A-Za-z_][A-Za-z0-9_]*)");
+    }
+    let mut out: String = previous_names(previous)
+        .filter(|name| !creds.env.contains_key(*name))
         .map(|name| remove(shell, name))
         .collect();
     for (name, value) in &creds.env {
@@ -76,7 +93,7 @@ pub fn export(shell: Shell, profile_id: &str, creds: &Credentials, previous: &[&
     let names: Vec<&str> = creds.env.keys().map(String::as_str).collect();
     out.push_str(&set(shell, "OMNIFOB_PROFILE", profile_id));
     out.push_str(&set(shell, "OMNIFOB_VARS", &names.join(",")));
-    out
+    Ok(out)
 }
 
 /// The line to add to a shell's startup file.
@@ -183,7 +200,8 @@ mod tests {
             "cf/acct/workers",
             &creds(&[("CLOUDFLARE_API_TOKEN", "t")]),
             &["AWS_REGION", "CLOUDFLARE_API_TOKEN"],
-        );
+        )
+        .unwrap();
         assert_eq!(
             out,
             "unset AWS_REGION\n\
@@ -194,10 +212,37 @@ mod tests {
     }
 
     #[test]
+    fn crafted_names_never_reach_shell_code() {
+        let crafted = ["AWS_REGION", "X;touch /tmp/pwned", "$(id)", "A B", ""];
+        for shell in [Shell::Posix, Shell::Fish, Shell::Powershell] {
+            let out = unset(shell, &crafted);
+            assert!(out.contains("AWS_REGION"), "{out}");
+            assert!(out.contains("OMNIFOB_VARS"), "{out}");
+            for bad in ["touch", "$(id)", "A B"] {
+                assert!(!out.contains(bad), "{bad} in {out}");
+            }
+            assert_eq!(out.lines().count(), 3, "{out}");
+
+            let out = export(shell, "p", &creds(&[("OK", "v")]), &crafted).unwrap();
+            for bad in ["touch", "$(id)", "A B"] {
+                assert!(!out.contains(bad), "{bad} in {out}");
+            }
+
+            let err = export(shell, "p", &creds(&[("X;id", "v")]), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("not a valid environment variable name"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn posix_export_round_trips_through_sh() {
         let value = "a'b\"c $HOME `x` \\n";
-        let code = export(Shell::Posix, "p", &creds(&[("FOB_TEST", value)]), &[]);
+        let code = export(Shell::Posix, "p", &creds(&[("FOB_TEST", value)]), &[]).unwrap();
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("{code}printf %s \"$FOB_TEST\""))

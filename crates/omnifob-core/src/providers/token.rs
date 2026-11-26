@@ -197,7 +197,8 @@ fn secrets_key(integration: &str) -> String {
     format!("token/{integration}/secrets")
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// Not `Debug`: it holds the secret values.
+#[derive(Default, Serialize, Deserialize)]
 struct Stored(BTreeMap<String, String>);
 
 /// Checks the values where the preset allows it, then stores them.

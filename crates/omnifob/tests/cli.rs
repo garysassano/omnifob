@@ -650,6 +650,54 @@ async fn an_integration_not_signed_in_is_mentioned_only_when_it_matters() {
     assert!(stderr.contains(note), "{stderr}");
 }
 
+/// `fob sync` keeps what synced when another integration fails, reports
+/// every failure at the end, and `fob check` reports in config order.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_saves_what_synced_and_reports_the_rest() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("sync-partial").with_server(&server);
+    let mut config = String::new();
+    for name in ["acme", "other", "zeta"] {
+        config.push_str(
+            &portal_config(name).replace("acme.awsapps.com", &format!("{name}.awsapps.com")),
+        );
+    }
+    fob.write_config(&config);
+    fob.sign_in("acme");
+    mount_portal(&server, &[("111111111111", "Dev")]).await;
+
+    let stderr = fob.fails(&["sync"]);
+    assert!(stderr.contains("fob: acme: 1 profiles"), "{stderr}");
+    for name in ["other", "zeta"] {
+        assert!(stderr.contains(&format!("syncing '{name}'")), "{stderr}");
+    }
+    assert!(
+        stderr.contains("2 of 3 integrations did not sync"),
+        "{stderr}"
+    );
+    let profiles =
+        std::fs::read_to_string(fob.root.join("state").join("omnifob").join("profiles.json"))
+            .unwrap();
+    assert!(profiles.contains("acme/dev/Admin"), "{profiles}");
+
+    // One failure is the error itself.
+    let stderr = fob.fails(&["sync", "acme", "other"]);
+    assert!(stderr.contains("fob: syncing 'other': "), "{stderr}");
+
+    let output = fob.run(&["check"]);
+    let (stdout, _) = texts(&output);
+    assert!(!output.status.success());
+    let checked: Vec<&str> = stdout
+        .lines()
+        .map(|l| l.split(':').next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        checked,
+        ["ok   acme", "FAIL other", "FAIL zeta"],
+        "{stdout}"
+    );
+}
+
 /// Not a test of its own: `fob exec` runs this test binary with
 /// `--ignored --exact` and `OMNIFOB_E2E_CHILD` set, as a child that works on
 /// every platform, and it prints the variables it got.

@@ -366,6 +366,29 @@ async fn credentials_carry_a_token_and_the_project() {
 }
 
 #[tokio::test]
+async fn token_info_sends_the_token_in_the_body_not_the_url() {
+    let (_guard, server) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/tokeninfo"))
+        .and(body_string_contains("access_token=sa-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "email": "deploy@proj-b.iam.gserviceaccount.com",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let creds = omnifob_core::Credentials {
+        env: [("CLOUDSDK_AUTH_ACCESS_TOKEN".into(), "sa-token".into())].into(),
+        ..Default::default()
+    };
+    let said = gcp::check_token(&creds).await.unwrap();
+    assert_eq!(said, "acts as deploy@proj-b.iam.gserviceaccount.com");
+    for request in server.received_requests().await.unwrap() {
+        assert!(request.url.query().is_none(), "{}", request.url);
+    }
+}
+
+#[tokio::test]
 async fn impersonation_refused_names_the_role_it_needs() {
     let (_guard, server) = setup().await;
     let config = gcp_config("");

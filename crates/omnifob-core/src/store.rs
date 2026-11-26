@@ -58,12 +58,36 @@ fn use_native() -> anyhow::Result<&'static str> {
 
 #[cfg(target_os = "linux")]
 fn use_native() -> anyhow::Result<&'static str> {
+    if !session_bus_may_exist(
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    ) {
+        tracing::debug!("no D-Bus session bus, so no Secret Service; using keyutils");
+        return use_store("keyutils").map(|_| "keyutils");
+    }
     match use_store("secret-service") {
         Ok(()) => Ok("secret-service"),
         Err(e) => {
             tracing::debug!("Secret Service unavailable ({e:#}), using keyutils");
             use_store("keyutils").map(|_| "keyutils")
         }
+    }
+}
+
+/// Whether a D-Bus session bus, and so a Secret Service, may be reachable,
+/// judged as zbus finds the bus: `DBUS_SESSION_BUS_ADDRESS` when set, else
+/// the socket `$XDG_RUNTIME_DIR/bus`. Only a missing socket rules it out, so
+/// a machine without a desktop session (WSL, a server) skips connecting to
+/// a bus and probing the service. Without `XDG_RUNTIME_DIR` zbus guesses a
+/// directory, so the Secret Service is still tried.
+#[cfg(target_os = "linux")]
+fn session_bus_may_exist(
+    address: Option<&std::ffi::OsStr>,
+    runtime_dir: Option<&std::ffi::OsStr>,
+) -> bool {
+    match (address, runtime_dir) {
+        (Some(_), _) | (None, None) => true,
+        (None, Some(dir)) => std::path::Path::new(dir).join("bus").exists(),
     }
 }
 
@@ -212,15 +236,8 @@ mod wsl {
                 && super::init().is_ok_and(|s| s == "keyutils")
                 && std::env::var("OMNIFOB_WSL_DPAPI").map_or(true, |v| v != "0")
                 && crate::platform::is_wsl()
-                && Command::new("powershell.exe")
-                    .arg("-?")
-                    // WSL drains an inherited stdin into the Windows process,
-                    // even unread, so input piped to `fob exec` would be lost.
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok()
+                && crate::platform::wsl_interop()
+                && crate::platform::on_path("powershell.exe")
         })
     }
 
@@ -260,8 +277,12 @@ mod wsl {
         Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
 
+    // Each function checks `persisted` (and, below, the file) before
+    // `enabled`, so a cached credential lookup never needs to learn whether
+    // Windows is reachable.
+
     pub fn write(key: &str, json: &str) -> anyhow::Result<()> {
-        if !enabled() || !persisted(key) {
+        if !persisted(key) || !enabled() {
             return Ok(());
         }
         let sealed = dpapi(PROTECT, &BASE64.encode(json.as_bytes()))?;
@@ -272,14 +293,14 @@ mod wsl {
     }
 
     pub fn write_if_missing(key: &str, json: &str) -> anyhow::Result<()> {
-        if enabled() && persisted(key) && !file(key).exists() {
+        if persisted(key) && !file(key).exists() && enabled() {
             write(key, json)?;
         }
         Ok(())
     }
 
     pub fn read(key: &str) -> anyhow::Result<Option<String>> {
-        if !enabled() || !persisted(key) {
+        if !persisted(key) || !enabled() {
             return Ok(None);
         }
         let sealed = match std::fs::read_to_string(file(key)) {
@@ -294,7 +315,7 @@ mod wsl {
     }
 
     pub fn delete(key: &str) -> anyhow::Result<bool> {
-        if !enabled() {
+        if !persisted(key) || !enabled() {
             return Ok(false);
         }
         match std::fs::remove_file(file(key)) {
@@ -619,6 +640,22 @@ pub fn credentials_key(profile_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_secret_service_is_skipped_only_without_a_bus_socket() {
+        use std::ffi::OsStr;
+        let dir = std::env::temp_dir().join(format!("omnifob-bus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = Some(dir.as_os_str());
+        assert!(!super::session_bus_may_exist(None, runtime));
+        let address = Some(OsStr::new("unix:path=/elsewhere"));
+        assert!(super::session_bus_may_exist(address, runtime));
+        assert!(super::session_bus_may_exist(None, None));
+        std::fs::write(dir.join("bus"), "").unwrap();
+        assert!(super::session_bus_may_exist(None, runtime));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn distinct_lock_names_never_share_a_file() {
         assert_eq!(super::lock_file_name("aws-sso-acme"), "aws-sso-acme.lock");

@@ -101,8 +101,9 @@ fn token_key(integration: &str) -> String {
     format!("cloudflare/{integration}/oauth")
 }
 
-/// What the keychain keeps for a signed-in integration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What the keychain keeps for a signed-in integration. Not `Debug`: it holds
+/// the tokens.
+#[derive(Clone, Serialize, Deserialize)]
 struct Stored {
     access_token: String,
     expires_at: Timestamp,
@@ -480,13 +481,14 @@ pub async fn revoke(integration: &str, config: &CloudflareConfig) -> anyhow::Res
     if let Some(refresh) = stored.refresh_token {
         tokens.insert(0, ("refresh_token", refresh));
     }
+    let http = crate::http::client();
     for (hint, token) in tokens {
         let mut body = reqwest::Url::parse("http://localhost/").expect("valid URL");
         body.query_pairs_mut()
             .append_pair("token", &token)
             .append_pair("token_type_hint", hint)
             .append_pair("client_id", &client_id);
-        let response = crate::http::client()
+        let response = http
             .post(format!("{}/oauth2/revoke", dash()))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body.query().unwrap_or_default().to_string())

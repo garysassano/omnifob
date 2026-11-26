@@ -59,7 +59,12 @@ pub fn main() -> ExitCode {
     .init();
 
     let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
-    let runtime = tokio::runtime::Runtime::new().expect("starting the async runtime");
+    // One thread: concurrent work (`fob check`, `fob sync`) is all waiting
+    // on the network, and a worker per core would only cost start-up time.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("starting the async runtime");
     match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
@@ -159,7 +164,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     return Err(agent::refuse_to_print(&profile.id));
                 }
                 let creds = app.credentials(&profile, !no_cache, ttl).await?;
-                print!("{}", shell::export(shell, &profile.id, &creds, &previous));
+                print!("{}", shell::export(shell, &profile.id, &creds, &previous)?);
                 eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
             }
         }
@@ -289,13 +294,22 @@ impl App {
                 integration,
                 reason,
             }) if interactive() => {
-                eprintln!("fob: {reason}; signing in again");
-                // The sign-in was just found lacking, so it is not kept.
-                self.login(&integration, false, false, false, false, true)
-                    .await?;
+                self.sign_in_again(&integration, &reason).await?;
                 Ok(f().await?)
             }
             other => Ok(other?),
         }
+    }
+
+    /// Signs in to `integration` again, since `reason` found its sign-in
+    /// lacking (which is why it is not kept).
+    pub(crate) async fn sign_in_again(
+        &self,
+        integration: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        eprintln!("fob: {reason}; signing in again");
+        self.login(integration, false, false, false, false, true)
+            .await
     }
 }
