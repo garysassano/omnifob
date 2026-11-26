@@ -2,6 +2,8 @@
 //! the OIDC and portal APIs. Secrets go to an in-memory store, never the
 //! keychain.
 
+mod support;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -9,7 +11,8 @@ use omnifob_core::config::{AwsSsoConfig, Config, Integration};
 use omnifob_core::providers::aws_sso::{self, Flow};
 use omnifob_core::{Error, store};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };
@@ -20,19 +23,17 @@ static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const START_URL: &str = "https://acme.awsapps.com/start";
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     omnifob_core::prompt::set_mfa_prompt(|_| Ok("123456".to_string()));
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-aws-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-aws-test"), server)
 }
 
 fn config() -> AwsSsoConfig {
@@ -172,6 +173,8 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
 
     let browser = std::sync::Arc::new(std::sync::Mutex::new(None));
     let opened = browser.clone();
+    let thread = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let started = thread.clone();
     aws_sso::login("browser", &config(), Flow::Browser, move |prompt| {
         assert!(prompt.user_code.is_none());
         let url = reqwest::Url::parse(&prompt.url).unwrap();
@@ -183,7 +186,7 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
         assert_eq!(query["code_challenge_method"], "S256");
         // The browser approves and Identity Center redirects back.
         *opened.lock().unwrap() = Some((query["redirect_uri"].clone(), challenge));
-        std::thread::spawn(move || {
+        *started.lock().unwrap() = Some(std::thread::spawn(move || {
             let mut s =
                 std::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).unwrap();
             write!(
@@ -193,10 +196,13 @@ async fn browser_sign_in_uses_pkce_and_a_loopback_redirect() {
             .unwrap();
             let mut reply = String::new();
             s.read_to_string(&mut reply).unwrap();
-        });
+            reply
+        }));
     })
     .await
     .unwrap();
+    let reply = thread.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(reply.contains("Sign-in approved"), "{reply}");
 
     let (redirect_uri, challenge) = browser.lock().unwrap().clone().unwrap();
     let requests = server.received_requests().await.unwrap();

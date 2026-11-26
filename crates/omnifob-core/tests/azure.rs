@@ -1,6 +1,8 @@
 //! Entra ID sign-in and Resource Manager discovery against a mock. Secrets go
 //! to an in-memory store, never the keychain.
 
+mod support;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -9,7 +11,8 @@ use omnifob_core::config::{AzureConfig, Config, Integration};
 use omnifob_core::providers::azure;
 use omnifob_core::{Error, Target, store};
 use serde_json::json;
-use tokio::sync::{Mutex, MutexGuard};
+use support::Scratch;
+use tokio::sync::Mutex;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -20,18 +23,16 @@ const HOME: &str = "11111111-1111-1111-1111-111111111111";
 const GUEST: &str = "22222222-2222-2222-2222-222222222222";
 const LOCKED: &str = "33333333-3333-3333-3333-333333333333";
 
-async fn setup() -> (MutexGuard<'static, ()>, MockServer) {
+async fn setup() -> (Scratch, MockServer) {
     let guard = SERIAL.lock().await;
     store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    let state = std::env::temp_dir().join(format!("omnifob-azure-test-{}", std::process::id()));
     // SAFETY: the tests run one at a time under SERIAL, and nothing else in
     // this process reads the environment concurrently.
     unsafe {
         std::env::set_var("OMNIFOB_AZURE_ENDPOINT", server.uri());
-        std::env::set_var("XDG_STATE_HOME", &state);
     }
-    (guard, server)
+    (Scratch::new(guard, "omnifob-azure-test"), server)
 }
 
 fn azure_config(extra: &str) -> AzureConfig {
@@ -138,6 +139,8 @@ async fn browser_sign_in_follows_az() {
     let config = azure_config(r#"tenant = "contoso.onmicrosoft.com""#);
     let opened = std::sync::Arc::new(std::sync::Mutex::new(None));
     let seen = opened.clone();
+    let browser = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let started = browser.clone();
     azure::login("work", &config, true, move |p| {
         let url = reqwest::Url::parse(p.url).unwrap();
         assert_eq!(url.path(), "/contoso.onmicrosoft.com/oauth2/v2.0/authorize");
@@ -145,7 +148,7 @@ async fn browser_sign_in_follows_az() {
         let redirect = reqwest::Url::parse(&query["redirect_uri"]).unwrap();
         let state = query["state"].clone();
         *seen.lock().unwrap() = Some(query);
-        std::thread::spawn(move || {
+        *started.lock().unwrap() = Some(std::thread::spawn(move || {
             let mut s =
                 std::net::TcpStream::connect(("127.0.0.1", redirect.port().unwrap())).unwrap();
             write!(
@@ -155,10 +158,13 @@ async fn browser_sign_in_follows_az() {
             .unwrap();
             let mut reply = String::new();
             s.read_to_string(&mut reply).unwrap();
-        });
+            reply
+        }));
     })
     .await
     .unwrap();
+    let reply = browser.lock().unwrap().take().unwrap().join().unwrap();
+    assert!(reply.contains("Sign-in approved"), "{reply}");
     let query = opened.lock().unwrap().take().unwrap();
     assert_eq!(query["client_id"], "04b07795-8ddb-461a-bbee-02f9e1bf7b46");
     assert!(query["redirect_uri"].starts_with("http://localhost:"));
@@ -172,6 +178,13 @@ async fn browser_sign_in_follows_az() {
         azure::account("work").unwrap().as_deref(),
         Some("me@contoso.com")
     );
+    // `fob login` keeps the sign-in only for the tenant it was made for.
+    assert!(azure::session_matches("work", &config).unwrap());
+    let home = azure_config(&format!(r#"tenant = "{HOME}""#));
+    assert!(azure::session_matches("work", &home).unwrap());
+    let other = azure_config(r#"tenant = "fabrikam.onmicrosoft.com""#);
+    assert!(!azure::session_matches("work", &other).unwrap());
+    assert!(!azure::session_matches("work", &azure_config("")).unwrap());
 }
 
 #[tokio::test]
@@ -303,6 +316,8 @@ async fn an_ended_sign_in_asks_for_a_new_one() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(azure::logout("work").unwrap());
-    assert!(!azure::is_signed_in("work").unwrap());
+    assert!(
+        !azure::is_signed_in("work").unwrap(),
+        "the dead sign-in is forgotten"
+    );
 }

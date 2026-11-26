@@ -15,7 +15,6 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -45,9 +44,6 @@ const CALLBACK_PATH: &str = "/oauth/callback";
 /// Center accepts any port on a loopback redirect (RFC 8252, section 7.3), so
 /// each sign-in can listen on a free one. The AWS CLI does the same.
 const REGISTERED_REDIRECT: &str = "http://127.0.0.1/oauth/callback";
-
-/// How long `fob login` waits for the browser sign-in to be approved.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A client registration is renewed when it has less than this left, so a
 /// new session never starts on a registration about to stop refreshing.
@@ -337,12 +333,8 @@ async fn browser_sign_in(
     oidc: &aws_sdk_ssooidc::Client,
     prompt: impl FnOnce(&SignInPrompt),
 ) -> anyhow::Result<(Registration, CreateTokenOutput)> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .context("listening on 127.0.0.1 for the sign-in callback")?;
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}{CALLBACK_PATH}",
-        listener.local_addr()?.port()
-    );
+    let loopback = oauth::Loopback::bind(0)?;
+    let redirect_uri = format!("http://127.0.0.1:{}{CALLBACK_PATH}", loopback.port());
     let registration = registration(integration, config, oidc, Flow::Browser).await?;
     // A configured endpoint wins over the one the registration names, as in
     // the AWS CLI, which builds the consent URL from the client's endpoint.
@@ -350,31 +342,27 @@ async fn browser_sign_in(
         Some(endpoint) if service_endpoint(OIDC_ENDPOINT_VARIABLE).is_none() => endpoint.clone(),
         _ => authorization_endpoint(&config.region).await?,
     };
-    let (verifier, challenge) = oauth::pkce()?;
-    let state = oauth::random_string(16)?;
+    let pkce = oauth::Pkce::new()?;
     prompt(&SignInPrompt {
         url: authorize_url(
             &endpoint,
             &registration.client_id,
             &redirect_uri,
-            &state,
-            &challenge,
+            &pkce.state,
+            &pkce.challenge,
             &config.scopes,
         ),
         user_code: None,
     });
 
-    let code = tokio::task::spawn_blocking(move || {
-        oauth::wait_for_code(&listener, CALLBACK_PATH, &state, CALLBACK_TIMEOUT, "AWS")
-    })
-    .await??;
+    let code = loopback.code(CALLBACK_PATH, &pkce.state, "AWS").await?;
     let token = oidc
         .create_token()
         .client_id(&registration.client_id)
         .client_secret(&registration.client_secret)
         .grant_type("authorization_code")
         .code(code)
-        .code_verifier(verifier)
+        .code_verifier(pkce.verifier)
         .redirect_uri(redirect_uri)
         .send()
         .await

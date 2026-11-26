@@ -302,7 +302,10 @@ fn the_test_store_needs_an_absolute_directory_and_says_it_is_unsafe() {
 #[test]
 fn a_bad_integration_name_points_at_fob_rename_which_fixes_it() {
     let fob = Fob::new("rename");
-    fob.write_config(&portal_config("\"my portal\""));
+    fob.write_config(&format!(
+        "{}\n[agent]\nprofiles = [\"my portal/dev/*\", \"other/*/*\"]\n",
+        portal_config("\"my portal\"")
+    ));
     fob.sign_in("my portal");
     let stderr = fob.fails(&["status"]);
     assert!(
@@ -317,6 +320,11 @@ fn a_bad_integration_name_points_at_fob_rename_which_fixes_it() {
         stderr.contains("renamed 'my portal' to 'acme' (kept the sign-in)"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("still names 'my portal' (my portal/dev/*)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("other/*/*"), "{stderr}");
     assert!(fob.secret("aws-sso/acme/token").exists());
     assert!(!fob.secret("aws-sso/my portal/token").exists());
     let config = std::fs::read_to_string(fob.config_file()).unwrap();
@@ -826,6 +834,36 @@ async fn export_writes_the_aws_config_atomically_and_rename_warns_about_it() {
     assert!(stderr.contains("still has profiles for 'acme'"), "{stderr}");
     let (stdout, _) = fob.ok(&["list"]);
     assert_eq!(lines(&stdout), ["corp/dev/Admin", "corp/prod/Admin"]);
+}
+
+#[test]
+fn export_gives_console_sign_in_profiles_their_region() {
+    let fob = Fob::new("export-login");
+    fob.write_config(
+        "[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\ndefault_region = \"eu-central-1\"\n",
+    );
+    std::fs::create_dir_all(fob.keyring()).unwrap();
+    let session = json!({
+        "login_session": "arn:aws:iam::123456789012:user/alice",
+        "account_id": "123456789012",
+        "client_id": "arn:aws:signin:::devtools/same-device",
+        "region": "eu-west-1",
+        "refresh_token": "refresh-1",
+        "dpop_key": "",
+        "access_key_id": "ASIAX",
+        "secret_access_key": "secret",
+        "session_token": "session",
+        "expires_at": "2100-01-01T00:00:00Z",
+    });
+    std::fs::write(fob.secret("aws-login/console/session"), session.to_string()).unwrap();
+    fob.ok(&["sync"]);
+    let (stdout, _) = fob.ok(&["export", "aws-config"]);
+    assert!(
+        stdout.contains(
+            "credential_process = fob creds console/123456789012/alice --format credential-process\nregion = eu-central-1\n"
+        ),
+        "{stdout}"
+    );
 }
 
 /// Not a test of its own: `an_integration_opens_in_its_browser` names this test binary

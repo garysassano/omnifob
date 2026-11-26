@@ -12,7 +12,7 @@ use crate::shell::Shell;
 #[command(
     name = "fob",
     version,
-    about = "One sign-in for every cloud: short-lived credentials for AWS (Identity Center and IAM users), Google Cloud, Azure and Cloudflare, and stored tokens for the rest",
+    about = "One sign-in for every cloud: short-lived credentials for AWS (Identity Center, IAM users and console sign-in), Google Cloud, Azure and Cloudflare, and stored tokens for the rest",
     after_help = "Config: $OMNIFOB_CONFIG or ~/.config/omnifob/config.toml"
 )]
 pub(crate) struct Cli {
@@ -31,8 +31,9 @@ pub(crate) enum Command {
         #[arg(long)]
         no_browser: bool,
         /// Sign in from a browser on any device instead of this machine's:
-        /// AWS and Azure show a code to enter there (the device flow), Google
-        /// a code to paste back here. Chosen on its own over SSH and in containers.
+        /// AWS IAM Identity Center and Azure show a code to enter there (the
+        /// device flow), AWS console sign-in and Google a code to paste back
+        /// here. Chosen on its own over SSH and in containers.
         #[arg(long)]
         device_code: bool,
         /// Read the token (a Cloudflare bootstrap token, a token integration's
@@ -44,7 +45,7 @@ pub(crate) enum Command {
         #[arg(long)]
         from_clipboard: bool,
         /// Sign in again even when the stored browser sign-in (AWS IAM Identity
-        /// Center, Google, Azure, Cloudflare OAuth) still works
+        /// Center, AWS console sign-in, Google, Azure, Cloudflare OAuth) still works
         #[arg(long)]
         force: bool,
     },

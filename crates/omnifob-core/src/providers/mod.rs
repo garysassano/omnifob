@@ -210,6 +210,10 @@ pub async fn credentials(
                 profile.id
             )
             .into()),
+            Target::AwsLogin { .. } => return Err(anyhow::anyhow!(
+                "--ttl does not apply to console sign-in credentials: AWS Sign-In always issues them for 15 minutes"
+            )
+            .into()),
             _ => {}
         }
     }
@@ -247,11 +251,14 @@ pub async fn credentials(
         return Ok(with_aws_account(config, profile, cached));
     }
 
-    let fresh = fetch(config, profile, ttl).await?;
-    let fresh = Credentials {
-        issued_at: Some(Timestamp::now()),
-        ..fresh
+    let fresh = fetch(config, profile, ttl, !use_cache).await?;
+    // Console sign-in credentials may come from the stored session, issued
+    // earlier; the others were issued now.
+    let issued_at = match profile.target {
+        Target::AwsLogin { .. } => fresh.issued_at.or(Some(Timestamp::now())),
+        _ => Some(Timestamp::now()),
     };
+    let fresh = Credentials { issued_at, ..fresh };
     // The cache holds credentials of the configured lifetime only: a `ttl`
     // request must not leave its shorter (or longer) ones for the next call.
     // New credentials without `ttl`, as `fob console` gets, replace it.
@@ -309,11 +316,14 @@ fn with_aws_account(config: &Config, profile: &Profile, mut creds: Credentials) 
     creds
 }
 
-/// Gets new credentials from the provider, bypassing the cache.
+/// Gets new credentials from the provider, bypassing the cache. `renew`
+/// makes providers that keep credentials of their own (console sign-in)
+/// renew them rather than hand out the stored ones.
 async fn fetch(
     config: &Config,
     profile: &Profile,
     ttl: Option<jiff::SignedDuration>,
+    renew: bool,
 ) -> Result<Credentials> {
     let integration = config.integration(&profile.integration)?;
     let fresh = match (integration, &profile.target) {
@@ -338,7 +348,7 @@ async fn fetch(
             aws_iam::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
         }
         (Integration::AwsLogin(c), Target::AwsLogin { .. }) => {
-            aws_login::credentials(&profile.integration, c).await?
+            aws_login::credentials(&profile.integration, c, renew).await?
         }
         (Integration::Gcp(c), Target::Gcp { project_id, .. }) => {
             gcp::user_credentials(&profile.integration, c, project_id).await?
@@ -401,7 +411,7 @@ pub async fn one_off_credentials(
         )
         .into());
     }
-    let mut fresh = fetch(config, profile, ttl).await?;
+    let mut fresh = fetch(config, profile, ttl, true).await?;
     fresh.issued_at = Some(Timestamp::now());
     Ok(fresh)
 }
@@ -708,13 +718,17 @@ const KEEP_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_mins(15);
 /// it may renew), was made for the configured portal and scopes, and does not
 /// end within [`KEEP_MARGIN`]. Returns the check's description when it can.
 ///
-/// Only the browser sign-ins (Identity Center, Google, Azure and Cloudflare
-/// OAuth) are kept; for the others `fob login` is how a key or token is
-/// replaced.
+/// Only the browser sign-ins (Identity Center, console sign-in, Google,
+/// Azure and Cloudflare OAuth) are kept; for the others `fob login` is how a
+/// key or token is replaced. A console sign-in is kept only for the
+/// configured Region, a Google one only for the configured OAuth client, and
+/// an Azure one only for the configured tenant.
 pub async fn keepable_sign_in(name: &str, integration: &Integration) -> Option<String> {
     let scopes_match = match integration {
         Integration::AwsSso(config) => aws_sso::session_has_scopes(name, config),
-        Integration::Gcp(_) | Integration::Azure(_) => Ok(true),
+        Integration::AwsLogin(config) => aws_login::session_matches(name, config),
+        Integration::Gcp(config) => gcp::session_matches(name, config),
+        Integration::Azure(config) => azure::session_matches(name, config),
         Integration::Cloudflare(config) if config.uses_oauth() => {
             cloudflare_oauth::granted_scopes(name).map(|granted| {
                 granted.is_some_and(|granted| {
@@ -874,7 +888,7 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
             Ok(moved)
         }
         Integration::Cloudflare(_) => {
-            cloudflare::rename_catalog(old, new);
+            cloudflare::rename_catalog(old, new)?;
             let oauth = cloudflare_oauth::rename(old, new)?;
             Ok(store::rename(
                 &format!("cloudflare/{old}/bootstrap"),
