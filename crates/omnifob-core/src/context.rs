@@ -32,6 +32,11 @@ pub type MfaPrompt = dyn Fn(&str) -> anyhow::Result<String> + Send + Sync;
 /// (`OMNIFOB_KEYRING=encrypted-file`); see [`PassphraseRequest`].
 pub type PassphrasePrompt = dyn Fn(&PassphraseRequest) -> anyhow::Result<String> + Send + Sync;
 
+/// The variable [`Context::builder_from_env`] reads the vault's
+/// passphrase from. Programs omnifob runs (`fob exec` commands, `command`
+/// integrations) never get it.
+pub const VAULT_PASSPHRASE_VAR: &str = "OMNIFOB_VAULT_PASSPHRASE";
+
 /// What a [`PassphrasePrompt`] is asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassphraseRequest {
@@ -347,7 +352,7 @@ impl Context {
         builder.keychain = Keychain::from_env();
         builder.wsl_dpapi = std::env::var("OMNIFOB_WSL_DPAPI").map_or(true, |v| v != "0");
         builder = builder
-            .vault_passphrase(std::env::var("OMNIFOB_VAULT_PASSPHRASE").ok())
+            .vault_passphrase(std::env::var(VAULT_PASSPHRASE_VAR).ok())
             .vault_key_cache(std::env::var("OMNIFOB_VAULT_KEY_CACHE").map_or(true, |v| v != "0"));
         builder.endpoints = Endpoints::from_env();
         builder

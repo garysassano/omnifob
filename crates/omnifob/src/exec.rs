@@ -432,6 +432,9 @@ pub(crate) fn child_env(
         .map(str::to_string)
         .collect();
     remove.push("OMNIFOB_VARS".to_string());
+    // The vault's passphrase opens every stored secret; the command never
+    // needs it.
+    remove.push(omnifob_core::context::VAULT_PASSPHRASE_VAR.to_string());
     if sets("AWS_ACCESS_KEY_ID") {
         let mut stale: Vec<&str> = AWS_CREDENTIAL_VARS.to_vec();
         stale.extend(AWS_COMPANION_VARS);
@@ -712,6 +715,7 @@ mod tests {
                 "GOOGLE_CLOUD_PROJECT",
                 "OMNIFOB_EXPIRES_AT",
                 "OMNIFOB_VARS",
+                "OMNIFOB_VAULT_PASSPHRASE",
             ]
         );
         assert!(set.contains(&("OMNIFOB_PROFILE".into(), "cf/acct/r2".into())));
@@ -736,6 +740,7 @@ mod tests {
                 "AWS_SECURITY_TOKEN",
                 "AWS_WEB_IDENTITY_TOKEN_FILE",
                 "OMNIFOB_VARS",
+                "OMNIFOB_VAULT_PASSPHRASE",
             ]
         );
         assert!(set.contains(&("OMNIFOB_EXPIRES_AT".into(), "2100-01-01T00:00:00Z".into())));
@@ -744,7 +749,14 @@ mod tests {
         let mut creds = Credentials::default();
         creds.env.insert("MODAL_TOKEN_ID".into(), "m".into());
         let (remove, _) = child_env(&profile(), &creds, "");
-        assert_eq!(remove, ["OMNIFOB_EXPIRES_AT", "OMNIFOB_VARS"]);
+        assert_eq!(
+            remove,
+            [
+                "OMNIFOB_EXPIRES_AT",
+                "OMNIFOB_VARS",
+                "OMNIFOB_VAULT_PASSPHRASE"
+            ]
+        );
     }
 
     #[test]

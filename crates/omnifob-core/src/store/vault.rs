@@ -56,6 +56,7 @@ const KEY_LEN: usize = 32;
 const CHECK: &[u8] = b"omnifob encrypted-file vault";
 const CHECK_AAD: &str = "omnifob-vault-check";
 /// The kernel keyring service the derived key is kept under.
+#[cfg(target_os = "linux")]
 const KEY_CACHE_SERVICE: &str = "omnifob-vault-key";
 
 /// The vault's directory from what follows [`NAME`] in `OMNIFOB_KEYRING`:
@@ -208,8 +209,16 @@ impl Vault {
 
     /// Creates the vault: a new passphrase, a random salt and the header.
     /// Another process creating it at the same time wins; this one then
-    /// opens that vault with the same passphrase.
+    /// opens that vault with the same passphrase. Refused when sealed files
+    /// are there without the header: a new salt would make them never open
+    /// again, even with the same passphrase.
     fn create(&self) -> anyhow::Result<RandomizedNonceKey> {
+        if self.has_sealed_files()? {
+            bail!(
+                "{} holds sealed secrets but no {HEADER}, whose salt they were sealed with; restore {HEADER} from a backup, or move the {SUFFIX} files away to start a new vault",
+                self.dir.display()
+            );
+        }
         let passphrase = self.passphrase(true)?;
         if passphrase.chars().count() < MIN_PASSPHRASE {
             bail!("the encrypted vault's passphrase needs at least {MIN_PASSPHRASE} characters");
@@ -249,19 +258,38 @@ impl Vault {
         }
     }
 
+    /// Whether the directory holds any sealed secret.
+    fn has_sealed_files(&self) -> anyhow::Result<bool> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
+        };
+        Ok(entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(SUFFIX)))
+    }
+
     fn passphrase(&self, new: bool) -> anyhow::Result<String> {
         if let Some(passphrase) = &self.unlock.passphrase {
             return Ok(passphrase.clone());
         }
         let Some(prompt) = &self.unlock.prompt else {
+            // An agent is not pointed at the variable: the passphrase is the
+            // person's, entered in their terminal.
+            let variable = if crate::Context::current().agent().is_some() {
+                ""
+            } else {
+                ", or set OMNIFOB_VAULT_PASSPHRASE"
+            };
             if new {
                 bail!(
-                    "creating the encrypted vault in {} needs a passphrase: run fob in a terminal, or set OMNIFOB_VAULT_PASSPHRASE",
+                    "creating the encrypted vault in {} needs a passphrase: run fob in a terminal{variable}",
                     self.dir.display()
                 );
             }
             bail!(
-                "the encrypted vault in {} is locked: run any fob command in a terminal to enter its passphrase (once per boot), or set OMNIFOB_VAULT_PASSPHRASE",
+                "the encrypted vault in {} is locked: run any fob command in a terminal to enter its passphrase (once per boot){variable}",
                 self.dir.display()
             );
         };
@@ -582,6 +610,54 @@ mod tests {
         let token = entry(&dir, None, "aws-sso/acme/token");
         token.delete_credential().unwrap();
         assert!(matches!(token.delete_credential(), Err(Error::NoEntry)));
+    }
+
+    #[test]
+    fn a_missing_header_never_starts_a_new_vault_over_sealed_secrets() {
+        let scratch = scratch("no-header");
+        let dir = scratch.0.join("vault");
+        let pass = "correct horse battery";
+        entry(&dir, Some(pass), "a").set_password("kept").unwrap();
+        std::fs::remove_file(dir.join(HEADER)).unwrap();
+        let refused = entry(&dir, Some(pass), "b")
+            .set_password("new")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("no vault.json"), "{refused}");
+        assert!(!dir.join(HEADER).exists());
+        // Reading a missing key still needs nothing.
+        assert!(matches!(
+            entry(&dir, Some(pass), "c").get_password(),
+            Err(Error::NoEntry)
+        ));
+    }
+
+    #[test]
+    fn an_agent_is_not_pointed_at_the_passphrase_variable() {
+        let scratch = scratch("agent-hint");
+        let dir = scratch.0.join("vault");
+        entry(&dir, Some("correct horse battery"), "a")
+            .set_password("x")
+            .unwrap();
+        let locked = || {
+            entry(&dir, None, "a")
+                .get_password()
+                .unwrap_err()
+                .to_string()
+        };
+        let person = crate::Context::builder().build();
+        let message = {
+            let _entered = person.enter();
+            locked()
+        };
+        assert!(message.contains("OMNIFOB_VAULT_PASSPHRASE"), "{message}");
+        let agent = crate::Context::builder()
+            .agent(Some(crate::context::Agent::default()))
+            .build();
+        let _entered = agent.enter();
+        let message = locked();
+        assert!(message.contains("is locked"), "{message}");
+        assert!(!message.contains("OMNIFOB_VAULT_PASSPHRASE"), "{message}");
     }
 
     #[test]

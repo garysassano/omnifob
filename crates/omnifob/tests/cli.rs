@@ -838,6 +838,22 @@ fn the_encrypted_vault_keeps_secrets_sealed_with_a_passphrase() {
         status.contains("files encrypted with a passphrase in"),
         "{status}"
     );
+    // The command gets the secret, never the vault's passphrase.
+    let keyring = format!("encrypted-file:{}", vault.display());
+    let seen = exec_child(
+        &fob,
+        "t/default/token",
+        &[
+            ("OMNIFOB_KEYRING", &keyring),
+            ("OMNIFOB_VAULT_KEY_CACHE", "0"),
+            ("OMNIFOB_VAULT_PASSPHRASE", pass.unwrap()),
+        ],
+        &["MY_KEY", "OMNIFOB_VAULT_PASSPHRASE"],
+    );
+    assert_eq!(
+        seen,
+        ["MY_KEY=vault-secret-123", "OMNIFOB_VAULT_PASSPHRASE unset"]
+    );
 
     let stderr = texts(&run(
         &["creds", "t/default/token"],
