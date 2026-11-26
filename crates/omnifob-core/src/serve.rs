@@ -4,10 +4,11 @@
 //! the variables their SDKs read, and every request must carry the secret
 //! omnifob put next to the URL, compared in constant time.
 //!
-//! It answers one request per connection (`Connection: close`), one
-//! connection at a time, with a timeout on reading each request, which is
-//! plenty for a single command's SDK calls. Requests and responses are
-//! never logged: they carry the secret and the tokens.
+//! It answers one request per connection (`Connection: close`), up to
+//! [`MAX_CONNECTIONS`] connections at once, so a request waiting for new
+//! credentials does not hold up the others, with a timeout on reading each
+//! request and on writing each answer. Requests and responses are never
+//! logged: they carry the secret and the tokens.
 
 use std::future::Future;
 use std::time::Duration;
@@ -20,8 +21,15 @@ use tokio::net::{TcpListener, TcpStream};
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 64 * 1024;
 
-/// How long a client has to send its request.
+/// How long a client has to send its request, and to take the answer.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many connections are answered at once; more wait to be accepted.
+pub const MAX_CONNECTIONS: usize = 32;
+
+/// How long to wait after `accept` fails, as it keeps failing while the
+/// process is out of file descriptors, before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// One request: the method, the path without the query, the decoded query
 /// pairs, the headers (names lowercased) and the body.
@@ -104,24 +112,42 @@ pub async fn bind() -> anyhow::Result<TcpListener> {
 }
 
 /// Answers requests on `listener` with `handler` until the future is
-/// dropped. A request that cannot be read gets a 400 and the connection is
-/// closed; nothing a client sends ends the server.
+/// dropped, several connections at once. A request that cannot be read
+/// gets a 400 and the connection is closed; nothing a client sends ends the
+/// server.
 pub async fn serve<H, F>(listener: TcpListener, handler: H)
 where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
+    use futures::StreamExt;
+    let mut connections = futures::stream::FuturesUnordered::new();
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let response = match tokio::time::timeout(READ_TIMEOUT, read_request(&mut stream)).await {
-            Ok(Ok(request)) => handler(request).await,
-            Ok(Err(e)) => Response::error(400, "message", format!("{e:#}")),
-            Err(_) => continue,
-        };
-        let _ = write_response(&mut stream, &response).await;
+        tokio::select! {
+            accepted = listener.accept(), if connections.len() < MAX_CONNECTIONS => match accepted {
+                Ok((stream, _)) => connections.push(answer(stream, &handler)),
+                Err(e) => {
+                    tracing::debug!("accepting a connection: {e}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                }
+            },
+            Some(()) = connections.next(), if !connections.is_empty() => {}
+        }
     }
+}
+
+/// Reads one request from `stream`, answers it with `handler`, and closes.
+async fn answer<H, F>(mut stream: TcpStream, handler: &H)
+where
+    H: Fn(Request) -> F,
+    F: Future<Output = Response>,
+{
+    let response = match tokio::time::timeout(READ_TIMEOUT, read_request(&mut stream)).await {
+        Ok(Ok(request)) => handler(request).await,
+        Ok(Err(e)) => Response::error(400, "message", format!("{e:#}")),
+        Err(_) => return,
+    };
+    let _ = tokio::time::timeout(READ_TIMEOUT, write_response(&mut stream, &response)).await;
 }
 
 async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Request> {
@@ -246,7 +272,12 @@ mod tests {
             stream.read_to_string(&mut out).await.unwrap();
             out
         };
-        let out = raw("garbage\r\n\r\n").await;
+        // A client that connects and sends nothing does not hold up the
+        // others.
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), raw("garbage\r\n\r\n"))
+            .await
+            .expect("answered while another connection waits");
         assert!(out.starts_with("HTTP/1.1 400"), "{out}");
         let out = raw(
             "POST /token?resource=https%3A%2F%2Fvault.azure.net HTTP/1.1\r\nHost: x\r\nx-secret: s\r\nContent-Length: 24\r\n\r\ngrant_type=refresh_token",

@@ -26,7 +26,7 @@
 | `CLOUDSDK_CORE_PROJECT`      | gcloud                                        |
 | `GOOGLE_CLOUD_PROJECT`       | Client libraries, Terraform                   |
 
-gcloud reads `CLOUDSDK_AUTH_ACCESS_TOKEN` before the `auth/access_token_file` property (`CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`) and any stored account (`_Load` in `googlecloudsdk/core/credentials/store.py`, Cloud SDK 585.0.0), and reads the file on every run, so `fob exec --token-file` replaces the variable with a private file that fob rewrites ten minutes before the token ends.
+gcloud reads `CLOUDSDK_AUTH_ACCESS_TOKEN` before the `auth/access_token_file` property (`CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`) and any stored account (`_Load` in `googlecloudsdk/core/credentials/store.py`, Cloud SDK 585.0.0), and reads the file on every run, so `fob exec --token-file` replaces the variable with a private file that fob rewrites ten minutes before the token ends, and at least hourly while a longer token lasts, so the clean-up of files a killed `fob exec` left (two hours old) never takes it.
 
 The client libraries' Application Default Credentials do not read an access token from the environment; they need a credentials file. `fob exec` gives them one for the command's lifetime (see below), so programs built on them no longer need `gcloud auth application-default login`.
 

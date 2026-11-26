@@ -16,8 +16,11 @@
 //!
 //! The endpoints listen on `127.0.0.1` only, each with a random secret that
 //! the tool sends back and that is compared in constant time, and live as
-//! long as the future that serves them. Files are written private, in the
-//! state directory's `run` directory, and deleted when dropped.
+//! long as the future that serves them. Their tasks work in the
+//! [`Context`](crate::Context) current when they were made, wherever they
+//! are polled, and never prompt: a request that needs an MFA code is
+//! answered with an error. Files are written private, in the state
+//! directory's `run` directory, and deleted when dropped.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,6 +39,11 @@ use crate::{Config, Credentials, Profile, Target, providers};
 
 /// A future that serves an endpoint, or keeps a file fresh, until dropped.
 pub type Task = Pin<Box<dyn Future<Output = ()>>>;
+
+/// `future` as a [`Task`]: in the context current now, and unattended.
+fn task(future: impl Future<Output = ()> + 'static) -> Task {
+    Box::pin(crate::Context::current().scope(crate::prompt::unattended(future)))
+}
 
 /// What a provisioner adds to a command: variables to set and to remove,
 /// files to delete when it ends, and a task to run while it runs.
@@ -89,14 +97,21 @@ impl Drop for TempFile {
     }
 }
 
+/// How old a token file has to be before [`run_dir`] takes it for one a
+/// killed `fob exec` left behind. A running command's file is rewritten at
+/// least every [`TOKEN_FILE_REWRITE`], so it never gets this old.
+const STALE_TOKEN_FILE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+const TOKEN_FILE_REWRITE: SignedDuration = SignedDuration::from_hours(1);
+
 /// `<state>/run`, private. Token files a killed `fob exec` left behind are
-/// deleted here: their tokens expired long ago, since a running command's
-/// file is rewritten before its token ends.
+/// deleted here: a running command's file is rewritten at least hourly,
+/// whatever its token's lifetime, so a file not written for two hours
+/// belongs to no running command.
 fn run_dir() -> anyhow::Result<PathBuf> {
     let dir = crate::paths::state_dir()?.join("run");
     crate::files::create_private_dir(&dir)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
-        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let stale = std::time::SystemTime::now() - STALE_TOKEN_FILE;
         for entry in entries.flatten() {
             let old = entry
                 .metadata()
@@ -139,6 +154,42 @@ async fn served_credentials(
     Ok(creds)
 }
 
+/// The credentials an endpoint last handed out, for the next requests while
+/// they last at least [`SERVE_MIN`] or are less than a minute old. With a
+/// `ttl` (the agent's cap), [`providers::credentials`] skips its cache, so
+/// without this every request would get new credentials. Requests that
+/// arrive while new ones are fetched wait for them.
+#[derive(Default)]
+struct Served(tokio::sync::Mutex<Option<Credentials>>);
+
+impl Served {
+    async fn get(
+        &self,
+        config: &Config,
+        profile: &Profile,
+        ttl: Option<SignedDuration>,
+    ) -> crate::Result<Credentials> {
+        let mut held = self.0.lock().await;
+        if let Some(creds) = held.as_ref().filter(|c| still_served(c, Timestamp::now())) {
+            return Ok(creds.clone());
+        }
+        let creds = served_credentials(config, profile, ttl).await?;
+        *held = Some(creds.clone());
+        Ok(creds)
+    }
+}
+
+/// Whether credentials an endpoint handed out can be handed out again.
+fn still_served(creds: &Credentials, now: Timestamp) -> bool {
+    let long = creds
+        .expires_at
+        .is_none_or(|at| at.duration_since(now) >= SERVE_MIN);
+    let recent = creds
+        .issued_at
+        .is_some_and(|at| now.duration_since(at) < SignedDuration::from_mins(1));
+    long || recent
+}
+
 /// How a failure reads in an endpoint's answer: the error, without the
 /// request that caused it. Errors never hold secrets.
 fn failure(e: &crate::Error) -> String {
@@ -154,22 +205,6 @@ fn failure(e: &crate::Error) -> String {
 }
 
 // --- AWS -------------------------------------------------------------------
-
-/// Variables that would win over the container endpoint in the SDKs'
-/// credential chain, or point it elsewhere.
-const AWS_SHADOWING: &[&str] = &[
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-    "AWS_CREDENTIAL_EXPIRATION",
-    "AWS_PROFILE",
-    "AWS_DEFAULT_PROFILE",
-    "AWS_ROLE_ARN",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-];
 
 /// The body the container credential provider expects. `Token` is
 /// required by botocore, so credentials without a session token fail.
@@ -204,18 +239,18 @@ pub async fn aws_container_endpoint(
     let listener = serve::bind().await?;
     let port = listener.local_addr()?.port();
     let secret = serve::secret()?;
-    let state = Rc::new((config, profile, secret.clone()));
+    let state = Rc::new((config, profile, secret.clone(), Served::default()));
     let handler = move |request: Request| {
         let state = state.clone();
         async move {
-            let (config, profile, secret) = &*state;
+            let (config, profile, secret, served) = &*state;
             if !serve::secret_matches(request.header("authorization"), secret) {
                 return Response::error(401, "message", "wrong or missing authorization token");
             }
             if request.method != "GET" || request.path != "/" {
                 return Response::error(404, "message", "GET / only");
             }
-            let creds = match served_credentials(config, profile, ttl).await {
+            let creds = match served.get(config, profile, ttl).await {
                 Ok(creds) => creds,
                 Err(e) => return Response::error(500, "message", failure(&e)),
             };
@@ -233,9 +268,15 @@ pub async fn aws_container_endpoint(
             ),
             ("AWS_CONTAINER_AUTHORIZATION_TOKEN".into(), secret),
         ],
-        remove: AWS_SHADOWING.iter().map(|v| v.to_string()).collect(),
+        // Every other source of AWS credentials, which would win over the
+        // container endpoint in the SDKs' chain or point it elsewhere. The
+        // endpoint's own two variables are set again.
+        remove: crate::credentials::AWS_CREDENTIAL_VARS
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
         files: Vec::new(),
-        tasks: vec![Box::pin(serve::serve(listener, handler))],
+        tasks: vec![task(serve::serve(listener, handler))],
     })
 }
 
@@ -350,7 +391,7 @@ pub async fn azure_identity_endpoint(
         ],
         remove: AZURE_SHADOWING.iter().map(|v| v.to_string()).collect(),
         files: Vec::new(),
-        tasks: vec![Box::pin(serve::serve(listener, handler))],
+        tasks: vec![task(serve::serve(listener, handler))],
     })
 }
 
@@ -383,18 +424,23 @@ fn gcp_token(creds: &Credentials) -> anyhow::Result<(&str, Option<Timestamp>)> {
 
 /// A token endpoint and an ADC file (`GOOGLE_APPLICATION_CREDENTIALS`)
 /// for a Google profile, so the client libraries get its access token and
-/// come back for a new one when it nears its end.
-pub async fn gcp_adc_endpoint(config: Config, profile: Profile) -> anyhow::Result<Provision> {
+/// come back for a new one when it nears its end. `ttl` caps the lifetime
+/// of a service account's tokens, as for `fob exec`.
+pub async fn gcp_adc_endpoint(
+    config: Config,
+    profile: Profile,
+    ttl: Option<SignedDuration>,
+) -> anyhow::Result<Provision> {
     let listener = serve::bind().await?;
     let port = listener.local_addr()?.port();
     let secret = serve::secret()?;
     let body = gcp_adc_file_body(&format!("http://127.0.0.1:{port}/token"), &secret);
     let file = TempFile::create(".json", &serde_json::to_vec_pretty(&body)?)?;
-    let state = Rc::new((config, profile, secret));
+    let state = Rc::new((config, profile, secret, Served::default()));
     let handler = move |request: Request| {
         let state = state.clone();
         async move {
-            let (config, profile, secret) = &*state;
+            let (config, profile, secret, served) = &*state;
             let error = |status, e: &str, d: String| Response {
                 status,
                 body: json!({ "error": e, "error_description": d }),
@@ -407,7 +453,7 @@ pub async fn gcp_adc_endpoint(config: Config, profile: Profile) -> anyhow::Resul
             {
                 return error(400, "invalid_grant", "wrong grant or refresh token".into());
             }
-            let creds = match served_credentials(config, profile, None).await {
+            let creds = match served.get(config, profile, ttl).await {
                 Ok(creds) => creds,
                 Err(e) => return error(400, "invalid_grant", failure(&e)),
             };
@@ -431,7 +477,7 @@ pub async fn gcp_adc_endpoint(config: Config, profile: Profile) -> anyhow::Resul
         )],
         remove: Vec::new(),
         files: vec![file],
-        tasks: vec![Box::pin(serve::serve(listener, handler))],
+        tasks: vec![task(serve::serve(listener, handler))],
     })
 }
 
@@ -439,28 +485,42 @@ pub async fn gcp_adc_endpoint(config: Config, profile: Profile) -> anyhow::Resul
 /// `CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`), written private and rewritten with a
 /// new token ten minutes before the old one ends, since gcloud reads it on
 /// every run. `CLOUDSDK_AUTH_ACCESS_TOKEN` is removed, because gcloud reads
-/// it first.
+/// it first. A token that lasts longer is written again every
+/// [`TOKEN_FILE_REWRITE`], so [`run_dir`] never takes the file for a stale
+/// one. `ttl` caps the lifetime of a service account's new tokens, as for
+/// `fob exec`.
 pub fn gcp_token_file(
     config: Config,
     profile: Profile,
     creds: &Credentials,
+    ttl: Option<SignedDuration>,
 ) -> anyhow::Result<Provision> {
     let (token, mut expires_at) = gcp_token(creds)?;
+    let mut token = token.to_string();
     let file = TempFile::create(".token", token.as_bytes())?;
     let path = file.path().to_path_buf();
     let keep_fresh = async move {
         loop {
-            let wait = expires_at
+            let until_renewal = expires_at
                 .map(|at| at.duration_since(Timestamp::now()) - SignedDuration::from_mins(10))
-                .unwrap_or(SignedDuration::from_mins(50))
+                .unwrap_or(SignedDuration::from_mins(50));
+            let wait = until_renewal
+                .min(TOKEN_FILE_REWRITE)
                 .max(SignedDuration::from_secs(30));
             tokio::time::sleep(wait.unsigned_abs()).await;
-            match providers::credentials(&config, &profile, false, None).await {
+            if until_renewal > TOKEN_FILE_REWRITE {
+                if let Err(e) = crate::files::write_private(&path, &token) {
+                    tracing::warn!("could not rewrite the gcloud token file: {e:#}");
+                }
+                continue;
+            }
+            match providers::credentials(&config, &profile, false, ttl).await {
                 Ok(creds) => match gcp_token(&creds) {
-                    Ok((token, at)) => {
-                        if let Err(e) = crate::files::write_private(&path, token) {
+                    Ok((new, at)) => {
+                        if let Err(e) = crate::files::write_private(&path, new) {
                             tracing::warn!("could not rewrite the gcloud token file: {e:#}");
                         }
+                        token = new.to_string();
                         expires_at = at;
                     }
                     Err(e) => tracing::warn!("{e:#}"),
@@ -476,7 +536,7 @@ pub fn gcp_token_file(
         )],
         remove: vec!["CLOUDSDK_AUTH_ACCESS_TOKEN".into()],
         files: vec![file],
-        tasks: vec![Box::pin(keep_fresh)],
+        tasks: vec![task(keep_fresh)],
     })
 }
 
