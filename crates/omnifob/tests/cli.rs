@@ -846,7 +846,7 @@ fn the_encrypted_vault_keeps_secrets_sealed_with_a_passphrase() {
         &[
             ("OMNIFOB_KEYRING", &keyring),
             ("OMNIFOB_VAULT_KEY_CACHE", "0"),
-            ("OMNIFOB_VAULT_PASSPHRASE", pass.unwrap()),
+            ("OMNIFOB_VAULT_PASSPHRASE", "a vault passphrase"),
         ],
         &["MY_KEY", "OMNIFOB_VAULT_PASSPHRASE"],
     );
