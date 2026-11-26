@@ -4,10 +4,12 @@
 //! The key lives in the keychain and is never handed out. Profiles get
 //! temporary credentials instead: the user's session from STS
 //! `GetSessionToken`, with an MFA code when `mfa_serial` is set, and roles
-//! assumed with that session. Because the session is the user's own, assuming
-//! a role from it is not role chaining, so roles get sessions of up to twelve
-//! hours, and a session with MFA satisfies roles that require it. One MFA code
-//! therefore covers every role until the session ends.
+//! assumed with that session. One MFA code therefore covers every role until
+//! the session ends, but STS counts a role assumed with session credentials
+//! as role chaining, so those roles last at most an hour. A role with
+//! `no_session` is assumed with the access key itself instead, as aws-vault's
+//! `--no-session` does: up to twelve hours, with an MFA code for each new
+//! session of that role.
 
 use anyhow::{Context, anyhow};
 use jiff::{SignedDuration, Timestamp};
@@ -235,15 +237,39 @@ pub async fn role_credentials(
         format!("no role '{label}' in integration '{integration}'; run `fob sync`")
     })?;
     let duration = ttl.or(role.duration).unwrap_or(DEFAULT_ROLE_SESSION);
+    let region = role.region.as_deref().or(config.region.as_deref());
+    if role.no_session {
+        if !(SESSION_MIN..=sts::ROLE_MAX).contains(&duration) {
+            return Err(
+                anyhow!("a role assumed with the access key lasts 15 minutes to 12 hours").into(),
+            );
+        }
+        // The key signs AssumeRole itself, so the role's session carries
+        // MFA only through this request's code.
+        let key = stored_key(integration)?;
+        let request = RoleRequest {
+            role_arn: &role.role_arn,
+            session_name: role.session_name.as_deref(),
+            external_id: role.external_id.as_deref(),
+            mfa_serial: config.mfa_serial.as_deref(),
+            duration,
+            profile_id,
+        };
+        return Ok(
+            sts::assume_role(&key_credentials(&key), &request, sts_region(config), region).await?,
+        );
+    }
     // STS counts a role assumed with the user's session as role chaining.
     if !(SESSION_MIN..=SignedDuration::from_hours(1)).contains(&duration) {
-        return Err(anyhow!("an IAM user's role session lasts 15 minutes to 1 hour").into());
+        return Err(anyhow!(
+            "an IAM user's role session lasts 15 minutes to 1 hour; set no_session = true on the role for up to 12 hours"
+        )
+        .into());
     }
     // The role's credentials outlive the session they came from (tried
     // live), so the duration is not shortened to what is left of it.
     let cached = fresh_session(integration).is_some();
     let session = session_credentials(integration, config, profile_id, None).await?;
-    let region = role.region.as_deref().or(config.region.as_deref());
     let request = RoleRequest {
         role_arn: &role.role_arn,
         session_name: role.session_name.as_deref(),

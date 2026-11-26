@@ -635,6 +635,244 @@ async fn ambiguous_queries_list_the_matches() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn profiles_are_picked_by_account_and_role() {
+    let (fob, _server) = synced_portal("by-account").await;
+    let key = |args: &[&str]| {
+        let mut all = vec!["creds", "--format", "credential-process"];
+        all.extend_from_slice(args);
+        let (stdout, _) = fob.ok(&all);
+        serde_json::from_str::<Value>(&stdout).unwrap()["AccessKeyId"].clone()
+    };
+    assert_eq!(
+        key(&["--account-id", "111111111111", "--role", "admin"]),
+        "ASIA111111111111"
+    );
+    assert_eq!(key(&["--account-id", "222222222222"]), "ASIA222222222222");
+    let stderr = fob.fails(&["creds", "--role", "Admin"]);
+    assert!(
+        stderr.contains("'--role Admin' matches 2 profiles"),
+        "{stderr}"
+    );
+    let stderr = fob.fails(&["creds", "--account-id", "333333333333"]);
+    assert!(
+        stderr.contains("no profile matches '--account-id 333333333333'"),
+        "{stderr}"
+    );
+    assert!(
+        fob.fails(&["creds", "acme", "--role", "Admin"])
+            .contains("cannot be used with")
+    );
+    // An account and role that name one profile are exact enough for an agent.
+    let output = fob.run_as_agent(&[
+        "creds",
+        "--account-id",
+        "222222222222",
+        "--role",
+        "Admin",
+        "--format",
+        "credential-process",
+    ]);
+    assert!(output.status.success(), "{:?}", texts(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_picks_its_default_profile() {
+    let (fob, _server) = synced_portal("directories").await;
+    let project = fob.root.join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    let mut config = portal_config("acme");
+    config.push_str(&format!(
+        "\n[directories]\n'{}' = \"acme/prod/Admin\"\n'{}' = \"acme/dev/Admin\"\n",
+        fob.root.display(),
+        project.join("src").display()
+    ));
+    fob.write_config(&config);
+    let env_in = |dir: &Path| {
+        let output = fob
+            .command(&["env", "--shell", "bash"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = texts(&output);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        stdout
+    };
+    assert!(env_in(&project).contains("ASIA222222222222"));
+    // The longest directory wins.
+    assert!(env_in(&project.join("src")).contains("ASIA111111111111"));
+    // A named profile still wins over the directory's.
+    let output = fob
+        .command(&["env", "acme/dev/Admin", "--shell", "bash"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(texts(&output).0.contains("ASIA111111111111"));
+    // An agent has to name it, and is told which one it is.
+    let output = fob
+        .command(&["exec", "--", "true"])
+        .env("CLAUDECODE", "1")
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stderr = texts(&output).1;
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("name a profile by its full id; this directory's default")
+            && stderr.contains("is acme/prod/Admin"),
+        "{stderr}"
+    );
+    // A default that is not a profile says so.
+    let mut config = portal_config("acme");
+    config.push_str(&format!(
+        "\n[directories]\n'{}' = \"acme/gone/Admin\"\n",
+        project.display()
+    ));
+    fob.write_config(&config);
+    let output = fob
+        .command(&["env", "--shell", "bash"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        texts(&output)
+            .1
+            .contains("acme/gone/Admin, the default profile of"),
+        "{:?}",
+        texts(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_integration_runs_its_program_and_caches_by_expiry() {
+    let (fob, server) = synced_portal("command").await;
+    // `fob creds` itself is the helper: it runs on every platform and
+    // prints the AWS credential_process format.
+    let mut config = portal_config("acme");
+    config.push_str(&format!(
+        "\n[integrations.wrapped]\ntype = \"command\"\ncommand = ['{FOB}', \"creds\", \"acme/prod/Admin\", \"--format\", \"credential-process\", \"--no-cache\"]\nformat = \"credential-process\"\nregion = \"eu-west-1\"\n"
+    ));
+    fob.write_config(&config);
+    let stderr = fob.ok(&["login", "wrapped"]).1;
+    assert!(stderr.contains("has nothing to sign in to"), "{stderr}");
+    let (list, _) = fob.ok(&["list", "wrapped"]);
+    assert!(list.contains("wrapped/default/fob"), "{list}");
+    let fetches = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/federation/credentials")
+            .count()
+    };
+    let before = fetches().await;
+    for _ in 0..2 {
+        let (stdout, _) = fob.ok(&["creds", "wrapped/default/fob"]);
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(value["env"]["AWS_ACCESS_KEY_ID"], "ASIA222222222222");
+        assert_eq!(value["env"]["AWS_ACCOUNT_ID"], "222222222222");
+        assert_eq!(value["env"]["AWS_REGION"], "eu-west-1");
+        assert_eq!(value["expires_at"], "2100-01-01T00:00:00Z");
+    }
+    // The program ran once; the second call came from the cache.
+    assert_eq!(fetches().await, before + 1);
+    let stderr = fob.fails(&["creds", "wrapped/default/fob", "--ttl", "30m"]);
+    assert!(stderr.contains("set `ttl` on 'wrapped'"), "{stderr}");
+}
+
+#[test]
+fn the_encrypted_vault_keeps_secrets_sealed_with_a_passphrase() {
+    let fob = Fob::new("vault");
+    fob.write_config(
+        "[integrations.t]\ntype = \"token\"\n[integrations.t.secrets]\nkey = [\"MY_KEY\"]\n",
+    );
+    let vault = fob.root.join("vault");
+    let run = |args: &[&str], passphrase: Option<&str>, stdin: Option<&str>| {
+        use std::io::Write;
+        let mut cmd = fob.command(args);
+        cmd.env(
+            "OMNIFOB_KEYRING",
+            format!("encrypted-file:{}", vault.display()),
+        )
+        .env("OMNIFOB_VAULT_KEY_CACHE", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        if let Some(p) = passphrase {
+            cmd.env("OMNIFOB_VAULT_PASSPHRASE", p);
+        }
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.unwrap_or_default().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let pass = Some("a vault passphrase");
+    let output = run(
+        &["login", "t", "--token-stdin"],
+        pass,
+        Some("vault-secret-123"),
+    );
+    assert!(output.status.success(), "{:?}", texts(&output));
+    let output = run(&["creds", "t/default/token"], pass, None);
+    assert!(output.status.success(), "{:?}", texts(&output));
+    assert!(texts(&output).0.contains("vault-secret-123"));
+    let names = entries(&vault);
+    assert!(names.contains(&"vault.json".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"token%2Ft%2Fsecrets.sealed".to_string()),
+        "{names:?}"
+    );
+    for name in &names {
+        let bytes = std::fs::read(vault.join(name)).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("vault-secret"),
+            "{name}"
+        );
+    }
+    let status = texts(&run(&["status"], pass, None)).0;
+    assert!(
+        status.contains("files encrypted with a passphrase in"),
+        "{status}"
+    );
+    // The command gets the secret, never the vault's passphrase.
+    let keyring = format!("encrypted-file:{}", vault.display());
+    let seen = exec_child(
+        &fob,
+        "t/default/token",
+        &[
+            ("OMNIFOB_KEYRING", &keyring),
+            ("OMNIFOB_VAULT_KEY_CACHE", "0"),
+            ("OMNIFOB_VAULT_PASSPHRASE", "a vault passphrase"),
+        ],
+        &["MY_KEY", "OMNIFOB_VAULT_PASSPHRASE"],
+    );
+    assert_eq!(
+        seen,
+        ["MY_KEY=vault-secret-123", "OMNIFOB_VAULT_PASSPHRASE unset"]
+    );
+
+    let stderr = texts(&run(
+        &["creds", "t/default/token"],
+        Some("another passphrase"),
+        None,
+    ))
+    .1;
+    assert!(stderr.contains("wrong passphrase"), "{stderr}");
+    // Without a terminal or a passphrase, the vault stays locked.
+    let output = run(&["creds", "t/default/token"], None, None);
+    assert!(!output.status.success());
+    assert!(
+        texts(&output).1.contains("is locked"),
+        "{:?}",
+        texts(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn exec_tells_its_own_failures_from_the_command() {
     let (fob, _server) = synced_portal("exec-status").await;
     let status = |args: &[&str]| fob.run(args).status.code();

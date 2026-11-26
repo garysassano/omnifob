@@ -185,13 +185,45 @@ impl App {
     /// Resolves a profile query, asking the user to pick when it is missing
     /// or ambiguous and a terminal is available. Under an agent the query must
     /// be a full profile id that `[agent] profiles` allows, so a command does
-    /// what it says and permission rules can match it.
-    pub(crate) async fn select(&mut self, query: Option<&str>) -> anyhow::Result<Profile> {
+    /// what it says and permission rules can match it; `--account-id` and
+    /// `--role` count when they name one profile.
+    pub(crate) async fn select<'a>(
+        &mut self,
+        pick: impl Into<Pick<'a>>,
+    ) -> anyhow::Result<Profile> {
+        let pick = pick.into();
         let skipped = self.ensure_synced().await?;
+        let mut query = pick.query;
+        let mut from_directory = None;
+        if query.is_none() && !pick.by_account() && pick.directory_default {
+            from_directory = self.directory_default()?;
+            if let Some((dir, id)) = &from_directory {
+                if agent::active() {
+                    bail!(
+                        "name a profile by its full id; this directory's default ({dir}) is {id}"
+                    );
+                }
+                if !self.cache.all().any(|p| p.id == *id) {
+                    bail!(
+                        "{id}, the default profile of {dir} in [directories], is not a profile; see `fob list`"
+                    );
+                }
+            }
+        }
+        if let Some((_, id)) = &from_directory {
+            query = Some(id.as_str());
+        }
         let mut candidates: Vec<&Profile> = match query {
             Some(q) => self.cache.find(q),
-            None => self.cache.all().collect(),
+            None => self.cache.all().filter(|p| pick.matches(p)).collect(),
         };
+        let precise = pick.by_account() && candidates.len() == 1;
+        let query_text = if pick.by_account() {
+            Some(pick.describe())
+        } else {
+            query.map(str::to_string)
+        };
+        let query = query_text.as_deref();
         // Recently used profiles first, in the picker and in error messages.
         History::load(&history::file()?).sort_recent_first(&mut candidates, |p| p.id.as_str());
         if candidates.is_empty() {
@@ -204,7 +236,9 @@ impl App {
                 query.unwrap_or_default()
             ),
             [] => bail!("no profiles yet; run `fob login <integration>`"),
-            [one] if !agent::active() || query == Some(one.id.as_str()) => (*one).clone(),
+            [one] if !agent::active() || precise || query == Some(one.id.as_str()) => {
+                (*one).clone()
+            }
             _ if agent::active() => match query {
                 None => bail!("name a profile by its full id; `fob list` shows them"),
                 Some(q) => bail!(
@@ -233,6 +267,80 @@ impl App {
             );
         }
         Ok(profile)
+    }
+}
+
+impl App {
+    /// The `[directories]` entry for the working directory: the directory
+    /// as configured and its profile id.
+    fn directory_default(&self) -> anyhow::Result<Option<(String, String)>> {
+        if self.config.directories.is_empty() {
+            return Ok(None);
+        }
+        let cwd = std::env::current_dir().context("reading the working directory")?;
+        Ok(self
+            .config
+            .directory_profile(&cwd, std::env::home_dir().as_deref())
+            .map(|(dir, id)| (dir.to_string(), id.to_string())))
+    }
+}
+
+/// How a command names its profile: words of its id, or the account and
+/// role, or nothing (a directory's default when the command takes one, else
+/// the picker).
+#[derive(Default)]
+pub(crate) struct Pick<'a> {
+    pub(crate) query: Option<&'a str>,
+    pub(crate) account_id: Option<&'a str>,
+    pub(crate) role: Option<&'a str>,
+    /// Whether, with nothing named, `[directories]` gives the profile.
+    pub(crate) directory_default: bool,
+}
+
+impl<'a> From<Option<&'a str>> for Pick<'a> {
+    fn from(query: Option<&'a str>) -> Self {
+        Self {
+            query,
+            ..Self::default()
+        }
+    }
+}
+
+impl Pick<'_> {
+    fn by_account(&self) -> bool {
+        self.account_id.is_some() || self.role.is_some()
+    }
+
+    /// Whether `profile` is in the account and has the role asked for. The
+    /// account is the provider's (AWS account, Azure subscription, Google
+    /// project, Cloudflare account); the role is the last part of the id (a
+    /// role, a Cloudflare template), ignoring case.
+    fn matches(&self, profile: &Profile) -> bool {
+        let account = self.account_id.is_none_or(|wanted| {
+            profile
+                .target
+                .account_id()
+                .is_some_and(|id| id.eq_ignore_ascii_case(wanted.trim()))
+        });
+        let role = self.role.is_none_or(|wanted| {
+            let leaf = profile.id.rsplit('/').next().unwrap_or_default();
+            let role_name = match &profile.target {
+                omnifob_core::Target::Aws { role_name, .. } => role_name.as_str(),
+                _ => leaf,
+            };
+            leaf.eq_ignore_ascii_case(wanted) || role_name.eq_ignore_ascii_case(wanted)
+        });
+        account && role
+    }
+
+    /// The account and role asked for, for messages.
+    fn describe(&self) -> String {
+        match (self.account_id, self.role) {
+            (Some(account), Some(role)) => format!("--account-id {account} --role {role}"),
+            (Some(account), None) => format!("--account-id {account}"),
+            (None, Some(role)) => format!("--role {role}"),
+            (None, None) => String::new(),
+        }
     }
 }
 

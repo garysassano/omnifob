@@ -121,11 +121,27 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // answer. Nothing has used the library yet, so the install takes.
     let mut context = omnifob_core::Context::builder_from_env().agent(agent::context_agent());
     if interactive() {
-        context = context.mfa_prompt(|serial| {
-            Ok(dialoguer::Input::<String>::new()
-                .with_prompt(format!("MFA code for {serial}"))
-                .interact_text_on(&Term::stderr())?)
-        });
+        context = context
+            .mfa_prompt(|serial| {
+                Ok(dialoguer::Input::<String>::new()
+                    .with_prompt(format!("MFA code for {serial}"))
+                    .interact_text_on(&Term::stderr())?)
+            })
+            .passphrase_prompt(|request| {
+                let vault = request.vault.display();
+                let mut prompt = dialoguer::Password::new();
+                if request.new {
+                    eprintln!(
+                        "fob: creating an encrypted vault in {vault}; it opens only with this passphrase, which omnifob cannot recover"
+                    );
+                    prompt = prompt
+                        .with_prompt("New vault passphrase")
+                        .with_confirmation("Repeat it", "the passphrases differ");
+                } else {
+                    prompt = prompt.with_prompt(format!("Passphrase for the vault in {vault}"));
+                }
+                Ok(prompt.interact_on(&Term::stderr())?)
+            });
     }
     if context.build().install().is_err() {
         tracing::debug!("the library's context was already chosen");
@@ -238,6 +254,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::List { query: words, json } => app.list(query(&words).as_deref(), json).await?,
         Command::Env {
             profile,
+            by,
             shell,
             unset,
             no_cache,
@@ -246,7 +263,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             debug_assert!(!unset, "handled before loading the config");
             let previous = std::env::var("OMNIFOB_VARS").unwrap_or_default();
             let previous: Vec<&str> = previous.split(',').filter(|v| !v.is_empty()).collect();
-            let profile = app.select(query(&profile).as_deref()).await?;
+            // `fob use` runs `fob env`, so both take the directory's default.
+            let words = query(&profile);
+            let pick = sync::Pick {
+                directory_default: true,
+                ..by.pick(&words)
+            };
+            let profile = app.select(pick).await?;
             if agent::active() {
                 return Err(agent::refuse_to_print(&profile.id));
             }
@@ -256,6 +279,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Exec {
             profile,
+            by,
             no_cache,
             ttl,
             revoke,
@@ -269,8 +293,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 no_server,
                 token_file,
             };
+            let words = query(&profile);
             let result = async {
-                let profile = app.select(query(&profile).as_deref()).await?;
+                let pick = sync::Pick {
+                    directory_default: true,
+                    ..by.pick(&words)
+                };
+                let profile = app.select(pick).await?;
                 // Under an agent with `[agent] auto_revoke`, each command
                 // gets a Cloudflare token of its own, deleted afterwards.
                 let auto_revoke = agent::active()
@@ -300,6 +329,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Console {
             profile,
+            by,
             print,
             copy,
             duration,
@@ -318,18 +348,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 console::Action::Open
             };
-            app.console(query(&profile).as_deref(), action, &options)
-                .await?
+            let words = query(&profile);
+            app.console(by.pick(&words), action, &options).await?
         }
         Command::Creds {
             profile,
+            by,
             format,
             cluster,
             region,
             no_cache,
             ttl,
         } => {
-            let profile = app.select(query(&profile).as_deref()).await?;
+            let words = query(&profile);
+            let profile = app.select(by.pick(&words)).await?;
             // credential_process, fnox, Google's libraries and kubectl run
             // fob inside the agent's own commands and hand the output to a
             // program, not to the agent.
@@ -371,6 +403,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             permissions,
             optional,
             r2_buckets,
+            zones,
             s3,
             ips,
             ttl,
@@ -383,6 +416,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 r2_buckets,
                 s3,
                 ips: (!ips.is_empty()).then_some(ips),
+                zones,
             };
             app.add_template(&integration, &name, template, replace)
                 .await?

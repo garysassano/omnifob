@@ -226,7 +226,7 @@ A refusal by network controls says nothing about the session: connecting to the 
 
 Roles of an `aws-iam` integration are assumed with the user's `GetSessionToken` session, so one MFA code covers every role. The 2026-11-08 entry chose this on the ground that it is not role chaining, so the roles could last up to 12 hours. Tried live, STS counts it as role chaining: a 2 hour `AssumeRole` with session credentials is refused with "The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining". Every `duration` over an hour therefore failed at the first use. `duration` on an `aws-iam` role and `fob exec --ttl` for one are now 15 minutes to 1 hour, refused when the config loads rather than at STS, and `fob import aws` takes `duration_seconds` up to 3600 for such roles. It is a break for a config with a longer `duration`, which never worked.
 
-Assuming roles with the access key itself would allow 12 hours (aws-vault's `--no-session`), at the cost of an MFA code per role and the key signing every `AssumeRole`. It is left until someone needs longer sessions.
+Assuming roles with the access key itself would allow 12 hours (aws-vault's `--no-session`), at the cost of an MFA code per role and the key signing every `AssumeRole`. It is left until someone needs longer sessions. (Update 2026-11-25: someone did. `no_session = true` on a role does it, allowing `duration` up to 12 hours; see the entry of that date.)
 
 The same live check showed that role credentials keep working after the session they were assumed with has expired (an hour's role from a session with 15 minutes left answered `GetCallerIdentity` after the session returned `ExpiredToken`), so the duration is no longer shortened to what is left of the session; that only gave shorter sessions. The federation endpoint also returns a sign-in token with `SessionDuration` for these credentials, so `console_duration` on an IAM user's role works although STS calls them chained.
 
@@ -236,7 +236,7 @@ The same live check showed that role credentials keep working after the session 
 
 The session, DPoP key included, is kept in the keychain like other providers' secrets, not in `~/.aws/login/cache` as plain JSON, so the AWS CLI does not see omnifob's sign-ins and omnifob does not read the CLI's. Sharing that cache would have kept a refresh token and its key in a file. The credentials last 15 minutes and are renewed five minutes before they expire, as the CLI does; refusals that mean the sign-in is over end it, anything else keeps it, as for Identity Center.
 
-There is one profile per integration, the signed-in identity. Roles assumed from it would be role chaining (an hour at most), and nothing asks for them yet.
+There is one profile per integration, the signed-in identity. Roles assumed from it would be role chaining (an hour at most), and nothing asks for them yet. (Update 2026-11-25: they were asked for, and `[integrations.<name>.roles.<label>]` adds them, capped at an hour; see the entry of that date.)
 
 ## 2026-11-21: AWS consoles opened apart, one per profile
 
@@ -347,3 +347,55 @@ Under an agent, roles whose config names no `session_name` start sessions named 
 `[agent] max_ttl` caps the lifetime where omnifob chooses it, by asking for that lifetime (which is not cached, as with `--ttl`); where the provider sets it (Identity Center, Google accounts, Azure, console sign-in) nothing can be done, and IAM user sessions and chained roles with MFA are left alone because each new one would ask for a code no one can enter. The cap also applies to the Google ADC endpoint and `--token-file`. It is at least 15 minutes, AWS's shortest session. `[agent] auto_revoke` makes `fob exec` on a Cloudflare profile behave as `--revoke` under an agent.
 
 `[audit] enabled` appends a JSON line per handout to `audit.jsonl` in the state directory: time, command, profile, integration, the agent's marker variable, how it was handed over, the expiry and a revocable token's ID, never a secret. It is off by default, local, append-only (one write per line to a file opened for appending, so parallel commands do not interleave) and never rotated by fob. Agent detection now reports which variable matched, and `AI_AGENT` and the markers of OpenCode, Crush, Qwen Code, Cline, Goose, Pi, Antigravity, Copilot CLI and Codex's thread were added after checking each agent's source or documentation; agents with no documented marker are left to `OMNIFOB_AGENT`.
+
+## 2026-11-25: Default profiles per directory, in the user's config, and not for agents
+
+`[directories]` maps a directory to a profile id, which `fob exec` and `fob use` take when no profile is named; the longest matching directory wins, compared by whole path components and also through the configured directory's real path, since the working directory never holds a symbolic link (macOS's `/var` is one). The 2026-10-07 entry deferred aliases to this, and the 2026-10-09 entry asked that such a mapping stay in omnifob's config rather than in repositories: a file in the repository would carry one person's integration names to everyone who clones it. Only `exec` and `use` take the default; `creds`, `console` and the rest keep asking, since a credential printed or a console opened as a surprise is worse than a prompt. Under a coding agent the default does not apply and the error names it, because the agent rules (2026-11-16) want a command to say which profile it uses, so a permission rule can match it.
+
+## 2026-11-25: Profiles picked by account and role
+
+`--account-id` and `--role` pick a profile without naming it, as aws-sso-util's `run-as` does, so a command in a runbook works for colleagues whose integrations and account names differ: account IDs and role names are the same for everyone. The account is whatever `Target::account_id` gives (AWS account, Azure subscription, Google project, Cloudflare account), and the role is the last segment of the id or an Identity Center role's name, ignoring case. An agent may use them when they select exactly one profile, since the command then names its target as precisely as a full id does. Tags and aliases (aws-sso-cli) were not added: they would be a second naming scheme to keep in sync.
+
+## 2026-11-25: Firefox containers coloured per profile pattern
+
+`[[browsers.<name>.containers]]` sets the colour and icon of the containers of profiles matching its patterns (the same patterns as `[agent] profiles`), the first match winning, and passes them as `color` and `icon` on the `ext+granted-containers:` URL. The 2026-11-21 entry left colours to the extension; telling production from development at a glance is worth one table. The extension silently drops values outside Firefox's colour and icon lists, so omnifob accepts only those and fails when the config loads. Firefox's own "Open URL in Container" extension (`ext+container:`) was not added: people coming from granted already have its extension.
+
+## 2026-11-25: `no_session` roles for IAM users
+
+The 2026-11-18 entry capped an IAM user's roles at an hour, since STS counts a role assumed with a `GetSessionToken` session as role chaining, and left assuming them with the key itself until someone needed longer sessions. Long batch jobs and long `terraform apply` runs do, so `no_session = true` on an `aws-iam` role assumes it as aws-vault's `--no-session` does: `AssumeRole` signed with the access key, which is not chaining, so `duration` and `--ttl` go up to 12 hours (and up to the role's maximum session duration, which omnifob cannot see, so STS refuses a longer one). It is per role rather than per integration, so one MFA code still covers every other role. The cost is what the earlier entry named: with `mfa_serial`, each new session of the role asks for a code, sent with `AssumeRole` since no MFA-carrying session exists, and the long-lived key signs every `AssumeRole` of the role rather than one `GetSessionToken` per session. Not yet tried live.
+
+## 2026-11-25: Roles assumed with a console sign-in
+
+`aws-login` integrations take `[integrations.<name>.roles.<label>]`, roles assumed with STS `AssumeRole` signed with the console sign-in's credentials, for people who sign in through the console and work in other accounts. Those credentials come from a role session or an IAM user's console session, so STS counts the assumed role as role chaining: `duration` and `--ttl` are 15 minutes to an hour, checked when the config loads, and `fob console` refuses a session length for them, as for Identity Center's chained roles. The role's `role_arn` must be in the partition of the sign-in's Region. `mfa_serial` asks for a code per new session, since whether the console session's MFA carries into these credentials is not documented. The roles use their own table type (`LoginRole`) rather than the IAM user's, which has `no_session` and `console_duration` that do not apply here. Not yet tried live.
+
+## 2026-11-25: A `command` integration for other credential tools
+
+`type = "command"` runs a program and reads credentials from its stdout, as the research on awsume proposed instead of in-process plugins: one integration covers saml2aws, gimme-aws-creds, okta-aws-cli, IAM Roles Anywhere's `credential_process` helper and in-house scripts. Two output formats are read: omnifob's own JSON (what `fob creds` prints, so any omnifob profile can be wrapped) and the AWS `credential_process` format, which most AWS helpers already print and which makes the profile an AWS one (stale AWS variables removed, `fob export aws-config`, `fob exec --server`, a federation console link). `format` is set in the config rather than guessed from the output, because whether a profile is an AWS one is decided at discovery, before the program has run.
+
+- The program runs without a shell, from an argument list, so nothing in the config is expanded or needs quoting; it must be a name on `PATH`, an absolute path or one under `~/`, since a relative path would depend on wherever `fob` runs.
+- It keeps the terminal's stdin and stderr, since these tools prompt for passwords and MFA and report there; only stdout is read, and its contents never appear in an error, which names the line and kind of problem instead, because stdout holds the secrets.
+- It is stopped after `timeout` (default 2 minutes, enough for a browser sign-in; 1 second to 10 minutes) and killed when fob stops waiting.
+- Credentials are cached by their stated expiry like any others; credentials without one are not cached at all, since omnifob cannot tell when they stop working and a long-lived key from a helper is cheap to fetch again.
+- The lifetime is the program's unless the config sets `ttl`, which says the program takes one: it is passed as `{ttl_seconds}` in the arguments and `OMNIFOB_TTL_SECONDS` in the environment, and then `--ttl` and `[agent] max_ttl` apply through `chosen_lifetime`. Without `ttl`, `--ttl` is refused rather than passed to a program that may ignore it, and `max_ttl` cannot cap it, as for other providers that set their own lifetime.
+- `fob login` has nothing to store, and `fob check` runs the program once.
+
+## 2026-11-25: An encrypted file vault for machines without a lasting keychain
+
+On a headless Linux server or a container there is no Secret Service, and keyutils forgets everything on reboot, which the 2026-10-06 entry accepted for then, naming an encrypted-file store as the fix if it annoyed; every reboot means signing in to everything again. `OMNIFOB_KEYRING=encrypted-file` keeps the secrets in files instead, one per keychain key, each sealed with AES-256-GCM under a key derived from a passphrase; the key name is the associated data, so a file renamed to another key does not open. Everything comes from `aws-lc-rs`, already in every build. It offers no memory-hard password hash (scrypt, Argon2), so the key is derived with PBKDF2-HMAC-SHA256 at 600,000 iterations, OWASP's recommendation for it, with a random 16 byte salt. The count is stored in the vault's header, with a known value sealed with the key, which tells a wrong passphrase from a damaged file. A new vault needs a passphrase of at least 12 characters.
+
+The passphrase comes from the library's `Context`, as MFA codes do: `OMNIFOB_VAULT_PASSPHRASE` for scripts and services, else the context's passphrase prompt, which the command line answers in the terminal (asking twice for a new vault). The library never reads a terminal. The derived key, not the passphrase, is then kept in the kernel keyring until reboot, so the passphrase is asked once per boot; `OMNIFOB_VAULT_KEY_CACHE=0` turns that off. Reading a key that has no file needs no passphrase, so commands that find nothing stored do not prompt. Under a coding agent nothing can answer the prompt, so the vault opens only once the user has unlocked it this boot, or with the variable set; the locked-vault error then names only the terminal, not the variable, since the passphrase is the person's to enter. The variable is removed from the environment of `fob exec` commands and `command` helpers, which never need it. A missing `vault.json` beside sealed files is an error rather than the start of a new vault: a new salt would make every existing file unopenable, even with the same passphrase.
+
+What it protects against:
+
+- A copy of the disk, a backup or a stolen machine that is off: the files open only with the passphrase, and the derived key in the kernel keyring is gone after a reboot.
+- Other users on the machine: the directory is `0700` and the files `0600`, as for every state file, and the kernel keyring is per user.
+- A file swapped for another key's, or changed: it fails to open instead of handing out the wrong credentials.
+
+What it does not protect against:
+
+- Code running as the same user while the vault is unlocked: it can read the derived key from the kernel keyring, as it can read keyutils' secrets today, or ask fob for credentials. That is the same exposure as the Secret Service once the desktop session is unlocked.
+- A weak passphrase: PBKDF2 slows guessing, but memory-hard functions would slow it more on GPUs; the iteration count can be raised for new vaults later.
+- `OMNIFOB_VAULT_PASSPHRASE` puts the passphrase in the process's environment, readable by the same user and by root; it is for automation that has a secret store of its own.
+- The file names, which name integrations and profiles, as the DPAPI files on WSL do.
+
+There is no passphrase change or recovery yet: a forgotten passphrase means deleting the directory and signing in again. The vault is opt-in, and the native keychains stay the default wherever one exists.

@@ -767,6 +767,113 @@ async fn narrow_tokens_carry_ip_conditions_buckets_and_s3_credentials() {
 }
 
 #[tokio::test]
+async fn zone_permissions_are_limited_to_the_templates_zones() {
+    let server = MockServer::start().await;
+    let base = format!("/accounts/{ACCOUNT}/tokens");
+    Mock::given(method("GET"))
+        .and(path(format!("{base}/permission_groups")))
+        .respond_with(ok(account_permission_groups()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/zones"))
+        .and(query_param("name", "example.com"))
+        .and(query_param("account.id", ACCOUNT))
+        .respond_with(ok(
+            json!([{ "id": "0123456789abcdef0123456789abcdef", "name": "example.com" }]),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/zones"))
+        .and(query_param("name", "missing.example"))
+        .respond_with(ok(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!({ "id": "tok-id", "value": "abc" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(base.clone()))
+        .respond_with(ok(json!([])))
+        .mount(&server)
+        .await;
+
+    let parse = |zones: &str| {
+        let text = format!(
+            r#"
+            [integrations.cf]
+            type = "cloudflare-token"
+            account_id = "{ACCOUNT}"
+            token_type = "account"
+
+            [integrations.cf.templates.dns]
+            permissions = ["DNS Write", "Workers Scripts Write"]
+            zones = [{zones}]
+            "#
+        );
+        match Config::parse(&text)
+            .unwrap()
+            .integrations
+            .remove("cf")
+            .unwrap()
+        {
+            Integration::Cloudflare(c) => c,
+            _ => unreachable!(),
+        }
+    };
+    let client = Client::new(server.uri(), "bootstrap");
+    // A name is looked up; an ID (in any case) is taken as it is.
+    let config = parse(r#""Example.com", "FEDCBA9876543210FEDCBA9876543210""#);
+    mint(
+        &client,
+        &config,
+        "cf/a/dns",
+        ACCOUNT,
+        "dns",
+        now(),
+        &mut Catalog::default(),
+    )
+    .await
+    .unwrap();
+    let body = posted_body(&server.received_requests().await.unwrap(), &base);
+    let resources: Vec<Value> = body["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["resources"].clone())
+        .collect();
+    assert!(resources.contains(&json!({ format!("com.cloudflare.api.account.{ACCOUNT}"): "*" })));
+    assert!(
+        resources.contains(&json!({
+            "com.cloudflare.api.account.zone.0123456789abcdef0123456789abcdef": "*",
+            "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210": "*"
+        })),
+        "{resources:?}"
+    );
+
+    let config = parse(r#""missing.example""#);
+    let error = mint(
+        &client,
+        &config,
+        "cf/a/dns",
+        ACCOUNT,
+        "dns",
+        now(),
+        &mut Catalog::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no zone named 'missing.example'"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn a_session_makes_the_bootstrap_expire_and_ends_the_previous_one() {
     let server = MockServer::start().await;
     let tokens = format!("/accounts/{ACCOUNT}/tokens");

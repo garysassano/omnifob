@@ -18,7 +18,7 @@ fob keeps the user's sign-ins and hands out short-lived credentials per profile.
    fob exec cf/personal/workers --revoke -- wrangler deploy   # Cloudflare token for this command only
    ```
 
-   Each of your commands starts in a new shell, so put `fob exec` on every command that needs credentials.
+   Each of your commands starts in a new shell, so put `fob exec` on every command that needs credentials. When the user gives an account and a role instead of a profile (from a runbook, say), `fob exec --account-id 123456789012 --role ReadOnly -- <command>` picks the one profile they name.
 
    Azure and Google profiles also give the command a local endpoint their SDKs use (`DefaultAzureCredential`, Google's Application Default Credentials), so code that uses those SDKs works under `fob exec` without `az login` or `gcloud auth application-default login`. For a long-running AWS command (a dev server), `fob exec <profile> --server -- <command>` serves renewed credentials to the SDKs.
 
@@ -36,9 +36,11 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 ## When fob says no
 
 - "run `fob login <integration>`": the sign-in lapsed. Either ask the user to run it, or run `fob login <integration>` yourself with a 10-minute timeout and tell the user to approve the sign-in in the browser window that opens on their screen. If it is still valid, it returns at once without opening anything.
-- "name the profile by its full id": use one of the ids it lists.
+- "name the profile by its full id": use one of the ids it lists. "this directory's default (...) is <id>": the user mapped the working directory to that profile; name it in full.
+- "the default profile of ... is not a profile": the user's `[directories]` entry is stale; tell them, and name a profile from `fob list`.
 - "is not open to agents": the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
 - "needs a code from the MFA device": ask the user to run the `fob exec ... -- true` command it names in their terminal, then retry.
+- "the encrypted vault ... is locked": the user keeps secrets in an encrypted vault that has not been unlocked since boot. Ask them to run any `fob` command (`fob status`) in their terminal to enter the passphrase, then retry; never ask for the passphrase or set `OMNIFOB_VAULT_PASSPHRASE` yourself.
 - `fob login` printing a URL and a code instead of opening a browser: this session looks remote, in a container or (on Linux) without a display. Pass both to the user to approve on any device, and keep the command running until it returns.
 - "parsing .../config.toml" followed by a key (`chained.prod: duration must be...`): the config is invalid. Tell the user which key and why; do not edit the config yourself.
 - "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.

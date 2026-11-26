@@ -31,6 +31,12 @@ pub enum Target {
         template: String,
     },
     Token {},
+    /// What a `command` integration's program prints; `aws` when it prints
+    /// the AWS `credential_process` format.
+    Command {
+        #[serde(default)]
+        aws: bool,
+    },
     /// A role assumed from an Identity Center role; details live in the
     /// integration's `chained` table under `label`.
     AwsChained {
@@ -54,6 +60,13 @@ pub enum Target {
     /// A console identity signed in through AWS Sign-In (`aws login`).
     AwsLogin {
         account_id: String,
+    },
+    /// A role assumed with a console sign-in's credentials; details live in
+    /// the `aws-login` integration's `roles` table under `label`.
+    AwsLoginRole {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     },
     /// A role assumed with an IAM user's session; details live in the
     /// integration's `roles` table under `label`.
@@ -92,15 +105,15 @@ impl Target {
             Target::AwsIamSession { account_id }
             | Target::AwsLogin { account_id }
             | Target::AwsCrossPartition { account_id, .. } => Some(account_id),
-            Target::AwsChained { account_id, .. } | Target::AwsIamRole { account_id, .. } => {
-                account_id.as_deref()
-            }
+            Target::AwsChained { account_id, .. }
+            | Target::AwsIamRole { account_id, .. }
+            | Target::AwsLoginRole { account_id, .. } => account_id.as_deref(),
             Target::Gcp { project_id, .. } => Some(project_id),
             Target::Azure {
                 subscription_id, ..
             } => Some(subscription_id),
             Target::GcpServiceAccount { project_id, .. } => project_id.as_deref(),
-            Target::Token {} => None,
+            Target::Token {} | Target::Command { .. } => None,
         }
     }
 
@@ -114,6 +127,8 @@ impl Target {
                 | Target::AwsIamSession { .. }
                 | Target::AwsIamRole { .. }
                 | Target::AwsLogin { .. }
+                | Target::AwsLoginRole { .. }
+                | Target::Command { aws: true }
         )
     }
 }

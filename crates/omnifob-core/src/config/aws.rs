@@ -151,7 +151,7 @@ fn check_region_partition(key: &str, region: &str, role_arn: &str) -> Result<(),
 /// Fails unless `region` is shaped like an AWS Region, naming the key.
 /// Regions become part of host names, so a malformed one is refused when
 /// the config loads rather than when a command first uses it.
-fn check_region(key: &str, region: &str) -> Result<(), String> {
+pub(super) fn check_region(key: &str, region: &str) -> Result<(), String> {
     crate::providers::aws::partition::check_region_name(region).map_err(|e| format!("{key}: {e}"))
 }
 
@@ -541,12 +541,22 @@ impl AwsIamConfig {
             return Err("session_duration must be between 15m and 36h".to_string());
         }
         for (label, role) in &self.roles {
-            if let Some(d) = role.duration
-                && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(1)).contains(&d)
-            {
-                return Err(format!(
-                    "roles.{label}.duration must be between 15m and 1h: STS counts a role assumed with the user's session as role chaining"
-                ));
+            if let Some(d) = role.duration {
+                if role.no_session
+                    && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(12))
+                        .contains(&d)
+                {
+                    return Err(format!(
+                        "roles.{label}.duration must be between 15m and 12h, the longest role session AWS allows"
+                    ));
+                }
+                if !role.no_session
+                    && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(1)).contains(&d)
+                {
+                    return Err(format!(
+                        "roles.{label}.duration must be between 15m and 1h: STS counts a role assumed with the user's session as role chaining; set no_session = true to assume it with the access key, for up to 12h"
+                    ));
+                }
             }
             check_console_duration(
                 &format!("roles.{label}.console_duration"),
@@ -590,6 +600,11 @@ pub struct AwsLoginConfig {
     /// Middle segment of the profile's id; defaults to the account ID.
     #[serde(default)]
     pub account: Option<String>,
+    /// Roles assumed with the console sign-in's credentials, keyed by a
+    /// label that becomes the middle of the profile id. STS counts these as
+    /// role chaining, so they last at most an hour.
+    #[serde(default)]
+    pub roles: BTreeMap<String, LoginRole>,
     /// The browser in `[browsers]` that this integration's sign-ins and
     /// consoles open in; by default the system's.
     #[serde(default)]
@@ -601,6 +616,92 @@ impl AwsLoginConfig {
         check_region("region", &self.region)?;
         if let Some(region) = &self.default_region {
             check_region("default_region", region)?;
+        }
+        for (label, role) in &self.roles {
+            role.validate(&self.region)
+                .map_err(|e| format!("roles.{label}: {e}"))?;
+        }
+        check_unique_ids(
+            self.roles
+                .iter()
+                .map(|(label, role)| ("roles", label, role.role_name())),
+        )
+    }
+}
+
+/// A role assumed with the credentials of a console sign-in
+/// (`[integrations.<name>.roles.<label>]` of an `aws-login` integration).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LoginRole {
+    pub role_arn: String,
+    /// `RoleSessionName`; defaults to "omnifob", or "omnifob-agent" for
+    /// sessions a coding agent starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Region exported for this role; defaults to the integration's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// MFA device the role's trust policy requires; a code is asked for
+    /// each new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa_serial: Option<String>,
+    /// Session length, 15 minutes to 1 hour (AWS caps role-chaining
+    /// sessions at one hour); defaults to one hour.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
+    pub duration: Option<SignedDuration>,
+}
+
+impl LoginRole {
+    /// The role name at the end of `role_arn` (after any path).
+    pub fn role_name(&self) -> &str {
+        self.role_arn.rsplit('/').next().unwrap_or(&self.role_arn)
+    }
+
+    /// The account in `role_arn`.
+    pub fn account_id(&self) -> Option<&str> {
+        self.role_arn.split(':').nth(4).filter(|a| !a.is_empty())
+    }
+
+    /// The partition in `role_arn`.
+    pub fn partition(&self) -> anyhow::Result<Partition> {
+        Partition::of_arn(&self.role_arn)
+    }
+
+    /// The role is assumed in the partition of the sign-in's Region
+    /// `login_region`.
+    fn validate(&self, login_region: &str) -> Result<(), String> {
+        check_role_arn(&self.role_arn)?;
+        if let Ok(login) = Partition::of_region(login_region) {
+            let role = Partition::of_arn(&self.role_arn).map_err(|e| format!("role_arn: {e:#}"))?;
+            if login != role {
+                return Err(format!(
+                    "role_arn is in the {role} partition, but the sign-in's Region {login_region} is in {login}; AssumeRole cannot cross partitions"
+                ));
+            }
+        }
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
+            check_region_partition("region", region, &self.role_arn)?;
+        }
+        if let Some(name) = &self.session_name {
+            check_session_name(name)?;
+        }
+        if let Some(d) = self.duration
+            && !(SignedDuration::from_mins(15)..=SignedDuration::from_hours(1)).contains(&d)
+        {
+            return Err(
+                "duration must be between 15m and 1h: STS counts a role assumed with console sign-in credentials as role chaining"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -623,7 +724,7 @@ pub struct IamRole {
     pub region: Option<String>,
     /// Session length, 15 minutes to 1 hour (STS counts a role assumed with
     /// the user's `GetSessionToken` session as role chaining, which it caps
-    /// at one hour); defaults to one hour.
+    /// at one hour), or to 12 hours with `no_session`; defaults to one hour.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -641,6 +742,13 @@ pub struct IamRole {
     )]
     #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub console_duration: Option<SignedDuration>,
+    /// Assume the role with the access key itself rather than the user's
+    /// session, as aws-vault's `--no-session` does: not role chaining, so
+    /// `duration` may be up to 12 hours (and up to the role's maximum
+    /// session duration). The user's `mfa_serial` code is then asked for
+    /// each new session of this role, and the key signs each `AssumeRole`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_session: bool,
 }
 
 impl IamRole {

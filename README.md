@@ -117,6 +117,11 @@ role_arn = "arn:aws:iam::222222222222:role/Admin"
 duration = "45m"               # optional, 15m to 1h (default 1h)
 console_duration = "8h"        # optional: `fob console` session length, 15m to 12h
 
+[integrations.legacy.roles.batch]  # profile id: legacy/batch/Batch
+role_arn = "arn:aws:iam::222222222222:role/Batch"
+no_session = true              # assumed with the key itself, as aws-vault --no-session:
+duration = "12h"               # up to 12h, with an MFA code for each new session
+
 # Console credentials, as `aws login` gets them: the browser picks a console
 # session (an IAM user, root or a federated role), and no access key is stored.
 # Profile id: console/<account ID>/<user, root or role name>.
@@ -124,6 +129,10 @@ console_duration = "8h"        # optional: `fob console` session length, 15m to 
 type = "aws-login"
 region = "eu-central-1"        # the Region signed in through; also AWS_REGION
 default_region = "eu-west-1"   # optional: AWS_REGION instead of region
+
+[integrations.console.roles.audit]  # profile id: console/audit/Audit, assumed with the
+role_arn = "arn:aws:iam::333333333333:role/Audit"   # console credentials: role chaining,
+duration = "1h"                # so 15m to 1h (default 1h)
 
 # A Google account, signed in like `gcloud auth login` (with gcloud's OAuth client).
 # Profile ids: google/<project>/user, and google/<label>/<name> per service account.
@@ -196,6 +205,21 @@ A `secrets` table replaces the preset's secrets and the fixed variables that com
 
 `fob login <name>` asks for each secret. An integration with a single secret also takes it from the clipboard (`--from-clipboard`, which refuses an empty clipboard, text with whitespace and URLs) or from stdin (`--token-stdin`).
 
+Any program that prints credentials becomes a profile with `type = "command"`: saml2aws, gimme-aws-creds, okta-aws-cli, IAM Roles Anywhere's `credential_process` helper or an in-house script.
+
+```toml
+[integrations.okta]
+type = "command"
+command = ["okta-aws-cli", "web", "--format", "process-credentials", "--session-duration", "{ttl_seconds}"]
+format = "credential-process"   # the AWS credential_process JSON; default "omnifob"
+ttl = "1h"                      # optional: what {ttl_seconds} and OMNIFOB_TTL_SECONDS ask for
+region = "eu-west-1"            # optional, with credential-process: AWS_REGION
+timeout = "5m"                  # optional, 1s to 10m (default 2m)
+account = "prod"                # optional: profile id okta/prod/okta-aws-cli
+```
+
+The program runs without a shell, so arguments need no quoting and nothing in them is expanded; it is a name on `PATH`, an absolute path or one under `~/`. It keeps the terminal's stdin and stderr, so it can prompt and report, gets `OMNIFOB_PROFILE` (but not `OMNIFOB_VAULT_PASSPHRASE`), and is stopped after `timeout`, or as soon as it prints more than 1 MiB. Its stdout is read as omnifob's JSON (`{"env": {"NAME": "value"}, "expires_at": "<RFC 3339>"}`, as `fob creds` prints it; `expires_at` is optional) or, with `format = "credential-process"`, the AWS format, which makes an AWS profile. Credentials with an expiry are cached until five minutes before it; credentials without one are fetched for every use. omnifob never prints the program's output, not even when it cannot read it. Without `ttl`, the program chooses the lifetime and `--ttl` is refused; with it, `--ttl` and `[agent] max_ttl` change what is asked for. `fob login` has nothing to do for these integrations, and `fob check` runs the program once.
+
 ### Browsers
 
 Sign-ins and consoles open in the system's default browser. To keep each identity's sessions in a browser, or a browser profile, of its own, define the browsers once and name one in each integration with `browser`; it applies to `fob login` and `fob console` alike, and integrations without it keep the default.
@@ -230,6 +254,34 @@ isolate = "firefox-container"   # a container per fob profile, through the Grant
 
 `chromium-profile` replaces any `--profile-directory` in the command with `--profile-directory=fob <integration> <account> <role>`, which Chrome creates on first use and reuses after; delete one in Chrome's profile manager. `firefox-container` opens `ext+granted-containers:name=<profile id>&url=<console URL>`, which needs the [Granted Containers](https://addons.mozilla.org/en-US/firefox/addon/granted/) extension; the extension creates the container, named after the profile, the first time. Sign-ins and other providers' consoles keep opening as the command says, since they rely on the session already in that browser profile.
 
+Containers can be told apart at a glance by colour and icon, set per profile pattern (`*` matches within one part of the id, as in `[agent] profiles`); the first entry that matches wins, and unmatched containers get the extension's own colour:
+
+```toml
+[[browsers.personal.containers]]
+profiles = ["*/prod/*", "*/prod-*/*"]
+color = "red"         # blue, turquoise, green, yellow, orange, red, pink or purple
+icon = "fingerprint"  # fingerprint, briefcase, dollar, cart, circle, gift, vacation, food, fruit, pet, tree or chill
+
+[[browsers.personal.containers]]
+profiles = ["*/dev/*"]
+color = "green"
+```
+
+fob adds them to the URL as `color` and `icon`, which Granted Containers applies when it creates the container.
+
+### Default profiles per directory
+
+`[directories]` maps a directory to the profile `fob exec` and `fob use` pick in it, and below it, when you name none. The longest matching directory wins, and a named profile always beats it. The mapping lives in your own config, so repositories carry no integration names:
+
+```toml
+[directories]
+"~/git/acme" = "acme/dev/ReadOnly"
+"~/git/acme/billing" = "acme/prod-billing/ReadOnly"
+"/srv/deploy" = "acme/prod/Deploy"
+```
+
+`fob exec -- terraform plan` in `~/git/acme/billing/infra` then runs with `acme/prod-billing/ReadOnly`. Commands run by a coding agent still name the profile in full (the error says which one the directory would pick), so what they use stays in the command.
+
 ## Use
 
 ```sh
@@ -245,6 +297,7 @@ fob exec cf workers --ttl 4h -- wrangler dev   # longer-lived token for a long s
 fob exec cf workers --revoke -- wrangler deploy   # token for this command only, deleted when it ends
 fob cf add-template cf pages             # pick services and access levels, save a template
 fob cf add-template cf r2 -p "Workers R2 Storage Bucket Item Write" --r2-bucket assets --s3
+fob cf add-template cf dns -p "DNS Edit" --zone example.com   # only that zone
 fob console prod admin    # opens the AWS console as that role
 fob console prod admin --service ec2 --region eu-west-1 --duration 8h
 fob console prod admin --copy   # copy the sign-in URL instead (over SSH, to your terminal's clipboard)
@@ -268,7 +321,7 @@ Without `browser`, URLs open in the system's default browser; on WSL without a L
 
 `--service` opens a console page, given as the path after the console host (`ec2`, `s3`, `lambda`, `cloudformation`, `route53/v2`), and `--region` the Region it opens in, which must be in the profile's partition; without it the profile's exported Region is used, if any.
 
-Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
+Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`), and `--account-id` with `--role` picks a profile without naming it at all, so a command written in a runbook works for colleagues whose integrations and accounts are named differently: `fob exec --account-id 123456789012 --role AdministratorAccess -- aws sts get-caller-identity` (also on `fob env`, `fob creds` and `fob console`). The account is the provider's (an AWS account, an Azure subscription, a Google Cloud project, a Cloudflare account) and the role is the last part of the id, ignoring case. With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
 
 `fob exec` exits with the command's status, or with 125 when fob itself fails (a config that does not load included), 127 when the command is not found and 126 when it cannot run, as `env` does. A Windows exit code too large for the 0 to 255 range is reported as 1 when its low byte would read as success in the runs fob waits for: `--revoke`, `--server`, `--token-file`, and Azure and Google profiles unless `--no-server`. Other `fob exec` runs pass it on whole.
 
@@ -370,7 +423,7 @@ Coding agents run each command in a new shell with no one at the terminal, and w
   auto_revoke = true   # `fob exec` on a Cloudflare profile acts as `--revoke`
   ```
 
-  `max_ttl` applies to Cloudflare tokens, chained roles and IAM user sessions without MFA, cross-partition and IAM users' roles, and Google service accounts, also when they are served from `fob exec`'s endpoints and `--token-file`; the provider sets the lifetime of Identity Center roles, Google accounts' and Azure tokens, and console sign-in credentials.
+  `max_ttl` applies to Cloudflare tokens, chained, cross-partition, IAM users' and console sign-ins' roles, IAM user sessions and Google service accounts, except where each new session asks for an MFA code (IAM user sessions with `mfa_serial`, `no_session` roles of such a user, and chained and console sign-ins' roles with `mfa_serial`), whose cached credentials agents get as they are. It also caps what `fob exec`'s endpoints and `--token-file` serve. The provider sets the lifetime of Identity Center roles, Google accounts' and Azure tokens, and console sign-in credentials.
 
 An agent gets credentials with `fob exec acme/dev/ReadOnly -- aws s3 ls`, or through AWS profiles from `fob export aws-config`, which work without fob in the command. When a sign-in lapses, the agent can ask you to run `fob login <integration>`, or run it itself: the browser opens on your screen for you to approve. Let the agent run `fob exec` per command rather than starting the agent itself inside `fob exec`, which would put the credentials in the environment of every command it runs.
 
@@ -389,9 +442,11 @@ appends one JSON line to `~/.local/state/omnifob/audit.jsonl` for every credenti
 
 SSO sessions, the Cloudflare bootstrap token, stored tokens and cached credentials are kept in the OS keychain under the service `omnifob`: Keychain on macOS, Credential Manager on Windows, the Secret Service on Linux. Where no Secret Service runs (WSL, servers), the kernel keyring is used, straight away when there is no D-Bus session bus; it forgets everything on reboot. On WSL, long-lived secrets are therefore also written to `~/.local/state/omnifob/vault`, encrypted with Windows DPAPI for your Windows user, and restored after a reboot (`OMNIFOB_WSL_DPAPI=0` turns this off). `OMNIFOB_KEYRING` forces a store; `fob status` shows which one is in use.
 
+On a machine without a keychain that survives reboots (a headless Linux server, a container with a mounted state directory), `OMNIFOB_KEYRING=encrypted-file` keeps the secrets in files encrypted with a passphrase instead, in `~/.local/state/omnifob/encrypted` (or `encrypted-file:<absolute dir>`). The first command that stores a secret asks for a new passphrase (at least 12 characters), and the passphrase is asked again only after a reboot: the key derived from it is kept in the kernel keyring until then (`OMNIFOB_VAULT_KEY_CACHE=0` asks every time). Scripts and services pass it in `OMNIFOB_VAULT_PASSPHRASE`, which fob removes from the environment of the commands and credential helpers it runs. If `vault.json` goes missing while sealed files remain, fob refuses to start a new vault over them, since a new salt would make them never open again; restore the file, or move the sealed files away. Each secret is encrypted with AES-256-GCM under a key derived with PBKDF2-HMAC-SHA256 (600,000 iterations); the passphrase cannot be recovered, and forgetting it means signing in to every integration again after deleting the directory. What this protects against, and what not, is in [docs/decisions.md](docs/decisions.md).
+
 Discovered profiles, which contain no secrets, are kept in `~/.local/state/omnifob/profiles.json` (`$XDG_STATE_HOME/omnifob`). Without a home directory, set `XDG_STATE_HOME` and `OMNIFOB_CONFIG` (or `XDG_CONFIG_HOME`): omnifob then refuses to start rather than keep its files in the current directory. If it cannot be read, `fob sync` and `fob login` start over from no profiles and rewrite it, and `fob status` and `fob logout` carry on with a warning. On Linux and macOS the state directory and the vault are readable by you only (`0700`, files `0600`), and every file in them is replaced atomically, so a concurrent `fob` never reads half of one.
 
-Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. Credentials asked for with `--ttl` are not cached, so the next command gets the configured lifetime again. `fob sync` deletes the cached credentials of profiles that went away. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache; `fob revoke --all` does it for every profile, leaving the sign-ins. A renewal in the background is skipped for a chained role with `mfa_serial`, which needs a code each session; the next command that needs one asks for it. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
+Credentials are cached until five minutes before they expire, and renewed in the background when a quarter of their lifetime is left, so commands rarely wait for new ones. Credentials asked for with `--ttl` are not cached, so the next command gets the configured lifetime again. `fob sync` deletes the cached credentials of profiles that went away. `fob revoke <profile>` deletes the Cloudflare tokens minted for a profile and clears its cache; `fob revoke --all` does it for every profile, leaving the sign-ins. A renewal in the background is skipped for roles that need a code each session (chained and console sign-ins' roles with `mfa_serial`, and an IAM user's `no_session` roles when the user has `mfa_serial`); the next command that needs one asks for it. Cloudflare tokens omnifob mints are named `omnifob <template>` (for example `omnifob workers`); omnifob remembers their IDs, deletes expired ones after each mint and on `fob sync`, and deletes all of them on `fob logout`. Tokens it did not mint are never touched.
 
 ## Documentation
 

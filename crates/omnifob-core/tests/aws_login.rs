@@ -434,3 +434,89 @@ async fn missing_permissions_are_named() {
     );
     assert!(aws::login::session("denied").unwrap().is_none());
 }
+
+#[tokio::test]
+async fn roles_are_assumed_with_the_console_credentials_for_at_most_an_hour() {
+    use wiremock::matchers::{body_string_contains, header_regex};
+    let (_guard, server) = setup().await;
+    browser_login(&server, "chain", 900).await;
+    let text = r#"
+        [integrations.chain]
+        type = "aws-login"
+        region = "eu-west-1"
+        default_region = "eu-central-1"
+
+        [integrations.chain.roles.prod]
+        role_arn = "arn:aws:iam::222222222222:role/Deploy"
+        duration = "30m"
+        region = "us-west-2"
+    "#;
+    let full = Config::parse(text).unwrap();
+    let Integration::AwsLogin(config) = &full.integrations["chain"] else {
+        unreachable!()
+    };
+    let profiles = aws::login::discover("chain", config).unwrap();
+    let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["chain/123456789012/alice", "chain/prod/Deploy"]);
+    assert_eq!(
+        profiles[1].target,
+        Target::AwsLoginRole {
+            label: "prod".into(),
+            account_id: Some("222222222222".into())
+        }
+    );
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=AssumeRole"))
+        .and(body_string_contains("DurationSeconds=1800"))
+        // Signed with the console sign-in's credentials.
+        .and(header_regex("authorization", "Credential=ASIAFIRST/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASIAROLE</AccessKeyId><SecretAccessKey>s</SecretAccessKey><SessionToken>t</SessionToken><Expiration>2100-01-01T00:00:00Z</Expiration></Credentials><AssumedRoleUser><AssumedRoleId>AROA:omnifob</AssumedRoleId><Arn>arn:aws:sts::222222222222:assumed-role/Deploy/omnifob</Arn></AssumedRoleUser></AssumeRoleResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></AssumeRoleResponse>"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let creds = omnifob_core::providers::credentials(&full, &profiles[1], true, None)
+        .await
+        .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAROLE");
+    assert_eq!(creds.env["AWS_REGION"], "us-west-2");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "222222222222");
+    // Role chaining: an hour at most, as `--ttl` and in the config.
+    assert_eq!(
+        omnifob_core::providers::chosen_lifetime(&full, &profiles[1]),
+        Some(jiff::SignedDuration::from_mins(30))
+    );
+    let err = omnifob_core::providers::credentials(
+        &full,
+        &profiles[1],
+        true,
+        Some(jiff::SignedDuration::from_hours(2)),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("15 minutes to 1 hour"), "{err}");
+    for (role, message) in [
+        (
+            "role_arn = \"arn:aws:iam::222222222222:role/D\"\nduration = \"2h\"",
+            "between 15m and 1h",
+        ),
+        (
+            "role_arn = \"arn:aws-cn:iam::222222222222:role/D\"",
+            "AssumeRole cannot cross partitions",
+        ),
+        (
+            "role_arn = \"arn:aws:iam::222222222222:role/D\"\nno_session = true",
+            "unknown field `no_session`",
+        ),
+    ] {
+        let text = format!(
+            "[integrations.x]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n[integrations.x.roles.prod]\n{role}\n"
+        );
+        let error = format!("{:#}", Config::parse(&text).unwrap_err());
+        assert!(error.contains(message), "{role}: {error}");
+    }
+}

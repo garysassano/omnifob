@@ -81,6 +81,9 @@ pub fn add_cloudflare_template(
     if template.s3 {
         new["s3"] = toml_edit::value(true);
     }
+    if !template.zones.is_empty() {
+        new["zones"] = toml_edit::value(template.zones.iter().collect::<toml_edit::Array>());
+    }
     if let Some(ips) = &template.ips {
         new["ips"] = toml_edit::value(ips.iter().collect::<toml_edit::Array>());
     }

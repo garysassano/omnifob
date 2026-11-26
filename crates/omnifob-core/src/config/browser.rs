@@ -18,6 +18,95 @@ pub struct Browser {
     /// signing in as one does not sign the console out of another.
     #[serde(default)]
     pub isolate: Option<Isolation>,
+    /// The colour and icon of the Firefox containers of the profiles each
+    /// entry matches, the first match winning (`isolate =
+    /// "firefox-container"`). Unmatched containers get the extension's own.
+    #[serde(default)]
+    pub containers: Vec<ContainerStyle>,
+}
+
+/// How the Firefox containers of some profiles look, e.g. red with a
+/// fingerprint for `*/prod/*`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStyle {
+    /// Profile ids this applies to, as patterns in which `*` stands for any
+    /// characters within one `/`-separated segment, as in `[agent]
+    /// profiles`.
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub color: Option<ContainerColor>,
+    #[serde(default)]
+    pub icon: Option<ContainerIcon>,
+}
+
+/// The colours Firefox containers come in, as Granted Containers takes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerColor {
+    Blue,
+    Turquoise,
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Pink,
+    Purple,
+}
+
+/// The icons Firefox containers come with, as Granted Containers takes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerIcon {
+    Fingerprint,
+    Briefcase,
+    Dollar,
+    Cart,
+    Circle,
+    Gift,
+    Vacation,
+    Food,
+    Fruit,
+    Pet,
+    Tree,
+    Chill,
+}
+
+impl ContainerColor {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Turquoise => "turquoise",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Orange => "orange",
+            Self::Red => "red",
+            Self::Pink => "pink",
+            Self::Purple => "purple",
+        }
+    }
+}
+
+impl ContainerIcon {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fingerprint => "fingerprint",
+            Self::Briefcase => "briefcase",
+            Self::Dollar => "dollar",
+            Self::Cart => "cart",
+            Self::Circle => "circle",
+            Self::Gift => "gift",
+            Self::Vacation => "vacation",
+            Self::Food => "food",
+            Self::Fruit => "fruit",
+            Self::Pet => "pet",
+            Self::Tree => "tree",
+            Self::Chill => "chill",
+        }
+    }
 }
 
 /// How a browser keeps AWS consoles apart, one per profile.
@@ -55,10 +144,26 @@ impl Browser {
         match self.isolate {
             None => self.command_for(url),
             Some(Isolation::FirefoxContainer) => {
-                let container = form_urlencoded::Serializer::new(String::new())
+                let mut container = form_urlencoded::Serializer::new(String::new());
+                container
                     .append_pair("name", &profile.id)
-                    .append_pair("url", url)
-                    .finish();
+                    .append_pair("url", url);
+                // The first entry that matches sets the colour and the icon.
+                let style = self.containers.iter().find(|style| {
+                    style
+                        .profiles
+                        .iter()
+                        .any(|p| super::matches_pattern(p, &profile.id))
+                });
+                if let Some(style) = style {
+                    if let Some(color) = style.color {
+                        container.append_pair("color", color.as_str());
+                    }
+                    if let Some(icon) = style.icon {
+                        container.append_pair("icon", icon.as_str());
+                    }
+                }
+                let container = container.finish();
                 self.command_for(&format!("ext+granted-containers:{container}"))
             }
             Some(Isolation::ChromiumProfile) => {
@@ -91,8 +196,37 @@ impl Browser {
             Some((_, args)) if !args.iter().any(|arg| arg.contains("{url}")) => {
                 Err("command must pass the URL: put {url} in an argument".to_string())
             }
-            Some(_) => Ok(()),
+            Some(_) => self.validate_containers(),
         }
+    }
+
+    fn validate_containers(&self) -> Result<(), String> {
+        if !self.containers.is_empty() && self.isolate != Some(Isolation::FirefoxContainer) {
+            return Err(
+                "containers style Firefox containers; they need isolate = \"firefox-container\""
+                    .to_string(),
+            );
+        }
+        for (i, style) in self.containers.iter().enumerate() {
+            if style.profiles.is_empty() {
+                return Err(format!(
+                    "containers[{i}].profiles must name at least one profile pattern"
+                ));
+            }
+            if let Some(pattern) = style
+                .profiles
+                .iter()
+                .find(|p| p.is_empty() || p.split('/').any(str::is_empty))
+            {
+                return Err(format!(
+                    "containers[{i}].profiles: '{pattern}' has an empty segment; write a profile id such as \"*/prod/*\""
+                ));
+            }
+            if style.color.is_none() && style.icon.is_none() {
+                return Err(format!("containers[{i}] must set a color or an icon"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -243,6 +377,48 @@ mod tests {
             ]
         );
 
+        // A matching style colours the container; the first match wins.
+        let styled = Config::parse(
+            r#"
+            [browsers.firefox]
+            command = ["firefox", "{url}"]
+            isolate = "firefox-container"
+
+            [[browsers.firefox.containers]]
+            profiles = ["*/prod-*/*", "*/live/*"]
+            color = "red"
+            icon = "fingerprint"
+
+            [[browsers.firefox.containers]]
+            profiles = ["acme/*/*"]
+            color = "green"
+            "#,
+        )
+        .unwrap();
+        let params = |profile: &Profile| {
+            let (_, args) = styled.browsers["firefox"].console_command_for(url, profile);
+            let container = args[0].strip_prefix("ext+granted-containers:").unwrap();
+            form_urlencoded::parse(container.as_bytes())
+                .into_owned()
+                .filter(|(k, _)| k == "color" || k == "icon")
+                .collect::<Vec<_>>()
+        };
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            params(&aws),
+            [pair("color", "red"), pair("icon", "fingerprint")]
+        );
+        let dev = Profile {
+            id: "acme/dev/Admin".into(),
+            ..aws.clone()
+        };
+        assert_eq!(params(&dev), [pair("color", "green")]);
+        let other = Profile {
+            id: "other/dev/Admin".into(),
+            ..aws.clone()
+        };
+        assert_eq!(params(&other), []);
+
         // Other consoles rely on the browser's own sign-in, so they stay put.
         let gcp = Profile {
             id: "g/proj/user".into(),
@@ -262,5 +438,31 @@ mod tests {
             Config::parse("[browsers.b]\ncommand = [\"b\", \"{url}\"]\nisolate = \"tabs\"\n")
                 .is_err()
         );
+        for (extra, message) in [
+            (
+                "isolate = \"chromium-profile\"\n[[browsers.b.containers]]\nprofiles = [\"*\"]\ncolor = \"red\"",
+                "they need isolate = \"firefox-container\"",
+            ),
+            (
+                "isolate = \"firefox-container\"\n[[browsers.b.containers]]\nprofiles = []\ncolor = \"red\"",
+                "containers[0].profiles must name at least one",
+            ),
+            (
+                "isolate = \"firefox-container\"\n[[browsers.b.containers]]\nprofiles = [\"a//b\"]\ncolor = \"red\"",
+                "has an empty segment",
+            ),
+            (
+                "isolate = \"firefox-container\"\n[[browsers.b.containers]]\nprofiles = [\"*\"]",
+                "must set a color or an icon",
+            ),
+            (
+                "isolate = \"firefox-container\"\n[[browsers.b.containers]]\nprofiles = [\"*\"]\nicon = \"fence\"",
+                "unknown variant `fence`",
+            ),
+        ] {
+            let text = format!("[browsers.b]\ncommand = [\"b\", \"{{url}}\"]\n{extra}\n");
+            let error = format!("{:#}", Config::parse(&text).unwrap_err());
+            assert!(error.contains(message), "{extra}: {error}");
+        }
     }
 }

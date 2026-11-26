@@ -9,7 +9,9 @@
 //! bootstrap tokens are also written to files encrypted with Windows DPAPI
 //! (see [`wsl`]), so they survive reboots; keyutils stays the fast cache.
 //! `OMNIFOB_KEYRING` forces a store: `keychain`, `windows`, `secret-service`
-//! or `keyutils`. For tests of the command line only,
+//! or `keyutils`, or `encrypted-file` for files encrypted with a passphrase
+//! (see [`vault`]), which survive reboots where no keychain does. For tests
+//! of the command line only,
 //! `test-plaintext-files:<absolute dir>` keeps secrets unencrypted in files
 //! (see [`test_files`]).
 
@@ -22,6 +24,8 @@ use serde::de::DeserializeOwned;
 
 use crate::Context;
 
+pub mod vault;
+
 const SERVICE: &str = "omnifob";
 
 /// Where a [`Context`] keeps secrets.
@@ -31,7 +35,8 @@ pub enum Keychain {
     /// else the Secret Service, falling back to keyutils on Linux.
     Native,
     /// A store by the name `OMNIFOB_KEYRING` gives it: `keychain`,
-    /// `windows`, `secret-service`, `keyutils`, or, for tests of the command
+    /// `windows`, `secret-service`, `keyutils`, `encrypted-file` (see
+    /// [`vault`]), or, for tests of the command
     /// line only, `test-plaintext-files:<absolute dir>` ([`test_files`]).
     Named(String),
     /// In memory, for tests: never touches the real keychain, and forgets
@@ -72,10 +77,10 @@ impl Selected {
     }
 }
 
-pub(crate) fn select(keychain: &Keychain) -> anyhow::Result<Selected> {
+pub(crate) fn select(cx: &Context, keychain: &Keychain) -> anyhow::Result<Selected> {
     let (name, store) = match keychain {
         Keychain::Native => use_native()?,
-        Keychain::Named(name) => (name.clone(), use_store(name)?),
+        Keychain::Named(name) => (name.clone(), use_named_store(cx, name)?),
         Keychain::Memory => (
             "memory".to_string(),
             keyring_core::mock::Store::new()? as Arc<CredentialStore>,
@@ -138,6 +143,16 @@ fn session_bus_may_exist(
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
     Ok(("secret-service".to_string(), use_store("secret-service")?))
+}
+
+/// A store `OMNIFOB_KEYRING` names, including the ones that need the
+/// context: the encrypted vault (its directory and passphrase).
+fn use_named_store(cx: &Context, name: &str) -> anyhow::Result<Arc<CredentialStore>> {
+    if let Some(rest) = name.strip_prefix(vault::NAME) {
+        let dir = vault::dir(rest, cx.state_dir()?)?;
+        return Ok(vault::Store::new(&dir, cx.vault_unlock().clone())? as Arc<CredentialStore>);
+    }
+    use_store(name)
 }
 
 fn use_store(name: &str) -> anyhow::Result<Arc<CredentialStore>> {
@@ -243,6 +258,12 @@ pub fn description() -> anyhow::Result<String> {
         return Ok(format!(
             "unencrypted files in {} (tests only)",
             test_files::dir(rest)?.display()
+        ));
+    }
+    if let Some(rest) = store.strip_prefix(vault::NAME) {
+        return Ok(format!(
+            "files encrypted with a passphrase in {}",
+            vault::dir(rest, cx.state_dir()?)?.display()
         ));
     }
     Ok(if wsl::enabled(&cx) {

@@ -112,6 +112,8 @@ pub(crate) enum Command {
     Env {
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
+        #[command(flatten)]
+        by: ByAccount,
         #[arg(long, value_enum, default_value_t = Shell::detect())]
         shell: Shell,
         /// Print code that removes the variables of the active profile instead
@@ -128,8 +130,12 @@ pub(crate) enum Command {
     },
     /// Run a command with a profile's credentials
     Exec {
+        /// The profile; without it, the working directory's default from
+        /// `[directories]`, else pick one from a list
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
+        #[command(flatten)]
+        by: ByAccount,
         #[arg(long)]
         no_cache: bool,
         /// Lifetime of new credentials instead of the configured one, e.g. "4h";
@@ -162,6 +168,8 @@ pub(crate) enum Command {
     Console {
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
+        #[command(flatten)]
+        by: ByAccount,
         /// Print the URL instead of opening it
         #[arg(long)]
         print: bool,
@@ -184,8 +192,13 @@ pub(crate) enum Command {
     },
     /// Print credentials for other tools (fnox, AWS credential_process, scripts)
     Creds {
-        #[arg(required = true, add = ArgValueCandidates::new(profile_candidates))]
+        #[arg(
+            required_unless_present_any = ["account_id", "role"],
+            add = ArgValueCandidates::new(profile_candidates)
+        )]
         profile: Vec<String>,
+        #[command(flatten)]
+        by: ByAccount,
         #[arg(long, value_enum, default_value_t = CredsFormat::Json)]
         format: CredsFormat,
         /// The EKS cluster's name, for `--format k8s-exec` with an AWS profile
@@ -234,6 +247,34 @@ pub(crate) enum Command {
     /// Get replacement credentials for a profile (started by fob in the background)
     #[command(hide = true)]
     Renew { profile: String },
+}
+
+/// Picks a profile by its account and role instead of words of its id, so
+/// a command written down works for colleagues whose integrations and
+/// accounts are named differently.
+#[derive(clap::Args)]
+pub(crate) struct ByAccount {
+    /// The account of the profile instead of naming it: an AWS account ID,
+    /// Azure subscription ID, Google Cloud project ID or Cloudflare account ID
+    #[arg(long, conflicts_with = "profile", value_name = "ID")]
+    pub(crate) account_id: Option<String>,
+    /// The role of the profile instead of naming it, e.g.
+    /// "AdministratorAccess" (the last part of its id: an AWS role, a
+    /// Cloudflare template)
+    #[arg(long, conflicts_with = "profile")]
+    pub(crate) role: Option<String>,
+}
+
+impl ByAccount {
+    /// The profile `words` name, or this account and role.
+    pub(crate) fn pick<'a>(&'a self, words: &'a Option<String>) -> crate::sync::Pick<'a> {
+        crate::sync::Pick {
+            query: words.as_deref(),
+            account_id: self.account_id.as_deref(),
+            role: self.role.as_deref(),
+            directory_default: false,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -322,6 +363,10 @@ pub(crate) enum CloudflareCommand {
         /// a jurisdiction); repeat for more
         #[arg(long = "r2-bucket")]
         r2_buckets: Vec<String>,
+        /// A zone that zone-level permissions apply to, as a domain name or
+        /// zone ID; repeat for more (default: every zone in the account)
+        #[arg(long = "zone")]
+        zones: Vec<String>,
         /// Also hand out R2's S3-compatible credentials
         #[arg(long)]
         s3: bool,
@@ -378,6 +423,9 @@ pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
                 omnifob_core::Target::AwsIamSession { .. } => "aws (iam user)",
                 omnifob_core::Target::AwsIamRole { .. } => "aws (iam role)",
                 omnifob_core::Target::AwsLogin { .. } => "aws (console sign-in)",
+                omnifob_core::Target::AwsLoginRole { .. } => "aws (console sign-in role)",
+                omnifob_core::Target::Command { aws: true } => "aws (command)",
+                omnifob_core::Target::Command { aws: false } => "command",
                 omnifob_core::Target::Gcp { .. } => "gcp",
                 omnifob_core::Target::Azure { .. } => "azure",
                 omnifob_core::Target::GcpServiceAccount { .. } => "gcp (service account)",

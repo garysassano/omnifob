@@ -123,13 +123,15 @@ pub fn services(groups: &[PermissionGroup], token_type: CloudflareTokenType) -> 
 }
 
 /// Builds token policies: one per resource kind the permissions apply to,
-/// each limited to the given account (and, for zone permissions, every zone
-/// in that account; for R2 bucket permissions, the listed buckets).
+/// each limited to the given account (and, for zone permissions, the zones
+/// in `zone_ids`, or every zone in that account when it is empty; for R2
+/// bucket permissions, the listed buckets).
 pub fn build_policies(
     groups: &[&PermissionGroup],
     account_id: &str,
     user_tag: Option<&str>,
     r2_buckets: &[String],
+    zone_ids: &[String],
 ) -> anyhow::Result<Vec<Value>> {
     let mut by_scope: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for group in groups {
@@ -149,6 +151,13 @@ pub fn build_policies(
         .map(|(scope, permission_groups)| {
             let resources = match scope {
                 SCOPE_ACCOUNT => json!({ account.clone(): "*" }),
+                // Single zones are named on their own, not under the account.
+                SCOPE_ZONE if !zone_ids.is_empty() => Value::Object(
+                    zone_ids
+                        .iter()
+                        .map(|id| (format!("{SCOPE_ZONE}.{id}"), json!("*")))
+                        .collect(),
+                ),
                 SCOPE_ZONE => json!({ account.clone(): { format!("{SCOPE_ZONE}.*"): "*" } }),
                 SCOPE_USER => {
                     let tag = user_tag.context(
@@ -180,6 +189,12 @@ pub fn build_policies(
             Ok(json!({ "effect": "allow", "resources": resources, "permission_groups": permission_groups }))
         })
         .collect()
+}
+
+/// Whether `zone` is written as a zone ID (32 hexadecimal digits) rather
+/// than as a domain name.
+pub fn is_zone_id(zone: &str) -> bool {
+    zone.len() == 32 && zone.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub(super) fn names(permission_groups: &[Value]) -> String {
@@ -339,7 +354,7 @@ mod tests {
     fn policies_group_by_scope_and_limit_to_account() {
         let groups = groups();
         let selected: Vec<_> = groups.iter().collect();
-        let policies = build_policies(&selected, "acct", Some("tag"), &[]).unwrap();
+        let policies = build_policies(&selected, "acct", Some("tag"), &[], &[]).unwrap();
         assert_eq!(policies.len(), 3);
         let resources: Vec<_> = policies.iter().map(|p| p["resources"].clone()).collect();
         assert!(resources.contains(&json!({ "com.cloudflare.api.account.acct": "*" })));
@@ -355,10 +370,31 @@ mod tests {
     }
 
     #[test]
+    fn zone_permissions_can_be_limited_to_zones() {
+        let groups = groups();
+        let selected: Vec<_> = groups.iter().filter(|g| g.id != "u").collect();
+        let zones = [
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "fedcba9876543210fedcba9876543210".to_string(),
+        ];
+        let policies = build_policies(&selected, "acct", None, &[], &zones).unwrap();
+        let resources: Vec<_> = policies.iter().map(|p| p["resources"].clone()).collect();
+        // Account permissions keep the account; zone ones name each zone.
+        assert!(resources.contains(&json!({ "com.cloudflare.api.account.acct": "*" })));
+        assert!(resources.contains(&json!({
+            "com.cloudflare.api.account.zone.0123456789abcdef0123456789abcdef": "*",
+            "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210": "*"
+        })));
+        assert!(is_zone_id(&zones[0]));
+        assert!(!is_zone_id("example.com"));
+        assert!(!is_zone_id("0123456789abcdef0123456789abcdeg"));
+    }
+
+    #[test]
     fn user_permissions_need_a_user_tag() {
         let groups = groups();
         let user: Vec<_> = groups.iter().filter(|g| g.id == "u").collect();
-        assert!(build_policies(&user, "acct", None, &[]).is_err());
+        assert!(build_policies(&user, "acct", None, &[], &[]).is_err());
     }
 
     #[test]
@@ -378,7 +414,7 @@ mod tests {
             SCOPE_R2_BUCKET,
         )];
         let selected: Vec<&PermissionGroup> = groups.iter().collect();
-        let err = build_policies(&selected, "acct", None, &[])
+        let err = build_policies(&selected, "acct", None, &[], &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("r2_buckets"), "{err}");
@@ -387,6 +423,7 @@ mod tests {
             "acct",
             None,
             &["logs".into(), "eu/backups".into()],
+            &[],
         )
         .unwrap();
         let resources = policies[0]["resources"].as_object().unwrap();

@@ -40,7 +40,8 @@ Each was read from a shallow clone of its repository.
 - Refreshes 15 minutes before expiry (matching the AWS CLI). A refresh token is single use, so on a failed refresh it re-reads the cache before deleting anything, in case another process refreshed first.
 - A 401 from GetRoleCredentials drops the cached token and retries once.
 - `exec`, `export`, `login` (console) and a local ECS/EC2 metadata server.
-- **Taken:** the refresh window, the default scope, 401 handling.
+- `--no-session` assumes a role with the access key itself instead of a `GetSessionToken` session, so the role is not chained and may last up to 12 hours, at the cost of an MFA code per role session.
+- **Taken:** the refresh window, the default scope, 401 handling, and `--no-session` as `no_session = true` on an `aws-iam` role.
 
 ### Leapp (Noovolari/leapp, TypeScript)
 
@@ -93,8 +94,8 @@ The 15 tools marked "to study" in [tools/](tools/README.md), read for the specif
 
 ### AWS Identity Center tools
 
-- **aws-sso-util** (`61418/aws-sso-util`): `run-as --account-id ... --role-name ...` runs a command without knowing any profile name; account IDs are stable and can be shared with colleagues, account names cannot. `check` diagnoses the Identity Center configuration and whether you can reach an account and role, with a quiet mode for scripts. Generated profile names are built from configurable components; whitespace in account names becomes `-` because SDKs parse such names inconsistently (omnifob's slugs already avoid that).
-- **aws-sso-cli** (second look): a _History_ of recently used roles (`HistoryLimit`, `HistoryMinutes`) shown first in the picker; per-account and per-role tags; console URLs can be opened, printed, copied, sent with OSC 52 (copies to the local clipboard over SSH), or opened in a **Firefox container** per role (granted's extension or "Open URL in Container"), so several accounts' consoles stay signed in side by side, colour-coded.
+- **aws-sso-util** (`61418/aws-sso-util`): `run-as --account-id ... --role-name ...` runs a command without knowing any profile name; account IDs are stable and can be shared with colleagues, account names cannot. `check` diagnoses the Identity Center configuration and whether you can reach an account and role, with a quiet mode for scripts. Generated profile names are built from configurable components; whitespace in account names becomes `-` because SDKs parse such names inconsistently (omnifob's slugs already avoid that). **Taken:** `--account-id` and `--role` on `fob exec`, `env`, `creds` and `console`.
+- **aws-sso-cli** (second look): a _History_ of recently used roles (`HistoryLimit`, `HistoryMinutes`) shown first in the picker; per-account and per-role tags; console URLs can be opened, printed, copied, sent with OSC 52 (copies to the local clipboard over SSH), or opened in a **Firefox container** per role (granted's extension or "Open URL in Container"), so several accounts' consoles stay signed in side by side, colour-coded. **Taken:** colour and icon per profile pattern for granted's extension (`[[browsers.<name>.containers]]`); its parser (`src/opener/parser.ts`, read 2026-11-25) reads `name`, `url`, `color` and `icon` and silently drops a colour or icon outside Firefox's lists, so omnifob checks them when the config loads.
 - **aws-cli-auth**: deliberately does not store the Identity Center refresh token and is meant for `credential_process`; less risk if the machine is compromised, at the cost of more sign-ins.
 - **aws-sso-creds**: a terminal UI that generates profiles into `~/.aws/config` and browses them with a fuzzy finder; nothing omnifob lacks.
 - **yawsso**: copies an Identity Center session into `~/.aws/credentials` for tools that predate SSO and `credential_process`.
@@ -110,7 +111,7 @@ The 15 tools marked "to study" in [tools/](tools/README.md), read for the specif
 
 ### Extensibility and multi-tool patterns
 
-- **awsume**: a plugin system (pluggy hooks) for collecting profiles and fetching credentials. A lighter equivalent for omnifob: a `command` integration, where any program that prints credentials as JSON becomes a profile, covering saml2aws, gimme-aws-creds and in-house scripts without in-process plugins.
+- **awsume**: a plugin system (pluggy hooks) for collecting profiles and fetching credentials. A lighter equivalent for omnifob: a `command` integration, where any program that prints credentials as JSON becomes a profile, covering saml2aws, gimme-aws-creds and in-house scripts without in-process plugins. **Taken:** `type = "command"`, reading omnifob's JSON or the AWS `credential_process` format, the latter as the AWS SDKs read it (`Version` 1, `Expiration` optional, `AccountId` as in the CLI's newer output).
 - **secretenv**: a "three-file model": the repository commits only alias names, and each machine maps aliases to real backends. For omnifob this solves naming a profile from a project, since profile ids contain each person's own integration names.
 - **gh**: several accounts per host with `gh auth switch`; `gh auth token` for other tools; acts as git's credential helper.
 - **Azure Developer CLI**: can hand sign-in to `az` (`auth.useAzCliAuth`) instead of duplicating it; supports letting official CLIs own sign-in for Azure and Google.
@@ -119,7 +120,7 @@ The 15 tools marked "to study" in [tools/](tools/README.md), read for the specif
 ## Cloudflare token tools (2026-10-07)
 
 - **create-cf-token**: an interactive picker over the permission catalogue, grouped by service (the name without Read, Write or Edit), with Read or Write per service and live fuzzy filtering; write also adds read. When Cloudflare rejects a permission it parses the name from the error, leaves it out and retries, and it always leaves out token-management permissions, which child tokens cannot carry. It can revoke the token it just made before exiting. **Taken:** the service-grouped picker (`fob cf add-template`) and revoking a token as soon as it is no longer needed (`fob exec --revoke`).
-- **cftoken**: scoped tokens per zone, with requester IP ranges (`allow-cidrs`, required unless the config sets defaults), TTL and per-zone permission templates in one JSON config. **Taken:** IP restrictions (`ips`, with `"current"`). **To take:** zone-limited templates.
+- **cftoken**: scoped tokens per zone, with requester IP ranges (`allow-cidrs`, required unless the config sets defaults), TTL and per-zone permission templates in one JSON config. **Taken:** IP restrictions (`ips`, with `"current"`), and zone-limited templates (`zones`, by name or ID).
 - **terraform-cloudflare-r2-api-token**: tokens limited to named R2 buckets, read or write. **Taken:** bucket-limited templates (`r2_buckets`), and the S3 credentials R2 derives from a token (the token ID as access key, the SHA-256 of the token as secret).
 
 ## Provisioners and agent markers (2026-11-25)
