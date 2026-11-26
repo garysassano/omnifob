@@ -176,6 +176,15 @@ async fn failures_name_the_program_but_never_its_output() {
     let e = error(&["/bin/sh", expired.to_str().unwrap()], "").await;
     assert!(e.contains("printed credentials that expired"), "{e}");
 
+    // A program that prints without end is stopped at 1 MiB, long before
+    // its time runs out.
+    let endless = script(&dir, "endless", "while :; do echo AKIA-secret-value; done");
+    let started = Instant::now();
+    let e = error(&["/bin/sh", endless.to_str().unwrap()], "timeout = \"30s\"").await;
+    assert!(e.contains("printed more than 1 MiB"), "{e}");
+    assert!(!e.contains("secret-value"), "{e}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+
     let missing = dir.join("missing");
     let e = error(&[missing.to_str().unwrap()], "").await;
     assert!(e.contains("was not found"), "{e}");

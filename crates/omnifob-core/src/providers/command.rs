@@ -1,10 +1,11 @@
 //! An external program that prints credentials (`type = "command"`).
 //!
-//! The program runs without a shell, with omnifob's environment plus
-//! `OMNIFOB_PROFILE` (and `OMNIFOB_TTL_SECONDS` when a lifetime is asked
-//! for), the terminal's stdin and stderr, so it can prompt and report, and
-//! a time limit. Only its stdout is read, and it never appears in an error
-//! message, since it holds the credentials.
+//! The program runs without a shell, with omnifob's environment (but not
+//! the vault's passphrase) plus `OMNIFOB_PROFILE` (and
+//! `OMNIFOB_TTL_SECONDS` when a lifetime is asked for), the terminal's
+//! stdin and stderr, so it can prompt and report, and a time limit. Only
+//! its stdout is read, up to [`MAX_OUTPUT`], and it never appears in an
+//! error message, since it holds the credentials.
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
@@ -12,6 +13,7 @@ use std::process::Stdio;
 use anyhow::{Context, anyhow, bail};
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 
 use crate::config::{CommandConfig, CommandFormat, TTL_PLACEHOLDER};
 use crate::{Credentials, Profile, Result, Target};
@@ -117,19 +119,36 @@ async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
+        .env_remove(crate::context::VAULT_PASSPHRASE_VAR)
         .env("OMNIFOB_PROFILE", profile_id);
     match &seconds {
         Some(s) => command.env("OMNIFOB_TTL_SECONDS", s),
         None => command.env_remove("OMNIFOB_TTL_SECONDS"),
     };
-    let child = command.spawn().map_err(|e| match e.kind() {
+    let mut child = command.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
             anyhow!("{program}, the command of '{integration}', was not found")
         }
         _ => anyhow!("running {program} for '{integration}': {e}"),
     })?;
+    let mut stdout = child.stdout.take().context("the program's stdout")?;
+    // Reads at most one byte more than allowed, so a program that prints
+    // without end is stopped rather than filling memory; it is then not
+    // waited for.
+    let read_and_wait = async {
+        let mut out = Vec::new();
+        (&mut stdout)
+            .take(MAX_OUTPUT as u64 + 1)
+            .read_to_end(&mut out)
+            .await?;
+        if out.len() > MAX_OUTPUT {
+            return Ok::<_, std::io::Error>((out, None));
+        }
+        let status = child.wait().await?;
+        Ok((out, Some(status)))
+    };
     let timeout = config.timeout();
-    let output = tokio::time::timeout(timeout.unsigned_abs(), child.wait_with_output())
+    let (stdout, status) = tokio::time::timeout(timeout.unsigned_abs(), read_and_wait)
         .await
         .map_err(|_| {
             anyhow!(
@@ -137,16 +156,14 @@ async fn run(
             )
         })?
         .with_context(|| format!("running {program} for '{integration}'"))?;
-    if !output.status.success() {
-        bail!(
-            "{program} for '{integration}' failed ({}); what it said is above",
-            output.status
-        );
+    let Some(status) = status else {
+        let _ = child.start_kill();
+        bail!("{program} for '{integration}' printed more than 1 MiB; it was stopped");
+    };
+    if !status.success() {
+        bail!("{program} for '{integration}' failed ({status}); what it said is above");
     }
-    if output.stdout.len() > MAX_OUTPUT {
-        bail!("{program} for '{integration}' printed more than 1 MiB");
-    }
-    Ok(output.stdout)
+    Ok(stdout)
 }
 
 /// What the program printed as credentials, by `format`. Errors name the

@@ -293,10 +293,11 @@ pub async fn credentials(
 /// The lifetime omnifob asks for when it gets a profile's credentials, for
 /// the profiles whose lifetime it chooses and that take `ttl`: Cloudflare
 /// tokens, chained, cross-partition, IAM users' and console sign-ins' roles,
-/// IAM user sessions and chained roles without MFA (with MFA, each new
-/// session asks for a code, and an agent's capped request, which is not
-/// cached, would ask every time), Google service accounts, and programs
-/// given a `ttl`. `None` for the others, whose provider sets it.
+/// and IAM user sessions, except those that ask for an MFA code (with MFA,
+/// each new session asks for a code, and an agent's capped request, which is
+/// not cached, would ask every time: IAM user sessions, `no_session` roles
+/// of a user with `mfa_serial`, and chained and console sign-ins' roles with
+/// `mfa_serial`), Google service accounts, and programs given a `ttl`. `None` for the others, whose provider sets it.
 pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::SignedDuration> {
     use jiff::SignedDuration;
     let hour = SignedDuration::from_hours(1);
@@ -321,7 +322,13 @@ pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::Signe
             Some(c.cross_partition.get(label)?.duration_or_default())
         }
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
-            Some(c.roles.get(label)?.duration.unwrap_or(hour))
+            let role = c.roles.get(label)?;
+            // Assumed with the access key, each session asks for the user's
+            // MFA code.
+            if role.no_session && c.mfa_serial.is_some() {
+                return None;
+            }
+            Some(role.duration.unwrap_or(hour))
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) if c.mfa_serial.is_none() => {
             Some(c.session_duration.unwrap_or(SignedDuration::from_hours(8)))
@@ -330,7 +337,11 @@ pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::Signe
             Some(c.service_accounts.get(label)?.lifetime.unwrap_or(hour))
         }
         (Integration::AwsLogin(c), Target::AwsLoginRole { label, .. }) => {
-            Some(c.roles.get(label)?.duration.unwrap_or(hour))
+            let role = c.roles.get(label)?;
+            if role.mfa_serial.is_some() {
+                return None;
+            }
+            Some(role.duration.unwrap_or(hour))
         }
         (Integration::Command(c), Target::Command { .. }) => c.ttl,
         _ => None,
@@ -1128,6 +1139,35 @@ mod tests {
         // an agent.
         assert_eq!(chosen_lifetime(&config, &chained("mfa")), None);
         assert_eq!(capped_ttl(&config, &chained("mfa"), None, max), None);
+
+        let config = Config::parse(
+            "[integrations.u]\ntype = \"aws-iam\"\nmfa_serial = \"arn:aws:iam::111111111111:mfa/me\"\n\
+             [integrations.u.roles.session]\nrole_arn = \"arn:aws:iam::222222222222:role/S\"\n\
+             [integrations.u.roles.key]\nrole_arn = \"arn:aws:iam::222222222222:role/K\"\nno_session = true\n\
+             [integrations.c]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n\
+             [integrations.c.roles.plain]\nrole_arn = \"arn:aws:iam::222222222222:role/P\"\n\
+             [integrations.c.roles.mfa]\nrole_arn = \"arn:aws:iam::222222222222:role/M\"\nmfa_serial = \"arn:aws:iam::111111111111:mfa/me\"\n",
+        )
+        .unwrap();
+        let role = |integration: &str, label: &str| {
+            let target = if integration == "u" {
+                Target::AwsIamRole {
+                    label: label.into(),
+                    account_id: None,
+                }
+            } else {
+                Target::AwsLoginRole {
+                    label: label.into(),
+                    account_id: None,
+                }
+            };
+            Profile::new(integration, "x", label, target)
+        };
+        // Assumed with the session, whose code was asked for once.
+        assert!(chosen_lifetime(&config, &role("u", "session")).is_some());
+        assert_eq!(chosen_lifetime(&config, &role("u", "key")), None);
+        assert!(chosen_lifetime(&config, &role("c", "plain")).is_some());
+        assert_eq!(chosen_lifetime(&config, &role("c", "mfa")), None);
     }
 
     #[test]

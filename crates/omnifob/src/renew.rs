@@ -24,13 +24,22 @@ impl App {
     }
 }
 
-/// Whether renewing `profile` needs someone at a terminal: a chained role
-/// whose trust policy wants an MFA code asks for one each session, so a
-/// renewal in the background always fails.
+/// Whether renewing `profile` needs someone at a terminal: a role whose
+/// trust policy wants an MFA code asks for one each session (a chained or
+/// console sign-in's role with `mfa_serial`, and an IAM user's `no_session`
+/// role when the user has `mfa_serial`), so a renewal in the background
+/// always fails.
 fn needs_a_person(config: &Config, profile: &Profile) -> bool {
     match (config.integration(&profile.integration), &profile.target) {
         (Ok(Integration::AwsSso(c)), Target::AwsChained { label, .. }) => c
             .chained
+            .get(label)
+            .is_some_and(|role| role.mfa_serial.is_some()),
+        (Ok(Integration::AwsIam(c)), Target::AwsIamRole { label, .. }) => {
+            c.mfa_serial.is_some() && c.roles.get(label).is_some_and(|role| role.no_session)
+        }
+        (Ok(Integration::AwsLogin(c)), Target::AwsLoginRole { label, .. }) => c
+            .roles
             .get(label)
             .is_some_and(|role| role.mfa_serial.is_some()),
         _ => false,
@@ -107,5 +116,62 @@ mfa_serial = "arn:aws:iam::111111111111:mfa/me"
         };
         assert!(!needs_a_person(&config, &chained("deploy")));
         assert!(needs_a_person(&config, &chained("guarded")));
+    }
+
+    #[test]
+    fn roles_assumed_with_an_mfa_code_are_not_renewed_in_the_background() {
+        let config = Config::parse(
+            r#"
+[integrations.user]
+type = "aws-iam"
+mfa_serial = "arn:aws:iam::111111111111:mfa/me"
+
+[integrations.user.roles.session]
+role_arn = "arn:aws:iam::222222222222:role/S"
+
+[integrations.user.roles.key]
+role_arn = "arn:aws:iam::222222222222:role/K"
+no_session = true
+
+[integrations.console]
+type = "aws-login"
+region = "eu-west-1"
+
+[integrations.console.roles.plain]
+role_arn = "arn:aws:iam::222222222222:role/P"
+
+[integrations.console.roles.guarded]
+role_arn = "arn:aws:iam::222222222222:role/G"
+mfa_serial = "arn:aws:iam::111111111111:mfa/me"
+"#,
+        )
+        .unwrap();
+        let profile = |integration: &str, target: Target| Profile {
+            id: format!("{integration}/x/y"),
+            integration: integration.into(),
+            target,
+        };
+        let iam = |label: &str| {
+            profile(
+                "user",
+                Target::AwsIamRole {
+                    label: label.into(),
+                    account_id: None,
+                },
+            )
+        };
+        let login = |label: &str| {
+            profile(
+                "console",
+                Target::AwsLoginRole {
+                    label: label.into(),
+                    account_id: None,
+                },
+            )
+        };
+        assert!(!needs_a_person(&config, &iam("session")));
+        assert!(needs_a_person(&config, &iam("key")));
+        assert!(!needs_a_person(&config, &login("plain")));
+        assert!(needs_a_person(&config, &login("guarded")));
     }
 }
