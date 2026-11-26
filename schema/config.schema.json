@@ -1,0 +1,718 @@
+{
+  "$id": "https://raw.githubusercontent.com/garysassano/omnifob/main/schema/config.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "AgentConfig": {
+      "additionalProperties": false,
+      "description": "Limits on what a coding agent can get, under `[agent]`.",
+      "properties": {
+        "profiles": {
+          "description": "Profile ids agents may get credentials for, as patterns in which `*`\nstands for any characters within one `/`-separated segment, e.g.\n`\"acme/dev/*\"` or `\"*/*/ReadOnly\"`. Unset, agents may use every profile.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Browser": {
+      "additionalProperties": false,
+      "description": "How to open a URL in one browser, or one profile of a browser, so that\neach integration's sign-in sessions stay in the profile it belongs to.",
+      "properties": {
+        "command": {
+          "description": "The program and its arguments, run without a shell; `{url}` in an\nargument is replaced by the URL, e.g.\n`[\"firefox\", \"-P\", \"work\", \"{url}\"]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "isolate": {
+          "$ref": "#/definitions/Isolation",
+          "description": "Opens each AWS profile's console apart from the others, so that\nsigning in as one does not sign the console out of another."
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "ChainedRole": {
+      "additionalProperties": false,
+      "description": "A role assumed with the credentials of an Identity Center role.",
+      "properties": {
+        "duration": {
+          "description": "Session length, 15 minutes to 1 hour (AWS caps role-chaining sessions\nat one hour); defaults to one hour.",
+          "type": "string"
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "mfa_serial": {
+          "description": "MFA device the role's trust policy requires (`mfa_serial` in\n`~/.aws/config`); a code is asked for each new session.",
+          "type": "string"
+        },
+        "region": {
+          "description": "Region exported for this role; defaults to the integration's.",
+          "type": "string"
+        },
+        "role_arn": {
+          "type": "string"
+        },
+        "session_name": {
+          "description": "`RoleSessionName`; defaults to \"omnifob\".",
+          "type": "string"
+        },
+        "via_account_id": {
+          "description": "Account of the Identity Center role to start from.",
+          "type": "string"
+        },
+        "via_role": {
+          "description": "Name of the Identity Center role (permission set) to start from.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "via_account_id",
+        "via_role",
+        "role_arn"
+      ],
+      "type": "object"
+    },
+    "CloudflareTemplate": {
+      "additionalProperties": false,
+      "description": "A named set of permissions, written as they appear in the dashboard's API\nnames (e.g. \"Workers Scripts Write\"), never as IDs.",
+      "properties": {
+        "ips": {
+          "description": "Overrides the integration's `ips` for this template.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "optional": {
+          "default": [],
+          "description": "Permissions added when the account offers them and skipped otherwise,\nfor products that are new, renamed or not enabled everywhere.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "permissions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "r2_buckets": {
+          "default": [],
+          "description": "R2 buckets that bucket-level permissions (\"Workers R2 Storage Bucket\nItem Write\") apply to; \"eu/name\" for a bucket in a jurisdiction.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "s3": {
+          "default": false,
+          "description": "Also hand out the S3-compatible credentials R2 derives from the token\n(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`).",
+          "type": "boolean"
+        },
+        "ttl": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "permissions"
+      ],
+      "type": "object"
+    },
+    "CloudflareTokenType": {
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "Minted with a user-owned bootstrap token (\"Create additional tokens\").",
+          "type": "string"
+        },
+        {
+          "const": "account",
+          "description": "Minted with an account-owned bootstrap token (\"Account API Tokens Edit\").",
+          "type": "string"
+        }
+      ]
+    },
+    "CrossPartitionRole": {
+      "additionalProperties": false,
+      "description": "A role in another AWS partition, reached from an Identity Center role\n(`[integrations.<name>.cross_partition.<label>]`): the Identity Center\nrole requests a web identity token with STS `GetWebIdentityToken` in its\nown partition, and `AssumeRoleWithWebIdentity` exchanges it for the\nrole's credentials in the other partition. Checked when the config loads,\nso `role_arn` is an IAM role ARN in a partition other than the source\nRegion's, and `region` is in the partition of `role_arn`.",
+      "properties": {
+        "audience": {
+          "description": "The token's one audience: a client ID of the destination account's\nOIDC provider for the source account's issuer.",
+          "type": "string"
+        },
+        "duration": {
+          "description": "Session length, 15 minutes to the destination role's maximum (at most\n12 hours); defaults to one hour\n([`CrossPartitionRole::DEFAULT_DURATION`]).",
+          "type": "string"
+        },
+        "region": {
+          "description": "The destination partition's STS Region, exported as `AWS_REGION`.",
+          "type": "string"
+        },
+        "role_arn": {
+          "description": "The role to assume, in another partition.",
+          "type": "string"
+        },
+        "session_name": {
+          "description": "`RoleSessionName`; defaults to \"omnifob\".",
+          "type": "string"
+        },
+        "signing_algorithm": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SigningAlgorithm"
+            }
+          ],
+          "default": "ES384",
+          "description": "How the token is signed; ES384 unless set."
+        },
+        "source_region": {
+          "description": "Where the token is requested; defaults to the integration's\n`default_region`, then the portal's Region\n([`CrossPartitionRole::source_region`]).",
+          "type": "string"
+        },
+        "via_account_id": {
+          "description": "Account of the Identity Center role that requests the token.",
+          "type": "string"
+        },
+        "via_role": {
+          "description": "Name of the Identity Center role (permission set) that requests the\ntoken.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "via_account_id",
+        "via_role",
+        "role_arn",
+        "audience",
+        "region"
+      ],
+      "type": "object"
+    },
+    "GcpServiceAccount": {
+      "additionalProperties": false,
+      "description": "A service account the signed-in account impersonates, which needs the\nService Account Token Creator role on it.",
+      "properties": {
+        "delegates": {
+          "default": [],
+          "description": "Service accounts to go through, in order, when the account may only\nimpersonate this one by way of others.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "email": {
+          "type": "string"
+        },
+        "lifetime": {
+          "description": "Token lifetime; defaults to one hour, the most Google allows unless the\norganization policy `iam.allowServiceAccountCredentialLifetimeExtension`\nlists the account (then up to 12 hours).",
+          "type": "string"
+        },
+        "project": {
+          "description": "Exported as the project; defaults to the one in the email.",
+          "type": "string"
+        },
+        "scopes": {
+          "description": "OAuth scopes for the token; defaults to cloud-platform and\nuserinfo.email, as gcloud asks.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "email"
+      ],
+      "type": "object"
+    },
+    "IamRole": {
+      "additionalProperties": false,
+      "description": "A role assumed with an IAM user's session.",
+      "properties": {
+        "console_duration": {
+          "description": "How long `fob console` sessions last (`SessionDuration`), 15 minutes\nto 12 hours and shorter than the role's maximum session duration.\nUnset, a console session lasts as long as the role's credentials.",
+          "type": "string"
+        },
+        "duration": {
+          "description": "Session length, 15 minutes to 1 hour (STS counts a role assumed with\nthe user's `GetSessionToken` session as role chaining, which it caps\nat one hour); defaults to one hour.",
+          "type": "string"
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "region": {
+          "description": "Region exported for this role; defaults to the integration's.",
+          "type": "string"
+        },
+        "role_arn": {
+          "type": "string"
+        },
+        "session_name": {
+          "description": "`RoleSessionName`; defaults to \"omnifob\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role_arn"
+      ],
+      "type": "object"
+    },
+    "Integration": {
+      "description": "The `type` values as written in the config file. Both Cloudflare types\nshare one configuration and differ only in how omnifob signs in.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "chained": {
+              "additionalProperties": {
+                "$ref": "#/definitions/ChainedRole"
+              },
+              "default": {},
+              "description": "Roles reached by assuming them from one of this portal's roles\n(`role_arn` + `source_profile` in `~/.aws/config`), keyed by a label\nthat becomes the middle of the profile id.",
+              "type": "object"
+            },
+            "console_duration": {
+              "description": "How long `fob console` sessions of this portal's roles last\n(`SessionDuration`), 15 minutes to 12 hours, and shorter than the\npermission set's session duration, which omnifob cannot see. Unset,\na console session lasts as long as the role's credentials. Chained\nroles cannot take it.",
+              "type": "string"
+            },
+            "cross_partition": {
+              "additionalProperties": {
+                "$ref": "#/definitions/CrossPartitionRole"
+              },
+              "default": {},
+              "description": "Roles in another AWS partition, reached with a web identity token\nthat one of this portal's roles requests, keyed by a label that\nbecomes the middle of the profile id.",
+              "type": "object"
+            },
+            "default_region": {
+              "description": "Region exported as `AWS_REGION` for every profile of this integration.",
+              "type": "string"
+            },
+            "region": {
+              "description": "The region IAM Identity Center runs in.",
+              "type": "string"
+            },
+            "scopes": {
+              "default": [
+                "sso:account:access"
+              ],
+              "description": "OIDC scopes. `sso:account:access` makes Identity Center issue a refresh\ntoken, so sessions renew without a browser until the portal session ends.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "start_url": {
+              "description": "The AWS access portal URL, e.g. `https://acme.awsapps.com/start`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "aws-sso",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "start_url",
+            "region"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An IAM user's access key, kept in the keychain (`type = \"aws-iam\"`), the\nway aws-vault keeps it. omnifob never hands the key out: it turns it into a\nsession with STS `GetSessionToken` (with an MFA code when `mfa_serial` is\nset), and assumes `roles` with that session, which STS counts as role\nchaining.",
+          "properties": {
+            "account": {
+              "description": "Middle segment of the session profile's id; defaults to the account ID.",
+              "type": "string"
+            },
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "mfa_serial": {
+              "description": "The user's MFA device; sessions then carry MFA, which roles requiring\nit accept.",
+              "type": "string"
+            },
+            "region": {
+              "description": "Region exported as `AWS_REGION` and used for STS; STS defaults to\nus-east-1 when unset, and no region is exported.",
+              "type": "string"
+            },
+            "roles": {
+              "additionalProperties": {
+                "$ref": "#/definitions/IamRole"
+              },
+              "default": {},
+              "description": "Roles assumed with the user's session, keyed by a label that becomes\nthe middle of the profile id.",
+              "type": "object"
+            },
+            "session_duration": {
+              "description": "Length of the user's session, 15 minutes to 36 hours; defaults to\neight hours, a working day.",
+              "type": "string"
+            },
+            "type": {
+              "const": "aws-iam",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "AWS console credentials (`type = \"aws-login\"`), as `aws login` gets\nthem: the browser signs in with a console session (an IAM user, the root\nuser or a federated role), and omnifob keeps a refresh token that renews\n15 minute credentials for up to 12 hours, with no access key stored.",
+          "properties": {
+            "account": {
+              "description": "Middle segment of the profile's id; defaults to the account ID.",
+              "type": "string"
+            },
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "default_region": {
+              "description": "Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` instead of `region`.",
+              "type": "string"
+            },
+            "region": {
+              "description": "The Region signed in through; the refresh token works only there. It\nis also exported as `AWS_REGION` unless `default_region` is set.",
+              "type": "string"
+            },
+            "type": {
+              "const": "aws-login",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "region"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Google account (`type = \"gcp\"`), signed in the way `gcloud auth login`\nsigns in. Profiles are the account itself in each project, and service\naccounts it may impersonate.",
+          "properties": {
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "client_id": {
+              "description": "An OAuth client of your own (a Desktop app client) instead of the one\ngcloud ships. Both or neither.",
+              "type": "string"
+            },
+            "client_secret": {
+              "type": "string"
+            },
+            "projects": {
+              "description": "The projects to offer; by default every active project the account\ncan see, listed at `fob sync`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "service_accounts": {
+              "additionalProperties": {
+                "$ref": "#/definitions/GcpServiceAccount"
+              },
+              "description": "Service accounts to impersonate, keyed by a label that becomes the\nmiddle of the profile id.",
+              "type": "object"
+            },
+            "type": {
+              "const": "gcp",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Microsoft Entra ID account (`type = \"azure\"`), signed in the way\n`az login` signs in. Profiles are the account in each subscription.",
+          "properties": {
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "subscriptions": {
+              "description": "The subscriptions to offer (IDs); by default every one the account\ncan see, listed at `fob sync`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "tenant": {
+              "description": "The tenant to sign in to (ID or domain); by default `organizations`,\nwhich finds every tenant the account belongs to.",
+              "type": "string"
+            },
+            "type": {
+              "const": "azure",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "account_id": {
+              "description": "Account to mint tokens for. When omitted, every account the bootstrap\ntoken can list is discovered.",
+              "type": "string"
+            },
+            "account_name": {
+              "description": "Display name for `account_id`; defaults to the ID.",
+              "type": "string"
+            },
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "client_id": {
+              "description": "`cloudflare-oauth`: the OAuth client to sign in with.",
+              "type": "string"
+            },
+            "ips": {
+              "default": [],
+              "description": "Addresses minted tokens may be used from, unless a template sets its\nown: IPs or CIDR ranges, or \"current\" for this machine's public\naddresses at minting time. Empty means anywhere.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scopes": {
+              "description": "`cloudflare-oauth`: scopes requested at sign-in; defaults to the ones\nminting needs.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "session": {
+              "description": "Sign-in session length. When set, `fob login` makes the new bootstrap\ntoken expire after this long, so it works like an SSO session: a\nstolen copy stops working, and a new one needs the dashboard sign-in.",
+              "type": "string"
+            },
+            "templates": {
+              "additionalProperties": {
+                "$ref": "#/definitions/CloudflareTemplate"
+              },
+              "description": "Extra templates, added to (or replacing) the built-in ones.",
+              "type": "object"
+            },
+            "token_type": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CloudflareTokenType"
+                }
+              ],
+              "description": "The configured owner of minted tokens (`cloudflare-token` only). OAuth\nleaves it at the default yet mints account-owned tokens, so code that\nacts on the owner reads [`CloudflareConfig::minting`] instead."
+            },
+            "ttl": {
+              "default": "1h",
+              "description": "Lifetime of minted tokens unless a template overrides it.",
+              "type": "string"
+            },
+            "type": {
+              "const": "cloudflare-token",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "account_id": {
+              "description": "Account to mint tokens for. When omitted, every account the bootstrap\ntoken can list is discovered.",
+              "type": "string"
+            },
+            "account_name": {
+              "description": "Display name for `account_id`; defaults to the ID.",
+              "type": "string"
+            },
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "client_id": {
+              "description": "`cloudflare-oauth`: the OAuth client to sign in with.",
+              "type": "string"
+            },
+            "ips": {
+              "default": [],
+              "description": "Addresses minted tokens may be used from, unless a template sets its\nown: IPs or CIDR ranges, or \"current\" for this machine's public\naddresses at minting time. Empty means anywhere.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scopes": {
+              "description": "`cloudflare-oauth`: scopes requested at sign-in; defaults to the ones\nminting needs.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "session": {
+              "description": "Sign-in session length. When set, `fob login` makes the new bootstrap\ntoken expire after this long, so it works like an SSO session: a\nstolen copy stops working, and a new one needs the dashboard sign-in.",
+              "type": "string"
+            },
+            "templates": {
+              "additionalProperties": {
+                "$ref": "#/definitions/CloudflareTemplate"
+              },
+              "description": "Extra templates, added to (or replacing) the built-in ones.",
+              "type": "object"
+            },
+            "token_type": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CloudflareTokenType"
+                }
+              ],
+              "description": "The configured owner of minted tokens (`cloudflare-token` only). OAuth\nleaves it at the default yet mints account-owned tokens, so code that\nacts on the owner reads [`CloudflareConfig::minting`] instead."
+            },
+            "ttl": {
+              "default": "1h",
+              "description": "Lifetime of minted tokens unless a template overrides it.",
+              "type": "string"
+            },
+            "type": {
+              "const": "cloudflare-oauth",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Long-lived tokens for providers without short-lived credentials.",
+          "properties": {
+            "account": {
+              "description": "Middle segment of the profile id; defaults to \"default\".",
+              "type": "string"
+            },
+            "browser": {
+              "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
+              "type": "string"
+            },
+            "console": {
+              "type": "string"
+            },
+            "preset": {
+              "description": "A known provider: its variable names, token check and console URL.",
+              "type": "string"
+            },
+            "secrets": {
+              "additionalProperties": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "default": {},
+              "description": "Secret name → environment variables that receive it. It replaces the\npreset's secrets and the fixed variables that come with them (such\nas unikraft's `UNIKRAFT_PROFILE_ENV`); set those under `vars`.",
+              "type": "object"
+            },
+            "type": {
+              "const": "token",
+              "type": "string"
+            },
+            "vars": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Non-secret variables exported along with the secrets.",
+              "type": "object"
+            },
+            "verify_url": {
+              "description": "URL that answers 2xx when the token is sent as a bearer token; it\nneeds exactly one secret, and replaces the preset's check.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Isolation": {
+      "description": "How a browser keeps AWS consoles apart, one per profile.",
+      "oneOf": [
+        {
+          "const": "chromium-profile",
+          "description": "A Chromium profile per fob profile (`--profile-directory`), in place\nof any the command names; Chrome creates it on first use.",
+          "type": "string"
+        },
+        {
+          "const": "firefox-container",
+          "description": "A Firefox container per fob profile, opened through the Granted\nContainers extension's `ext+granted-containers:` URLs.",
+          "type": "string"
+        }
+      ]
+    },
+    "SigningAlgorithm": {
+      "description": "The algorithm `GetWebIdentityToken` signs the token with\n(`SigningAlgorithm`).",
+      "oneOf": [
+        {
+          "const": "ES384",
+          "description": "ECDSA with P-384 and SHA-384, the one AWS's examples use.",
+          "type": "string"
+        },
+        {
+          "const": "RS256",
+          "description": "RSA with SHA-256, for relying parties without ECDSA.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "agent": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AgentConfig"
+        }
+      ],
+      "description": "What commands run by a coding agent may use."
+    },
+    "browsers": {
+      "additionalProperties": {
+        "$ref": "#/definitions/Browser"
+      },
+      "description": "Browsers, or profiles of one browser, that integrations open in,\nkeyed by the name their `browser` key refers to.",
+      "type": "object"
+    },
+    "integrations": {
+      "additionalProperties": {
+        "$ref": "#/definitions/Integration"
+      },
+      "type": "object"
+    }
+  },
+  "title": "omnifob config.toml",
+  "type": "object"
+}

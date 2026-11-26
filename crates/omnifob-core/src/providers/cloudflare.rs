@@ -588,25 +588,30 @@ pub async fn resolve_ips(ips: &[String], api_base: &str) -> anyhow::Result<Vec<S
             resolved.extend(current.iter().map(|ip| cidr(*ip)));
             continue;
         }
-        let (addr, prefix) = ip
-            .split_once('/')
-            .map_or((ip.as_str(), None), |(a, p)| (a, Some(p)));
-        let addr: std::net::IpAddr = addr
-            .parse()
-            .with_context(|| format!("'{ip}' is not an IP address or CIDR range"))?;
-        resolved.push(match prefix {
-            Some(prefix) => {
-                let max = if addr.is_ipv4() { 32 } else { 128 };
-                match prefix.parse::<u8>() {
-                    Ok(p) if p <= max => format!("{addr}/{p}"),
-                    _ => bail!("'{ip}' has an invalid prefix length"),
-                }
-            }
-            None => cidr(addr),
-        });
+        resolved.push(ip_range(ip)?);
     }
     resolved.dedup();
     Ok(resolved)
+}
+
+/// An IP address or CIDR range as the CIDR range Cloudflare takes: an
+/// address alone becomes a `/32` or `/128`. The config check uses it too, so
+/// a typo fails when the config loads rather than at the next mint.
+pub(crate) fn ip_range(ip: &str) -> anyhow::Result<String> {
+    let (addr, prefix) = ip.split_once('/').map_or((ip, None), |(a, p)| (a, Some(p)));
+    let addr: std::net::IpAddr = addr
+        .parse()
+        .with_context(|| format!("'{ip}' is not an IP address, a CIDR range or \"current\""))?;
+    Ok(match prefix {
+        Some(prefix) => {
+            let max = if addr.is_ipv4() { 32 } else { 128 };
+            match prefix.parse::<u8>() {
+                Ok(p) if p <= max => format!("{addr}/{p}"),
+                _ => bail!("'{ip}' has an invalid prefix length"),
+            }
+        }
+        None => cidr(addr),
+    })
 }
 
 fn cidr(ip: std::net::IpAddr) -> String {
@@ -926,6 +931,15 @@ pub async fn discover(integration: &str, config: &CloudflareConfig) -> Result<Ve
             ));
         }
     }
+    // Two accounts named "Acme (EU)" and "ACME EU" both slug to acme-eu.
+    crate::profile::disambiguate_accounts(&mut profiles, |target| match target {
+        Target::Cloudflare {
+            account_id,
+            account_name,
+            ..
+        } => Some((account_name, account_id)),
+        _ => None,
+    });
     Ok(profiles)
 }
 
@@ -1099,8 +1113,8 @@ impl CatalogChanges {
     }
 }
 
-fn catalog_file(integration: &str) -> std::path::PathBuf {
-    crate::paths::state_dir().join(format!("cloudflare-{integration}.json"))
+fn catalog_file(integration: &str) -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::paths::state_dir()?.join(format!("cloudflare-{integration}.json")))
 }
 
 /// The catalog for reading only, such as the copy a mint starts from:
@@ -1117,7 +1131,7 @@ fn load_catalog(integration: &str) -> Catalog {
 /// cannot be read or parsed is an error, never an empty catalog, so an
 /// update cannot replace token IDs it failed to see.
 fn read_catalog(integration: &str) -> anyhow::Result<Catalog> {
-    let file = catalog_file(integration);
+    let file = catalog_file(integration)?;
     let text = match crate::files::retry_busy(|| std::fs::read_to_string(&file)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Catalog::default()),
@@ -1134,7 +1148,7 @@ fn read_catalog(integration: &str) -> anyhow::Result<Catalog> {
 fn save_catalog(integration: &str, catalog: &Catalog) -> anyhow::Result<()> {
     let text = serde_json::to_string(catalog)?;
     // The writer tries a refused replace again on Windows.
-    crate::files::write_private(&catalog_file(integration), text)
+    crate::files::write_private(&catalog_file(integration)?, text)
 }
 
 /// How long to wait for other processes updating the same catalog, each of
@@ -1163,7 +1177,7 @@ pub fn update_catalog(integration: &str, change: impl FnOnce(&mut Catalog)) -> a
     let mut catalog = read_catalog(integration)?;
     let before = catalog.clone();
     change(&mut catalog);
-    if catalog == before && catalog_file(integration).exists() {
+    if catalog == before && catalog_file(integration)?.exists() {
         return Ok(());
     }
     save_catalog(integration, &catalog)
@@ -1264,7 +1278,7 @@ pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
     let (first, second) = if old < new { (old, new) } else { (new, old) };
     let _first = lock_catalog(first)?;
     let _second = lock_catalog(second)?;
-    let from = catalog_file(old);
+    let from = catalog_file(old)?;
     if !from.exists() {
         return Ok(());
     }
@@ -1284,7 +1298,9 @@ pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
 
 /// Removes the stored catalog, for example after signing out.
 pub fn forget_catalog(integration: &str) {
-    let _ = std::fs::remove_file(catalog_file(integration));
+    if let Ok(file) = catalog_file(integration) {
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// Forgets every tracked token ID, once all the accounts' minted tokens are

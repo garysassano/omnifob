@@ -2,6 +2,7 @@
 //! omnifob and the AWS config file.
 
 use anyhow::Context;
+use omnifob_core::profile::slug;
 use omnifob_core::{Config, Integration, Profile, paths};
 
 use crate::App;
@@ -63,7 +64,14 @@ pub(crate) fn export_aws_config(
             Some((p.id.clone(), region))
         })
         .collect();
-    let block = aws_config_block(&profiles, prefix, &regions, &program);
+    let (block, clashes) = aws_config_block(&profiles, prefix, &regions, &program);
+    for clash in &clashes {
+        eprintln!(
+            "fob: left out {}: its AWS profile name {} is {}'s already; rename one of the integrations or accounts to tell them apart",
+            clash.left_out, clash.name, clash.kept
+        );
+    }
+    let written = profiles.len() - clashes.len();
     if !write {
         print!("{block}");
         return Ok(());
@@ -82,7 +90,7 @@ pub(crate) fn export_aws_config(
     if !existing.is_empty() {
         // A new file with the config's permissions, so a config holding keys
         // is not copied somewhere more readable.
-        let backup = path.with_extension("omnifob-backup");
+        let backup = backup_path(&path);
         match std::fs::remove_file(&backup) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(e).with_context(|| format!("replacing {}", backup.display()));
@@ -98,11 +106,19 @@ pub(crate) fn export_aws_config(
     }
     write_atomically(&path, &updated)?;
     eprintln!(
-        "fob: wrote {} profile(s) to omnifob's block in {}; use them with --profile {prefix}<integration>-<account>-<role>",
-        profiles.len(),
+        "fob: wrote {written} profile(s) to omnifob's block in {}; use them with --profile {prefix}<integration>-<account>-<role>",
         path.display()
     );
     Ok(())
+}
+
+/// `<file>.omnifob-backup` next to the file: the suffix is appended, so
+/// `--file work.ini` backs up to `work.ini.omnifob-backup` rather than
+/// replacing the extension.
+fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".omnifob-backup");
+    name.into()
 }
 
 pub(crate) fn import_aws(
@@ -111,8 +127,8 @@ pub(crate) fn import_aws(
     write: bool,
 ) -> anyhow::Result<()> {
     use omnifob_core::import::{
-        aws_iam_user_toml, aws_import, aws_portal_toml, chained_toml, iam_roles_toml,
-        normalize_start_url,
+        aws_iam_user_toml, aws_import, aws_login_toml, aws_portal_toml, chained_toml,
+        iam_roles_toml, normalize_start_url,
     };
     let file = aws_config_file(file)?;
     let text =
@@ -152,9 +168,9 @@ pub(crate) fn import_aws(
     }
     for mut portal in import.portals {
         if let Some((name, existing)) = configured.get(&portal.start_url) {
-            portal
-                .chained
-                .retain(|label, _| !existing.chained.contains_key(label));
+            // Labels become lowercase in ids, so `Prod` there is `prod` here.
+            let labels: Vec<String> = existing.chained.keys().map(|l| slug(l)).collect();
+            portal.chained.retain(|label, _| !labels.contains(label));
             if portal.chained.is_empty() {
                 eprintln!(
                     "fob: {} is already configured as '{name}'",
@@ -187,8 +203,8 @@ pub(crate) fn import_aws(
         // An aws-iam integration named after the profile is taken to be the
         // same user, so importing again adds only new roles.
         if let Some(Integration::AwsIam(existing)) = config.integrations.get(&user.name) {
-            user.roles
-                .retain(|label, _| !existing.roles.contains_key(label));
+            let labels: Vec<String> = existing.roles.keys().map(|l| slug(l)).collect();
+            user.roles.retain(|label, _| !labels.contains(label));
             if user.roles.is_empty() {
                 eprintln!(
                     "fob: profile '{}' (an access key) is already configured as '{}'",
@@ -221,11 +237,30 @@ pub(crate) fn import_aws(
         sections.push(aws_iam_user_toml(&user));
         new_users.push(user.name);
     }
+    let mut new_logins = Vec::new();
+    for mut login in import.logins {
+        // An aws-login integration named after the profile is taken to be
+        // the same sign-in.
+        if let Some(Integration::AwsLogin(_)) = config.integrations.get(&login.name) {
+            eprintln!(
+                "fob: profile '{}' (an `aws login` sign-in) is already configured as '{}'",
+                login.profile, login.name
+            );
+            continue;
+        }
+        unique(&mut login.name);
+        eprintln!(
+            "fob: profile '{}' (an `aws login` sign-in) as aws-login '{}' in {}",
+            login.profile, login.name, login.region
+        );
+        sections.push(aws_login_toml(&login));
+        new_logins.push(login.name);
+    }
     if sections.is_empty() {
         eprintln!("fob: nothing new to import");
         return Ok(());
     }
-    let key_hint = if new_users.is_empty() {
+    let mut key_hint = if new_users.is_empty() {
         String::new()
     } else {
         let logins: Vec<String> = new_users
@@ -237,16 +272,26 @@ pub(crate) fn import_aws(
             logins.join(", ")
         )
     };
+    if !new_logins.is_empty() {
+        let logins: Vec<String> = new_logins
+            .iter()
+            .map(|n| format!("`fob login {n}`"))
+            .collect();
+        key_hint.push_str(&format!(
+            "; the `aws login` sessions stay with the AWS CLI: run {} to sign in through omnifob",
+            logins.join(", ")
+        ));
+    }
     let toml = sections.join("\n");
     if !write {
         print!("{toml}");
         eprintln!(
             "fob: review the names, then run again with --write to append them to {}{key_hint}",
-            paths::config_file().display()
+            paths::config_file()?.display()
         );
         return Ok(());
     }
-    let path = paths::config_file();
+    let path = paths::config_file()?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -264,8 +309,25 @@ pub(crate) fn import_aws(
     write_atomically(&path, &updated)?;
     eprintln!(
         "fob: added {} integration(s) and {new_chained} role(s) to {}; run `fob sync`, or `fob login <name>` for new integrations{key_hint}",
-        new_portals + new_users.len(),
+        new_portals + new_users.len() + new_logins.len(),
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backups_append_their_suffix() {
+        assert_eq!(
+            backup_path(std::path::Path::new("/home/me/.aws/config")),
+            std::path::PathBuf::from("/home/me/.aws/config.omnifob-backup")
+        );
+        assert_eq!(
+            backup_path(std::path::Path::new("work.ini")),
+            std::path::PathBuf::from("work.ini.omnifob-backup")
+        );
+    }
 }

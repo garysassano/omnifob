@@ -122,7 +122,7 @@ impl App {
         // Optional permissions are kept as given: an account that does not
         // offer one now may later, which is what they are for.
         template.permissions = permissions;
-        let path = paths::config_file();
+        let path = paths::config_file()?;
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let text = omnifob_core::config::add_cloudflare_template(

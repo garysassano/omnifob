@@ -574,7 +574,7 @@ pub async fn discover(integration: &str, config: &GcpConfig) -> Result<Vec<Profi
         })
         .collect();
     for (label, sa) in &config.service_accounts {
-        profiles.push(Profile::new(
+        let profile = Profile::new(
             integration,
             label,
             sa.name(),
@@ -582,7 +582,18 @@ pub async fn discover(integration: &str, config: &GcpConfig) -> Result<Vec<Profi
                 label: label.clone(),
                 project_id: sa.project().map(str::to_string),
             },
-        ));
+        );
+        // A label named like a project, for an account named `user`.
+        if profiles.iter().any(|p| p.id == profile.id) {
+            return Err(anyhow::anyhow!(
+                "the service account '{label}' of '{integration}' would be {}, which the \
+                 account's own profile in a project already is; give it another label in \
+                 [integrations.{integration}.service_accounts]",
+                profile.id
+            )
+            .into());
+        }
+        profiles.push(profile);
     }
     Ok(profiles)
 }

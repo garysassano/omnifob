@@ -39,7 +39,7 @@ impl App {
             if self.config.integrations.is_empty() {
                 bail!(
                     "no integrations configured in {}",
-                    paths::config_file().display()
+                    paths::config_file()?.display()
                 );
             }
             let names: Vec<&str> = if integrations.is_empty() {
@@ -115,7 +115,7 @@ impl App {
         if self.config.integrations.is_empty() && !json {
             println!(
                 "No integrations configured in {}",
-                paths::config_file().display()
+                paths::config_file()?.display()
             );
             return Ok(());
         }
@@ -169,7 +169,7 @@ impl App {
                 })
                 .collect();
             let value = json!({
-                "config": paths::config_file(),
+                "config": paths::config_file()?,
                 "secrets": secrets,
                 "active_profile": active.as_ref().map(|a| &a.0),
                 "active_expires_at": active.as_ref().and_then(|a| a.1),

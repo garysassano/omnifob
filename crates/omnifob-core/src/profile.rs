@@ -147,6 +147,58 @@ pub fn slug(name: &str) -> String {
     }
 }
 
+/// Keeps accounts whose names slug alike apart: when one account segment
+/// (the slug of a name) belongs to two or more distinct accounts, every
+/// profile of those accounts gets `<slug>-<account id>` as its segment, so
+/// all of one account's profiles move together and keep one prefix.
+/// `account` gives a profile's account name and ID, or `None` for a profile
+/// it does not apply to. Accounts with a name of their own keep their ids.
+///
+/// AWS accounts (account ID), Azure subscriptions (subscription ID) and
+/// Cloudflare accounts (account ID) go through it.
+pub fn disambiguate_accounts(
+    profiles: &mut [Profile],
+    account: impl Fn(&Target) -> Option<(&str, &str)>,
+) {
+    let mut ids_per_slug: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for p in profiles.iter() {
+        if let Some((name, id)) = account(&p.target) {
+            ids_per_slug
+                .entry(slug(name))
+                .or_default()
+                .insert(id.to_string());
+        }
+    }
+    for p in profiles.iter_mut() {
+        let Some((name, id)) = account(&p.target) else {
+            continue;
+        };
+        let segment = slug(name);
+        if ids_per_slug[&segment].len() < 2 {
+            continue;
+        }
+        let leaf = p.id.splitn(3, '/').nth(2).unwrap_or_default().to_string();
+        p.id = format!("{}/{segment}-{}/{leaf}", p.integration, slug(id));
+    }
+}
+
+/// Fails when two profiles of an integration still have the same id after
+/// discovery: they would share cached credentials and overwrite each other
+/// in `profiles.json`.
+pub fn check_unique_ids(integration: &str, profiles: &[Profile]) -> anyhow::Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for p in profiles {
+        if !seen.insert(p.id.as_str()) {
+            anyhow::bail!(
+                "two profiles of '{integration}' would both be {}; rename one of the accounts or \
+                 configured roles behind them",
+                p.id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Profiles discovered by `sync`, kept on disk per integration. Contains no
 /// secrets.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -401,5 +453,60 @@ mod tests {
         assert_eq!(ids("acme2 admin"), ["acme2/test/AdministratorAccess"]);
         assert_eq!(ids("test admin").len(), 2);
         assert_eq!(ids("cm").len(), 2);
+    }
+
+    #[test]
+    fn accounts_named_alike_take_their_ids_and_others_stay() {
+        let sub = |name: &str, id: &str| {
+            Profile::new(
+                "work",
+                name,
+                "user",
+                Target::Azure {
+                    subscription_id: id.into(),
+                    subscription_name: name.into(),
+                    tenant_id: "t".into(),
+                },
+            )
+        };
+        let token = Profile::new("work", "pay-as-you-go", "token", Target::Token {});
+        let mut profiles = vec![
+            sub("Pay-As-You-Go", "1111-AAAA"),
+            sub("Pay As You Go", "2222"),
+            sub("Prod", "3333"),
+            token.clone(),
+        ];
+        disambiguate_accounts(&mut profiles, |target| match target {
+            Target::Azure {
+                subscription_id,
+                subscription_name,
+                ..
+            } => Some((subscription_name, subscription_id)),
+            _ => None,
+        });
+        let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "work/pay-as-you-go-1111-aaaa/user",
+                "work/pay-as-you-go-2222/user",
+                "work/prod/user",
+                "work/pay-as-you-go/token"
+            ]
+        );
+        // One account under one name is left alone, however many profiles.
+        let mut same = vec![sub("Prod", "3333"), sub("Prod", "3333")];
+        disambiguate_accounts(&mut same, |t| match t {
+            Target::Azure {
+                subscription_id,
+                subscription_name,
+                ..
+            } => Some((subscription_name, subscription_id)),
+            _ => None,
+        });
+        assert_eq!(same[0].id, "work/prod/user");
+        let error = check_unique_ids("work", &same).unwrap_err().to_string();
+        assert!(error.contains("would both be work/prod/user"), "{error}");
+        assert!(check_unique_ids("work", &profiles).is_ok());
     }
 }

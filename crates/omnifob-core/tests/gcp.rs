@@ -298,6 +298,17 @@ async fn discovery_lists_projects_across_pages_and_service_accounts() {
     let listed = config_with_projects();
     let profiles = gcp::discover("g", &listed).await.unwrap();
     assert_eq!(profiles[0].id, "g/only-this/user");
+
+    // A service account labelled like a project, named `user`, would take
+    // the account's own profile there.
+    let clash = gcp_config(
+        "projects = [\"only-this\"]\n[integrations.g.service_accounts.only-this]\nemail = \"user@proj-b.iam.gserviceaccount.com\"",
+    );
+    let error = gcp::discover("g", &clash).await.unwrap_err().to_string();
+    assert!(
+        error.contains("the service account 'only-this' of 'g' would be g/only-this/user"),
+        "{error}"
+    );
 }
 
 fn config_with_projects() -> GcpConfig {

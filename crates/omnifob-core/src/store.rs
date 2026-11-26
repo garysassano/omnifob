@@ -202,7 +202,7 @@ pub fn description() -> anyhow::Result<String> {
     Ok(if wsl::enabled() {
         format!(
             "{store}, persisted with Windows DPAPI in {}",
-            wsl::dir().display()
+            wsl::dir()?.display()
         )
     } else if store == "keyutils" {
         "keyutils (lost on reboot)".to_string()
@@ -241,16 +241,16 @@ mod wsl {
         })
     }
 
-    pub fn dir() -> PathBuf {
-        crate::paths::state_dir().join("vault")
+    pub fn dir() -> anyhow::Result<PathBuf> {
+        Ok(crate::paths::state_dir()?.join("vault"))
     }
 
     fn persisted(key: &str) -> bool {
         !key.starts_with("credentials/")
     }
 
-    fn file(key: &str) -> PathBuf {
-        dir().join(format!("{}.dpapi", crate::files::encode_key_filename(key)))
+    fn file(key: &str) -> anyhow::Result<PathBuf> {
+        Ok(dir()?.join(format!("{}.dpapi", crate::files::encode_key_filename(key))))
     }
 
     /// Runs a DPAPI script with base64 on stdin; returns base64 from stdout.
@@ -288,12 +288,12 @@ mod wsl {
         let sealed = dpapi(PROTECT, &BASE64.encode(json.as_bytes()))?;
         // The directory and file are the user's only: even sealed, the file
         // names give away integrations and profiles.
-        crate::files::create_private_dir(&crate::paths::state_dir())?;
-        crate::files::write_private(&file(key), sealed)
+        crate::files::create_private_dir(&crate::paths::state_dir()?)?;
+        crate::files::write_private(&file(key)?, sealed)
     }
 
     pub fn write_if_missing(key: &str, json: &str) -> anyhow::Result<()> {
-        if persisted(key) && !file(key).exists() && enabled() {
+        if persisted(key) && !file(key)?.exists() && enabled() {
             write(key, json)?;
         }
         Ok(())
@@ -303,7 +303,7 @@ mod wsl {
         if !persisted(key) || !enabled() {
             return Ok(None);
         }
-        let sealed = match std::fs::read_to_string(file(key)) {
+        let sealed = match std::fs::read_to_string(file(key)?) {
             Ok(sealed) => sealed,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -318,7 +318,7 @@ mod wsl {
         if !persisted(key) || !enabled() {
             return Ok(false);
         }
-        match std::fs::remove_file(file(key)) {
+        match std::fs::remove_file(file(key)?) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -619,7 +619,7 @@ fn try_lock(
 /// The directory of lock files, `locks` in the state directory, created
 /// private if missing.
 pub fn lock_dir() -> anyhow::Result<std::path::PathBuf> {
-    let state = crate::paths::state_dir();
+    let state = crate::paths::state_dir()?;
     crate::files::create_private_dir(&state)?;
     let dir = state.join("locks");
     crate::files::create_private_dir(&dir)?;

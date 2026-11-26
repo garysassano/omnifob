@@ -37,5 +37,9 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 - "name the profile by its full id": use one of the ids it lists.
 - "is not open to agents": the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
 - "needs a code from the MFA device": ask the user to run the `fob exec ... -- true` command it names in their terminal, then retry.
+- `fob login` printing a URL and a code instead of opening a browser: this session looks remote, in a container or (on Linux) without a display. Pass both to the user to approve on any device, and keep the command running until it returns.
+- "parsing .../config.toml" followed by a key (`chained.prod: duration must be...`): the config is invalid. Tell the user which key and why; do not edit the config yourself.
+- "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.
+- "could not check the token ... try again later" or "could not reach": the provider is down or unreachable, and the token may be fine; retry later. "the token was rejected" means the token itself is refused and the user must replace it.
 - AWS `AccessDenied` right after the user was given access: Identity Center takes a minute to propagate; retry once, then report.
 - `fob check` (exit status 1 if a sign-in fails; `--integration <name>` for one, `--json` for structured output), `fob check <profile>` (what the credentials act as) and `fob status` diagnose without printing secrets.

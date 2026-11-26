@@ -19,6 +19,12 @@ use crate::{Config, Credentials, Error, Integration, Profile, Result, Target, st
 
 /// Discovers every profile an integration offers.
 pub async fn discover(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
+    let profiles = discover_unchecked(name, integration).await?;
+    crate::profile::check_unique_ids(name, &profiles)?;
+    Ok(profiles)
+}
+
+async fn discover_unchecked(name: &str, integration: &Integration) -> Result<Vec<Profile>> {
     match integration {
         Integration::AwsSso(config) => aws_sso::discover(name, config).await,
         Integration::AwsIam(config) => aws_iam::discover(name, config).await,
@@ -1025,6 +1031,7 @@ mod tests {
             r#"
             [integrations.user]
             type = "aws-iam"
+            region = "cn-north-1"
             [integrations.user.roles.cn]
             role_arn = "arn:aws-cn:iam::333333333333:role/Admin"
             "#,
@@ -1051,7 +1058,7 @@ mod tests {
                 Target::AwsIamSession {
                     account_id: "444444444444".into(),
                 },
-                Partition::Aws,
+                Partition::China,
             ),
             (
                 user,
