@@ -159,7 +159,13 @@ mod tests {
             Config::parse(&format!("[integrations.c]\ntype = \"command\"\n{extra}\n"))
                 .map_err(|e| format!("{e:#}"))
         };
-        let parsed = command("command = [\"/opt/bin/Get Creds.exe\", \"--json\"]").unwrap();
+        // An absolute path on each platform.
+        let program = if cfg!(windows) {
+            "C:/Tools/Get Creds.exe"
+        } else {
+            "/opt/bin/Get Creds.exe"
+        };
+        let parsed = command(&format!("command = [\"{program}\", \"--json\"]")).unwrap();
         let Integration::Command(c) = &parsed.integrations["c"] else {
             panic!()
         };
