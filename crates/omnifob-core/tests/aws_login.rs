@@ -9,29 +9,22 @@ use std::io::{Read, Write};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use omnifob_core::config::{AwsLoginConfig, Config, Integration};
-use omnifob_core::providers::aws_login;
-use omnifob_core::{Error, Target, store};
+use omnifob_core::providers::aws;
+use omnifob_core::{Endpoints, Error, Target};
 use serde_json::{Value, json};
 use support::Scratch;
-use tokio::sync::Mutex;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-
-/// The tests share environment variables, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
 
 const IDENTITY: &str = "arn:aws:iam::123456789012:user/alice";
 
 async fn setup() -> (Scratch, MockServer) {
-    let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-login-test"), server)
+    let endpoints = Endpoints {
+        aws: Some(server.uri()),
+        ..Default::default()
+    };
+    (Scratch::new("omnifob-login-test", endpoints), server)
 }
 
 fn config() -> AwsLoginConfig {
@@ -124,7 +117,7 @@ async fn browser_login(server: &MockServer, integration: &str, expires_in: i64) 
         .mount(server)
         .await;
     let mut browser = None;
-    let identity = aws_login::login(
+    let identity = aws::login::login(
         integration,
         &config(),
         true,
@@ -183,7 +176,7 @@ async fn browser_sign_in_redeems_the_code_with_a_dpop_proof() {
     assert_eq!(claims["htm"], "POST");
     assert_eq!(claims["htu"], format!("{}/v1/token", server.uri()));
 
-    let profiles = aws_login::discover("browser", &config()).unwrap();
+    let profiles = aws::login::discover("browser", &config()).unwrap();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].id, "browser/123456789012/alice");
     assert_eq!(
@@ -193,7 +186,7 @@ async fn browser_sign_in_redeems_the_code_with_a_dpop_proof() {
         }
     );
 
-    let creds = aws_login::credentials("browser", &config(), false)
+    let creds = aws::login::credentials("browser", &config(), false)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAFIRST");
@@ -219,7 +212,7 @@ async fn a_pasted_code_signs_in_from_another_device() {
         .await;
     let state = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let shown = state.clone();
-    aws_login::login(
+    aws::login::login(
         "remote",
         &config(),
         false,
@@ -242,7 +235,7 @@ async fn a_pasted_code_signs_in_from_another_device() {
     )
     .await
     .unwrap();
-    let creds = aws_login::credentials("remote", &config(), false)
+    let creds = aws::login::credentials("remote", &config(), false)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAREMOTE");
@@ -265,7 +258,7 @@ async fn expiring_credentials_are_renewed_with_the_same_key() {
         .mount(&server)
         .await;
 
-    let creds = aws_login::credentials("renew", &config(), false)
+    let creds = aws::login::credentials("renew", &config(), false)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIASECOND");
@@ -278,7 +271,7 @@ async fn expiring_credentials_are_renewed_with_the_same_key() {
         .respond_with(token("ASIATHIRD", "refresh-3", 900))
         .mount(&server)
         .await;
-    let creds = aws_login::credentials("renew", &config(), false)
+    let creds = aws::login::credentials("renew", &config(), false)
         .await
         .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIASECOND", "still fresh");
@@ -289,7 +282,7 @@ async fn renewing_refreshes_credentials_that_are_still_fresh() {
     let (_guard, server) = setup().await;
     // Fresh for the whole test: only a forced renewal reaches AWS Sign-In.
     browser_login(&server, "forced", 900).await;
-    let stored = aws_login::credentials("forced", &config(), false)
+    let stored = aws::login::credentials("forced", &config(), false)
         .await
         .unwrap();
     assert_eq!(stored.env["AWS_ACCESS_KEY_ID"], "ASIAFIRST");
@@ -309,13 +302,13 @@ async fn renewing_refreshes_credentials_that_are_still_fresh() {
         .mount(&server)
         .await;
 
-    let renewed = aws_login::credentials("forced", &config(), true)
+    let renewed = aws::login::credentials("forced", &config(), true)
         .await
         .unwrap();
     assert_eq!(renewed.env["AWS_ACCESS_KEY_ID"], "ASIARENEWED");
     assert!(renewed.issued_at.unwrap() >= first_issued);
     // The renewed session is the stored one now.
-    let again = aws_login::credentials("forced", &config(), false)
+    let again = aws::login::credentials("forced", &config(), false)
         .await
         .unwrap();
     assert_eq!(again.env["AWS_ACCESS_KEY_ID"], "ASIARENEWED");
@@ -325,19 +318,19 @@ async fn renewing_refreshes_credentials_that_are_still_fresh() {
 async fn a_sign_in_is_kept_only_for_its_region_and_ttl_is_refused() {
     let (_guard, server) = setup().await;
     browser_login(&server, "kept", 900).await;
-    assert!(aws_login::session_matches("kept", &config()).unwrap());
+    assert!(aws::login::session_matches("kept", &config()).unwrap());
     let moved = AwsLoginConfig {
         region: "us-east-1".into(),
         ..config()
     };
-    assert!(!aws_login::session_matches("kept", &moved).unwrap());
-    assert!(!aws_login::session_matches("nobody", &config()).unwrap());
+    assert!(!aws::login::session_matches("kept", &moved).unwrap());
+    assert!(!aws::login::session_matches("nobody", &config()).unwrap());
 
     let full = Config {
         integrations: [("kept".to_string(), Integration::AwsLogin(config()))].into(),
         ..Config::default()
     };
-    let profile = aws_login::discover("kept", &config()).unwrap().remove(0);
+    let profile = aws::login::discover("kept", &config()).unwrap().remove(0);
     let err = omnifob_core::providers::credentials(
         &full,
         &profile,
@@ -360,12 +353,12 @@ async fn an_ended_sign_in_asks_for_a_new_one_and_is_forgotten() {
         .mount(&server)
         .await;
 
-    let err = aws_login::credentials("ended", &config(), false)
+    let err = aws::login::credentials("ended", &config(), false)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NeedsLogin { .. }), "{err}");
     assert!(err.to_string().contains("has ended"), "{err}");
-    assert!(aws_login::session("ended").unwrap().is_none(), "forgotten");
+    assert!(aws::login::session("ended").unwrap().is_none(), "forgotten");
 }
 
 #[tokio::test]
@@ -379,7 +372,7 @@ async fn a_server_error_during_renewal_keeps_the_sign_in() {
         .mount(&server)
         .await;
 
-    let err = aws_login::credentials("outage", &config(), false)
+    let err = aws::login::credentials("outage", &config(), false)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Other(_)), "{err}");
@@ -387,7 +380,7 @@ async fn a_server_error_during_renewal_keeps_the_sign_in() {
         format!("{err:#}").contains("could not renew the sign-in for 'outage'"),
         "{err:#}"
     );
-    assert!(aws_login::session("outage").unwrap().is_some(), "kept");
+    assert!(aws::login::session("outage").unwrap().is_some(), "kept");
 }
 
 #[tokio::test]
@@ -402,7 +395,7 @@ async fn missing_permissions_are_named() {
         ))
         .mount(&server)
         .await;
-    let err = aws_login::login(
+    let err = aws::login::login(
         "denied",
         &config(),
         false,
@@ -415,7 +408,7 @@ async fn missing_permissions_are_named() {
 
     let state = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let shown = state.clone();
-    let err = aws_login::login(
+    let err = aws::login::login(
         "denied",
         &config(),
         false,
@@ -439,5 +432,5 @@ async fn missing_permissions_are_named() {
         err.to_string().contains("SignInLocalDevelopmentAccess"),
         "{err}"
     );
-    assert!(aws_login::session("denied").unwrap().is_none());
+    assert!(aws::login::session("denied").unwrap().is_none());
 }

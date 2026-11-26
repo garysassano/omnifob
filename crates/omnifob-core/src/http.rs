@@ -21,8 +21,8 @@ pub fn builder() -> reqwest::ClientBuilder {
         .timeout(TIMEOUT)
 }
 
-/// A client with the user agent and timeouts set, so no request can hang a
-/// command.
+/// The current [`Context`](crate::Context)'s client, with the user agent
+/// and timeouts set, so no request can hang a command.
 pub fn client() -> reqwest::Client {
-    builder().build().expect("HTTP client")
+    crate::Context::current().http()
 }

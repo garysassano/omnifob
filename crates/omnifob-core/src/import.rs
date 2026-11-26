@@ -339,7 +339,7 @@ pub fn aws_import(text: &str) -> AwsImport {
         if let Err(e) = crate::config::check_https_url("sso_start_url", &sso.start_url) {
             return Some(e);
         }
-        crate::providers::aws_partition::check_region_name(&sso.sso_region)
+        crate::providers::aws::partition::check_region_name(&sso.sso_region)
             .err()
             .map(|e| format!("sso_region: {e:#}"))
     }
@@ -384,7 +384,7 @@ pub fn aws_import(text: &str) -> AwsImport {
                     );
                     continue;
                 };
-                if let Err(e) = crate::providers::aws_partition::check_region_name(region) {
+                if let Err(e) = crate::providers::aws::partition::check_region_name(region) {
                     skip(name, format!("its region: {e:#}"));
                     continue;
                 }
@@ -532,7 +532,7 @@ pub fn aws_import(text: &str) -> AwsImport {
                 .regions
                 .into_iter()
                 .filter(|(region, _)| {
-                    crate::providers::aws_partition::check_region_name(region).is_ok()
+                    crate::providers::aws::partition::check_region_name(region).is_ok()
                 })
                 .max_by_key(|(region, count)| (*count, std::cmp::Reverse(region.clone())))
                 .map(|(region, _)| region);
@@ -554,7 +554,7 @@ pub fn aws_import(text: &str) -> AwsImport {
             let region = source.and_then(|k| k.get("region").cloned());
             if let Some(Err(e)) = region
                 .as_deref()
-                .map(crate::providers::aws_partition::check_region_name)
+                .map(crate::providers::aws::partition::check_region_name)
             {
                 for (name, _, _) in &roles {
                     skip(name, format!("its source profile '{profile}' has a region that is not valid: {e:#}"));

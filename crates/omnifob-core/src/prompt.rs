@@ -1,25 +1,14 @@
 //! Questions the library may need to ask mid-operation. Whoever embeds it
-//! answers them: the command line registers a terminal prompt when it runs in
-//! one. Without a registered prompt, an operation that needs an answer fails
-//! with an error that says how to get past it.
-
-use std::sync::OnceLock;
+//! answers them through its [`Context`](crate::Context): the command line
+//! sets a terminal prompt when it runs in one. Without one, an operation
+//! that needs an answer fails with an error that says how to get past it.
 
 use anyhow::bail;
 
-type MfaPrompt = Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
-
-static MFA: OnceLock<MfaPrompt> = OnceLock::new();
-
-/// Registers the function that asks for a code from the MFA device whose ARN
-/// it is given. Only the first registration counts.
-pub fn set_mfa_prompt(prompt: impl Fn(&str) -> anyhow::Result<String> + Send + Sync + 'static) {
-    let _ = MFA.set(Box::new(prompt));
-}
-
 /// A six-digit code from the MFA device `serial`, for `what` (a profile id).
 pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
-    let Some(prompt) = MFA.get() else {
+    let cx = crate::Context::current();
+    let Some(prompt) = cx.mfa_prompt() else {
         bail!(
             "{what} needs a code from the MFA device {serial}; run `fob exec {what} -- true` in a terminal first, which asks for it"
         );

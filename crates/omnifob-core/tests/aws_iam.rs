@@ -3,36 +3,34 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use omnifob_core::config::{AwsIamConfig, Config, Integration};
-use omnifob_core::providers::{self, aws_iam};
-use omnifob_core::{Profile, Target, store};
+use omnifob_core::providers::{self, aws};
+use omnifob_core::{Context, Endpoints, Profile, Target};
 use support::Scratch;
-use tokio::sync::Mutex;
 use wiremock::matchers::{body_string_contains, header_regex, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// The tests share environment variables, so they run one at a time.
-static SERIAL: Mutex<()> = Mutex::const_new(());
-
-/// How often the MFA prompt was asked.
-static MFA_PROMPTS: AtomicUsize = AtomicUsize::new(0);
-
 async fn setup() -> (Scratch, MockServer) {
-    let guard = SERIAL.lock().await;
-    store::use_memory_store().unwrap();
-    omnifob_core::prompt::set_mfa_prompt(|_| {
-        MFA_PROMPTS.fetch_add(1, Ordering::SeqCst);
-        Ok("654321".to_string())
-    });
+    setup_counting_prompts(Arc::default()).await
+}
+
+/// [`setup`], counting the MFA prompts in `prompts`.
+async fn setup_counting_prompts(prompts: Arc<AtomicUsize>) -> (Scratch, MockServer) {
     let server = MockServer::start().await;
-    // SAFETY: the tests run one at a time under SERIAL, and nothing else in
-    // this process reads the environment concurrently.
-    unsafe {
-        std::env::set_var("OMNIFOB_AWS_ENDPOINT", server.uri());
-    }
-    (Scratch::new(guard, "omnifob-iam-test"), server)
+    let endpoints = Endpoints {
+        aws: Some(server.uri()),
+        ..Default::default()
+    };
+    let context = Context::builder()
+        .endpoints(endpoints)
+        .mfa_prompt(move |_| {
+            prompts.fetch_add(1, Ordering::SeqCst);
+            Ok("654321".to_string())
+        });
+    (Scratch::with("omnifob-iam-test", context), server)
 }
 
 fn config(extra: &str) -> AwsIamConfig {
@@ -87,7 +85,7 @@ async fn mock_identity(server: &MockServer) {
 
 async fn login(server: &MockServer, integration: &str, config: &AwsIamConfig) {
     mock_identity(server).await;
-    let arn = aws_iam::login(integration, config, "AKIAEXAMPLE", "secret")
+    let arn = aws::iam::login(integration, config, "AKIAEXAMPLE", "secret")
         .await
         .unwrap();
     assert_eq!(arn, "arn:aws:iam::123456789012:user/me");
@@ -97,17 +95,17 @@ async fn login(server: &MockServer, integration: &str, config: &AwsIamConfig) {
 async fn login_checks_the_key_and_rejects_temporary_ones() {
     let (_guard, server) = setup().await;
     let config = config("");
-    let err = aws_iam::login("tmp", &config, "ASIAEXAMPLE", "secret")
+    let err = aws::iam::login("tmp", &config, "ASIAEXAMPLE", "secret")
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("AKIA"), "{err}");
-    assert!(!aws_iam::has_key("tmp").unwrap());
+    assert!(!aws::iam::has_key("tmp").unwrap());
 
     login(&server, "keyed", &config).await;
-    assert!(aws_iam::has_key("keyed").unwrap());
-    assert!(aws_iam::logout("keyed").unwrap());
-    assert!(!aws_iam::has_key("keyed").unwrap());
+    assert!(aws::iam::has_key("keyed").unwrap());
+    assert!(aws::iam::logout("keyed").unwrap());
+    assert!(!aws::iam::has_key("keyed").unwrap());
 }
 
 #[tokio::test]
@@ -115,7 +113,7 @@ async fn discovery_lists_the_session_and_each_role() {
     let (_guard, server) = setup().await;
     let config = config("");
     login(&server, "found", &config).await;
-    let profiles = aws_iam::discover("found", &config).await.unwrap();
+    let profiles = aws::iam::discover("found", &config).await.unwrap();
     let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(ids, ["found/123456789012/session", "found/prod/Deploy"]);
     assert_eq!(
@@ -128,7 +126,8 @@ async fn discovery_lists_the_session_and_each_role() {
 
 #[tokio::test]
 async fn one_mfa_code_covers_parallel_calls_and_every_role() {
-    let (_guard, server) = setup().await;
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let (_guard, server) = setup_counting_prompts(prompts.clone()).await;
     let config = config(
         r#"mfa_serial = "arn:aws:iam::123456789012:mfa/me"
         session_duration = "12h""#,
@@ -162,19 +161,18 @@ async fn one_mfa_code_covers_parallel_calls_and_every_role() {
         .mount(&server)
         .await;
 
-    let before = MFA_PROMPTS.load(Ordering::SeqCst);
     let calls =
-        (0..4).map(|_| aws_iam::role_credentials("mfa", &config, "prod", "mfa/prod/Deploy", None));
+        (0..4).map(|_| aws::iam::role_credentials("mfa", &config, "prod", "mfa/prod/Deploy", None));
     for result in futures::future::join_all(calls).await {
         let creds = result.unwrap();
         assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAROLE");
         assert_eq!(creds.env["AWS_REGION"], "eu-west-1");
     }
-    let session = aws_iam::session_credentials("mfa", &config, "mfa/x/session", None)
+    let session = aws::iam::session_credentials("mfa", &config, "mfa/x/session", None)
         .await
         .unwrap();
     assert_eq!(session.env["AWS_ACCESS_KEY_ID"], "ASIASESSION");
-    assert_eq!(MFA_PROMPTS.load(Ordering::SeqCst) - before, 1);
+    assert_eq!(prompts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -182,7 +180,7 @@ async fn durations_outside_what_sts_allows_are_refused() {
     let (_guard, server) = setup().await;
     let config = config("");
     login(&server, "limits", &config).await;
-    let err = aws_iam::role_credentials(
+    let err = aws::iam::role_credentials(
         "limits",
         &config,
         "prod",
@@ -234,7 +232,7 @@ async fn discovery_takes_the_account_from_sts() {
         ))
         .mount(&server)
         .await;
-    let profiles = aws_iam::discover("acct-sts", &config).await.unwrap();
+    let profiles = aws::iam::discover("acct-sts", &config).await.unwrap();
     assert_eq!(
         profiles[0].target,
         Target::AwsIamSession {
@@ -246,7 +244,7 @@ async fn discovery_takes_the_account_from_sts() {
     let clash = self::config(
         "[integrations.legacy.roles.\"123456789012\"]\nrole_arn = \"arn:aws:iam::222222222222:role/session\"",
     );
-    let error = aws_iam::discover("acct-sts", &clash)
+    let error = aws::iam::discover("acct-sts", &clash)
         .await
         .unwrap_err()
         .to_string();
@@ -265,7 +263,7 @@ async fn discovery_takes_the_account_from_sts() {
         ))
         .mount(&server)
         .await;
-    let err = aws_iam::discover("acct-sts", &config)
+    let err = aws::iam::discover("acct-sts", &config)
         .await
         .unwrap_err()
         .to_string();
@@ -430,18 +428,12 @@ async fn a_refused_session_is_started_again_once() {
 /// the AWS CLI.
 #[tokio::test]
 async fn sts_calls_follow_aws_endpoint_url_sts() {
-    let (_guard, server) = setup().await;
-    // SAFETY: the tests run one at a time under SERIAL.
-    unsafe {
-        std::env::remove_var("OMNIFOB_AWS_ENDPOINT");
-        std::env::set_var("AWS_ENDPOINT_URL_STS", server.uri());
-    }
+    let (scratch, server) = setup().await;
+    let _vpc = scratch.switch_endpoints(Endpoints::from_vars(|name| {
+        (name == "AWS_ENDPOINT_URL_STS").then(|| server.uri())
+    }));
     let config = config("");
     mock_identity(&server).await;
-    let result = aws_iam::login("sts-endpoint", &config, "AKIAEXAMPLE", "secret").await;
-    // SAFETY: as above.
-    unsafe {
-        std::env::remove_var("AWS_ENDPOINT_URL_STS");
-    }
+    let result = aws::iam::login("sts-endpoint", &config, "AKIAEXAMPLE", "secret").await;
     assert_eq!(result.unwrap(), "arn:aws:iam::123456789012:user/me");
 }

@@ -40,16 +40,18 @@ const SCOPE: &str = "https://management.core.windows.net//.default offline_acces
 const ARM_API_VERSION: &str = "2022-12-01";
 
 fn login_host() -> String {
-    std::env::var("OMNIFOB_AZURE_ENDPOINT")
-        .ok()
-        .filter(|v| !v.is_empty())
+    crate::Context::current()
+        .endpoints()
+        .azure
+        .clone()
         .unwrap_or_else(|| "https://login.microsoftonline.com".to_string())
 }
 
 fn arm_host() -> String {
-    std::env::var("OMNIFOB_AZURE_ENDPOINT")
-        .ok()
-        .filter(|v| !v.is_empty())
+    crate::Context::current()
+        .endpoints()
+        .azure
+        .clone()
         .unwrap_or_else(|| "https://management.azure.com".to_string())
 }
 

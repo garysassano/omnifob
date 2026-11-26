@@ -4,8 +4,13 @@
 //!
 //! The command-line crate only does presentation; everything that talks to a
 //! provider or to the keychain lives here so it can be reused elsewhere.
+//! What it works with (files, keychain, HTTP client, MFA prompt, endpoint
+//! overrides) comes from a [`Context`].
+
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod config;
+pub mod context;
 pub mod credentials;
 pub mod files;
 pub mod history;
@@ -20,6 +25,7 @@ pub mod providers;
 pub mod store;
 
 pub use config::{Config, Integration};
+pub use context::{Context, Endpoints};
 pub use credentials::Credentials;
 pub use profile::{Profile, Target};
 

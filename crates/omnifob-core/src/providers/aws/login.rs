@@ -30,8 +30,8 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use super::aws_partition::Partition;
-use super::aws_sso;
+use super::partition::Partition;
+use super::{service_endpoint, sts};
 use crate::config::AwsLoginConfig;
 use crate::profile::slug;
 use crate::{Credentials, Error, Profile, Result, Target, oauth, store};
@@ -163,7 +163,7 @@ fn client(region: &str) -> aws_sdk_signin::Client {
     let mut config = aws_sdk_signin::Config::builder()
         .region(aws_sdk_signin::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_signin::config::BehaviorVersion::latest());
-    if let Some(url) = aws_sso::service_endpoint(ENDPOINT_VARIABLE) {
+    if let Some(url) = service_endpoint(ENDPOINT_VARIABLE) {
         config = config.endpoint_url(url);
     }
     aws_sdk_signin::Client::from_conf(config.build())
@@ -173,7 +173,7 @@ fn client(region: &str) -> aws_sdk_signin::Client {
 /// partitions work), or a configured one; the AWS CLI builds the consent
 /// page from it the same way.
 async fn base_url(region: &str) -> anyhow::Result<String> {
-    if let Some(url) = aws_sso::service_endpoint(ENDPOINT_VARIABLE) {
+    if let Some(url) = service_endpoint(ENDPOINT_VARIABLE) {
         return Ok(url.trim_end_matches('/').to_string());
     }
     use aws_sdk_signin::config::endpoint::{DefaultResolver, Params, ResolveEndpoint};
@@ -333,7 +333,7 @@ fn authorize_url(
         ("code_challenge", challenge),
     ]
     .iter()
-    .map(|(k, v)| format!("{k}={}", aws_sso::percent_encode(v)))
+    .map(|(k, v)| format!("{k}={}", oauth::percent_encode(v)))
     .collect::<Vec<_>>()
     .join("&");
     format!("{base}/v1/authorize?{query}")
@@ -605,7 +605,7 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
 /// Checks that the sign-in works; says whom it belongs to.
 pub async fn check(integration: &str, config: &AwsLoginConfig) -> Result<String> {
     let creds = credentials(integration, config, false).await?;
-    let identity = aws_sso::caller_identity(&creds, &config.region).await?;
+    let identity = sts::caller_identity(&creds, &config.region).await?;
     Ok(format!("signed in as {}", identity.arn))
 }
 

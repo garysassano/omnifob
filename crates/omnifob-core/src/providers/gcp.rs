@@ -66,9 +66,7 @@ enum Endpoint {
 }
 
 fn url(endpoint: Endpoint) -> String {
-    let base = std::env::var("OMNIFOB_GOOGLE_ENDPOINT")
-        .ok()
-        .filter(|v| !v.is_empty());
+    let base = crate::Context::current().endpoints().google.clone();
     let (host, path) = match endpoint {
         Endpoint::Authorize => ("https://accounts.google.com", "/o/oauth2/auth"),
         Endpoint::Token => ("https://oauth2.googleapis.com", "/token"),

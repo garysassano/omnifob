@@ -526,7 +526,10 @@ mod tests {
 
     #[test]
     fn preset_vars_come_with_the_secrets_and_config_vars_win() {
-        store::use_memory_store().unwrap();
+        let _cx = crate::Context::builder()
+            .keychain(store::Keychain::Memory)
+            .build()
+            .enter();
         let c = config(
             "preset = \"unikraft\"\nvars = { UKC_METRO = \"fra\", UNIKRAFT_PROFILE_ENV = \"1\" }",
         );

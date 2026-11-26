@@ -77,7 +77,7 @@ mod tests {
             assert!(!sdk_logs_http_bodies(target, Level::DEBUG), "{target}");
         }
         for target in [
-            "omnifob_core::providers::aws_sso",
+            "omnifob_core::providers::aws::sso",
             "omnifob",
             "hyperlocal",
             "h2o",
@@ -128,7 +128,7 @@ mod tests {
                 target: "aws_smithy_runtime::client::orchestrator",
                 "beginning attempt #1"
             );
-            tracing::trace!(target: "omnifob_core::providers::aws_sso", "our own trace");
+            tracing::trace!(target: "omnifob_core::providers::aws::sso", "our own trace");
         });
         let log = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(!log.contains("secret-request-body"), "{log}");

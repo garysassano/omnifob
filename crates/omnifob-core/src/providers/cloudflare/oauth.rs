@@ -88,12 +88,13 @@ pub fn scope_for(permission: &str) -> Option<&'static str> {
         .map(|(_, scope)| *scope)
 }
 
-/// The dashboard's OAuth endpoints; `OMNIFOB_CLOUDFLARE_DASH` overrides the
-/// host for testing.
+/// The dashboard's OAuth endpoints; the context's `cloudflare_dash`
+/// endpoint (`OMNIFOB_CLOUDFLARE_DASH`) overrides the host for testing.
 fn dash() -> String {
-    std::env::var("OMNIFOB_CLOUDFLARE_DASH")
-        .ok()
-        .filter(|v| !v.is_empty())
+    crate::Context::current()
+        .endpoints()
+        .cloudflare_dash
+        .clone()
         .unwrap_or_else(|| DASH.to_string())
 }
 
@@ -144,7 +145,7 @@ pub fn scopes(config: &CloudflareConfig) -> Vec<String> {
         return scopes.clone();
     }
     let mut scopes: Vec<String> = BASE_SCOPES.iter().map(|s| s.to_string()).collect();
-    for template in super::cloudflare::templates(config).values() {
+    for template in super::templates(config).values() {
         for permission in template.permissions.iter().chain(&template.optional) {
             match scope_for(permission) {
                 Some(scope) => scopes.push(scope.to_string()),
@@ -522,7 +523,7 @@ mod tests {
 
     #[test]
     fn builtin_templates_have_scopes() {
-        for template in super::super::cloudflare::builtin_templates().values() {
+        for template in super::super::builtin_templates().values() {
             for permission in template.permissions.iter().chain(&template.optional) {
                 assert!(scope_for(permission).is_some(), "{permission}");
             }

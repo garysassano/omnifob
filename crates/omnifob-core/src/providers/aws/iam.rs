@@ -13,8 +13,9 @@ use anyhow::{Context, anyhow};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use super::aws_partition::Partition;
-use super::aws_sso::{self, RoleRequest, SESSION_MIN};
+use super::console::{self, ConsoleRequest};
+use super::partition::Partition;
+use super::sts::{self, RoleRequest, SESSION_MIN};
 use crate::config::AwsIamConfig;
 use crate::{Credentials, Error, Profile, Result, Target, store};
 
@@ -87,7 +88,7 @@ pub async fn login(
             "an IAM user's access key ID starts with AKIA; temporary keys (ASIA) cannot be stored"
         );
     }
-    let arn = aws_sso::caller_identity(&key_credentials(&key), sts_region(config))
+    let arn = sts::caller_identity(&key_credentials(&key), sts_region(config))
         .await
         .context("checking the access key")?
         .arn;
@@ -109,14 +110,14 @@ pub fn has_key(integration: &str) -> anyhow::Result<bool> {
 /// Checks that the stored key works; says whom it belongs to.
 pub async fn check(integration: &str, config: &AwsIamConfig) -> Result<String> {
     let key = stored_key(integration)?;
-    let identity = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
+    let identity = sts::caller_identity(&key_credentials(&key), sts_region(config)).await?;
     Ok(format!("access key valid for {}", identity.arn))
 }
 
 /// The user's session profile and one profile per configured role.
 pub async fn discover(integration: &str, config: &AwsIamConfig) -> Result<Vec<Profile>> {
     let key = stored_key(integration)?;
-    let identity = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
+    let identity = sts::caller_identity(&key_credentials(&key), sts_region(config)).await?;
     let account_id = identity
         .account
         .with_context(|| format!("STS named no account for {}", identity.arn))?;
@@ -181,9 +182,9 @@ pub async fn session_credentials(
         return Err(anyhow!("an IAM user's session lasts 15 minutes to 36 hours").into());
     }
     let key = stored_key(integration)?;
-    let mut call = aws_sso::sts_client(&key_credentials(&key), sts_region(config))?
+    let mut call = sts::sts_client(&key_credentials(&key), sts_region(config))?
         .get_session_token()
-        .duration_seconds(aws_sso::whole_seconds(duration)?);
+        .duration_seconds(sts::whole_seconds(duration)?);
     if let Some(serial) = &config.mfa_serial {
         call = call
             .serial_number(serial)
@@ -194,7 +195,7 @@ pub async fn session_credentials(
         .await
         .map_err(|e| anyhow!("{}", aws_sdk_sts::error::DisplayErrorContext(&e)))
         .context("starting a session with the access key")?;
-    let session = aws_sso::from_sts(
+    let session = sts::from_sts(
         response.credentials().context("no credentials returned")?,
         config.region.as_deref(),
     )?;
@@ -252,14 +253,14 @@ pub async fn role_credentials(
         duration,
         profile_id,
     };
-    match aws_sso::assume_role(&session, &request, sts_region(config), region).await {
+    match sts::assume_role(&session, &request, sts_region(config), region).await {
         // A kept session that STS no longer takes (revoked, or the clock
         // was off): start a new one once, which may ask for an MFA code.
-        Err(e) if cached && e.downcast_ref::<aws_sso::CredentialsRejected>().is_some() => {
+        Err(e) if cached && e.downcast_ref::<sts::CredentialsRejected>().is_some() => {
             tracing::debug!("starting a new session: STS refused the kept one: {e:#}");
             forget_session_if_current(integration, &session).await?;
             let session = session_credentials(integration, config, profile_id, None).await?;
-            Ok(aws_sso::assume_role(&session, &request, sts_region(config), region).await?)
+            Ok(sts::assume_role(&session, &request, sts_region(config), region).await?)
         }
         result => Ok(result?),
     }
@@ -310,7 +311,7 @@ pub async fn console_url(
     service: Option<&str>,
 ) -> Result<String> {
     let key = stored_key(integration)?;
-    let user = aws_sso::caller_identity(&key_credentials(&key), sts_region(config)).await?;
+    let user = sts::caller_identity(&key_credentials(&key), sts_region(config)).await?;
     let duration = config
         .session_duration
         .unwrap_or(DEFAULT_SESSION)
@@ -318,27 +319,27 @@ pub async fn console_url(
     // Federated sessions get the intersection of this policy and the user's.
     let allow_all =
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
-    let response = aws_sso::sts_client(&key_credentials(&key), sts_region(config))?
+    let response = sts::sts_client(&key_credentials(&key), sts_region(config))?
         .get_federation_token()
         .name(federation_name(&user.arn))
         .policy(allow_all)
-        .duration_seconds(aws_sso::whole_seconds(duration)?)
+        .duration_seconds(sts::whole_seconds(duration)?)
         .send()
         .await
         .map_err(|e| anyhow!("{}", aws_sdk_sts::error::DisplayErrorContext(&e)))
         .context("getting a federated session for the console")?;
-    let creds = aws_sso::from_sts(
+    let creds = sts::from_sts(
         response.credentials().context("no credentials returned")?,
         None,
     )?;
-    let request = aws_sso::ConsoleRequest {
+    let request = ConsoleRequest {
         partition,
         home_region: Some(sts_region(config)),
         region,
         service,
         session_duration: None,
     };
-    Ok(aws_sso::console_url(&creds, &request).await?)
+    Ok(console::console_url(&creds, &request).await?)
 }
 
 #[cfg(test)]
