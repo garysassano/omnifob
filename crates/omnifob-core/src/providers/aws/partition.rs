@@ -125,6 +125,18 @@ impl Partition {
         }
     }
 
+    /// STS's regional host in `region`. Fails for a name not shaped like a
+    /// Region.
+    pub fn sts_host(self, region: &str) -> anyhow::Result<String> {
+        check_region_name(region)?;
+        let domain = match self {
+            Self::Aws | Self::UsGov => "amazonaws.com",
+            Self::China => "amazonaws.com.cn",
+            Self::EuropeanSovereign => "amazonaws.eu",
+        };
+        Ok(format!("sts.{region}.{domain}"))
+    }
+
     /// The sign-in host for federation in `region`, regional as AWS
     /// recommends; a few Regions use the unprefixed host. Fails for a name
     /// not shaped like a Region, which could otherwise name another host.

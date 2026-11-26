@@ -141,6 +141,20 @@ pub(crate) enum Command {
         /// ends (Cloudflare)
         #[arg(long, conflicts_with = "no_cache")]
         revoke: bool,
+        /// Serve the credentials from a loopback container credentials
+        /// endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI) instead of
+        /// variables, renewed while the command runs (AWS)
+        #[arg(long)]
+        server: bool,
+        /// Run no managed identity endpoint (Azure) or ADC token endpoint
+        /// (Google Cloud) for the command
+        #[arg(long, conflicts_with = "server")]
+        no_server: bool,
+        /// Give gcloud its token in a private file (CLOUDSDK_AUTH_ACCESS_TOKEN_FILE),
+        /// renewed while the command runs, instead of CLOUDSDK_AUTH_ACCESS_TOKEN
+        /// (Google Cloud)
+        #[arg(long)]
+        token_file: bool,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -174,6 +188,13 @@ pub(crate) enum Command {
         profile: Vec<String>,
         #[arg(long, value_enum, default_value_t = CredsFormat::Json)]
         format: CredsFormat,
+        /// The EKS cluster's name, for `--format k8s-exec` with an AWS profile
+        #[arg(long)]
+        cluster: Option<String>,
+        /// The Region of the EKS cluster's STS endpoint, for `--format
+        /// k8s-exec` (default: the profile's, else us-east-1)
+        #[arg(long)]
+        region: Option<String>,
         #[arg(long)]
         no_cache: bool,
         /// Lifetime of new credentials instead of the configured one, e.g. "4h";
@@ -248,6 +269,24 @@ pub(crate) enum ExportCommand {
         #[arg(long)]
         file: Option<std::path::PathBuf>,
     },
+    /// Google Application Default Credentials that run `fob creds --format
+    /// gcp-executable` and exchange the account's ID token through a
+    /// workload identity pool; holds no token
+    GcpAdc {
+        #[arg(required = true, add = ArgValueCandidates::new(profile_candidates))]
+        profile: Vec<String>,
+        /// The workload identity pool provider that trusts
+        /// https://accounts.google.com, as
+        /// //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+        #[arg(long)]
+        audience: String,
+        /// Write the full path of this fob binary instead of `fob`
+        #[arg(long)]
+        absolute: bool,
+        /// Write the file here instead of printing it
+        #[arg(long, value_name = "PATH")]
+        write: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -307,6 +346,12 @@ pub(crate) enum CredsFormat {
     Fnox,
     /// The output AWS `credential_process` expects
     CredentialProcess,
+    /// The response of Google's executable-sourced credentials: the
+    /// account's ID token (see `fob export gcp-adc`)
+    GcpExecutable,
+    /// A kubectl exec plugin's `ExecCredential`: an EKS token (with
+    /// --cluster), a GKE access token or an AKS Entra ID token
+    K8sExec,
 }
 
 pub(crate) fn parse_ttl(s: &str) -> anyhow::Result<jiff::SignedDuration> {

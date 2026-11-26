@@ -7,12 +7,33 @@
       "additionalProperties": false,
       "description": "Limits on what a coding agent can get, under `[agent]`.",
       "properties": {
+        "auto_revoke": {
+          "default": false,
+          "description": "Whether `fob exec` mints a Cloudflare token for each command an\nagent runs and deletes it when the command ends, as `--revoke` does.",
+          "type": "boolean"
+        },
+        "max_ttl": {
+          "description": "The longest lifetime of credentials an agent gets, e.g. \"15m\", for\nprofiles whose lifetime omnifob chooses (Cloudflare tokens, chained\nand IAM users' roles, cross-partition roles, Google service\naccounts). Longer ones are asked for with this lifetime and not\ncached. At least 15 minutes, the shortest AWS session.",
+          "type": "string"
+        },
         "profiles": {
           "description": "Profile ids agents may get credentials for, as patterns in which `*`\nstands for any characters within one `/`-separated segment, e.g.\n`\"acme/dev/*\"` or `\"*/*/ReadOnly\"`. Unset, agents may use every profile.",
           "items": {
             "type": "string"
           },
           "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "AuditConfig": {
+      "additionalProperties": false,
+      "description": "The local audit log, under `[audit]`.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Append a line to `audit.jsonl` in the state directory for every\ncredential handed out: when, which profile, which command, which\nagent, until when. Never the credentials.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -61,7 +82,7 @@
           "type": "string"
         },
         "session_name": {
-          "description": "`RoleSessionName`; defaults to \"omnifob\".",
+          "description": "`RoleSessionName`; defaults to \"omnifob\", or \"omnifob-agent\" for\nsessions a coding agent starts.",
           "type": "string"
         },
         "via_account_id": {
@@ -162,7 +183,7 @@
           "type": "string"
         },
         "session_name": {
-          "description": "`RoleSessionName`; defaults to \"omnifob\".",
+          "description": "`RoleSessionName`; defaults to \"omnifob\", or \"omnifob-agent\" for\nsessions a coding agent starts.",
           "type": "string"
         },
         "signing_algorithm": {
@@ -255,7 +276,7 @@
           "type": "string"
         },
         "session_name": {
-          "description": "`RoleSessionName`; defaults to \"omnifob\".",
+          "description": "`RoleSessionName`; defaults to \"omnifob\", or \"omnifob-agent\" for\nsessions a coding agent starts.",
           "type": "string"
         }
       },
@@ -698,6 +719,14 @@
         }
       ],
       "description": "What commands run by a coding agent may use."
+    },
+    "audit": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditConfig"
+        }
+      ],
+      "description": "The local audit log of credentials handed out."
     },
     "browsers": {
       "additionalProperties": {

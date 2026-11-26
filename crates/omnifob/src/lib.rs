@@ -35,7 +35,7 @@ use omnifob_core::{Config, Error, paths};
 
 use crate::cli::{Cli, CloudflareCommand, Command, CredsFormat, ExportCommand, ImportCommand};
 use crate::exec::{creds_output, exec, expiry_note};
-use crate::import_export::{export_aws_config, import_aws};
+use crate::import_export::{export_aws_config, export_gcp_adc, import_aws};
 use crate::logging::log_subscriber;
 use crate::shell::Shell;
 
@@ -110,6 +110,8 @@ fn interactive() -> bool {
 struct App {
     config: Config,
     cache: ProfileCache,
+    /// The command's name, for the audit log.
+    command: &'static str,
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -117,7 +119,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // keychain and endpoints from the environment, one HTTP client for
     // this runtime, and a terminal prompt for MFA codes when someone can
     // answer. Nothing has used the library yet, so the install takes.
-    let mut context = omnifob_core::Context::builder_from_env();
+    let mut context = omnifob_core::Context::builder_from_env().agent(agent::context_agent());
     if interactive() {
         context = context.mfa_prompt(|serial| {
             Ok(dialoguer::Input::<String>::new()
@@ -174,7 +176,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Config::load(&config_file)?
     };
     let cache = load_profiles(&cli.command)?;
-    let mut app = App { config, cache };
+    let command = match &cli.command {
+        Command::Exec { .. } => "exec",
+        Command::Creds { .. } => "creds",
+        Command::Env { .. } => "env",
+        Command::Console { .. } => "console",
+        _ => "other",
+    };
+    let mut app = App {
+        config,
+        cache,
+        command,
+    };
 
     match cli.command {
         Command::Login {
@@ -237,7 +250,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             if agent::active() {
                 return Err(agent::refuse_to_print(&profile.id));
             }
-            let creds = app.credentials(&profile, !no_cache, ttl).await?;
+            let creds = app.credentials(&profile, !no_cache, ttl, "shell").await?;
             print!("{}", shell::export(shell, &profile.id, &creds, &previous)?);
             eprintln!("fob: using {}{}", profile.id, expiry_note(&creds));
         }
@@ -246,15 +259,36 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             no_cache,
             ttl,
             revoke,
+            server,
+            no_server,
+            token_file,
             command,
         } => {
+            let options = exec::ExecOptions {
+                server,
+                no_server,
+                token_file,
+            };
             let result = async {
                 let profile = app.select(query(&profile).as_deref()).await?;
-                if revoke {
+                // Under an agent with `[agent] auto_revoke`, each command
+                // gets a Cloudflare token of its own, deleted afterwards.
+                let auto_revoke = agent::active()
+                    && app.config.agent.auto_revoke
+                    && !no_cache
+                    && matches!(profile.target, omnifob_core::Target::Cloudflare { .. });
+                if revoke || auto_revoke {
                     return app.exec_and_revoke(&profile, ttl, &command).await;
                 }
-                let creds = app.credentials(&profile, !no_cache, ttl).await?;
-                exec(&profile, &creds, &command)
+                // With `--server` too, so a sign-in it needs happens now and
+                // the endpoint starts from cached credentials.
+                let creds = app.credentials(&profile, !no_cache, ttl, "env").await?;
+                let (provision, via) = app.provision(&profile, &creds, ttl, options).await?;
+                if via.is_empty() {
+                    return exec(&profile, &creds, &command);
+                }
+                app.audit(&profile, &via.join(", "), creds.expires_at, None);
+                exec::run_to_end(&profile, &creds, &command, provision).await
             }
             .await;
             // As `env` does: 125 when fob fails, so it is not mistaken for the
@@ -290,16 +324,40 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Creds {
             profile,
             format,
+            cluster,
+            region,
             no_cache,
             ttl,
         } => {
             let profile = app.select(query(&profile).as_deref()).await?;
-            // credential_process and fnox run fob inside the agent's own
-            // commands and hand the output to a program, not to the agent.
+            // credential_process, fnox, Google's libraries and kubectl run
+            // fob inside the agent's own commands and hand the output to a
+            // program, not to the agent.
             if agent::active() && matches!(format, CredsFormat::Json) {
                 return Err(agent::refuse_to_print(&profile.id));
             }
-            let creds = app.credentials(&profile, !no_cache, ttl).await?;
+            if matches!(format, CredsFormat::GcpExecutable | CredsFormat::K8sExec) {
+                if ttl.is_some() {
+                    bail!("--ttl does not apply to --format gcp-executable or k8s-exec");
+                }
+                let output = app
+                    .tool_creds(
+                        &profile,
+                        format,
+                        cluster.as_deref(),
+                        region.as_deref(),
+                        !no_cache,
+                    )
+                    .await?;
+                println!("{output}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let via = match format {
+                CredsFormat::Json => "json",
+                CredsFormat::Fnox => "fnox",
+                _ => "credential-process",
+            };
+            let creds = app.credentials(&profile, !no_cache, ttl, via).await?;
             println!("{}", creds_output(&profile, &creds, format)?);
         }
         Command::Revoke { all: true, .. } => app.revoke_all().await?,
@@ -341,6 +399,15 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }) => {
             app.ensure_synced().await?.report();
             export_aws_config(&app, &prefix, absolute, write, file)?;
+        }
+        Command::Export(ExportCommand::GcpAdc {
+            profile,
+            audience,
+            absolute,
+            write,
+        }) => {
+            let profile = app.select(query(&profile).as_deref()).await?;
+            export_gcp_adc(&app, &profile, &audience, absolute, write.as_deref())?;
         }
         Command::Renew { profile } => app.renew(&profile).await?,
     }

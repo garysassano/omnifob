@@ -8,6 +8,66 @@ use omnifob_core::{Config, Integration, Profile, paths};
 use crate::App;
 use crate::files::{aws_config_file, write_atomically};
 
+/// `fob export gcp-adc`: an `external_account` ADC file whose subject
+/// token comes from `fob creds <profile> --format gcp-executable`. It holds
+/// no token, so it may be written anywhere.
+pub(crate) fn export_gcp_adc(
+    app: &App,
+    profile: &Profile,
+    audience: &str,
+    absolute: bool,
+    write: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use omnifob_core::provision::{check_wif_audience, gcp_executable_adc};
+    check_wif_audience(audience)?;
+    let impersonate = match (
+        &profile.target,
+        app.config.integration(&profile.integration)?,
+    ) {
+        (omnifob_core::Target::Gcp { .. }, _) => None,
+        (omnifob_core::Target::GcpServiceAccount { label, .. }, Integration::Gcp(c)) => Some(
+            c.service_accounts
+                .get(label)
+                .with_context(|| format!("no service account '{label}'; run `fob sync`"))?
+                .email
+                .clone(),
+        ),
+        _ => anyhow::bail!("{} is not a Google Cloud profile", profile.id),
+    };
+    let program = fob_program(absolute)?;
+    let command = format!("{program} creds {} --format gcp-executable", profile.id);
+    let adc = gcp_executable_adc(&command, audience, impersonate.as_deref());
+    let text = serde_json::to_string_pretty(&adc)? + "\n";
+    match write {
+        Some(path) => {
+            write_atomically(path, text)?;
+            eprintln!(
+                "fob: wrote {}; set GOOGLE_APPLICATION_CREDENTIALS to it, and GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1 so the client libraries run fob",
+                path.display()
+            );
+        }
+        None => {
+            print!("{text}");
+            eprintln!(
+                "fob: the client libraries run fob only with GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// How generated configuration runs fob: `fob`, or this binary's full path.
+fn fob_program(absolute: bool) -> anyhow::Result<String> {
+    if !absolute {
+        return Ok("fob".to_string());
+    }
+    let exe = std::env::current_exe().context("finding the path of this fob binary")?;
+    let exe = exe
+        .to_str()
+        .with_context(|| format!("the path {} is not valid Unicode", exe.display()))?;
+    omnifob_core::import::credential_process_program(exe, cfg!(windows))
+}
+
 pub(crate) fn export_aws_config(
     app: &App,
     prefix: &str,
@@ -15,16 +75,8 @@ pub(crate) fn export_aws_config(
     write: bool,
     file: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    use omnifob_core::import::{aws_config_block, credential_process_program, replace_aws_block};
-    let program = if absolute {
-        let exe = std::env::current_exe().context("finding the path of this fob binary")?;
-        let exe = exe
-            .to_str()
-            .with_context(|| format!("the path {} is not valid Unicode", exe.display()))?;
-        credential_process_program(exe, cfg!(windows))?
-    } else {
-        "fob".to_string()
-    };
+    use omnifob_core::import::{aws_config_block, replace_aws_block};
+    let program = fob_program(absolute)?;
     let profiles: Vec<&Profile> = app.cache.all().filter(|p| p.target.is_aws()).collect();
     let regions: std::collections::BTreeMap<String, String> = profiles
         .iter()

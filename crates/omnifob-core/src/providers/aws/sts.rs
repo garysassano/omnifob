@@ -128,7 +128,11 @@ pub(crate) async fn assume_role(
     let mut call = sts
         .assume_role()
         .role_arn(request.role_arn)
-        .role_session_name(request.session_name.unwrap_or("omnifob"))
+        .role_session_name(
+            request
+                .session_name
+                .unwrap_or(super::default_session_name()),
+        )
         .set_external_id(request.external_id.map(str::to_string))
         .duration_seconds(whole_seconds(request.duration)?);
     if let Some(serial) = request.mfa_serial {

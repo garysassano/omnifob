@@ -103,6 +103,10 @@ struct Stored {
     email: String,
     /// The client the refresh token belongs to; it renews only with that one.
     client_id: String,
+    /// The account's last ID token, which Google returns with each access
+    /// token for the `openid` scope; for `fob creds --format gcp-executable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +256,7 @@ pub async fn login(
         expires_at: expiry(now, response.expires_in)?,
         email: email.clone(),
         client_id: client_id.to_string(),
+        id_token: response.id_token,
     };
     // Not while a renewal is under way, which would write back the sign-in
     // it read.
@@ -371,6 +376,9 @@ async fn renew(integration: &str, config: &GcpConfig) -> Result<Stored> {
     if let Some(refresh) = response.refresh_token {
         stored.refresh_token = refresh;
     }
+    if response.id_token.is_some() {
+        stored.id_token = response.id_token;
+    }
     store::set(&token_key(integration), &stored)?;
     Ok(stored)
 }
@@ -406,6 +414,37 @@ where
         }
         result => Ok(result?),
     }
+}
+
+/// When an ID token expires: its `exp` claim.
+fn id_token_expiry(id_token: &str) -> Option<Timestamp> {
+    #[derive(Deserialize)]
+    struct Exp {
+        exp: i64,
+    }
+    let claims: Exp = crate::oauth::decode_jwt_payload(id_token).ok()?;
+    Timestamp::from_second(claims.exp).ok()
+}
+
+/// The account's Google ID token (issuer `https://accounts.google.com`,
+/// audience the OAuth client), renewed when it has less than
+/// [`RENEW_MARGIN`] left: the subject token of executable-sourced
+/// credentials, which Google's STS exchanges through a workload identity
+/// pool that trusts Google as an OIDC provider.
+pub async fn id_token(integration: &str, config: &GcpConfig) -> Result<(String, Timestamp)> {
+    let current = |stored: &Stored| {
+        let token = stored.id_token.clone()?;
+        let expiry = id_token_expiry(&token)?;
+        (expiry.duration_since(Timestamp::now()) > RENEW_MARGIN).then_some((token, expiry))
+    };
+    if let Some(found) = current(&stored(integration)?) {
+        return Ok(found);
+    }
+    let renewed = renew(integration, config).await?;
+    current(&renewed).ok_or_else(|| {
+        anyhow!("Google returned no ID token; sign in again with `fob login {integration} --force`")
+            .into()
+    })
 }
 
 pub fn is_signed_in(integration: &str) -> anyhow::Result<bool> {

@@ -3,10 +3,41 @@
 //! sets a terminal prompt when it runs in one. Without one, an operation
 //! that needs an answer fails with an error that says how to get past it.
 
+use std::cell::Cell;
+use std::future::Future;
+
 use anyhow::bail;
+
+thread_local! {
+    /// Set while an [`unattended`] future is polled.
+    static UNATTENDED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `future` where nobody answers prompts, whatever the context
+/// offers: for the endpoints `fob exec` serves while its command runs,
+/// where a prompt would share the terminal with the command. An operation
+/// that needs an MFA code fails there instead, saying so.
+pub fn unattended<F: Future>(future: F) -> impl Future<Output = F::Output> + use<F> {
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                UNATTENDED.set(self.0);
+            }
+        }
+        let _restore = Restore(UNATTENDED.replace(true));
+        future.as_mut().poll(cx)
+    })
+}
 
 /// A six-digit code from the MFA device `serial`, for `what` (a profile id).
 pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
+    if UNATTENDED.get() {
+        bail!(
+            "{what} needs a code from the MFA device {serial}, which cannot be asked for while a command runs; run `fob exec {what} -- true` in a terminal first, which asks for it"
+        );
+    }
     let cx = crate::Context::current();
     let Some(prompt) = cx.mfa_prompt() else {
         bail!(
@@ -18,4 +49,23 @@ pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
         bail!("an MFA code is six digits");
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unattended_futures_never_prompt() {
+        let cx = crate::Context::builder()
+            .mfa_prompt(|_| Ok("123456".into()))
+            .build();
+        let _entered = cx.enter();
+        assert_eq!(mfa_code("arn:mfa", "p").unwrap(), "123456");
+        let asked = futures::executor::block_on(unattended(async { mfa_code("arn:mfa", "p") }));
+        let err = asked.unwrap_err().to_string();
+        assert!(err.contains("while a command runs"), "{err}");
+        // Only while it is polled.
+        assert_eq!(mfa_code("arn:mfa", "p").unwrap(), "123456");
+    }
 }

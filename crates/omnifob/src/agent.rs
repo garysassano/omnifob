@@ -13,41 +13,81 @@ use std::sync::OnceLock;
 
 use anyhow::anyhow;
 
-/// Variables coding agents set in the commands they run. `OMNIFOB_AGENT`
-/// covers the others, and turns detection off with `0`.
+/// Variables coding agents set in the commands they run, each checked
+/// against the agent's documentation or source on 2026-11-25.
+/// `OMNIFOB_AGENT` covers the others, and turns detection off with `0`.
+/// Aider, Windsurf, Amp and Kiro document none, so they need it.
 const MARKERS: &[&str] = &[
+    // The cross-agent marker proposed in agents.md, which Claude Code,
+    // OpenCode, Crush and Pi set.
+    "AI_AGENT",
     // Claude Code
     "CLAUDECODE",
-    // Gemini CLI
+    // Gemini CLI (`shellExecutionService.ts`)
     "GEMINI_CLI",
-    // Cursor's agent
+    // Cursor's agent (its terminal documentation)
     "CURSOR_AGENT",
-    // Codex, when it runs commands in its sandbox
+    // Codex: in its sandbox, and the thread of every command it runs
+    // (`codex-rs/protocol/src/shell_environment.rs`)
     "CODEX_SANDBOX",
+    "CODEX_THREAD_ID",
     // GitHub Copilot's coding agent (the Azure CLI reads it too)
     "COPILOT_AGENT_SESSION_ID",
+    // GitHub Copilot CLI (its changelog)
+    "COPILOT_CLI",
+    // OpenCode (anomalyco/opencode#51975)
+    "OPENCODE",
+    // Crush (`internal/shell/shell.go`)
+    "CRUSH",
+    // Qwen Code (`shellExecutionService.ts`)
+    "QWEN_CODE",
+    // Cline, in the terminals it opens (`VscodeTerminalRegistry.ts`)
+    "CLINE_ACTIVE",
+    // Goose's developer shell (aaif-goose/goose#13598)
+    "GOOSE_TERMINAL",
+    // Pi (`docs/environment-variables.md`)
+    "PI_CODING_AGENT",
+    // Antigravity (set by its `agy` binary)
+    "ANTIGRAVITY_AGENT",
 ];
 
 /// Whether a coding agent runs this command.
 pub(crate) fn active() -> bool {
-    static ACTIVE: OnceLock<bool> = OnceLock::new();
-    *ACTIVE.get_or_init(|| detect(|name| std::env::var_os(name)))
+    marker().is_some()
 }
 
-fn detect(var: impl Fn(&str) -> Option<OsString>) -> bool {
+/// The variable that says a coding agent runs this command: its marker,
+/// or `OMNIFOB_AGENT`.
+pub(crate) fn marker() -> Option<&'static str> {
+    static MARKER: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MARKER.get_or_init(|| detect(|name| std::env::var_os(name)))
+}
+
+/// The library's view of the agent: its Copilot session, which Entra ID
+/// records in tokens, when it has one.
+pub(crate) fn context_agent() -> Option<omnifob_core::Agent> {
+    active().then(|| omnifob_core::Agent {
+        session_id: std::env::var("COPILOT_AGENT_SESSION_ID")
+            .ok()
+            .filter(|v| !v.is_empty()),
+    })
+}
+
+fn detect(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
     match var("OMNIFOB_AGENT")
         .as_ref()
         .and_then(|v| v.to_str())
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("1" | "true" | "yes") => return true,
-        Some("0" | "false" | "no") => return false,
+        Some("1" | "true" | "yes") => return Some("OMNIFOB_AGENT"),
+        Some("0" | "false" | "no") => return None,
         _ => {}
     }
     MARKERS
         .iter()
-        .any(|marker| var(marker).is_some_and(|v| !v.is_empty()))
+        .copied()
+        .find(|marker| var(marker).is_some_and(|v| !v.is_empty()))
 }
 
 /// The error for a command that would print credentials into the agent's
@@ -68,6 +108,7 @@ mod tests {
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| OsString::from(v))
         })
+        .is_some()
     }
 
     #[test]
@@ -84,5 +125,16 @@ mod tests {
             ("OMNIFOB_AGENT", "maybe"),
             ("CLAUDECODE", "1")
         ]));
+        for marker in [
+            "AI_AGENT",
+            "OPENCODE",
+            "GOOSE_TERMINAL",
+            "CLINE_ACTIVE",
+            "COPILOT_CLI",
+        ] {
+            assert!(detect_with(&[(marker, "1")]), "{marker}");
+        }
+        let found = detect(|name| (name == "CODEX_THREAD_ID").then(|| OsString::from("t")));
+        assert_eq!(found, Some("CODEX_THREAD_ID"));
     }
 }

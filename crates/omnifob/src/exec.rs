@@ -3,10 +3,11 @@
 
 use std::process::ExitCode;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use jiff::Timestamp;
-use omnifob_core::providers;
-use omnifob_core::{Credentials, Profile};
+use omnifob_core::credentials::AWS_CREDENTIAL_VARS;
+use omnifob_core::provision::{self, Provision};
+use omnifob_core::{Credentials, Integration, Profile, Target, providers};
 
 use crate::cli::CredsFormat;
 use crate::renew::spawn_renewal;
@@ -39,22 +40,234 @@ pub(crate) fn expiry_note(creds: &Credentials) -> String {
     }
 }
 
+/// What `fob exec` hands the command besides variables.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExecOptions {
+    /// An AWS container credentials endpoint (`--server`).
+    pub(crate) server: bool,
+    /// No Azure or Google endpoint (`--no-server`).
+    pub(crate) no_server: bool,
+    /// gcloud's token in a file (`--token-file`).
+    pub(crate) token_file: bool,
+}
+
 impl App {
+    /// The lifetime to ask for: `ttl`, capped at `[agent] max_ttl` for an
+    /// agent where the profile's lifetime is omnifob's to choose.
+    pub(crate) fn agent_ttl(
+        &self,
+        profile: &Profile,
+        ttl: Option<jiff::SignedDuration>,
+    ) -> Option<jiff::SignedDuration> {
+        match self.config.agent.max_ttl {
+            Some(max) if crate::agent::active() => {
+                providers::capped_ttl(&self.config, profile, ttl, max)
+            }
+            _ => ttl,
+        }
+    }
+
+    /// Gets a profile's credentials for a command, which hands them over
+    /// `via` (for the audit log).
     pub(crate) async fn credentials(
         &self,
         profile: &Profile,
         use_cache: bool,
         ttl: Option<jiff::SignedDuration>,
+        via: &str,
     ) -> anyhow::Result<Credentials> {
+        let ttl = self.agent_ttl(profile, ttl);
         let creds = self
             .with_login(|| providers::credentials(&self.config, profile, use_cache, ttl))
             .await
             .with_context(|| format!("getting credentials for {}", profile.id))?;
-        if use_cache && creds.wants_renewal(Timestamp::now()) {
+        if use_cache && ttl.is_none() && creds.wants_renewal(Timestamp::now()) {
             spawn_renewal(&self.config, profile);
         }
         record_use(&profile.id);
+        self.audit(profile, via, creds.expires_at, creds.token_id.as_deref());
         Ok(creds)
+    }
+
+    /// Appends a line to the audit log when `[audit] enabled` says so. A
+    /// log that cannot be written is reported and does not stop the command.
+    pub(crate) fn audit(
+        &self,
+        profile: &Profile,
+        via: &str,
+        expires_at: Option<Timestamp>,
+        token_id: Option<&str>,
+    ) {
+        if !self.config.audit.enabled {
+            return;
+        }
+        let entry = omnifob_core::audit::Entry {
+            timestamp: Timestamp::now(),
+            command: self.command,
+            profile: &profile.id,
+            integration: &profile.integration,
+            agent: crate::agent::marker(),
+            via,
+            expires_at,
+            token_id,
+        };
+        if let Err(e) = omnifob_core::audit::record(&entry) {
+            eprintln!("fob: could not write the audit log: {e:#}");
+        }
+    }
+
+    /// The endpoints and files `fob exec` adds for a profile: Azure's
+    /// managed identity and Google's ADC endpoint unless `--no-server`, an
+    /// AWS container endpoint with `--server`, and gcloud's token file with
+    /// `--token-file`. Also names them, for the audit log.
+    pub(crate) async fn provision(
+        &self,
+        profile: &Profile,
+        creds: &Credentials,
+        ttl: Option<jiff::SignedDuration>,
+        options: ExecOptions,
+    ) -> anyhow::Result<(Provision, Vec<&'static str>)> {
+        let mut provision = Provision::default();
+        let mut via = Vec::new();
+        let target = &profile.target;
+        if options.server {
+            if !target.is_aws() {
+                bail!(
+                    "--server serves AWS credentials; {} is not an AWS profile",
+                    profile.id
+                );
+            }
+            provision.merge(
+                provision::aws_container_endpoint(self.config.clone(), profile.clone(), ttl)
+                    .await?,
+            );
+            via.push("aws-container");
+        }
+        let google = matches!(
+            target,
+            Target::Gcp { .. } | Target::GcpServiceAccount { .. }
+        );
+        // The agent's cap, as for the variables.
+        let ttl = self.agent_ttl(profile, ttl);
+        if options.token_file {
+            if !google {
+                bail!(
+                    "--token-file is for Google Cloud profiles; {} is not one",
+                    profile.id
+                );
+            }
+            provision.merge(provision::gcp_token_file(
+                self.config.clone(),
+                profile.clone(),
+                creds,
+                ttl,
+            )?);
+            via.push("gcloud-token-file");
+        }
+        if !options.no_server {
+            if let Some((integration, tenant)) = provision::azure_tenant(profile) {
+                provision.merge(
+                    provision::azure_identity_endpoint(integration.to_string(), tenant.to_string())
+                        .await?,
+                );
+                via.push("azure-identity");
+            } else if google {
+                provision.merge(
+                    provision::gcp_adc_endpoint(self.config.clone(), profile.clone(), ttl).await?,
+                );
+                via.push("gcp-adc");
+            }
+        }
+        Ok((provision, via))
+    }
+
+    /// Output for a tool that runs `fob creds` itself: Google's
+    /// executable-sourced credentials and kubectl's exec plugins.
+    pub(crate) async fn tool_creds(
+        &self,
+        profile: &Profile,
+        format: CredsFormat,
+        cluster: Option<&str>,
+        region: Option<&str>,
+        use_cache: bool,
+    ) -> anyhow::Result<String> {
+        let value = match (format, &profile.target) {
+            (CredsFormat::GcpExecutable, Target::Gcp { .. } | Target::GcpServiceAccount { .. }) => {
+                let Integration::Gcp(config) = self.config.integration(&profile.integration)?
+                else {
+                    bail!(
+                        "{} does not match its integration; run `fob sync`",
+                        profile.id
+                    );
+                };
+                let (token, expires_at) = self
+                    .with_login(|| providers::gcp::id_token(&profile.integration, config))
+                    .await?;
+                record_use(&profile.id);
+                self.audit(profile, "gcp-executable", Some(expires_at), None);
+                provision::gcp_executable_response(&token, expires_at)
+            }
+            (CredsFormat::GcpExecutable, _) => {
+                bail!(
+                    "--format gcp-executable is for Google Cloud profiles; {} is not one",
+                    profile.id
+                )
+            }
+            (CredsFormat::K8sExec, target) => {
+                let api_version = provision::exec_api_version(
+                    std::env::var("KUBERNETES_EXEC_INFO").ok().as_deref(),
+                )?;
+                let (token, expires_at) = match target {
+                    Target::Azure { tenant_id, .. } => {
+                        let (token, at) = self
+                            .with_login(|| {
+                                providers::azure::resource_token(
+                                    &profile.integration,
+                                    tenant_id,
+                                    provision::AKS_SERVER_APP,
+                                )
+                            })
+                            .await?;
+                        record_use(&profile.id);
+                        self.audit(profile, "k8s-exec", Some(at), None);
+                        (token, Some(at))
+                    }
+                    Target::Gcp { .. } | Target::GcpServiceAccount { .. } => {
+                        let creds = self
+                            .credentials(profile, use_cache, None, "k8s-exec")
+                            .await?;
+                        let token = creds
+                            .env
+                            .get("CLOUDSDK_AUTH_ACCESS_TOKEN")
+                            .context("no Google access token in the credentials")?
+                            .clone();
+                        (token, creds.expires_at)
+                    }
+                    target if target.is_aws() => {
+                        let cluster = cluster
+                            .context("an EKS token is for one cluster: add --cluster <name>")?;
+                        let creds = self
+                            .credentials(profile, use_cache, None, "k8s-exec")
+                            .await?;
+                        let region = region
+                            .or_else(|| provision::aws_region(&creds))
+                            .unwrap_or("us-east-1");
+                        let (token, at) = provision::eks_token(&creds, cluster, region)?;
+                        // The token ends before the credentials that signed it
+                        // when they end sooner.
+                        let at = creds.expires_at.map_or(at, |end| end.min(at));
+                        (token, Some(at))
+                    }
+                    _ => bail!(
+                        "--format k8s-exec is for AWS (EKS), Google Cloud (GKE) and Azure (AKS) profiles; {} is none of them",
+                        profile.id
+                    ),
+                };
+                provision::exec_credential(&api_version, &token, expires_at)
+            }
+            _ => unreachable!("other formats print the credentials themselves"),
+        };
+        Ok(serde_json::to_string(&value)?)
     }
 
     /// Runs a command with a token minted for it alone, and revokes the token
@@ -65,12 +278,19 @@ impl App {
         ttl: Option<jiff::SignedDuration>,
         command: &[String],
     ) -> anyhow::Result<ExitCode> {
+        let ttl = self.agent_ttl(profile, ttl);
         let creds = self
             .with_login(|| providers::one_off_credentials(&self.config, profile, ttl))
             .await
             .with_context(|| format!("getting credentials for {}", profile.id))?;
         record_use(&profile.id);
-        let status = run_to_end(profile, &creds, command).await;
+        self.audit(
+            profile,
+            "env, revoked after",
+            creds.expires_at,
+            creds.token_id.as_deref(),
+        );
+        let status = run_to_end(profile, &creds, command, Provision::default()).await;
         if let Some(id) = &creds.token_id {
             match providers::revoke_token(&self.config, profile, id).await {
                 Ok(()) => eprintln!("fob: revoked the token for {}", profile.id),
@@ -156,6 +376,9 @@ pub(crate) fn creds_output(
             "expires_at": creds.expires_at,
             "lease_id": format!("omnifob:{}", profile.id),
         }),
+        CredsFormat::GcpExecutable | CredsFormat::K8sExec => {
+            unreachable!("written by App::tool_creds")
+        }
         CredsFormat::CredentialProcess => {
             let get = |k: &str| {
                 creds
@@ -180,28 +403,20 @@ pub(crate) fn creds_output(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Variables fob puts into AWS profiles' environments. When a profile hands
-/// out an access key, the ones among these it does not set are removed from
-/// the command's environment, so a session token, account or S3 endpoint
-/// left in the shell (by `fob use`, another tool or by hand) is not mixed
-/// with the new key. Region variables are not here: see [`child_env`].
-const AWS_CREDENTIAL_VARS: &[&str] = &[
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    // The older name of AWS_SESSION_TOKEN, which botocore still reads.
-    "AWS_SECURITY_TOKEN",
-    "AWS_CREDENTIAL_EXPIRATION",
-    "AWS_ACCOUNT_ID",
-    "AWS_ENDPOINT_URL_S3",
-];
+/// Variables fob puts into AWS profiles' environments besides the
+/// credentials, which go stale with them: the account, and R2's S3
+/// endpoint. Region variables are not here: see [`child_env`].
+const AWS_COMPANION_VARS: &[&str] = &["AWS_ACCOUNT_ID", "AWS_ENDPOINT_URL_S3"];
 
 /// The command's environment: the variables to remove from fob's own
 /// environment, and the ones to set.
 ///
 /// Removed are the variables a previous `fob use` set (`previous`, from
 /// `OMNIFOB_VARS`) that this profile does not, `OMNIFOB_VARS` itself, and,
-/// when the profile hands out an AWS access key, the AWS credential and
-/// endpoint variables it does not set. A Region variable is removed only
+/// when the profile hands out an AWS access key, the other sources of AWS
+/// credentials ([`AWS_CREDENTIAL_VARS`]: a profile, web identity, a
+/// container endpoint) and the account and endpoint variables it does not
+/// set. A Region variable is removed only
 /// when the profile sets the other one (R2 sets `AWS_REGION` alone), since
 /// for a profile with no Region of its own the one in the shell is the
 /// user's choice.
@@ -219,6 +434,7 @@ pub(crate) fn child_env(
     remove.push("OMNIFOB_VARS".to_string());
     if sets("AWS_ACCESS_KEY_ID") {
         let mut stale: Vec<&str> = AWS_CREDENTIAL_VARS.to_vec();
+        stale.extend(AWS_COMPANION_VARS);
         if sets("AWS_REGION") || sets("AWS_DEFAULT_REGION") {
             stale.extend(["AWS_REGION", "AWS_DEFAULT_REGION"]);
         }
@@ -274,14 +490,19 @@ pub(crate) async fn run_to_end(
     profile: &Profile,
     creds: &Credentials,
     command: &[String],
+    provision: Provision,
 ) -> anyhow::Result<ExitCode> {
-    let (remove, set) = command_env(profile, creds);
+    let (remove, set) = with_provision(command_env(profile, creds), &provision);
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
     for name in &remove {
         cmd.env_remove(name);
     }
     cmd.envs(set);
+    // The endpoints serve while the command runs, on this thread, and close
+    // with it; the files go when `provision` is dropped at the end.
+    let Provision { files, tasks, .. } = provision;
+    let mut serving = std::pin::pin!(Provision::run(tasks));
     // The terminal sends Ctrl-C, and a hangup when it closes, to the command
     // too; omnifob waits for the command to end instead of ending first.
     // Listening for them, from before the command starts, keeps them from
@@ -308,6 +529,7 @@ pub(crate) async fn run_to_end(
         #[cfg(unix)]
         tokio::select! {
             status = child.wait() => break status?,
+            () = &mut serving => {}
             _ = interrupt.recv() => {}
             _ = hangup.recv() => {}
             _ = terminate.recv() => {
@@ -321,13 +543,33 @@ pub(crate) async fn run_to_end(
         #[cfg(windows)]
         tokio::select! {
             status = child.wait() => break status?,
+            () = &mut serving => {}
             _ = interrupt.recv() => {}
             _ = ctrl_break.recv() => {}
         }
         #[cfg(not(any(unix, windows)))]
-        break child.wait().await?;
+        tokio::select! {
+            status = child.wait() => break status?,
+            () = &mut serving => {}
+        }
     };
+    drop(files);
     Ok(exit_code(status))
+}
+
+/// The command's environment with a provisioner's changes: the variables
+/// it replaces are removed, also from those the profile sets.
+fn with_provision(
+    (mut remove, mut set): (Vec<String>, Vec<(String, String)>),
+    provision: &Provision,
+) -> (Vec<String>, Vec<(String, String)>) {
+    set.retain(|(name, _)| !provision.remove.contains(name));
+    remove.extend(provision.remove.iter().cloned());
+    set.extend(provision.set.iter().cloned());
+    remove.retain(|name| !set.iter().any(|(n, _)| n == name));
+    remove.sort();
+    remove.dedup();
+    (remove, set)
 }
 
 pub(crate) fn exec(
@@ -454,10 +696,19 @@ mod tests {
             remove,
             [
                 "AWS_ACCOUNT_ID",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
                 "AWS_CREDENTIAL_EXPIRATION",
+                "AWS_DEFAULT_PROFILE",
                 "AWS_DEFAULT_REGION",
+                "AWS_PROFILE",
+                "AWS_ROLE_ARN",
+                "AWS_ROLE_SESSION_NAME",
                 "AWS_SECURITY_TOKEN",
                 "AWS_SESSION_TOKEN",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
                 "GOOGLE_CLOUD_PROJECT",
                 "OMNIFOB_EXPIRES_AT",
                 "OMNIFOB_VARS",
@@ -466,15 +717,24 @@ mod tests {
         assert!(set.contains(&("OMNIFOB_PROFILE".into(), "cf/acct/r2".into())));
 
         // An AWS profile without a Region keeps the user's, but not an R2
-        // endpoint left in the shell.
+        // endpoint, or another source of credentials, left in the shell.
         let creds = aws_creds(Some("111111111111"));
         let (remove, set) = child_env(&profile(), &creds, "");
         assert_eq!(
             remove,
             [
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
                 "AWS_CREDENTIAL_EXPIRATION",
+                "AWS_DEFAULT_PROFILE",
                 "AWS_ENDPOINT_URL_S3",
+                "AWS_PROFILE",
+                "AWS_ROLE_ARN",
+                "AWS_ROLE_SESSION_NAME",
                 "AWS_SECURITY_TOKEN",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
                 "OMNIFOB_VARS",
             ]
         );

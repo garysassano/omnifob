@@ -9,6 +9,7 @@
 
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod audit;
 pub mod config;
 pub mod context;
 pub mod credentials;
@@ -22,10 +23,12 @@ pub mod platform;
 pub mod profile;
 pub mod prompt;
 pub mod providers;
+pub mod provision;
+pub mod serve;
 pub mod store;
 
 pub use config::{Config, Integration};
-pub use context::{Context, Endpoints};
+pub use context::{Agent, Context, Endpoints};
 pub use credentials::Credentials;
 pub use profile::{Profile, Target};
 
