@@ -1,7 +1,9 @@
 //! Background renewal: `fob renew`, which fob starts detached when cached
 //! credentials near their end.
 
-use omnifob_core::{providers, store};
+use std::time::Duration;
+
+use omnifob_core::{Config, Integration, Profile, Target, providers, store};
 
 use crate::App;
 
@@ -12,7 +14,9 @@ impl App {
         let Some(profile) = self.cache.all().find(|p| p.id == id).cloned() else {
             return Ok(());
         };
-        let Some(_lock) = RenewalLock::acquire(id)? else {
+        // Taken at once or not at all: a renewal already running will do.
+        // The OS lets go of it when this process ends, however it ends.
+        let Some(_lock) = store::lock(&format!("renew-{id}"), Duration::ZERO).await? else {
             return Ok(());
         };
         providers::credentials(&self.config, &profile, false, None).await?;
@@ -20,9 +24,27 @@ impl App {
     }
 }
 
+/// Whether renewing `profile` needs someone at a terminal: a chained role
+/// whose trust policy wants an MFA code asks for one each session, so a
+/// renewal in the background always fails.
+fn needs_a_person(config: &Config, profile: &Profile) -> bool {
+    match (config.integration(&profile.integration), &profile.target) {
+        (Ok(Integration::AwsSso(c)), Target::AwsChained { label, .. }) => c
+            .chained
+            .get(label)
+            .is_some_and(|role| role.mfa_serial.is_some()),
+        _ => false,
+    }
+}
+
 /// Starts `fob renew <profile>` detached from the terminal, so the next
-/// command finds fresh credentials instead of waiting for them.
-pub(crate) fn spawn_renewal(profile_id: &str) {
+/// command finds fresh credentials instead of waiting for them. Profiles
+/// that cannot be renewed without a person are left for the next command.
+pub(crate) fn spawn_renewal(config: &Config, profile: &Profile) {
+    if needs_a_person(config, profile) {
+        return;
+    }
+    let profile_id = profile.id.as_str();
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -49,39 +71,41 @@ pub(crate) fn spawn_renewal(profile_id: &str) {
     }
 }
 
-/// A lock file per profile so concurrent commands start one renewal only.
-/// A lock older than two minutes is considered abandoned.
-pub(crate) struct RenewalLock(std::path::PathBuf);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl RenewalLock {
-    fn acquire(profile_id: &str) -> anyhow::Result<Option<Self>> {
-        let path = store::lock_dir()?.join(store::lock_file_name(&format!("renew-{profile_id}")));
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Some(Self(path))),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let age = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok());
-                    if age.is_some_and(|a| a < std::time::Duration::from_secs(120)) {
-                        return Ok(None);
-                    }
-                    let _ = std::fs::remove_file(&path);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(None)
-    }
-}
+    #[test]
+    fn chained_roles_with_mfa_are_not_renewed_in_the_background() {
+        let config = Config::parse(
+            r#"
+[integrations.acme]
+type = "aws-sso"
+start_url = "https://acme.awsapps.com/start"
+region = "eu-west-1"
 
-impl Drop for RenewalLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+[integrations.acme.chained.deploy]
+via_account_id = "111111111111"
+via_role = "Admin"
+role_arn = "arn:aws:iam::222222222222:role/Deploy"
+
+[integrations.acme.chained.guarded]
+via_account_id = "111111111111"
+via_role = "Admin"
+role_arn = "arn:aws:iam::222222222222:role/Guarded"
+mfa_serial = "arn:aws:iam::111111111111:mfa/me"
+"#,
+        )
+        .unwrap();
+        let chained = |label: &str| Profile {
+            id: format!("acme/x/{label}"),
+            integration: "acme".into(),
+            target: Target::AwsChained {
+                label: label.into(),
+                account_id: None,
+            },
+        };
+        assert!(!needs_a_person(&config, &chained("deploy")));
+        assert!(needs_a_person(&config, &chained("guarded")));
     }
 }

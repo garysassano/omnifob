@@ -51,7 +51,7 @@ impl App {
             .await
             .with_context(|| format!("getting credentials for {}", profile.id))?;
         if use_cache && creds.wants_renewal(Timestamp::now()) {
-            spawn_renewal(&profile.id);
+            spawn_renewal(&self.config, profile);
         }
         record_use(&profile.id);
         Ok(creds)
@@ -81,6 +81,42 @@ impl App {
             }
         }
         status
+    }
+
+    /// Revokes everything omnifob handed out: deletes the tokens every
+    /// Cloudflare integration minted, and clears every profile's cached
+    /// credentials. Sign-ins stay.
+    pub(crate) async fn revoke_all(&mut self) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        let mut deleted = 0;
+        for (name, integration) in &self.config.integrations {
+            if !matches!(integration, omnifob_core::Integration::Cloudflare(_)) {
+                continue;
+            }
+            let accounts = self.cloudflare_accounts(name);
+            match providers::revoke_all(name, integration, &accounts).await {
+                Ok(n) => deleted += n,
+                // Not signing in just for this: `fob logout` deleted them
+                // when the sign-in ended, unless it lapsed on its own.
+                Err(omnifob_core::Error::NeedsLogin { .. }) => eprintln!(
+                    "fob: '{name}' is not signed in, so its tokens were not deleted; `fob login {name}` and run this again"
+                ),
+                Err(e) => {
+                    eprintln!("fob: deleting the tokens of '{name}': {e:#}");
+                    failed.push(name.as_str());
+                }
+            }
+        }
+        let profiles: Vec<&Profile> = self.cache.all().collect();
+        providers::forget_credentials(profiles.iter().copied());
+        eprintln!(
+            "fob: deleted {deleted} token(s) and cleared the cache of {} profile(s); other credentials already handed out stay valid until they expire",
+            profiles.len()
+        );
+        if !failed.is_empty() {
+            anyhow::bail!("could not delete the tokens of {}", failed.join(", "));
+        }
+        Ok(())
     }
 
     pub(crate) async fn revoke(&mut self, query: Option<&str>) -> anyhow::Result<()> {
@@ -144,6 +180,94 @@ pub(crate) fn creds_output(
     Ok(serde_json::to_string(&value)?)
 }
 
+/// Variables fob puts into AWS profiles' environments. When a profile hands
+/// out an access key, the ones among these it does not set are removed from
+/// the command's environment, so a session token, account or S3 endpoint
+/// left in the shell (by `fob use`, another tool or by hand) is not mixed
+/// with the new key. Region variables are not here: see [`child_env`].
+const AWS_CREDENTIAL_VARS: &[&str] = &[
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    // The older name of AWS_SESSION_TOKEN, which botocore still reads.
+    "AWS_SECURITY_TOKEN",
+    "AWS_CREDENTIAL_EXPIRATION",
+    "AWS_ACCOUNT_ID",
+    "AWS_ENDPOINT_URL_S3",
+];
+
+/// The command's environment: the variables to remove from fob's own
+/// environment, and the ones to set.
+///
+/// Removed are the variables a previous `fob use` set (`previous`, from
+/// `OMNIFOB_VARS`) that this profile does not, `OMNIFOB_VARS` itself, and,
+/// when the profile hands out an AWS access key, the AWS credential and
+/// endpoint variables it does not set. A Region variable is removed only
+/// when the profile sets the other one (R2 sets `AWS_REGION` alone), since
+/// for a profile with no Region of its own the one in the shell is the
+/// user's choice.
+pub(crate) fn child_env(
+    profile: &Profile,
+    creds: &Credentials,
+    previous: &str,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let sets = |name: &str| creds.env.contains_key(name);
+    let mut remove: Vec<String> = previous
+        .split(',')
+        .filter(|name| !name.is_empty() && !sets(name))
+        .map(str::to_string)
+        .collect();
+    remove.push("OMNIFOB_VARS".to_string());
+    if sets("AWS_ACCESS_KEY_ID") {
+        let mut stale: Vec<&str> = AWS_CREDENTIAL_VARS.to_vec();
+        if sets("AWS_REGION") || sets("AWS_DEFAULT_REGION") {
+            stale.extend(["AWS_REGION", "AWS_DEFAULT_REGION"]);
+        }
+        remove.extend(
+            stale
+                .into_iter()
+                .filter(|name| !sets(name))
+                .map(str::to_string),
+        );
+    }
+    let mut set: Vec<(String, String)> = creds
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    set.push(("OMNIFOB_PROFILE".to_string(), profile.id.clone()));
+    match creds.expires_at {
+        Some(at) => set.push(("OMNIFOB_EXPIRES_AT".to_string(), at.to_string())),
+        None => remove.push("OMNIFOB_EXPIRES_AT".to_string()),
+    }
+    remove.sort();
+    remove.dedup();
+    (remove, set)
+}
+
+/// [`child_env`] for this process's `OMNIFOB_VARS`.
+fn command_env(profile: &Profile, creds: &Credentials) -> (Vec<String>, Vec<(String, String)>) {
+    let previous = std::env::var("OMNIFOB_VARS").unwrap_or_default();
+    child_env(profile, creds, &previous)
+}
+
+/// The exit code that reports a command's `status`: its own code where it
+/// fits in a byte. A larger code (Windows has 32-bit ones) whose low byte is
+/// 0 would read as success, so it becomes 1.
+fn exit_code(status: std::process::ExitStatus) -> ExitCode {
+    #[cfg(unix)]
+    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
+        return ExitCode::from(128 + signal as u8);
+    }
+    ExitCode::from(code_byte(status.code().unwrap_or(1)))
+}
+
+fn code_byte(code: i32) -> u8 {
+    match code as u8 {
+        0 if code != 0 => 1,
+        byte => byte,
+    }
+}
+
 /// Runs a command to its end and returns its exit status. Ctrl-C reaches the
 /// command, not omnifob, so omnifob can clean up after it.
 pub(crate) async fn run_to_end(
@@ -151,30 +275,40 @@ pub(crate) async fn run_to_end(
     creds: &Credentials,
     command: &[String],
 ) -> anyhow::Result<ExitCode> {
-    let mut child = match tokio::process::Command::new(&command[0])
-        .args(&command[1..])
-        .envs(&creds.env)
-        .env("OMNIFOB_PROFILE", &profile.id)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return Ok(could_not_start(&command[0], &e)),
-    };
+    let (remove, set) = command_env(profile, creds);
+    let mut cmd = tokio::process::Command::new(&command[0]);
+    cmd.args(&command[1..]);
+    for name in &remove {
+        cmd.env_remove(name);
+    }
+    cmd.envs(set);
     // The terminal sends Ctrl-C, and a hangup when it closes, to the command
     // too; omnifob waits for the command to end instead of ending first.
+    // Listening for them, from before the command starts, keeps them from
+    // ending omnifob.
     #[cfg(unix)]
-    let (mut hangup, mut terminate) = {
+    let (mut interrupt, mut hangup, mut terminate) = {
         use tokio::signal::unix::{SignalKind, signal};
         (
+            signal(SignalKind::interrupt())?,
             signal(SignalKind::hangup())?,
             signal(SignalKind::terminate())?,
         )
+    };
+    #[cfg(windows)]
+    let (mut interrupt, mut ctrl_break) = (
+        tokio::signal::windows::ctrl_c()?,
+        tokio::signal::windows::ctrl_break()?,
+    );
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Ok(could_not_start(&command[0], &e)),
     };
     let status = loop {
         #[cfg(unix)]
         tokio::select! {
             status = child.wait() => break status?,
-            _ = tokio::signal::ctrl_c() => {}
+            _ = interrupt.recv() => {}
             _ = hangup.recv() => {}
             _ = terminate.recv() => {
                 // Unlike Ctrl-C, nobody else told the command to stop.
@@ -184,17 +318,16 @@ pub(crate) async fn run_to_end(
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         tokio::select! {
             status = child.wait() => break status?,
-            _ = tokio::signal::ctrl_c() => {}
+            _ = interrupt.recv() => {}
+            _ = ctrl_break.recv() => {}
         }
+        #[cfg(not(any(unix, windows)))]
+        break child.wait().await?;
     };
-    #[cfg(unix)]
-    if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
-        return Ok(ExitCode::from(128 + signal as u8));
-    }
-    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    Ok(exit_code(status))
 }
 
 pub(crate) fn exec(
@@ -202,10 +335,13 @@ pub(crate) fn exec(
     creds: &Credentials,
     command: &[String],
 ) -> anyhow::Result<ExitCode> {
+    let (remove, set) = command_env(profile, creds);
     let mut cmd = std::process::Command::new(&command[0]);
-    cmd.args(&command[1..])
-        .envs(&creds.env)
-        .env("OMNIFOB_PROFILE", &profile.id);
+    cmd.args(&command[1..]);
+    for name in &remove {
+        cmd.env_remove(name);
+    }
+    cmd.envs(set);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -214,11 +350,25 @@ pub(crate) fn exec(
     }
     #[cfg(not(unix))]
     {
+        // Ctrl-C reaches the command, which shares the console; while a
+        // handler is registered it does not end fob, which waits for the
+        // command and then reports its status.
+        #[cfg(windows)]
+        let _ignored = (
+            tokio::signal::windows::ctrl_c()?,
+            tokio::signal::windows::ctrl_break()?,
+        );
         let status = match cmd.status() {
             Ok(status) => status,
             Err(e) => return Ok(could_not_start(&command[0], &e)),
         };
-        Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+        // Windows exit codes are 32-bit; nothing is left to clean up, so
+        // pass the command's code on whole.
+        #[cfg(windows)]
+        if let Some(code) = status.code() {
+            std::process::exit(code);
+        }
+        Ok(exit_code(status))
     }
 }
 
@@ -270,5 +420,80 @@ mod tests {
         // Optional in the format: left out rather than null.
         let value = output(aws_creds(None));
         assert!(value.get("AccountId").is_none(), "{value}");
+    }
+
+    fn profile() -> Profile {
+        Profile::new(
+            "cf",
+            "acct",
+            "r2",
+            Target::Cloudflare {
+                account_id: "a".into(),
+                account_name: "acct".into(),
+                template: "r2".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn the_command_gets_no_stale_variables() {
+        // R2's S3 credentials after an AWS profile's `fob use`.
+        let mut creds = Credentials::default();
+        for (k, v) in [
+            ("AWS_ACCESS_KEY_ID", "r2-key"),
+            ("AWS_SECRET_ACCESS_KEY", "r2-secret"),
+            ("AWS_ENDPOINT_URL_S3", "https://a.r2.cloudflarestorage.com"),
+            ("AWS_REGION", "auto"),
+            ("CLOUDFLARE_API_TOKEN", "t"),
+        ] {
+            creds.env.insert(k.into(), v.into());
+        }
+        let previous = "AWS_ACCESS_KEY_ID,AWS_REGION,AWS_SESSION_TOKEN,GOOGLE_CLOUD_PROJECT";
+        let (remove, set) = child_env(&profile(), &creds, previous);
+        assert_eq!(
+            remove,
+            [
+                "AWS_ACCOUNT_ID",
+                "AWS_CREDENTIAL_EXPIRATION",
+                "AWS_DEFAULT_REGION",
+                "AWS_SECURITY_TOKEN",
+                "AWS_SESSION_TOKEN",
+                "GOOGLE_CLOUD_PROJECT",
+                "OMNIFOB_EXPIRES_AT",
+                "OMNIFOB_VARS",
+            ]
+        );
+        assert!(set.contains(&("OMNIFOB_PROFILE".into(), "cf/acct/r2".into())));
+
+        // An AWS profile without a Region keeps the user's, but not an R2
+        // endpoint left in the shell.
+        let creds = aws_creds(Some("111111111111"));
+        let (remove, set) = child_env(&profile(), &creds, "");
+        assert_eq!(
+            remove,
+            [
+                "AWS_CREDENTIAL_EXPIRATION",
+                "AWS_ENDPOINT_URL_S3",
+                "AWS_SECURITY_TOKEN",
+                "OMNIFOB_VARS",
+            ]
+        );
+        assert!(set.contains(&("OMNIFOB_EXPIRES_AT".into(), "2100-01-01T00:00:00Z".into())));
+
+        // A token profile leaves AWS variables alone unless `fob use` set them.
+        let mut creds = Credentials::default();
+        creds.env.insert("MODAL_TOKEN_ID".into(), "m".into());
+        let (remove, _) = child_env(&profile(), &creds, "");
+        assert_eq!(remove, ["OMNIFOB_EXPIRES_AT", "OMNIFOB_VARS"]);
+    }
+
+    #[test]
+    fn exit_codes_that_would_read_as_success_become_failures() {
+        assert_eq!(code_byte(0), 0);
+        assert_eq!(code_byte(3), 3);
+        assert_eq!(code_byte(256), 1);
+        assert_eq!(code_byte(257), 1);
+        assert_eq!(code_byte(-1073741510), 0x3a);
+        assert_eq!(code_byte(0x1_0000), 1);
     }
 }

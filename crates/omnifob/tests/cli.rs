@@ -478,6 +478,9 @@ async fn sync_and_list() {
     assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
     let (stdout, _) = fob.ok(&["ls", "prod"]);
     assert_eq!(lines(&stdout), ["acme/prod/Admin"]);
+    // Several words, as every other profile command takes them.
+    let (stdout, _) = fob.ok(&["list", "prod", "admin"]);
+    assert_eq!(lines(&stdout), ["acme/prod/Admin"]);
     let (stdout, _) = fob.ok(&["list", "--json"]);
     let profiles: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(profiles[0]["id"], "acme/dev/Admin");
@@ -700,49 +703,112 @@ async fn sync_saves_what_synced_and_reports_the_rest() {
 
 /// Not a test of its own: `fob exec` runs this test binary with
 /// `--ignored --exact` and `OMNIFOB_E2E_CHILD` set, as a child that works on
-/// every platform, and it prints the variables it got.
+/// every platform, and it prints the variables `OMNIFOB_E2E_CHILD_VARS` names.
 #[test]
-#[ignore = "run by exec_hands_the_account_and_region_to_the_command"]
+#[ignore = "run by exec_child"]
 fn child_prints_its_environment() {
     if std::env::var_os("OMNIFOB_E2E_CHILD").is_none() {
         return;
     }
-    for name in [
-        "AWS_ACCESS_KEY_ID",
-        "AWS_ACCOUNT_ID",
-        "AWS_REGION",
-        "OMNIFOB_PROFILE",
-    ] {
-        println!("child: {name}={}", std::env::var(name).unwrap_or_default());
+    let names = std::env::var("OMNIFOB_E2E_CHILD_VARS").unwrap_or_default();
+    for name in names.split(',') {
+        match std::env::var(name) {
+            Ok(value) => println!("child: {name}={value}"),
+            Err(_) => println!("child: {name} unset"),
+        }
     }
+}
+
+/// Runs `fob exec <profile> -- <this test binary>` with `env` added to
+/// fob's environment; returns what the child printed of `names`.
+fn exec_child(fob: &Fob, profile: &str, env: &[(&str, &str)], names: &[&str]) -> Vec<String> {
+    let me = std::env::current_exe().unwrap();
+    let mut cmd = fob.command(&[
+        "exec",
+        profile,
+        "--",
+        me.to_str().unwrap(),
+        "child_prints_its_environment",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    cmd.env("OMNIFOB_E2E_CHILD", "1")
+        .env("OMNIFOB_E2E_CHILD_VARS", names.join(","));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    stdout
+        .lines()
+        .filter_map(|l| l.split_once("child: ").map(|(_, v)| v.to_string()))
+        .collect()
+}
+
+/// What an earlier `fob use` or another tool left in the shell does not
+/// reach the command next to the new profile's credentials.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_leaves_no_stale_variables_in_the_command() {
+    let (fob, _server) = synced_portal("exec-stale").await;
+    let printed = exec_child(
+        &fob,
+        "acme/dev/Admin",
+        &[
+            // An R2 profile's `fob use`, and a variable it set.
+            ("OMNIFOB_VARS", "AWS_ENDPOINT_URL_S3,CLOUDFLARE_API_TOKEN"),
+            (
+                "AWS_ENDPOINT_URL_S3",
+                "https://acct.r2.cloudflarestorage.com",
+            ),
+            ("CLOUDFLARE_API_TOKEN", "stale"),
+            // Set by another tool, not by fob.
+            ("AWS_SECURITY_TOKEN", "stale"),
+            ("OMNIFOB_EXPIRES_AT", "2000-01-01T00:00:00Z"),
+            ("UNRELATED", "kept"),
+        ],
+        &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SESSION_TOKEN",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_SECURITY_TOKEN",
+            "CLOUDFLARE_API_TOKEN",
+            "OMNIFOB_VARS",
+            "OMNIFOB_EXPIRES_AT",
+            "UNRELATED",
+        ],
+    );
+    assert_eq!(
+        printed,
+        [
+            "AWS_ACCESS_KEY_ID=ASIA111111111111",
+            "AWS_SESSION_TOKEN=role-session",
+            "AWS_ENDPOINT_URL_S3 unset",
+            "AWS_SECURITY_TOKEN unset",
+            "CLOUDFLARE_API_TOKEN unset",
+            "OMNIFOB_VARS unset",
+            "OMNIFOB_EXPIRES_AT=2100-01-01T00:00:00Z",
+            "UNRELATED=kept",
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_hands_the_account_and_region_to_the_command() {
     let (fob, _server) = synced_portal("exec").await;
-    let me = std::env::current_exe().unwrap();
-    let output = fob
-        .command(&[
-            "exec",
-            "acme/dev/Admin",
-            "--",
-            me.to_str().unwrap(),
-            "child_prints_its_environment",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("OMNIFOB_E2E_CHILD", "1")
-        .output()
-        .unwrap();
-    let (stdout, stderr) = texts(&output);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
-    // The harness writes "test <name> ... " before the first line.
-    let printed: Vec<&str> = stdout
-        .lines()
-        .filter_map(|l| l.split_once("child: ").map(|(_, v)| v))
-        .collect();
+    let printed = exec_child(
+        &fob,
+        "acme/dev/Admin",
+        &[],
+        &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_ACCOUNT_ID",
+            "AWS_REGION",
+            "OMNIFOB_PROFILE",
+        ],
+    );
     assert_eq!(
         printed,
         [
@@ -961,4 +1027,272 @@ browser = "work"
         std::fs::read_to_string(&out).unwrap(),
         "https://console.example.test/home?a=1&b=two words"
     );
+}
+
+/// A broken config.toml or profiles.json must not break the shell's
+/// start-up (`fob activate`) or `fob unuse`, and `fob sync` rewrites a
+/// corrupt profiles.json.
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_commands_work_with_a_broken_config() {
+    let (fob, _server) = synced_portal("broken").await;
+    let profiles = fob.root.join("state").join("omnifob").join("profiles.json");
+    std::fs::write(&profiles, "{ not json").unwrap();
+    // Status reports, and sync starts over from no profiles.
+    let (stdout, stderr) = fob.ok(&["status"]);
+    assert!(
+        stderr.contains("ignoring the discovered profiles"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("0 profiles"), "{stdout}");
+    fob.fails(&["list"]);
+    fob.ok(&["sync"]);
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
+
+    std::fs::write(&profiles, "{ not json").unwrap();
+    fob.write_config("[integrations.acme\nbroken");
+    let (stdout, _) = fob.ok(&["activate", "bash"]);
+    assert!(stdout.contains("fob()"), "{stdout}");
+    let output = fob
+        .command(&["env", "--shell", "bash", "--unset"])
+        .env("OMNIFOB_VARS", "AWS_REGION")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("unset AWS_REGION\n"), "{stdout}");
+    let stderr = fob.fails(&["use", "acme/prod/Admin"]);
+    assert!(stderr.contains("needs the shell integration"), "{stderr}");
+    // Commands that need the config still say what is wrong with it.
+    let stderr = fob.fails(&["list"]);
+    assert!(stderr.contains("parsing"), "{stderr}");
+}
+
+/// `--config` stands in for `OMNIFOB_CONFIG`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_config_flag_names_the_config_file() {
+    let (fob, _server) = synced_portal("config-flag").await;
+    let elsewhere = fob.root.join("elsewhere.toml");
+    std::fs::rename(fob.config_file(), &elsewhere).unwrap();
+    let (stdout, _) = fob.ok(&["status"]);
+    assert!(stdout.contains("No integrations configured"), "{stdout}");
+    let (stdout, _) = fob.ok(&["status", "--config", elsewhere.to_str().unwrap()]);
+    assert!(stdout.starts_with("Secrets: "), "{stdout}");
+    assert!(
+        stdout.contains("acme  aws-sso  signed in until 2100-01-01"),
+        "{stdout}"
+    );
+}
+
+/// A path given with `--config` has to exist, and `fob exec` fails with 125
+/// when the config does not load, as for its other failures.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_or_broken_config_is_an_error() {
+    let (fob, _server) = synced_portal("config-missing").await;
+    let missing = fob.root.join("missing.toml");
+    let stderr = fob.fails(&["status", "--config", missing.to_str().unwrap()]);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    let output = fob.run(&[
+        "--config",
+        missing.to_str().unwrap(),
+        "exec",
+        "acme/prod/Admin",
+        "--",
+        "true",
+    ]);
+    assert_eq!(output.status.code(), Some(125));
+
+    fob.write_config("[integrations.acme\nbroken");
+    let output = fob.run(&["exec", "acme/prod/Admin", "--", "true"]);
+    assert_eq!(output.status.code(), Some(125));
+    let (_, stderr) = texts(&output);
+    assert!(stderr.contains("parsing"), "{stderr}");
+}
+
+/// The shell wrapper recognises `use` and `unuse` after `--config`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shell_wrapper_sees_use_after_the_config_flag() {
+    let (fob, _server) = synced_portal("wrapper-config").await;
+    let elsewhere = fob.root.join("elsewhere.toml");
+    std::fs::rename(fob.config_file(), &elsewhere).unwrap();
+    let bin_dir = Path::new(FOB).parent().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let base = fob.command(&[]);
+    let mut bash = Command::new("bash");
+    for (name, value) in base.get_envs() {
+        match value {
+            Some(value) => bash.env(name, value),
+            None => bash.env_remove(name),
+        };
+    }
+    let script = r#"eval "$(fob activate bash)"
+fob --config "$1" use acme/prod/Admin || exit 1
+echo "profile=$OMNIFOB_PROFILE"
+fob --config="$1" unuse || exit 1
+echo "after=${OMNIFOB_PROFILE:-none}"
+"#;
+    let output = bash
+        .env("PATH", path)
+        .args(["-c", script, "bash", elsewhere.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(lines(&stdout), ["profile=acme/prod/Admin", "after=none"]);
+}
+
+/// `fob status --json` and `fob check --json` for scripts and status bars,
+/// and `fob check --integration` for one sign-in.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_and_check_print_json() {
+    let (fob, _server) = synced_portal("json").await;
+    let mut config = portal_config("acme");
+    config.push_str(&portal_config("other").replace("acme.awsapps.com", "other.awsapps.com"));
+    fob.write_config(&config);
+
+    let output = fob
+        .command(&["status", "--json"])
+        .env("OMNIFOB_PROFILE", "acme/prod/Admin")
+        .env("OMNIFOB_EXPIRES_AT", "2100-01-01T00:00:00Z")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    let status: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["active_profile"], "acme/prod/Admin");
+    assert_eq!(status["active_expires_at"], "2100-01-01T00:00:00Z");
+    let integrations = status["integrations"].as_array().unwrap();
+    assert_eq!(integrations[0]["name"], "acme");
+    assert_eq!(integrations[0]["type"], "aws-sso");
+    assert_eq!(integrations[0]["signed_in"], true);
+    assert_eq!(integrations[0]["profiles"], 2);
+    assert!(integrations[0]["synced_at"].is_string());
+    assert_eq!(integrations[1]["name"], "other");
+    assert_eq!(integrations[1]["signed_in"], false);
+    assert!(integrations[1]["synced_at"].is_null());
+
+    // The text form: aligned columns, the active profile and sync age.
+    let output = fob
+        .command(&["status"])
+        .env("OMNIFOB_PROFILE", "acme/prod/Admin")
+        .output()
+        .unwrap();
+    let (stdout, _) = texts(&output);
+    assert!(
+        stdout.contains("Active in this shell: acme/prod/Admin\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("acme   aws-sso  signed in until"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("other  aws-sso  signed out, 0 profiles, not synced"),
+        "{stdout}"
+    );
+
+    let output = fob.run(&["check", "--json"]);
+    assert!(!output.status.success());
+    let checked: Value = serde_json::from_str(&texts(&output).0).unwrap();
+    assert_eq!(checked[0]["integration"], "acme");
+    assert_eq!(checked[0]["ok"], true);
+    assert_eq!(checked[1]["integration"], "other");
+    assert_eq!(checked[1]["ok"], false);
+    assert!(
+        checked[1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("fob login other")
+    );
+
+    let (stdout, _) = fob.ok(&["check", "--integration", "acme"]);
+    assert_eq!(lines(&stdout).len(), 1, "{stdout}");
+    assert!(stdout.starts_with("ok   acme: "), "{stdout}");
+    let stderr = fob.fails(&["check", "--integration", "nope"]);
+    assert!(stderr.contains("nope"), "{stderr}");
+
+    // The mock has no STS, so the profile's check fails, in JSON too.
+    let output = fob.run(&["check", "acme/prod/Admin", "--json"]);
+    assert!(!output.status.success());
+    let checked: Value = serde_json::from_str(&texts(&output).0).unwrap();
+    assert_eq!(checked[0]["profile"], "acme/prod/Admin");
+    assert_eq!(checked[0]["ok"], false);
+}
+
+/// Under an agent, `fob list` shows every profile but marks the ones
+/// `[agent] profiles` keeps from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_sees_which_profiles_are_closed_to_it() {
+    let (fob, _server) = synced_portal("agent-list").await;
+    let mut config = portal_config("acme");
+    config.push_str("\n[agent]\nprofiles = [\"acme/dev/*\"]\n");
+    fob.write_config(&config);
+    let output = fob.run_as_agent(&["list"]);
+    let (stdout, _) = texts(&output);
+    assert_eq!(
+        lines(&stdout),
+        ["acme/dev/Admin", "acme/prod/Admin (not open to agents)"]
+    );
+    assert!(!stdout.contains("OMNIFOB_AGENT"), "{stdout}");
+    let output = fob.run_as_agent(&["list", "--json"]);
+    let profiles: Value = serde_json::from_str(&texts(&output).0).unwrap();
+    assert_eq!(profiles[0]["open_to_agents"], true);
+    assert_eq!(profiles[1]["open_to_agents"], false);
+    // People see the list as it is.
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
+    let (stdout, _) = fob.ok(&["list", "--json"]);
+    assert!(!stdout.contains("open_to_agents"), "{stdout}");
+}
+
+/// `fob revoke --all` clears every cached credential; `fob logout --all`
+/// signs out of every integration and goes on past those not signed in.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_and_logout_all() {
+    let (fob, server) = synced_portal("all").await;
+    Mock::given(method("POST"))
+        .and(path("/logout"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    for profile in ["acme/dev/Admin", "acme/prod/Admin"] {
+        fob.ok(&["creds", profile, "--format", "credential-process"]);
+        assert!(fob.secret(&format!("credentials/{profile}")).exists());
+    }
+    let (_, stderr) = fob.ok(&["revoke", "--all"]);
+    assert!(
+        stderr.contains("deleted 0 token(s) and cleared the cache of 2 profile(s)"),
+        "{stderr}"
+    );
+    for profile in ["acme/dev/Admin", "acme/prod/Admin"] {
+        assert!(!fob.secret(&format!("credentials/{profile}")).exists());
+    }
+    fob.fails(&["revoke", "--all", "acme/dev/Admin"]);
+    // A corrupt profiles.json does not stop it: the Cloudflare tokens are
+    // read from the catalog.
+    let profiles = fob.root.join("state").join("omnifob").join("profiles.json");
+    let saved = std::fs::read(&profiles).unwrap();
+    std::fs::write(&profiles, "{ not json").unwrap();
+    let (_, stderr) = fob.ok(&["revoke", "--all"]);
+    assert!(
+        stderr.contains("ignoring the discovered profiles"),
+        "{stderr}"
+    );
+    std::fs::write(&profiles, saved).unwrap();
+
+    let mut config = portal_config("acme");
+    config.push_str(&portal_config("other").replace("acme.awsapps.com", "other.awsapps.com"));
+    fob.write_config(&config);
+    let (_, stderr) = fob.ok(&["logout", "--all"]);
+    assert!(stderr.contains("fob: signed out of 'acme'"), "{stderr}");
+    assert!(
+        stderr.contains("fob: 'other' was not signed in"),
+        "{stderr}"
+    );
+    assert!(!fob.secret("aws-sso/acme/token").exists());
 }

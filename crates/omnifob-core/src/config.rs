@@ -165,10 +165,9 @@ impl Browser {
                 );
                 let isolated = [profile_dir, "--no-first-run".to_string()]
                     .into_iter()
-                    .chain(
-                        args.into_iter()
-                            .filter(|arg| !arg.starts_with("--profile-directory=")),
-                    )
+                    .chain(args.into_iter().filter(|arg| {
+                        !arg.starts_with("--profile-directory=") && arg != "--no-first-run"
+                    }))
                     .collect();
                 (program, isolated)
             }
@@ -194,7 +193,8 @@ impl Browser {
 
 /// The Chromium profile folder for fob profile `id`: `fob` and the id's
 /// segments, separated by spaces. Characters a Windows folder name cannot
-/// hold become `_`.
+/// hold become `_`, and trailing dots and spaces, which Windows drops from a
+/// folder name, are left out.
 fn chromium_profile_directory(id: &str) -> String {
     let mut dir = String::from("fob");
     for segment in id.split('/') {
@@ -207,7 +207,7 @@ fn chromium_profile_directory(id: &str) -> String {
             }
         }));
     }
-    dir
+    dir.trim_end_matches(['.', ' ']).to_string()
 }
 
 /// An identity source: something you sign in to once and that yields many
@@ -2085,7 +2085,7 @@ mod tests {
         let config = Config::parse(
             r#"
             [browsers.chrome]
-            command = ["chrome", "--profile-directory=Profile 1", "--new-window", "{url}"]
+            command = ["chrome", "--profile-directory=Profile 1", "--no-first-run", "--new-window", "{url}"]
             isolate = "chromium-profile"
 
             [browsers.firefox]
@@ -2115,6 +2115,11 @@ mod tests {
                     url.to_string(),
                 ]
             )
+        );
+        // Windows drops trailing dots and spaces from folder names.
+        assert_eq!(
+            chromium_profile_directory("acme/prod/Ops. "),
+            "fob acme prod Ops"
         );
         let (_, args) = config.browsers["firefox"].console_command_for(url, &aws);
         assert_eq!(&args[..2], ["-P", "work"]);

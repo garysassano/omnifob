@@ -33,7 +33,20 @@ fn quote(shell: Shell, value: &str) -> String {
     match shell {
         Shell::Posix => format!("'{}'", value.replace('\'', r"'\''")),
         Shell::Fish => format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'")),
-        Shell::Powershell => format!("'{}'", value.replace('\'', "''")),
+        Shell::Powershell => {
+            // PowerShell also ends a single-quoted string at the typographic
+            // single quotes U+2018 to U+201B; doubling each keeps it literal.
+            let mut quoted = String::with_capacity(value.len() + 2);
+            quoted.push('\'');
+            for c in value.chars() {
+                if matches!(c, '\'' | '\u{2018}'..='\u{201B}') {
+                    quoted.push(c);
+                }
+                quoted.push(c);
+            }
+            quoted.push('\'');
+            quoted
+        }
     }
 }
 
@@ -65,13 +78,15 @@ fn previous_names<'a>(previous: &'a [&'a str]) -> impl Iterator<Item = &'a str> 
 /// Removes the variables a previous `fob use` set, plus omnifob's own markers.
 pub fn unset(shell: Shell, previous: &[&str]) -> String {
     previous_names(previous)
-        .chain(["OMNIFOB_PROFILE", "OMNIFOB_VARS"])
+        .chain(["OMNIFOB_PROFILE", "OMNIFOB_VARS", "OMNIFOB_EXPIRES_AT"])
         .map(|name| remove(shell, name))
         .collect()
 }
 
 /// Exports `creds`, first removing variables of the previous profile that
-/// this one does not set, so nothing stale (like `AWS_REGION`) lingers.
+/// this one does not set, so nothing stale (like `AWS_REGION`) lingers, and
+/// sets `OMNIFOB_PROFILE`, `OMNIFOB_VARS` and, when the credentials expire,
+/// `OMNIFOB_EXPIRES_AT` (RFC 3339).
 /// Refuses credentials with a variable name that is not
 /// `[A-Za-z_][A-Za-z0-9_]*`, which the shell would read as code.
 pub fn export(
@@ -93,6 +108,12 @@ pub fn export(
     let names: Vec<&str> = creds.env.keys().map(String::as_str).collect();
     out.push_str(&set(shell, "OMNIFOB_PROFILE", profile_id));
     out.push_str(&set(shell, "OMNIFOB_VARS", &names.join(",")));
+    // For prompts (Starship and the like) to count down to, whatever the
+    // provider.
+    match creds.expires_at {
+        Some(at) => out.push_str(&set(shell, "OMNIFOB_EXPIRES_AT", &at.to_string())),
+        None => out.push_str(&remove(shell, "OMNIFOB_EXPIRES_AT")),
+    }
     Ok(out)
 }
 
@@ -106,23 +127,32 @@ pub fn activation_line(shell: Shell) -> &'static str {
 }
 
 /// A `fob` wrapper function: `fob use [profile]` and `fob unuse` change the
-/// current shell; everything else runs the binary. Also registers completions,
-/// which ask the binary for profile ids as you type.
+/// current shell; everything else runs the binary. Global options before the
+/// command (`fob --config x use p`) are passed on. Also registers
+/// completions, which ask the binary for profile ids as you type.
 pub fn activate(shell: Shell) -> &'static str {
     match shell {
         Shell::Posix => {
             r#"fob() {
-  case "$1" in
+  local __fob_config=
+  while :; do
+    case "${1:-}" in
+      --config) [ $# -ge 2 ] || break; __fob_config="--config=$2"; shift 2 ;;
+      --config=*) __fob_config="$1"; shift ;;
+      *) break ;;
+    esac
+  done
+  case "${1:-}" in
     use)
       shift
       local __fob_env
-      __fob_env="$(command fob env --shell posix "$@")" && eval "$__fob_env"
+      __fob_env="$(command fob ${__fob_config:+"$__fob_config"} env --shell posix "$@")" && eval "$__fob_env"
       ;;
     unuse)
-      eval "$(command fob env --shell posix --unset)"
+      eval "$(command fob ${__fob_config:+"$__fob_config"} env --shell posix --unset)"
       ;;
     *)
-      command fob "$@"
+      command fob ${__fob_config:+"$__fob_config"} "$@"
       ;;
   esac
 }
@@ -135,33 +165,62 @@ fi
         }
         Shell::Fish => {
             r#"function fob
+  set -l __fob_global
+  while test (count $argv) -gt 0
+    switch $argv[1]
+      case --config
+        test (count $argv) -ge 2; or break
+        set -a __fob_global --config=$argv[2]
+        set -e argv[1..2]
+      case '--config=*'
+        set -a __fob_global $argv[1]
+        set -e argv[1]
+      case '*'
+        break
+    end
+  end
   switch "$argv[1]"
     case use
-      set -l __fob_env (command fob env --shell fish $argv[2..-1]); or return
+      set -l __fob_env (command fob $__fob_global env --shell fish $argv[2..-1]); or return
       printf '%s\n' $__fob_env | source
     case unuse
-      command fob env --shell fish --unset | source
+      command fob $__fob_global env --shell fish --unset | source
     case '*'
-      command fob $argv
+      command fob $__fob_global $argv
   end
 end
 COMPLETE=fish command fob | source
 "#
         }
         Shell::Powershell => {
-            r#"function fob {
-  if ($args.Count -gt 0 -and $args[0] -eq 'use') {
-    $rest = @($args | Select-Object -Skip 1)
-    $code = (& fob.exe env --shell powershell @rest) -join "`n"
-    if ($LASTEXITCODE -eq 0) { Invoke-Expression $code }
-  } elseif ($args.Count -gt 0 -and $args[0] -eq 'unuse') {
-    Invoke-Expression ((& fob.exe env --shell powershell --unset) -join "`n")
+            r#"$global:__fob_bin = (Get-Command fob -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+function fob {
+  $fobGlobal = @()
+  $fobArgs = @($args)
+  while ($fobArgs.Count -gt 0) {
+    if ($fobArgs[0] -eq '--config' -and $fobArgs.Count -ge 2) {
+      $fobGlobal += "--config=$($fobArgs[1])"
+      $fobArgs = @($fobArgs | Select-Object -Skip 2)
+    } elseif ("$($fobArgs[0])" -like '--config=*') {
+      $fobGlobal += $fobArgs[0]
+      $fobArgs = @($fobArgs | Select-Object -Skip 1)
+    } else {
+      break
+    }
+  }
+  if ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'use') {
+    $rest = @($fobArgs | Select-Object -Skip 1)
+    $code = (& $global:__fob_bin @fobGlobal env --shell powershell @rest) -join "`n"
+    if ($LASTEXITCODE -eq 0 -and $code) { Invoke-Expression $code }
+  } elseif ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'unuse') {
+    $code = (& $global:__fob_bin @fobGlobal env --shell powershell --unset) -join "`n"
+    if ($LASTEXITCODE -eq 0 -and $code) { Invoke-Expression $code }
   } else {
-    & fob.exe @args
+    & $global:__fob_bin @args
   }
 }
 $env:COMPLETE = "powershell"
-fob.exe | Out-String | Invoke-Expression
+& $global:__fob_bin | Out-String | Invoke-Expression
 Remove-Item Env:\COMPLETE
 "#
         }
@@ -191,6 +250,13 @@ mod tests {
         assert_eq!(quote(Shell::Posix, "it's"), r"'it'\''s'");
         assert_eq!(quote(Shell::Fish, r"a\b'c"), r"'a\\b\'c'");
         assert_eq!(quote(Shell::Powershell, "it's"), "'it''s'");
+        assert_eq!(
+            quote(
+                Shell::Powershell,
+                "a\u{2018}b\u{2019}c\u{201A}d\u{201B}e\u{201C}"
+            ),
+            "'a\u{2018}\u{2018}b\u{2019}\u{2019}c\u{201A}\u{201A}d\u{201B}\u{201B}e\u{201C}'"
+        );
     }
 
     #[test]
@@ -207,8 +273,42 @@ mod tests {
             "unset AWS_REGION\n\
              export CLOUDFLARE_API_TOKEN='t'\n\
              export OMNIFOB_PROFILE='cf/acct/workers'\n\
-             export OMNIFOB_VARS='CLOUDFLARE_API_TOKEN'\n"
+             export OMNIFOB_VARS='CLOUDFLARE_API_TOKEN'\n\
+             unset OMNIFOB_EXPIRES_AT\n"
         );
+        let mut expiring = creds(&[("CLOUDFLARE_API_TOKEN", "t")]);
+        expiring.expires_at = Some("2100-01-01T00:00:00Z".parse().unwrap());
+        let out = export(Shell::Fish, "p", &expiring, &[]).unwrap();
+        assert!(
+            out.ends_with("set -gx OMNIFOB_EXPIRES_AT '2100-01-01T00:00:00Z'\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn powershell_finds_fob_on_any_platform() {
+        let script = activate(Shell::Powershell);
+        assert!(!script.contains("fob.exe"), "{script}");
+        assert!(script.contains("-and $code"), "{script}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_posix_wrapper_works_under_set_u() {
+        // Bare `fob` under `set -u` must reach the binary, not fail on "$1".
+        // The function only: completion needs bash or zsh.
+        let script = activate(Shell::Posix)
+            .split("if [ -n")
+            .next()
+            .unwrap()
+            .replace("command fob", "echo ran");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -u\n{script}fob\n"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "ran\n");
     }
 
     #[test]
@@ -221,7 +321,7 @@ mod tests {
             for bad in ["touch", "$(id)", "A B"] {
                 assert!(!out.contains(bad), "{bad} in {out}");
             }
-            assert_eq!(out.lines().count(), 3, "{out}");
+            assert_eq!(out.lines().count(), 4, "{out}");
 
             let out = export(shell, "p", &creds(&[("OK", "v")]), &crafted).unwrap();
             for bad in ["touch", "$(id)", "A B"] {

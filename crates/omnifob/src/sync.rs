@@ -153,11 +153,30 @@ impl App {
             Some(q) => self.cache.find(q),
             None => self.cache.all().collect(),
         };
+        // An agent sees every profile, so it can tell the user which one to
+        // open to it, but the ones `[agent] profiles` keeps from it are
+        // marked, so it does not try them.
+        let marks = agent::active() && self.config.agent.profiles.is_some();
+        let closed = |p: &Profile| marks && !self.config.agent.allows(&p.id);
         if json {
-            println!("{}", serde_json::to_string_pretty(&profiles)?);
+            let rows = profiles
+                .iter()
+                .map(|p| {
+                    let mut row = serde_json::to_value(p)?;
+                    if marks {
+                        row["open_to_agents"] = (!closed(p)).into();
+                    }
+                    Ok(row)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
         } else {
             for profile in profiles {
-                println!("{}", profile.id);
+                if closed(profile) {
+                    println!("{} (not open to agents)", profile.id);
+                } else {
+                    println!("{}", profile.id);
+                }
             }
         }
         Ok(())
