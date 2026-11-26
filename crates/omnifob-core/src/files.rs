@@ -4,6 +4,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -137,12 +138,46 @@ fn write(path: &Path, contents: &[u8], access: Access) -> anyhow::Result<()> {
         if let Some(permissions) = permissions {
             std::fs::set_permissions(&tmp, permissions)?;
         }
-        std::fs::rename(&tmp, &target)
+        retry_busy(|| std::fs::rename(&tmp, &target))
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     written.with_context(|| format!("writing {}", path.display()))
+}
+
+/// How often a file operation that a busy file can refuse is tried. On
+/// Windows, a file another process is replacing, or that an antivirus or
+/// indexer holds open, can refuse to be opened or replaced for a moment
+/// ("Access is denied"), so two `fob` processes writing the same state at
+/// once would otherwise fail. Elsewhere such a failure is final.
+const BUSY_ATTEMPTS: u32 = if cfg!(windows) { 10 } else { 1 };
+const BUSY_PAUSE: Duration = Duration::from_millis(50);
+
+/// Runs `io`, trying again on Windows while it fails with anything but
+/// `NotFound`, for up to half a second. [`write_atomically`] and
+/// [`write_private`] replace their file through it; use it for reads of a
+/// file other processes replace.
+pub fn retry_busy<T>(io: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    retry(BUSY_ATTEMPTS, BUSY_PAUSE, io)
+}
+
+fn retry<T>(
+    attempts: u32,
+    pause: Duration,
+    mut io: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 1;
+    loop {
+        match io() {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && attempt < attempts => {
+                tracing::debug!("file busy ({e}); trying again");
+                attempt += 1;
+                std::thread::sleep(pause);
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +228,36 @@ mod tests {
     }
 
     #[test]
+    fn busy_files_are_tried_again_but_missing_ones_are_not() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let mut calls = 0;
+        let result = retry(3, Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 { Err(denied()) } else { Ok(calls) }
+        });
+        assert_eq!(result.unwrap(), 3);
+
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry(3, Duration::ZERO, || {
+            calls += 1;
+            Err(denied())
+        });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry(3, Duration::ZERO, || {
+            calls += 1;
+            Err(std::io::ErrorKind::NotFound.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn atomic_writes_replace_the_file_and_leave_nothing_behind() {
         let dir = scratch("atomic");
         let path = dir.join("aws").join("config");
@@ -206,8 +271,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // Unix only: Windows may refuse to replace a file another rename is
-    // replacing at the same moment, which this test would make flaky.
+    // Unix only: on Windows eight threads replacing one file can keep it
+    // busy for longer than the writer's retries wait, which would make this
+    // test flaky.
     #[cfg(unix)]
     #[test]
     fn concurrent_writes_never_share_a_temporary_file() {
