@@ -37,6 +37,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -65,8 +67,31 @@ jobs:
           msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
           test -n "$msrv" || { echo "::error::no rust-version in Cargo.toml"; exit 1; }
           rustup toolchain install "$msrv" --profile minimal && rustup default "$msrv"
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check
         run: cargo check --locked --all-targets
+
+  # Markdown and YAML formatting, and the one shell script.
+  lint:
+    name: Lint
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.stack == null ||
+      github.event.pull_request.stack.position == github.event.pull_request.stack.size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: biomejs/setup-biome@4c91541eaada48f67d7dbd7833600ce162b68f51 # v2.7.1
+        with:
+          # The version whose schema biome.json names.
+          version: 2.6.9
+      - name: Biome
+        run: biome check .
+      - name: ShellCheck
+        run: shellcheck docs/tools/refresh.sh
 
   # Every release target, built and packaged as a tag would build it, so a
   # new target or a release-profile change fails here rather than at release.

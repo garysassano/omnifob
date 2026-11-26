@@ -13,8 +13,8 @@ The AWS tools are also fragile as projects: granted slowed down after Common Fat
 A mise for cloud credentials.
 mise replaced nvm, pyenv and tfenv with one tool and one mental model; omnifob does the same for cloud sign-in.
 
-1. Sign in once per identity source (an _integration_): an IAM Identity Center portal, a Cloudflare account, later a Google or Entra ID account.
-2. omnifob discovers every identity that sign-in can reach (a _profile_): each AWS account and role, each Cloudflare account and permission template.
+1. Sign in once per identity source (an _integration_): an IAM Identity Center portal, an AWS console sign-in or IAM user, a Google account, an Entra ID account, a Cloudflare account, or a provider's long-lived token.
+2. omnifob discovers every identity that sign-in can reach (a _profile_): each AWS account and role, each Google Cloud project, each Azure subscription, each Cloudflare account and permission template.
 3. Any profile becomes short-lived credentials on demand: exported into the shell, injected into a command, opened in the web console, or handed to another tool.
 
 The project is called omnifob; the command is `fob`, since it is typed many times a day.

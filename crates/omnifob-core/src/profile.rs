@@ -270,6 +270,38 @@ impl ProfileCache {
     /// whole id segment or the account ID beats one starting a segment, which
     /// beats one found anywhere. So `acme/test` picks `acme/test/...` over
     /// `acme2/test/...`, and `123456789012 admin` finds that account's admin role.
+    ///
+    /// ```
+    /// use omnifob_core::profile::{ProfileCache, SyncedProfiles};
+    /// use omnifob_core::{Profile, Target};
+    ///
+    /// let role = |account: &str, id: &str, role: &str| {
+    ///     let target = Target::Aws {
+    ///         account_id: id.into(),
+    ///         account_name: account.into(),
+    ///         role_name: role.into(),
+    ///     };
+    ///     Profile::new("acme", account, role, target)
+    /// };
+    /// let mut cache = ProfileCache::default();
+    /// cache.integrations.insert(
+    ///     "acme".into(),
+    ///     SyncedProfiles {
+    ///         synced_at: jiff::Timestamp::now(),
+    ///         profiles: vec![
+    ///             role("dev", "111111111111", "Admin"),
+    ///             role("prod", "222222222222", "Admin"),
+    ///             role("prod", "222222222222", "ReadOnly"),
+    ///         ],
+    ///     },
+    /// );
+    /// let ids = |query| -> Vec<&str> {
+    ///     cache.find(query).iter().map(|p| p.id.as_str()).collect()
+    /// };
+    /// assert_eq!(ids("prod admin"), ["acme/prod/Admin"]);
+    /// assert_eq!(ids("222222222222"), ["acme/prod/Admin", "acme/prod/ReadOnly"]);
+    /// assert_eq!(ids("acme/dev/Admin"), ["acme/dev/Admin"]);
+    /// ```
     pub fn find(&self, query: &str) -> Vec<&Profile> {
         if let Some(exact) = self.all().find(|p| p.id == query) {
             return vec![exact];
