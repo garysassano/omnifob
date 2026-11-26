@@ -528,8 +528,13 @@ mod tests {
             std::os::unix::fs::symlink(home.join("git"), home.join("code")).unwrap();
             let linked =
                 Config::parse("[directories]\n\"~/code/acme\" = \"acme/dev/Admin\"\n").unwrap();
+            // The working directory as the OS reports it, with links
+            // resolved: macOS's temporary directory is under a link.
+            let cwd = std::fs::canonicalize(home.join("git/acme"))
+                .unwrap()
+                .join("x");
             assert_eq!(
-                linked.directory_profile(&home.join("git/acme/x"), Some(&home)),
+                linked.directory_profile(&cwd, Some(&home)),
                 Some(("~/code/acme", "acme/dev/Admin"))
             );
         }
