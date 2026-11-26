@@ -33,7 +33,20 @@ fn quote(shell: Shell, value: &str) -> String {
     match shell {
         Shell::Posix => format!("'{}'", value.replace('\'', r"'\''")),
         Shell::Fish => format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'")),
-        Shell::Powershell => format!("'{}'", value.replace('\'', "''")),
+        Shell::Powershell => {
+            // PowerShell also ends a single-quoted string at the typographic
+            // single quotes U+2018 to U+201B; doubling each keeps it literal.
+            let mut quoted = String::with_capacity(value.len() + 2);
+            quoted.push('\'');
+            for c in value.chars() {
+                if matches!(c, '\'' | '\u{2018}'..='\u{201B}') {
+                    quoted.push(c);
+                }
+                quoted.push(c);
+            }
+            quoted.push('\'');
+            quoted
+        }
     }
 }
 
@@ -114,23 +127,32 @@ pub fn activation_line(shell: Shell) -> &'static str {
 }
 
 /// A `fob` wrapper function: `fob use [profile]` and `fob unuse` change the
-/// current shell; everything else runs the binary. Also registers completions,
-/// which ask the binary for profile ids as you type.
+/// current shell; everything else runs the binary. Global options before the
+/// command (`fob --config x use p`) are passed on. Also registers
+/// completions, which ask the binary for profile ids as you type.
 pub fn activate(shell: Shell) -> &'static str {
     match shell {
         Shell::Posix => {
             r#"fob() {
+  local __fob_config=
+  while :; do
+    case "${1:-}" in
+      --config) [ $# -ge 2 ] || break; __fob_config="--config=$2"; shift 2 ;;
+      --config=*) __fob_config="$1"; shift ;;
+      *) break ;;
+    esac
+  done
   case "${1:-}" in
     use)
       shift
       local __fob_env
-      __fob_env="$(command fob env --shell posix "$@")" && eval "$__fob_env"
+      __fob_env="$(command fob ${__fob_config:+"$__fob_config"} env --shell posix "$@")" && eval "$__fob_env"
       ;;
     unuse)
-      eval "$(command fob env --shell posix --unset)"
+      eval "$(command fob ${__fob_config:+"$__fob_config"} env --shell posix --unset)"
       ;;
     *)
-      command fob "$@"
+      command fob ${__fob_config:+"$__fob_config"} "$@"
       ;;
   esac
 }
@@ -143,14 +165,28 @@ fi
         }
         Shell::Fish => {
             r#"function fob
+  set -l __fob_global
+  while test (count $argv) -gt 0
+    switch $argv[1]
+      case --config
+        test (count $argv) -ge 2; or break
+        set -a __fob_global --config=$argv[2]
+        set -e argv[1..2]
+      case '--config=*'
+        set -a __fob_global $argv[1]
+        set -e argv[1]
+      case '*'
+        break
+    end
+  end
   switch "$argv[1]"
     case use
-      set -l __fob_env (command fob env --shell fish $argv[2..-1]); or return
+      set -l __fob_env (command fob $__fob_global env --shell fish $argv[2..-1]); or return
       printf '%s\n' $__fob_env | source
     case unuse
-      command fob env --shell fish --unset | source
+      command fob $__fob_global env --shell fish --unset | source
     case '*'
-      command fob $argv
+      command fob $__fob_global $argv
   end
 end
 COMPLETE=fish command fob | source
@@ -159,12 +195,25 @@ COMPLETE=fish command fob | source
         Shell::Powershell => {
             r#"$global:__fob_bin = (Get-Command fob -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 function fob {
-  if ($args.Count -gt 0 -and $args[0] -eq 'use') {
-    $rest = @($args | Select-Object -Skip 1)
-    $code = (& $global:__fob_bin env --shell powershell @rest) -join "`n"
+  $fobGlobal = @()
+  $fobArgs = @($args)
+  while ($fobArgs.Count -gt 0) {
+    if ($fobArgs[0] -eq '--config' -and $fobArgs.Count -ge 2) {
+      $fobGlobal += "--config=$($fobArgs[1])"
+      $fobArgs = @($fobArgs | Select-Object -Skip 2)
+    } elseif ("$($fobArgs[0])" -like '--config=*') {
+      $fobGlobal += $fobArgs[0]
+      $fobArgs = @($fobArgs | Select-Object -Skip 1)
+    } else {
+      break
+    }
+  }
+  if ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'use') {
+    $rest = @($fobArgs | Select-Object -Skip 1)
+    $code = (& $global:__fob_bin @fobGlobal env --shell powershell @rest) -join "`n"
     if ($LASTEXITCODE -eq 0 -and $code) { Invoke-Expression $code }
-  } elseif ($args.Count -gt 0 -and $args[0] -eq 'unuse') {
-    $code = (& $global:__fob_bin env --shell powershell --unset) -join "`n"
+  } elseif ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'unuse') {
+    $code = (& $global:__fob_bin @fobGlobal env --shell powershell --unset) -join "`n"
     if ($LASTEXITCODE -eq 0 -and $code) { Invoke-Expression $code }
   } else {
     & $global:__fob_bin @args
@@ -201,6 +250,13 @@ mod tests {
         assert_eq!(quote(Shell::Posix, "it's"), r"'it'\''s'");
         assert_eq!(quote(Shell::Fish, r"a\b'c"), r"'a\\b\'c'");
         assert_eq!(quote(Shell::Powershell, "it's"), "'it''s'");
+        assert_eq!(
+            quote(
+                Shell::Powershell,
+                "a\u{2018}b\u{2019}c\u{201A}d\u{201B}e\u{201C}"
+            ),
+            "'a\u{2018}\u{2018}b\u{2019}\u{2019}c\u{201A}\u{201A}d\u{201B}\u{201B}e\u{201C}'"
+        );
     }
 
     #[test]
