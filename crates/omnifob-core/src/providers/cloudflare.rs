@@ -1112,33 +1112,12 @@ fn load_catalog(integration: &str) -> Catalog {
     })
 }
 
-/// How often, and how far apart, a catalog file operation is tried before
-/// it fails. On Windows, a file being replaced, or held by an antivirus or
-/// indexer, can refuse to open or to be replaced for a moment.
-const CATALOG_IO_ATTEMPTS: u32 = 10;
-const CATALOG_IO_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Runs `io` until it succeeds or [`CATALOG_IO_ATTEMPTS`] are used up.
-fn retried<T>(mut io: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
-    let mut attempt = 1;
-    loop {
-        match io() {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound && attempt < CATALOG_IO_ATTEMPTS => {
-                tracing::debug!("Cloudflare catalog file busy ({e}); trying again");
-                attempt += 1;
-                std::thread::sleep(CATALOG_IO_PAUSE);
-            }
-            result => return result,
-        }
-    }
-}
-
 /// The catalog as stored: empty only when there is no file. A file that
 /// cannot be read or parsed is an error, never an empty catalog, so an
 /// update cannot replace token IDs it failed to see.
 fn read_catalog(integration: &str) -> anyhow::Result<Catalog> {
     let file = catalog_file(integration);
-    let text = match retried(|| std::fs::read_to_string(&file)) {
+    let text = match crate::files::retry_busy(|| std::fs::read_to_string(&file)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Catalog::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
@@ -1153,18 +1132,8 @@ fn read_catalog(integration: &str) -> anyhow::Result<Catalog> {
 
 fn save_catalog(integration: &str, catalog: &Catalog) -> anyhow::Result<()> {
     let text = serde_json::to_string(catalog)?;
-    let file = catalog_file(integration);
-    let mut attempt = 1;
-    loop {
-        match crate::files::write_private(&file, &text) {
-            Err(e) if attempt < CATALOG_IO_ATTEMPTS => {
-                tracing::debug!("writing the Cloudflare catalog: {e:#}; trying again");
-                attempt += 1;
-                std::thread::sleep(CATALOG_IO_PAUSE);
-            }
-            result => return result,
-        }
-    }
+    // The writer tries a refused replace again on Windows.
+    crate::files::write_private(&catalog_file(integration), text)
 }
 
 /// How long to wait for other processes updating the same catalog, each of
@@ -1308,7 +1277,8 @@ pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
         })
         .collect();
     save_catalog(new, &catalog)?;
-    retried(|| std::fs::remove_file(&from)).with_context(|| format!("removing {}", from.display()))
+    crate::files::retry_busy(|| std::fs::remove_file(&from))
+        .with_context(|| format!("removing {}", from.display()))
 }
 
 /// Removes the stored catalog, for example after signing out.
