@@ -72,11 +72,18 @@ pub fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("starting the async runtime");
+    // `fob exec` fails with 125 whatever went wrong before the command ran,
+    // a config that does not load included, as `env` does.
+    let failed = if matches!(cli.command, Command::Exec { .. }) {
+        ExitCode::from(exec::FOB_FAILED)
+    } else {
+        ExitCode::FAILURE
+    };
     match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("fob: {e:#}");
-            ExitCode::FAILURE
+            failed
         }
     }
 }
@@ -143,11 +150,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         _ => {}
     }
+    // A config named with `--config` has to exist, so a mistyped path is not
+    // taken for an empty config. `fob import --write` may create it.
+    let config_file = paths::config_file();
+    if cli.config.is_some()
+        && !matches!(cli.command, Command::Import(_))
+        && matches!(std::fs::metadata(&config_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        bail!("the config file {} does not exist", config_file.display());
+    }
     // `fob rename` has to open a config with a name the rule refuses, to fix it.
     let config = if matches!(cli.command, Command::Rename { .. }) {
-        Config::load_allowing_any_names(&paths::config_file())?
+        Config::load_allowing_any_names(&config_file)?
     } else {
-        Config::load(&paths::config_file())?
+        Config::load(&config_file)?
     };
     let cache = load_profiles(&cli.command)?;
     let mut app = App { config, cache };
@@ -340,7 +356,8 @@ fn load_profiles(command: &Command) -> anyhow::Result<ProfileCache> {
         Command::Login { .. }
         | Command::Sync { .. }
         | Command::Status { .. }
-        | Command::Logout { .. } => true,
+        | Command::Logout { .. }
+        | Command::Revoke { all: true, .. } => true,
         _ => false,
     };
     match ProfileCache::load(&profiles_file()) {

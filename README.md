@@ -47,7 +47,7 @@ Coming from granted, aws-vault or the AWS CLI? `fob import aws` finds every IAM 
 
 Integration names may contain only letters, digits, `.`, `_` and `-`, and may not start with `-`. A config with another name is refused with a pointer to `fob rename "<old name>" <new-name>`, which still works on it.
 
-`~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`, or `--config <path>` on any command):
+`~/.config/omnifob/config.toml` (or `$OMNIFOB_CONFIG`, or `--config <path>` on any command, which has to name an existing file except for `fob import aws --write`):
 
 ```toml
 [integrations.acme]
@@ -256,7 +256,7 @@ Without `browser`, URLs open in the system's default browser; on WSL without a L
 
 Profiles are `<integration>/<account>/<role or template>`, but you rarely type the full id. Any words that together match one profile select it (`prod admin`, or just `dns-read`); a word equal to a whole segment wins, so `read` picks `cf/personal/read` over `cf/personal/dns-read`. An account ID works too (`fob exec 123456789012 admin -- ...`). With no match or several, `fob` shows a fuzzy picker that lists recently used profiles first; without a terminal it lists the matches instead.
 
-`fob exec` exits with the command's status, or with 125 when fob itself fails, 127 when the command is not found and 126 when it cannot run, as `env` does. A Windows exit code too large for the 0 to 255 range of `--revoke` runs is reported as 1 when its low byte would read as success; plain `fob exec` passes it on whole.
+`fob exec` exits with the command's status, or with 125 when fob itself fails (a config that does not load included), 127 when the command is not found and 126 when it cannot run, as `env` does. A Windows exit code too large for the 0 to 255 range of `--revoke` runs is reported as 1 when its low byte would read as success; plain `fob exec` passes it on whole.
 
 The command gets the profile's variables, `OMNIFOB_PROFILE` and, when the credentials expire, `OMNIFOB_EXPIRES_AT`. What a `fob use` in the same shell exported and this profile does not set is removed, and so is `OMNIFOB_VARS`. When the profile hands out an AWS access key, the AWS credential variables it does not set (`AWS_SESSION_TOKEN`, `AWS_SECURITY_TOKEN`, `AWS_CREDENTIAL_EXPIRATION`, `AWS_ACCOUNT_ID`) and `AWS_ENDPOINT_URL_S3` are removed too, so a session token or an R2 endpoint left in the shell is not mixed with the new key. A Region you set yourself stays for a profile without one, but is replaced when the profile sets one (R2 sets `AWS_REGION=auto` and removes `AWS_DEFAULT_REGION`).
 
@@ -270,7 +270,7 @@ fob activate fish | source      # fish
 fob activate powershell | Out-String | Invoke-Expression   # PowerShell
 ```
 
-Then `fob use prod admin` exports the credentials into the current shell, and `fob unuse` removes them. Switching profiles removes variables the previous one set and the new one does not. `OMNIFOB_PROFILE` names the active profile and `OMNIFOB_EXPIRES_AT` (RFC 3339) says when its credentials expire, for a shell prompt; `fob status` shows both. `fob activate` and `fob unuse` work even when the config or `profiles.json` is broken, so a typo does not break every new shell. In PowerShell the wrapper finds the `fob` binary on `PATH`, so it works with `pwsh` on Linux and macOS too.
+Then `fob use prod admin` exports the credentials into the current shell, and `fob unuse` removes them. Switching profiles removes variables the previous one set and the new one does not. `OMNIFOB_PROFILE` names the active profile and `OMNIFOB_EXPIRES_AT` (RFC 3339) says when its credentials expire, for a shell prompt; `fob status` shows both. `fob activate` and `fob unuse` work even when the config or `profiles.json` is broken, so a typo does not break every new shell. The wrapper also recognises `use` and `unuse` after `--config <path>`. In PowerShell the wrapper finds the `fob` binary on `PATH`, so it works with `pwsh` on Linux and macOS too.
 
 The same line enables tab completion of commands, integration names and profile ids (`fob exec cf<TAB>`), read live from your discovered profiles. Only completion, without the `fob use` wrapper: `source <(COMPLETE=bash fob)`, `source <(COMPLETE=zsh fob)` or `COMPLETE=fish fob | source`.
 

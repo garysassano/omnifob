@@ -1084,6 +1084,68 @@ async fn the_config_flag_names_the_config_file() {
     );
 }
 
+/// A path given with `--config` has to exist, and `fob exec` fails with 125
+/// when the config does not load, as for its other failures.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_or_broken_config_is_an_error() {
+    let (fob, _server) = synced_portal("config-missing").await;
+    let missing = fob.root.join("missing.toml");
+    let stderr = fob.fails(&["status", "--config", missing.to_str().unwrap()]);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    let output = fob.run(&[
+        "--config",
+        missing.to_str().unwrap(),
+        "exec",
+        "acme/prod/Admin",
+        "--",
+        "true",
+    ]);
+    assert_eq!(output.status.code(), Some(125));
+
+    fob.write_config("[integrations.acme\nbroken");
+    let output = fob.run(&["exec", "acme/prod/Admin", "--", "true"]);
+    assert_eq!(output.status.code(), Some(125));
+    let (_, stderr) = texts(&output);
+    assert!(stderr.contains("parsing"), "{stderr}");
+}
+
+/// The shell wrapper recognises `use` and `unuse` after `--config`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shell_wrapper_sees_use_after_the_config_flag() {
+    let (fob, _server) = synced_portal("wrapper-config").await;
+    let elsewhere = fob.root.join("elsewhere.toml");
+    std::fs::rename(fob.config_file(), &elsewhere).unwrap();
+    let bin_dir = Path::new(FOB).parent().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let base = fob.command(&[]);
+    let mut bash = Command::new("bash");
+    for (name, value) in base.get_envs() {
+        match value {
+            Some(value) => bash.env(name, value),
+            None => bash.env_remove(name),
+        };
+    }
+    let script = r#"eval "$(fob activate bash)"
+fob --config "$1" use acme/prod/Admin || exit 1
+echo "profile=$OMNIFOB_PROFILE"
+fob --config="$1" unuse || exit 1
+echo "after=${OMNIFOB_PROFILE:-none}"
+"#;
+    let output = bash
+        .env("PATH", path)
+        .args(["-c", script, "bash", elsewhere.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = texts(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(lines(&stdout), ["profile=acme/prod/Admin", "after=none"]);
+}
+
 /// `fob status --json` and `fob check --json` for scripts and status bars,
 /// and `fob check --integration` for one sign-in.
 #[tokio::test(flavor = "multi_thread")]
@@ -1211,6 +1273,17 @@ async fn revoke_and_logout_all() {
         assert!(!fob.secret(&format!("credentials/{profile}")).exists());
     }
     fob.fails(&["revoke", "--all", "acme/dev/Admin"]);
+    // A corrupt profiles.json does not stop it: the Cloudflare tokens are
+    // read from the catalog.
+    let profiles = fob.root.join("state").join("omnifob").join("profiles.json");
+    let saved = std::fs::read(&profiles).unwrap();
+    std::fs::write(&profiles, "{ not json").unwrap();
+    let (_, stderr) = fob.ok(&["revoke", "--all"]);
+    assert!(
+        stderr.contains("ignoring the discovered profiles"),
+        "{stderr}"
+    );
+    std::fs::write(&profiles, saved).unwrap();
 
     let mut config = portal_config("acme");
     config.push_str(&portal_config("other").replace("acme.awsapps.com", "other.awsapps.com"));
