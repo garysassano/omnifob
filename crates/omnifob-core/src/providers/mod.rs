@@ -275,8 +275,10 @@ pub async fn credentials(
 /// The lifetime omnifob asks for when it gets a profile's credentials, for
 /// the profiles whose lifetime it chooses and that take `ttl`: Cloudflare
 /// tokens, chained, cross-partition and IAM users' roles, IAM user sessions
-/// without MFA (with MFA, each new session asks for a code), and Google
-/// service accounts. `None` for the others, whose provider sets it.
+/// and chained roles without MFA (with MFA, each new session asks for a
+/// code, and an agent's capped request, which is not cached, would ask
+/// every time), and Google service accounts. `None` for the others, whose
+/// provider sets it.
 pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::SignedDuration> {
     use jiff::SignedDuration;
     let hour = SignedDuration::from_hours(1);
@@ -291,7 +293,11 @@ pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::Signe
                 .unwrap_or(c.ttl),
         ),
         (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
-            Some(c.chained.get(label)?.duration.unwrap_or(hour))
+            let role = c.chained.get(label)?;
+            if role.mfa_serial.is_some() {
+                return None;
+            }
+            Some(role.duration.unwrap_or(hour))
         }
         (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
             Some(c.cross_partition.get(label)?.duration_or_default())
@@ -996,6 +1002,37 @@ pub fn forget_removed_credentials<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roles_that_need_mfa_keep_their_lifetime_under_a_cap() {
+        let config = Config::parse(
+            "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\
+             [integrations.a.chained.plain]\nvia_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nduration = \"1h\"\n\
+             [integrations.a.chained.mfa]\nvia_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/M\"\nmfa_serial = \"arn:aws:iam::111111111111:mfa/me\"\n",
+        )
+        .unwrap();
+        let chained = |label: &str| {
+            Profile::new(
+                "a",
+                "x",
+                label,
+                Target::AwsChained {
+                    label: label.into(),
+                    account_id: None,
+                },
+            )
+        };
+        let max = jiff::SignedDuration::from_mins(15);
+        assert_eq!(
+            chosen_lifetime(&config, &chained("plain")),
+            Some(jiff::SignedDuration::from_hours(1))
+        );
+        assert_eq!(capped_ttl(&config, &chained("plain"), None, max), Some(max));
+        // Each capped request would ask for a code, which nobody can give
+        // an agent.
+        assert_eq!(chosen_lifetime(&config, &chained("mfa")), None);
+        assert_eq!(capped_ttl(&config, &chained("mfa"), None, max), None);
+    }
 
     #[test]
     fn profiles_that_go_away_lose_their_cached_credentials() {

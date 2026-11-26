@@ -26,6 +26,29 @@ pub struct Credentials {
     pub token_id: Option<String>,
 }
 
+/// Every variable through which the AWS SDKs and CLI find credentials:
+/// the access key and its session, a profile, web identity, and a
+/// container endpoint. `fob exec` removes those a profile does not set, so
+/// one left in the shell is not mixed with the profile's credentials or
+/// taken before them.
+pub const AWS_CREDENTIAL_VARS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    // The older name of AWS_SESSION_TOKEN, which botocore still reads.
+    "AWS_SECURITY_TOKEN",
+    "AWS_CREDENTIAL_EXPIRATION",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+];
+
 /// Whether `name` is a portable environment variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`), the only kind omnifob puts into shell code.
 pub fn is_var_name(name: &str) -> bool {

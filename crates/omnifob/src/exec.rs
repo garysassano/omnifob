@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, bail};
 use jiff::Timestamp;
+use omnifob_core::credentials::AWS_CREDENTIAL_VARS;
 use omnifob_core::provision::{self, Provision};
 use omnifob_core::{Credentials, Integration, Profile, Target, providers};
 
@@ -136,7 +137,6 @@ impl App {
                     profile.id
                 );
             }
-            let ttl = self.agent_ttl(profile, ttl);
             provision.merge(
                 provision::aws_container_endpoint(self.config.clone(), profile.clone(), ttl)
                     .await?,
@@ -147,6 +147,8 @@ impl App {
             target,
             Target::Gcp { .. } | Target::GcpServiceAccount { .. }
         );
+        // The agent's cap, as for the variables.
+        let ttl = self.agent_ttl(profile, ttl);
         if options.token_file {
             if !google {
                 bail!(
@@ -158,6 +160,7 @@ impl App {
                 self.config.clone(),
                 profile.clone(),
                 creds,
+                ttl,
             )?);
             via.push("gcloud-token-file");
         }
@@ -170,7 +173,7 @@ impl App {
                 via.push("azure-identity");
             } else if google {
                 provision.merge(
-                    provision::gcp_adc_endpoint(self.config.clone(), profile.clone()).await?,
+                    provision::gcp_adc_endpoint(self.config.clone(), profile.clone(), ttl).await?,
                 );
                 via.push("gcp-adc");
             }
@@ -400,28 +403,20 @@ pub(crate) fn creds_output(
     Ok(serde_json::to_string(&value)?)
 }
 
-/// Variables fob puts into AWS profiles' environments. When a profile hands
-/// out an access key, the ones among these it does not set are removed from
-/// the command's environment, so a session token, account or S3 endpoint
-/// left in the shell (by `fob use`, another tool or by hand) is not mixed
-/// with the new key. Region variables are not here: see [`child_env`].
-const AWS_CREDENTIAL_VARS: &[&str] = &[
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    // The older name of AWS_SESSION_TOKEN, which botocore still reads.
-    "AWS_SECURITY_TOKEN",
-    "AWS_CREDENTIAL_EXPIRATION",
-    "AWS_ACCOUNT_ID",
-    "AWS_ENDPOINT_URL_S3",
-];
+/// Variables fob puts into AWS profiles' environments besides the
+/// credentials, which go stale with them: the account, and R2's S3
+/// endpoint. Region variables are not here: see [`child_env`].
+const AWS_COMPANION_VARS: &[&str] = &["AWS_ACCOUNT_ID", "AWS_ENDPOINT_URL_S3"];
 
 /// The command's environment: the variables to remove from fob's own
 /// environment, and the ones to set.
 ///
 /// Removed are the variables a previous `fob use` set (`previous`, from
 /// `OMNIFOB_VARS`) that this profile does not, `OMNIFOB_VARS` itself, and,
-/// when the profile hands out an AWS access key, the AWS credential and
-/// endpoint variables it does not set. A Region variable is removed only
+/// when the profile hands out an AWS access key, the other sources of AWS
+/// credentials ([`AWS_CREDENTIAL_VARS`]: a profile, web identity, a
+/// container endpoint) and the account and endpoint variables it does not
+/// set. A Region variable is removed only
 /// when the profile sets the other one (R2 sets `AWS_REGION` alone), since
 /// for a profile with no Region of its own the one in the shell is the
 /// user's choice.
@@ -439,6 +434,7 @@ pub(crate) fn child_env(
     remove.push("OMNIFOB_VARS".to_string());
     if sets("AWS_ACCESS_KEY_ID") {
         let mut stale: Vec<&str> = AWS_CREDENTIAL_VARS.to_vec();
+        stale.extend(AWS_COMPANION_VARS);
         if sets("AWS_REGION") || sets("AWS_DEFAULT_REGION") {
             stale.extend(["AWS_REGION", "AWS_DEFAULT_REGION"]);
         }
@@ -700,10 +696,19 @@ mod tests {
             remove,
             [
                 "AWS_ACCOUNT_ID",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
                 "AWS_CREDENTIAL_EXPIRATION",
+                "AWS_DEFAULT_PROFILE",
                 "AWS_DEFAULT_REGION",
+                "AWS_PROFILE",
+                "AWS_ROLE_ARN",
+                "AWS_ROLE_SESSION_NAME",
                 "AWS_SECURITY_TOKEN",
                 "AWS_SESSION_TOKEN",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
                 "GOOGLE_CLOUD_PROJECT",
                 "OMNIFOB_EXPIRES_AT",
                 "OMNIFOB_VARS",
@@ -712,15 +717,24 @@ mod tests {
         assert!(set.contains(&("OMNIFOB_PROFILE".into(), "cf/acct/r2".into())));
 
         // An AWS profile without a Region keeps the user's, but not an R2
-        // endpoint left in the shell.
+        // endpoint, or another source of credentials, left in the shell.
         let creds = aws_creds(Some("111111111111"));
         let (remove, set) = child_env(&profile(), &creds, "");
         assert_eq!(
             remove,
             [
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
                 "AWS_CREDENTIAL_EXPIRATION",
+                "AWS_DEFAULT_PROFILE",
                 "AWS_ENDPOINT_URL_S3",
+                "AWS_PROFILE",
+                "AWS_ROLE_ARN",
+                "AWS_ROLE_SESSION_NAME",
                 "AWS_SECURITY_TOKEN",
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
                 "OMNIFOB_VARS",
             ]
         );

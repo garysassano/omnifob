@@ -543,7 +543,7 @@ async fn the_adc_endpoint_hands_the_libraries_the_profiles_token() {
             project_name: "A".into(),
         },
     );
-    let mut provision = omnifob_core::provision::gcp_adc_endpoint(config, profile)
+    let mut provision = omnifob_core::provision::gcp_adc_endpoint(config, profile, None)
         .await
         .unwrap();
     let file = std::path::PathBuf::from(&provision.set[0].1);
@@ -583,4 +583,77 @@ async fn the_adc_endpoint_hands_the_libraries_the_profiles_token() {
     assert!(good["expires_in"].as_i64().unwrap() > 3000);
     drop(provision);
     assert!(!file.exists(), "the ADC file goes with the command");
+}
+
+/// Under an agent's cap, the ADC endpoint asks for service account tokens
+/// of the capped lifetime, which are not cached, and hands the same one to
+/// the requests that follow while it lasts.
+#[tokio::test]
+async fn the_adc_endpoint_caps_service_accounts_and_reuses_their_tokens() {
+    let (_guard, server) = setup().await;
+    let gcp_config = gcp_config("");
+    browser_login(&server, "g", &gcp_config).await;
+    let mut config = Config::default();
+    config
+        .integrations
+        .insert("g".into(), Integration::Gcp(gcp_config));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "user-access-2",
+            "expires_in": 3599,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/-/serviceAccounts/deploy@proj-b.iam.gserviceaccount.com:generateAccessToken",
+        ))
+        .and(body_partial_json(json!({ "lifetime": "900s" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessToken": "sa-capped",
+            "expireTime": "2100-01-01T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let profile = omnifob_core::Profile::new(
+        "g",
+        "proj-b",
+        "deploy",
+        Target::GcpServiceAccount {
+            label: "deploy".into(),
+            project_id: Some("proj-b".into()),
+        },
+    );
+    let mut provision = omnifob_core::provision::gcp_adc_endpoint(
+        config,
+        profile,
+        Some(jiff::SignedDuration::from_mins(15)),
+    )
+    .await
+    .unwrap();
+    let file = std::path::PathBuf::from(&provision.set[0].1);
+    let adc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let token_url = adc["token_url"].as_str().unwrap().to_string();
+    let secret = adc["refresh_token"].as_str().unwrap().to_string();
+    let task = provision.tasks.remove(0);
+    let http = reqwest::Client::new();
+    let refresh = || {
+        http.post(&token_url)
+            .form(&[("grant_type", "refresh_token"), ("refresh_token", &secret)])
+            .send()
+    };
+    let (first, second) = tokio::select! {
+        () = task => unreachable!(),
+        out = async {
+            let first: serde_json::Value = refresh().await.unwrap().json().await.unwrap();
+            let second: serde_json::Value = refresh().await.unwrap().json().await.unwrap();
+            (first, second)
+        } => out,
+    };
+    assert_eq!(first["access_token"], "sa-capped");
+    assert_eq!(second["access_token"], "sa-capped");
 }
