@@ -26,7 +26,6 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use base64::Engine;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -272,11 +271,7 @@ fn expiry(now: Timestamp, expires_in: Option<i64>) -> anyhow::Result<Timestamp> 
 /// The `email` claim of an ID token straight from the token endpoint (over
 /// TLS, so its signature need not be checked to trust it).
 fn id_token_email(id_token: &str) -> Option<String> {
-    let payload = id_token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let claims: serde_json::Value = crate::oauth::decode_jwt_payload(id_token).ok()?;
     claims.get("email")?.as_str().map(str::to_string)
 }
 
@@ -674,6 +669,7 @@ pub fn console_url(integration: &str, project_id: Option<&str>) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn consent_url_follows_gcloud() {

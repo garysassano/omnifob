@@ -17,10 +17,8 @@ fn readers() -> Vec<(&'static str, Vec<&'static str>)> {
     } else if cfg!(windows) {
         vec![powershell]
     } else {
-        let wsl = std::fs::read_to_string("/proc/version")
-            .is_ok_and(|v| v.to_lowercase().contains("microsoft"));
         let mut readers = Vec::new();
-        if wsl {
+        if omnifob_core::platform::is_wsl() {
             readers.push(powershell);
         }
         readers.push(("wl-paste", vec!["--no-newline"]));

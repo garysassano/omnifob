@@ -172,13 +172,9 @@ impl ProfileCache {
         }
     }
 
+    /// Writes the cache atomically, readable by the user only.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        crate::files::write_private(path, serde_json::to_string_pretty(self)?)
     }
 
     /// Moves an integration's discovered profiles to a new name, rewriting

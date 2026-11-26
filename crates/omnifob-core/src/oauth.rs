@@ -42,6 +42,21 @@ pub fn random_string(bytes: usize) -> anyhow::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
 
+/// The payload of a JWT, the JSON between its first and second `.`, read
+/// without checking the signature: for tokens that came straight from the
+/// issuer over TLS, or whose claims are only shown. Padding is accepted
+/// though JWTs leave it out.
+pub fn decode_jwt_payload<T: serde::de::DeserializeOwned>(token: &str) -> anyhow::Result<T> {
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+        bail!("the token is not a JWT");
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .context("the token's payload is not base64url")?;
+    serde_json::from_slice(&bytes).context("the token's payload is not the expected JSON")
+}
+
 /// How long a connection may take to send its request. Browsers open
 /// connections speculatively and may never use them; such a connection is
 /// closed after this, without ending the sign-in.
@@ -381,6 +396,32 @@ fn parse_callback(query: &str, state: &str, provider: &str) -> Option<anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jwt_payloads_are_decoded_without_their_signature() {
+        let encode = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let token = format!("{}.{}.sig", encode("{}"), encode(r#"{"sub":"me","n":1}"#));
+        let claims: serde_json::Value = decode_jwt_payload(&token).unwrap();
+        assert_eq!(claims["sub"], "me");
+        // Padding is tolerated.
+        let padded = format!("h.{}==.s", encode(r#"{"a":1}"#));
+        assert!(decode_jwt_payload::<serde_json::Value>(&padded).is_ok());
+        for broken in ["", "one", "h.p", "h.!!!.s", "h.e30"] {
+            assert!(
+                decode_jwt_payload::<serde_json::Value>(broken).is_err(),
+                "{broken}"
+            );
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Needs {
+            tid: String,
+        }
+        assert!(
+            decode_jwt_payload::<Needs>(&token).is_err(),
+            "missing claim"
+        );
+    }
 
     #[test]
     fn pkce_challenge_is_rfc_7636_s256() {

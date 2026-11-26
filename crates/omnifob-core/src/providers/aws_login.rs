@@ -371,15 +371,8 @@ fn pasted_code(pasted: &str, state: &str) -> anyhow::Result<String> {
 /// comes straight from AWS Sign-In over TLS, so its signature is not checked,
 /// as the AWS CLI does not.
 fn subject(id_token: &str) -> anyhow::Result<String> {
-    let payload = id_token
-        .split('.')
-        .nth(1)
-        .context("the ID token is not a JWT")?;
-    let claims: serde_json::Value = serde_json::from_slice(
-        &URL_SAFE_NO_PAD
-            .decode(payload.trim_end_matches('='))
-            .context("the ID token is not base64url")?,
-    )?;
+    let claims: serde_json::Value =
+        crate::oauth::decode_jwt_payload(id_token).context("reading the ID token")?;
     claims["sub"]
         .as_str()
         .filter(|s| s.starts_with("arn:"))

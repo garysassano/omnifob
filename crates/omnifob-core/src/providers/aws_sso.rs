@@ -1168,12 +1168,7 @@ impl TokenClaims {
     /// Reads `iss`, `sub` and `aud` from a JWT's payload. The signature is
     /// not checked: the claims are for display only.
     pub fn of(token: &str) -> Option<Self> {
-        use base64::Engine;
-        let payload = token.split('.').nth(1)?;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload.trim_end_matches('='))
-            .ok()?;
-        serde_json::from_slice(&bytes).ok()
+        crate::oauth::decode_jwt_payload(token).ok()
     }
 }
 

@@ -24,7 +24,6 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use base64::Engine;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -149,11 +148,7 @@ struct Claims {
 }
 
 fn claims(id_token: &str) -> Option<Claims> {
-    let payload = id_token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
+    crate::oauth::decode_jwt_payload(id_token).ok()
 }
 
 /// What `fob login` shows: a URL, and with the device flow a code to enter.
@@ -538,6 +533,7 @@ pub fn console_url(subscription_id: &str, tenant_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn claims_name_the_account_and_tenant() {

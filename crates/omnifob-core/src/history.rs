@@ -29,14 +29,9 @@ impl History {
             .unwrap_or_default()
     }
 
+    /// Writes the history atomically, readable by the user only.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string(self)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::files::write_private(path, serde_json::to_string(self)?)
     }
 
     pub fn record(&mut self, profile_id: &str, now: Timestamp) {
