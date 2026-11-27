@@ -428,7 +428,7 @@ fn id_token_expiry(id_token: &str) -> Option<Timestamp> {
 
 /// The account's Google ID token (issuer `https://accounts.google.com`,
 /// audience the OAuth client), renewed when it has less than
-/// [`RENEW_MARGIN`] left: the subject token of executable-sourced
+/// `RENEW_MARGIN` left: the subject token of executable-sourced
 /// credentials, which Google's STS exchanges through a workload identity
 /// pool that trusts Google as an OIDC provider.
 pub async fn id_token(integration: &str, config: &GcpConfig) -> Result<(String, Timestamp)> {

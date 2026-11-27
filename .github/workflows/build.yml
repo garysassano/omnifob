@@ -61,7 +61,14 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           BUILD: ${{ contains(matrix.target, 'musl') && 'zigbuild' || 'build' }}
-        run: cargo "$BUILD" --locked --release --bins --target "$TARGET"
+        # `omnifob` is the same program under its long name, so it is a copy
+        # of `fob` rather than a second link-time-optimised build.
+        run: |
+          set -euo pipefail
+          cargo "$BUILD" --locked --release --bin fob --target "$TARGET"
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          cp "target/$TARGET/release/fob$ext" "target/$TARGET/release/omnifob$ext"
       - name: Check the binaries
         if: ${{ !matrix.cross }}
         shell: bash

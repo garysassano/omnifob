@@ -665,7 +665,7 @@ const FOLD_MIN: usize = 2;
 /// Splits imported chained roles into the ones kept as tables and rules for
 /// the rest: roles assumed in the source permission set's own account,
 /// grouped by permission set, role name and path and every other key, become
-/// one rule per group of [`FOLD_MIN`] or more, limited with `accounts` to
+/// one rule per group of `FOLD_MIN` or more, limited with `accounts` to
 /// the accounts the file names, so the rule gives exactly the profiles the
 /// tables would have. Removing `accounts` then covers every account.
 pub fn fold_chained(

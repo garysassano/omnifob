@@ -177,7 +177,7 @@ enum Progress {
 /// listener polls rather than blocks, so the process can exit then.
 ///
 /// Connections are served side by side, so one that stays silent cannot hold
-/// up the callback; it is closed after [`REQUEST_TIMEOUT`]. A connection that
+/// up the callback; it is closed after `REQUEST_TIMEOUT`. A connection that
 /// fails, a request for another path (404), and a callback with another
 /// `state` (400) are answered or dropped, and the wait goes on: none of them
 /// can end a sign-in. `provider` names the provider in the page the browser
