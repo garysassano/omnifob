@@ -1,10 +1,10 @@
 //! `fob discover aws`: roles an Identity Center role may assume in its own
 //! account, which Identity Center does not list.
 //!
-//! For each source (an account and a permission set), the role's
-//! credentials list the account's IAM roles (`iam:ListRoles`), keep those
-//! whose trust policy lets the account, or the source role itself, call
-//! `sts:AssumeRole`, and ask the policy simulator
+//! For each account, the credentials of one of its sources (a permission
+//! set) list its IAM roles (`iam:ListRoles`). For each source, fob keeps
+//! the roles whose trust policy lets the account, or the source role
+//! itself, call `sts:AssumeRole`, and asks the policy simulator
 //! (`iam:SimulatePrincipalPolicy`) whether the source role's own policies
 //! allow it. Nothing is assumed, so no `AssumeRole` reaches CloudTrail.
 //!
@@ -143,7 +143,11 @@ fn stops_everything(error: crate::Error) -> std::result::Result<String, crate::E
 }
 
 /// The roles the sources of one account may assume there. The account's
-/// roles are listed once, with the first source whose credentials may.
+/// roles are listed once, with the first source whose credentials may, and
+/// every source is then simulated, with the lister's credentials or its
+/// own: a permission set that may not list roles can still be simulated by
+/// one that may, and one that may list but not simulate does not stop the
+/// others.
 async fn search_account(
     integration: &str,
     config: &AwsSsoConfig,
@@ -151,47 +155,44 @@ async fn search_account(
 ) -> Result<Discovery> {
     let partition = config.partition()?;
     let mut discovery = Discovery::default();
+    let mut clients = Clients {
+        integration,
+        config,
+        partition,
+        made: BTreeMap::new(),
+    };
+    let mut refused: BTreeMap<&str, String> = BTreeMap::new();
     let mut listed = None;
-    let mut refused = Vec::new();
     for source in &sources {
-        let attempt = async {
-            let creds =
-                super::sso::credentials(integration, config, &source.account_id, &source.via_role)
-                    .await?;
-            let iam = Iam::new(&creds, partition)?;
-            let roles = iam.list_roles().await?;
-            Ok::<_, crate::Error>((iam, roles))
+        let iam = match clients.get(source).await? {
+            Ok(iam) => iam,
+            Err(reason) => {
+                refused.insert(&source.via_role, reason);
+                continue;
+            }
         };
-        match attempt.await {
-            Ok(found) => {
-                listed = Some(found);
+        match iam.list_roles().await {
+            Ok(roles) => {
+                listed = Some((source.via_role.clone(), roles));
                 break;
             }
-            Err(e) => refused.push((source, stops_everything(e)?)),
+            Err(e) => {
+                refused.insert(&source.via_role, stops_everything(e)?);
+            }
         }
     }
-    let Some((iam, roles)) = listed else {
-        discovery.skipped = refused
-            .into_iter()
-            .map(|(source, reason)| Skipped {
+    let Some((lister, roles)) = listed else {
+        discovery.skipped = sources
+            .iter()
+            .map(|source| Skipped {
                 source: source.clone(),
-                reason,
+                reason: refused.remove(source.via_role.as_str()).unwrap_or_default(),
             })
             .collect();
         return Ok(discovery);
     };
-    let tried: BTreeSet<&str> = refused.iter().map(|(s, _)| s.via_role.as_str()).collect();
-    for (source, reason) in &refused {
-        discovery.skipped.push(Skipped {
-            source: (*source).clone(),
-            reason: reason.clone(),
-        });
-    }
-    for source in sources
-        .iter()
-        .filter(|s| !tried.contains(s.via_role.as_str()))
-    {
-        match search(&iam, &roles, partition, source).await {
+    for source in &sources {
+        match search(&mut clients, &lister, &roles, partition, source).await {
             Ok((found, unreadable)) => {
                 discovery.found.extend(found);
                 discovery.unreadable.extend(unreadable);
@@ -205,10 +206,53 @@ async fn search_account(
     Ok(discovery)
 }
 
+/// An IAM client per permission set of an account, made the first time it
+/// is needed, or why it could not be.
+struct Clients<'a> {
+    integration: &'a str,
+    config: &'a AwsSsoConfig,
+    partition: Partition,
+    made: BTreeMap<String, std::result::Result<Iam, String>>,
+}
+
+impl Clients<'_> {
+    /// The client of `source`'s permission set; `Err` only for an error that
+    /// stops every search.
+    async fn get(&mut self, source: &Source) -> Result<std::result::Result<&Iam, String>> {
+        if !self.made.contains_key(&source.via_role) {
+            let made = async {
+                let creds = super::sso::credentials(
+                    self.integration,
+                    self.config,
+                    &source.account_id,
+                    &source.via_role,
+                )
+                .await?;
+                Ok::<_, crate::Error>(Iam::new(&creds, self.partition)?)
+            }
+            .await;
+            let made = match made {
+                Ok(iam) => Ok(iam),
+                Err(e) => Err(stops_everything(e)?),
+            };
+            self.made.insert(source.via_role.clone(), made);
+        }
+        Ok(self.made[&source.via_role].as_ref().map_err(Clone::clone))
+    }
+
+    /// The client of a permission set already made.
+    fn made(&self, via_role: &str) -> Option<&Iam> {
+        self.made.get(via_role).and_then(|m| m.as_ref().ok())
+    }
+}
+
 /// The roles among `roles` that one source may assume, and those whose
-/// trust policy could not be read.
+/// trust policy could not be read. The simulator is called with the
+/// credentials of `lister`, the permission set that listed the roles, or
+/// with the source's own when `lister`'s may not call it.
 async fn search(
-    iam: &Iam,
+    clients: &mut Clients<'_>,
+    lister: &str,
     roles: &[Role],
     partition: Partition,
     source: &Source,
@@ -256,11 +300,8 @@ async fn search(
             Err(e) => unreadable.push(format!("{} ({e:#})", role.arn)),
         }
     }
-    let mut allowed = BTreeSet::new();
-    for chunk in candidates.chunks(SIMULATED_PER_CALL) {
-        let arns: Vec<&str> = chunk.iter().map(|(r, _)| r.arn.as_str()).collect();
-        allowed.extend(iam.simulate_assume_role(&source_arn, &arns).await?);
-    }
+    let arns: Vec<&str> = candidates.iter().map(|(r, _)| r.arn.as_str()).collect();
+    let allowed = simulate(clients, lister, source, &source_arn, &arns).await?;
     let found = candidates
         .into_iter()
         .filter(|(role, _)| allowed.contains(&role.arn))
@@ -281,6 +322,74 @@ async fn search(
         })
         .collect();
     Ok((found, unreadable))
+}
+
+/// The role ARNs among `arns` the simulator lets `source_arn` assume, asked
+/// with `lister`'s credentials, or with the source's own when `lister`'s
+/// may not call the simulator.
+async fn simulate(
+    clients: &mut Clients<'_>,
+    lister: &str,
+    source: &Source,
+    source_arn: &str,
+    arns: &[&str],
+) -> Result<BTreeSet<String>> {
+    if arns.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let iam = clients
+        .made(lister)
+        .context("the permission set that listed the roles has no client")?;
+    match simulate_with(iam, source_arn, arns).await {
+        Err(e) if is_denied(&e) && source.via_role != lister => {}
+        Err(e) if is_denied(&e) => return Err(untested(e, arns.len())),
+        other => return other,
+    }
+    let own = match clients.get(source).await? {
+        Ok(iam) => iam,
+        Err(reason) => {
+            return Err(anyhow!(
+                "{lister} may not call iam:SimulatePrincipalPolicy, and {reason}; {} role(s) in \
+                 the account trust it",
+                arns.len()
+            )
+            .into());
+        }
+    };
+    simulate_with(own, source_arn, arns).await.map_err(|e| {
+        if is_denied(&e) {
+            anyhow!(
+                "neither it nor {lister} may call iam:SimulatePrincipalPolicy; {} role(s) in the \
+                 account trust it",
+                arns.len()
+            )
+            .into()
+        } else {
+            e
+        }
+    })
+}
+
+/// `e`, a refused simulation, with how many roles it left untested.
+fn untested(e: crate::Error, roles: usize) -> crate::Error {
+    anyhow!("{e:#}; {roles} role(s) in the account trust it").into()
+}
+
+async fn simulate_with(iam: &Iam, source_arn: &str, arns: &[&str]) -> Result<BTreeSet<String>> {
+    let mut allowed = BTreeSet::new();
+    for chunk in arns.chunks(SIMULATED_PER_CALL) {
+        allowed.extend(iam.simulate_assume_role(source_arn, chunk).await?);
+    }
+    Ok(allowed)
+}
+
+/// IAM refused the call: the permission set may not make it.
+#[derive(Debug, thiserror::Error)]
+#[error("the permission set may not call {0}")]
+struct Denied(&'static str);
+
+fn is_denied(e: &crate::Error) -> bool {
+    matches!(e, crate::Error::Other(e) if e.downcast_ref::<Denied>().is_some())
 }
 
 /// An IAM role as `ListRoles` gives it.
@@ -385,7 +494,7 @@ impl Iam {
 
     /// One signed Query call, tried again with backoff while IAM throttles
     /// it or fails on its side.
-    async fn call(&self, action: &str, params: &[(&str, String)]) -> Result<String> {
+    async fn call(&self, action: &'static str, params: &[(&str, String)]) -> Result<String> {
         let body = form_urlencoded::Serializer::new(String::new())
             .extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())))
             .append_pair("Version", "2010-05-08")
@@ -415,7 +524,7 @@ impl Iam {
             }
             return Err(match iam_failure(&text) {
                 Some((code, _)) if code == "AccessDenied" || code == "AccessDeniedException" => {
-                    anyhow!("the permission set may not call {action}").into()
+                    anyhow::Error::new(Denied(action)).into()
                 }
                 Some((code, message)) => anyhow!("{action} failed: {code}: {message}").into(),
                 None => anyhow!("{action} failed with HTTP {status}").into(),

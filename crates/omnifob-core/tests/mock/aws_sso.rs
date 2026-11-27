@@ -1983,6 +1983,159 @@ async fn discovery_lists_an_account_once_and_keeps_one_table_per_role() {
     );
 }
 
+/// Each permission set's own credentials, so IAM mocks can tell them apart:
+/// the access key is `AKIA` and the permission set's name in capitals.
+async fn credentials_per_permission_set(server: &MockServer, names: &[&str]) {
+    for name in names {
+        Mock::given(method("GET"))
+            .and(path("/federation/credentials"))
+            .and(query_param("role_name", *name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "roleCredentials": {
+                    "accessKeyId": format!("AKIA{}", name.to_uppercase()),
+                    "secretAccessKey": "secret",
+                    "sessionToken": "session",
+                    "expiration": 4_102_444_800_000i64,
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// IAM's answer to a call the credentials may not make.
+fn iam_denied() -> ResponseTemplate {
+    ResponseTemplate::new(403).set_body_string(
+        r#"<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>not allowed</Message></Error></ErrorResponse>"#,
+    )
+}
+
+/// A simulation that allows `admin-root`.
+fn admin_root_allowed() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(
+        r#"<SimulatePrincipalPolicyResponse><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::111111111111:role/admin-root</EvalResourceName><EvalDecision>allowed</EvalDecision></member></EvaluationResults></SimulatePrincipalPolicyResult></SimulatePrincipalPolicyResponse>"#,
+    )
+}
+
+/// The `ListRoles` answer for two permission sets and `admin-root`.
+fn two_permission_sets(first: &str, second: &str) -> ResponseTemplate {
+    let sso = "/aws-reserved/sso.amazonaws.com/";
+    let root = r#"{"AWS":"arn:aws:iam::111111111111:root"}"#;
+    iam_roles(&[
+        (
+            sso,
+            &format!("AWSReservedSSO_{first}_0123456789abcdef"),
+            root,
+        ),
+        (
+            sso,
+            &format!("AWSReservedSSO_{second}_0123456789abcdef"),
+            root,
+        ),
+        ("/", "admin-root", root),
+    ])
+}
+
+fn in_dev(via_role: &str) -> omnifob_core::providers::aws::discover::Source {
+    omnifob_core::providers::aws::discover::Source {
+        account_id: "111111111111".into(),
+        segment: "dev".into(),
+        via_role: via_role.into(),
+    }
+}
+
+#[tokio::test]
+async fn discovery_simulates_with_its_own_credentials_when_the_lister_may_not() {
+    use omnifob_core::providers::aws::discover::discover;
+    use wiremock::matchers::header_regex;
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "own", 3600).await;
+    credentials_per_permission_set(&server, &["Audit", "PowerUser"]).await;
+    // Audit, first by name, lists the roles but may not simulate; PowerUser
+    // may simulate itself.
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListRoles"))
+        .and(header_regex("authorization", "Credential=AKIAAUDIT/"))
+        .respond_with(two_permission_sets("Audit", "PowerUser"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .and(header_regex("authorization", "Credential=AKIAAUDIT/"))
+        .respond_with(iam_denied())
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .and(body_string_contains("AWSReservedSSO_PowerUser_"))
+        .and(header_regex("authorization", "Credential=AKIAPOWERUSER/"))
+        .respond_with(admin_root_allowed())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let discovery = discover("own", &config(), vec![in_dev("Audit"), in_dev("PowerUser")])
+        .await
+        .unwrap();
+    assert_eq!(discovery.found.len(), 1, "{:?}", discovery.found);
+    assert_eq!(discovery.found[0].role.via_role, "PowerUser");
+    assert_eq!(discovery.skipped.len(), 1, "{:?}", discovery.skipped);
+    assert_eq!(discovery.skipped[0].source.via_role, "Audit");
+    assert_eq!(
+        discovery.skipped[0].reason,
+        "the permission set may not call iam:SimulatePrincipalPolicy; 1 role(s) in the account \
+         trust it"
+    );
+}
+
+#[tokio::test]
+async fn discovery_simulates_a_permission_set_that_may_not_list_roles() {
+    use omnifob_core::providers::aws::discover::discover;
+    use wiremock::matchers::header_regex;
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "lister", 3600).await;
+    credentials_per_permission_set(&server, &["Developer", "PowerUser"]).await;
+    // Developer, first by name, may not list roles; PowerUser lists them and
+    // simulates both.
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListRoles"))
+        .and(header_regex("authorization", "Credential=AKIADEVELOPER/"))
+        .respond_with(iam_denied())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListRoles"))
+        .and(header_regex("authorization", "Credential=AKIAPOWERUSER/"))
+        .respond_with(two_permission_sets("Developer", "PowerUser"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .and(header_regex("authorization", "Credential=AKIAPOWERUSER/"))
+        .respond_with(admin_root_allowed())
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let discovery = discover(
+        "lister",
+        &config(),
+        vec![in_dev("Developer"), in_dev("PowerUser")],
+    )
+    .await
+    .unwrap();
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    assert_eq!(discovery.found.len(), 1, "{:?}", discovery.found);
+    assert_eq!(discovery.found[0].role.via_role, "Developer");
+    assert_eq!(discovery.found[0].also_via, ["PowerUser"]);
+}
+
 #[tokio::test]
 async fn discovery_without_a_sign_in_asks_for_one() {
     use omnifob_core::providers::aws::discover::{Source, discover};
