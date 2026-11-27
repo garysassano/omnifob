@@ -2,17 +2,15 @@
 //! Google's OAuth, Resource Manager and IAM Credentials APIs. Secrets go to
 //! an in-memory store, never the keychain.
 
-mod support;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use crate::support::Scratch;
 use base64::Engine;
 use omnifob_core::config::{Config, GcpConfig, Integration};
 use omnifob_core::providers::gcp;
 use omnifob_core::{Endpoints, Error, Target};
 use serde_json::json;
-use support::Scratch;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };

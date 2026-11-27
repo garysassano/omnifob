@@ -652,7 +652,7 @@ pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Pro
     // Taken in tenant order: `join_all` polls the futures in order, and a
     // Tokio mutex hands itself out first come, first served.
     let exchanges = tokio::sync::Mutex::new(());
-    let per_tenant = futures::future::join_all(tenants.iter().map(|tenant| {
+    let per_tenant = futures_util::future::join_all(tenants.iter().map(|tenant| {
         let (http, home_token, exchanges) = (&http, &home_token, &exchanges);
         let home = *tenant == stored.tenant_id;
         async move {

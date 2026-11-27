@@ -1,9 +1,8 @@
 //! Cloudflare minting against a mock of the v4 API.
 
-mod support;
-
 use std::path::PathBuf;
 
+use crate::support::Scratch;
 use jiff::Timestamp;
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
 use omnifob_core::providers::cloudflare::{
@@ -11,7 +10,6 @@ use omnifob_core::providers::cloudflare::{
 };
 use omnifob_core::{Endpoints, paths, providers, store};
 use serde_json::{Value, json};
-use support::Scratch;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 

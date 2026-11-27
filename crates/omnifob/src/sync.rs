@@ -39,7 +39,7 @@ impl App {
         // Every integration is discovered at once. The ones that need a new
         // sign-in then sign in one at a time, since each may open a browser
         // or ask in the terminal.
-        let discovered = futures::future::join_all(
+        let discovered = futures_util::future::join_all(
             integrations
                 .iter()
                 .map(|(name, integration)| providers::discover(name, integration)),
@@ -121,7 +121,7 @@ impl App {
             .iter()
             .map(|name| self.config.integration(name))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let discovered = futures::future::join_all(
+        let discovered = futures_util::future::join_all(
             missing
                 .iter()
                 .zip(&integrations)

@@ -1,18 +1,16 @@
 //! AWS console sign-in (`aws login`) against a mock of AWS Sign-In. Secrets
 //! go to an in-memory store, never the keychain.
 
-mod support;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use crate::support::Scratch;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use omnifob_core::config::{AwsLoginConfig, Config, Integration};
 use omnifob_core::providers::aws;
 use omnifob_core::{Endpoints, Error, Target};
 use serde_json::{Value, json};
-use support::Scratch;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 

@@ -2,17 +2,15 @@
 //! dashboard's OAuth endpoints and the v4 API. Secrets go to an in-memory
 //! store, never the keychain.
 
-mod support;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use crate::support::Scratch;
 use jiff::{SignedDuration, Timestamp};
 use omnifob_core::config::{CloudflareConfig, Config, Integration};
 use omnifob_core::providers::cloudflare::{self, oauth as cloudflare_oauth};
 use omnifob_core::{Endpoints, Error, store};
 use serde_json::{Value, json};
-use support::Scratch;
 use tokio::sync::{Mutex, MutexGuard};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

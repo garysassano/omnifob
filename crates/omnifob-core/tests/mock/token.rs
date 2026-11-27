@@ -2,14 +2,12 @@
 //! `login` stores and what `check` reports for each answer. The secrets go
 //! to an in-memory store, never the keychain.
 
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::Scratch;
 use omnifob_core::config::{Config, Integration, TokenConfig};
 use omnifob_core::providers::token;
 use omnifob_core::{Endpoints, Error};
-use support::Scratch;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

@@ -2,16 +2,14 @@
 //! the OIDC and portal APIs. Secrets go to an in-memory store, never the
 //! keychain.
 
-mod support;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use crate::support::Scratch;
 use omnifob_core::config::{AwsSsoConfig, Config, Integration};
 use omnifob_core::providers::aws::{self, sso::Flow};
 use omnifob_core::{Context, Endpoints, Error, store};
 use serde_json::{Value, json};
-use support::Scratch;
 use wiremock::matchers::{
     body_partial_json, body_string_contains, header, method, path, query_param,
 };
@@ -256,7 +254,7 @@ async fn concurrent_callers_refresh_an_expiring_session_once() {
 
     let config = config();
     let calls = (0..8).map(|_| aws::sso::credentials("race", &config, "111111111111", "Admin"));
-    for result in futures::future::join_all(calls).await {
+    for result in futures_util::future::join_all(calls).await {
         let creds = result.unwrap();
         assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "AKIAEXAMPLE");
     }

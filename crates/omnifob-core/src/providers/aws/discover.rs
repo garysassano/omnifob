@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use super::partition::Partition;
@@ -94,7 +94,7 @@ pub async fn discover(
             .push(source);
     }
     let results: Vec<Result<Discovery>> =
-        futures::stream::iter(accounts.into_values().map(|mut sources| async move {
+        futures_util::stream::iter(accounts.into_values().map(|mut sources| async move {
             sources.sort_by(|a, b| a.via_role.cmp(&b.via_role));
             search_account(integration, config, sources).await
         }))

@@ -20,7 +20,7 @@ Unlike `aws sso login`, and like granted, it first checks the stored session as 
 
 A 401 from a portal call renews the session once and retries. If the portal refuses the renewed token too, or Identity Center refuses the renewal, the session is deleted (only if it still holds the refused token) and a new sign-in is asked for. A renewal that fails for any other reason keeps the session and reports the error.
 
-The SDK clients are built without `aws-config` (the portal and OIDC calls are unsigned), which keeps dependencies down. `OMNIFOB_AWS_ENDPOINT` (in the library, a context's `Endpoints::aws`) sends every AWS call to one URL, the console's `getSigninToken` included (at `<url>/federation`; the returned sign-in URL keeps the real host); the tests in `crates/omnifob-core/tests/aws_sso.rs` point it at a mock.
+The SDK clients are built without `aws-config` (the portal and OIDC calls are unsigned), which keeps dependencies down. `OMNIFOB_AWS_ENDPOINT` (in the library, a context's `Endpoints::aws`) sends every AWS call to one URL, the console's `getSigninToken` included (at `<url>/federation`; the returned sign-in URL keeps the real host); the tests in `crates/omnifob-core/tests/mock/aws_sso.rs` point it at a mock.
 
 ### VPC endpoints and network controls
 
