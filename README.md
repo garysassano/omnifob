@@ -22,10 +22,10 @@ Token presets: `hetzner`, `digitalocean`, `vultr`, `linode` (Akamai Cloud), `ups
 
 ## Install
 
-From source:
+From [crates.io](https://crates.io/crates/omnifob), built from source:
 
 ```sh
-cargo install --locked --git https://github.com/garysassano/omnifob omnifob
+cargo install --locked omnifob
 ```
 
 Every [release](https://github.com/garysassano/omnifob/releases) has prebuilt binaries, with build provenance and the SHA-256 digest GitHub shows for each file, for Linux (x86_64 and ARM64, static musl binaries that run on any distribution), macOS (Apple Silicon and Intel) and Windows (x86_64 and ARM64). Up to 0.6.1 the Linux builds were linked against glibc, and there were no Intel macOS or Windows ARM64 builds. With mise:
@@ -37,7 +37,7 @@ mise use -g github:garysassano/omnifob
 Or with [cargo binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same release archive for your platform:
 
 ```sh
-cargo binstall --git https://github.com/garysassano/omnifob omnifob
+cargo binstall omnifob
 ```
 
 This installs two names for the same binary: `fob` for daily use and `omnifob` for scripts.
