@@ -1,6 +1,8 @@
 ---
 name: omnifob
 description: Get cloud credentials through fob (omnifob) when the user has it set up — run AWS, Google Cloud, Azure, Cloudflare and token-based CLIs with `fob exec`, find profiles, and handle sign-in errors. Use whenever a command needs cloud credentials and `fob` is installed, and on errors such as no credentials, expired token, ExpiredToken, "not signed in" or "run `fob login`".
+metadata:
+  fob-version: "0.12.0"
 ---
 
 # Cloud credentials with fob
@@ -46,4 +48,5 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 - "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.
 - "could not check the token ... try again later" or "could not reach": the provider is down or unreachable, and the token may be fine; retry later. "the token was rejected" means the token itself is refused and the user must replace it.
 - AWS `AccessDenied` right after the user was given access: Identity Center takes a minute to propagate; retry once, then report.
-- `fob check` (exit status 1 if a sign-in fails; `--integration <name>` for one, `--json` for structured output), `fob check <profile>` (what the credentials act as) and `fob status` diagnose without printing secrets.
+- `fob check` (exit status 1 if a sign-in fails; `--integration <name>` for one, `--json` for structured output), `fob check <profile>` (what the credentials act as) and `fob status --check` diagnose without printing secrets. Plain `fob status` shows only what is stored: a sign-in whose token "renews on next use if the portal session is still open" (`"needs_check": true` in `--json`) may have ended, so check before telling the user it works.
+- "the omnifob skill in ... describes fob ...": this skill is out of date or ahead of fob. Tell the user, who updates it (`npx skills update`) or fob; meanwhile prefer what `fob <command> --help` says over this file.
