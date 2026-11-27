@@ -3,16 +3,14 @@
 //! `fob creds` as the helper.
 #![cfg(unix)]
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::support::Scratch;
 use jiff::SignedDuration;
 use omnifob_core::config::Config;
 use omnifob_core::providers;
 use omnifob_core::{Endpoints, Profile, Target};
-use support::Scratch;
 
 /// A script in `dir` called `name`. Tests run it as `/bin/sh <script>`:
 /// executing a file just written fails with ETXTBSY while another test's

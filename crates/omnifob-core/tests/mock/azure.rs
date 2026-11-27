@@ -1,17 +1,15 @@
 //! Entra ID sign-in and Resource Manager discovery against a mock. Secrets go
 //! to an in-memory store, never the keychain.
 
-mod support;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use crate::support::Scratch;
 use base64::Engine;
 use omnifob_core::config::{AzureConfig, Config, Integration};
 use omnifob_core::providers::azure;
 use omnifob_core::{Endpoints, Error, Target};
 use serde_json::json;
-use support::Scratch;
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

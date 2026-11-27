@@ -12,6 +12,17 @@ readme = "README.md"
 keywords = ["aws", "sso", "credentials", "keychain", "cli"]
 rust-version = "1.94.1"
 
+# Versions both crates use, kept in one place; each crate adds its features.
+[workspace.dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
+jiff = { version = "0.2.40", default-features = false, features = ["std"] }
+serde_json = "1.0.154"
+tokio = "1.54.1"
+tracing = "0.1.44"
+wiremock = "0.6.5"
+
 # Every crate opts in with `lints.workspace = true`. omnifob-core also denies
 # printing (`clippy::print_stdout`, `clippy::print_stderr`) in its `lib.rs`:
 # a library returns what it has to say, so nothing it holds can reach a
@@ -23,6 +34,12 @@ unsafe_op_in_unsafe_fn = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+
+# Debug builds: full debug info for the workspace's own crates, none for
+# dependencies, whose DWARF made every test binary 300-400 MB and `target/`
+# tens of gigabytes. Backtraces still name dependency functions.
+[profile.dev.package."*"]
+debug = false
 
 # Release binaries: thin LTO and one codegen unit make them smaller and a
 # little faster at the cost of a longer build; symbols are stripped. Panics

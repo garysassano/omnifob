@@ -1,15 +1,13 @@
 //! IAM users' access keys against a mock of STS. Secrets go to an in-memory
 //! store, never the keychain.
 
-mod support;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::support::Scratch;
 use omnifob_core::config::{AwsIamConfig, Config, Integration};
 use omnifob_core::providers::{self, aws};
 use omnifob_core::{Context, Endpoints, Profile, Target};
-use support::Scratch;
 use wiremock::matchers::{body_string_contains, header_regex, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -163,7 +161,7 @@ async fn one_mfa_code_covers_parallel_calls_and_every_role() {
 
     let calls =
         (0..4).map(|_| aws::iam::role_credentials("mfa", &config, "prod", "mfa/prod/Deploy", None));
-    for result in futures::future::join_all(calls).await {
+    for result in futures_util::future::join_all(calls).await {
         let creds = result.unwrap();
         assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAROLE");
         assert_eq!(creds.env["AWS_REGION"], "eu-west-1");

@@ -120,8 +120,8 @@ where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
-    use futures::StreamExt;
-    let mut connections = futures::stream::FuturesUnordered::new();
+    use futures_util::StreamExt;
+    let mut connections = futures_util::stream::FuturesUnordered::new();
     loop {
         tokio::select! {
             accepted = listener.accept(), if connections.len() < MAX_CONNECTIONS => match accepted {

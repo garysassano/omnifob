@@ -56,7 +56,7 @@ impl App {
                 .map(|name| Ok((*name, self.config.integration(name)?)))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             // All at once, reported in the order given (config order).
-            let outcomes = futures::future::join_all(
+            let outcomes = futures_util::future::join_all(
                 checked
                     .iter()
                     .map(|(name, integration)| providers::check_sign_in(name, integration)),
@@ -115,7 +115,7 @@ impl App {
         let secrets = omnifob_core::store::description()?;
         // Before reading the stored state, which a check may renew.
         let mut checked: Vec<Option<Result<String, Failure>>> = if check {
-            futures::future::join_all(
+            futures_util::future::join_all(
                 self.config
                     .integrations
                     .iter()

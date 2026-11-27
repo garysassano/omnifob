@@ -66,7 +66,7 @@ impl Provision {
 
     /// Runs every task until the future is dropped; never ends otherwise.
     pub async fn run(tasks: Vec<Task>) {
-        futures::future::join_all(tasks).await;
+        futures_util::future::join_all(tasks).await;
         std::future::pending::<()>().await
     }
 }

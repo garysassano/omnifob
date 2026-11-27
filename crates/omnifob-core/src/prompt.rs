@@ -76,7 +76,10 @@ mod tests {
             .build();
         let _entered = cx.enter();
         assert_eq!(mfa_code("arn:mfa", "p").unwrap(), "123456");
-        let asked = futures::executor::block_on(unattended(async { mfa_code("arn:mfa", "p") }));
+        let asked = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(unattended(async { mfa_code("arn:mfa", "p") }));
         let err = asked.unwrap_err();
         assert_eq!(crate::classify(&err).0, crate::Code::MfaRequired);
         let err = err.to_string();

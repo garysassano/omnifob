@@ -21,7 +21,7 @@ use anyhow::{Context, anyhow, bail};
 use aws_sdk_sso::config::http::HttpResponse;
 use aws_sdk_sso::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_ssooidc::operation::create_token::{CreateTokenError, CreateTokenOutput};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -965,7 +965,7 @@ async fn list_roles(
         .await
         .map_err(|e| portal_error("listing accounts", e))?;
 
-    let per_account = futures::stream::iter(accounts.iter().map(|account| async move {
+    let per_account = futures_util::stream::iter(accounts.iter().map(|account| async move {
         let account_id = account.account_id().ok_or_else(|| {
             PortalError::Other(anyhow!("the portal listed an account without its ID"))
         })?;
