@@ -1722,7 +1722,7 @@ async fn an_out_of_date_agent_skill_is_pointed_out() {
     assert_eq!(current, [false, true], "{value}");
 
     let (_, stderr) = fob.ok(&["list"]);
-    assert!(!stderr.contains("skill"), "{stderr}");
+    assert!(!stderr.contains("describes fob"), "{stderr}");
     let output = fob.run_as_agent(&["list"]);
     let (_, stderr) = texts(&output);
     assert!(stderr.contains("describes fob 0.0.1"), "{stderr}");
@@ -1868,6 +1868,54 @@ async fn status_and_check_print_json() {
     assert_eq!(checked[0]["ok"], false);
 }
 
+/// `fob list` labels each profile's environment and access level, from
+/// `[[labels]]` or guessed from its id, says where each came from, and
+/// notes integrations whose sign-in lapsed; scripts reading plain output
+/// still get bare ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn profiles_are_listed_with_labels_and_sign_in_state() {
+    let (fob, _server) = synced_portal("labels").await;
+    let mut config = portal_config("acme");
+    config.push_str(
+        "\n[[labels]]\nprofiles = [\"acme/prod/*\"]\nenv = \"production\"\naccess = \"read\"\n",
+    );
+    fob.write_config(&config);
+    let (stdout, _) = fob.ok(&["list", "--json"]);
+    let profiles: Value = serde_json::from_str(&stdout).unwrap();
+    let dev = &profiles[0];
+    assert_eq!(dev["id"], "acme/dev/Admin");
+    assert_eq!(dev["env"], "dev", "{dev}");
+    assert_eq!(dev["env_source"], "name", "{dev}");
+    assert_eq!(dev["access"], "admin", "{dev}");
+    assert_eq!(dev["access_source"], "name", "{dev}");
+    assert_eq!(dev["sign_in"], "signed_in", "{dev}");
+    let prod = &profiles[1];
+    assert_eq!(prod["env"], "production", "{prod}");
+    assert_eq!(prod["env_source"], "config", "{prod}");
+    assert_eq!(prod["access"], "read", "{prod}");
+    assert_eq!(prod["access_source"], "config", "{prod}");
+
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["acme/dev/Admin", "acme/prod/Admin"]);
+    let output = fob.run_as_agent(&["list"]);
+    let (stdout, stderr) = texts(&output);
+    assert_eq!(
+        lines(&stdout),
+        [
+            "acme/dev/Admin   dev?        admin?",
+            "acme/prod/Admin  production  read"
+        ]
+    );
+    assert!(stderr.contains("? marks a guess"), "{stderr}");
+
+    std::fs::remove_file(fob.secret("aws-sso/acme/token")).unwrap();
+    let (stdout, _) = texts(&fob.run_as_agent(&["list"]));
+    assert!(lines(&stdout)[0].ends_with("(signed out)"), "{stdout}");
+    let (stdout, _) = fob.ok(&["list", "--json"]);
+    let profiles: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(profiles[0]["sign_in"], "signed_out");
+}
+
 /// Under an agent, `fob list` shows every profile but marks the ones
 /// `[agent] profiles` keeps from it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1880,7 +1928,10 @@ async fn an_agent_sees_which_profiles_are_closed_to_it() {
     let (stdout, _) = texts(&output);
     assert_eq!(
         lines(&stdout),
-        ["acme/dev/Admin", "acme/prod/Admin (not open to agents)"]
+        [
+            "acme/dev/Admin   dev?   admin?",
+            "acme/prod/Admin  prod?  admin?  (not open to agents)"
+        ]
     );
     assert!(!stdout.contains("OMNIFOB_AGENT"), "{stdout}");
     let output = fob.run_as_agent(&["list", "--json"]);

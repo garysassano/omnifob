@@ -1,12 +1,15 @@
 //! `fob sync` and `fob list`, and picking a profile for the commands that use
 //! one (`fob exec`, `fob use` and the rest).
 
+use std::collections::HashMap;
+use std::io::IsTerminal;
+
 use anyhow::{Context, bail};
-use dialoguer::console::Term;
+use dialoguer::console::{Term, style};
 use jiff::Timestamp;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::SyncedProfiles;
-use omnifob_core::{Code, Coded, Error, Integration, Profile, paths, providers};
+use omnifob_core::{Code, Coded, Error, Integration, Profile, labels, paths, providers};
 
 use crate::{App, agent, interactive, profiles_file};
 
@@ -168,11 +171,24 @@ impl App {
         // marked, so it does not try them.
         let marks = agent::active() && self.config.agent.profiles.is_some();
         let closed = |p: &Profile| marks && !self.config.agent.allows(&p.id);
+        // Each integration's sign-in, read once.
+        let mut sign_ins: HashMap<&str, SignInState> = HashMap::new();
+        for profile in &profiles {
+            sign_ins
+                .entry(profile.integration.as_str())
+                .or_insert_with(|| sign_in_state(&self.config, &profile.integration));
+        }
         if json {
             let rows = profiles
                 .iter()
                 .map(|p| {
                     let mut row = serde_json::to_value(p)?;
+                    let found = labels::of(&self.config, p);
+                    row["env"] = found.env.as_ref().map(|(env, _)| env.as_str()).into();
+                    row["env_source"] = found.env.as_ref().map(|(_, s)| s.as_str()).into();
+                    row["access"] = found.access.map(|(a, _)| a.as_str()).into();
+                    row["access_source"] = found.access.map(|(_, s)| s.as_str()).into();
+                    row["sign_in"] = sign_ins[p.integration.as_str()].as_str().into();
                     if marks {
                         row["open_to_agents"] = (!closed(p)).into();
                     }
@@ -180,14 +196,78 @@ impl App {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             println!("{}", serde_json::to_string_pretty(&rows)?);
-        } else {
+            return Ok(());
+        }
+        // Plain ids for scripts (`fob list | fzf`); labels and notes for
+        // people at a terminal and for agents.
+        if !std::io::stdout().is_terminal() && !agent::active() {
             for profile in profiles {
-                if closed(profile) {
-                    println!("{} (not open to agents)", profile.id);
-                } else {
-                    println!("{}", profile.id);
-                }
+                println!("{}", profile.id);
             }
+            return Ok(());
+        }
+        let mut guessed = false;
+        let rows: Vec<[String; 4]> = profiles
+            .iter()
+            .map(|p| {
+                let found = labels::of(&self.config, p);
+                let mut mark = |source: labels::Source| {
+                    if source == labels::Source::Name {
+                        guessed = true;
+                        "?"
+                    } else {
+                        ""
+                    }
+                };
+                let env = found
+                    .env
+                    .as_ref()
+                    .map(|(env, source)| format!("{env}{}", mark(*source)))
+                    .unwrap_or_default();
+                let access = found
+                    .access
+                    .map(|(access, source)| format!("{}{}", access.as_str(), mark(source)))
+                    .unwrap_or_default();
+                let mut notes = Vec::new();
+                match sign_ins[p.integration.as_str()] {
+                    SignInState::SignedIn => {}
+                    state => notes.push(state.describe()),
+                }
+                if closed(p) {
+                    notes.push("not open to agents");
+                }
+                let notes = if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", notes.join(", "))
+                };
+                [p.id.clone(), env, access, notes]
+            })
+            .collect();
+        let widths: Vec<usize> = (0..4)
+            .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+            .collect();
+        for row in &rows {
+            let mut line = String::new();
+            for (i, cell) in row.iter().enumerate() {
+                // Columns no profile has are left out.
+                if widths[i] == 0 {
+                    continue;
+                }
+                let padded = format!("{cell:width$}  ", width = widths[i]);
+                let styled = match i {
+                    1 if is_production(cell) => style(padded).red().bold().to_string(),
+                    3 => style(padded).dim().to_string(),
+                    _ => padded,
+                };
+                line.push_str(&styled);
+            }
+            println!("{}", line.trim_end());
+        }
+        if guessed {
+            eprintln!(
+                "fob: ? marks a guess from the profile's name; [[labels]] in the config states them"
+            );
         }
         Ok(())
     }
@@ -393,6 +473,63 @@ impl Pick<'_> {
             (None, None) => String::new(),
         }
     }
+}
+
+/// Whether an integration's sign-in can give credentials, as `fob list`
+/// reports it for each profile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignInState {
+    SignedIn,
+    /// The token expired and renews only while a session fob cannot see
+    /// lasts; `fob status --check` asks the provider.
+    NeedsCheck,
+    SignedOut,
+    /// The stored sign-in could not be read (a locked vault).
+    Unknown,
+}
+
+impl SignInState {
+    fn as_str(self) -> &'static str {
+        match self {
+            SignInState::SignedIn => "signed_in",
+            SignInState::NeedsCheck => "needs_check",
+            SignInState::SignedOut => "signed_out",
+            SignInState::Unknown => "unknown",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            SignInState::SignedIn => "signed in",
+            SignInState::NeedsCheck => "sign-in may have ended",
+            SignInState::SignedOut => "signed out",
+            SignInState::Unknown => "sign-in unreadable",
+        }
+    }
+}
+
+fn sign_in_state(config: &omnifob_core::Config, integration: &str) -> SignInState {
+    let Ok(found) = config.integration(integration) else {
+        return SignInState::Unknown;
+    };
+    match providers::sign_in(integration, found) {
+        Ok(providers::SignIn::SignedOut) => SignInState::SignedOut,
+        Ok(providers::SignIn::Token) => SignInState::SignedIn,
+        Ok(providers::SignIn::Session { expires_at, .. }) if expires_at > Timestamp::now() => {
+            SignInState::SignedIn
+        }
+        Ok(providers::SignIn::Session {
+            refreshable: true, ..
+        }) => SignInState::NeedsCheck,
+        Ok(providers::SignIn::Session { .. }) => SignInState::SignedOut,
+        Err(_) => SignInState::Unknown,
+    }
+}
+
+/// Whether an environment label is production's, which `fob list` marks.
+fn is_production(env: &str) -> bool {
+    let env = env.trim().trim_end_matches('?');
+    env.eq_ignore_ascii_case("prod") || env.eq_ignore_ascii_case("production")
 }
 
 /// Integrations [`App::ensure_synced`] could not sync, as notes for the user.

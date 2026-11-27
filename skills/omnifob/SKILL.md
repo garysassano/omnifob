@@ -24,7 +24,7 @@ fob keeps the user's sign-ins and hands out short-lived credentials per profile.
 
    Azure and Google profiles also give the command a local endpoint their SDKs use (`DefaultAzureCredential`, Google's Application Default Credentials), so code that uses those SDKs works under `fob exec` without `az login` or `gcloud auth application-default login`. For a long-running AWS command (a dev server), `fob exec <profile> --server -- <command>` serves renewed credentials to the SDKs.
 
-3. Pick the least-privileged profile that does the job (a read-only role to look, a deploy role to deploy). Ask before using an admin or production profile the user did not name.
+3. Pick the least-privileged profile that does the job (a read-only role to look, a deploy role to deploy). Ask before using an admin or production profile the user did not name. `fob list` shows each profile's environment and access level (`fob list --json`: `env`, `access`); a trailing `?` (`"env_source": "name"`) is fob's guess from the id, so treat an unlabelled or guessed profile with care rather than as safe. A profile noted `(signed out)` needs `fob login` first.
 
 For AWS, profiles exported with `fob export aws-config` work without fob in the command: `aws s3 ls --profile fob-acme-dev-ReadOnly`, or `AWS_PROFILE` for tools and SDKs. Check `~/.aws/config` for `fob-` profiles before assuming they exist; do not run `fob export aws-config --write` unless asked.
 

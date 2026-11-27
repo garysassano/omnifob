@@ -306,6 +306,22 @@ fob adds them to the URL as `color` and `icon`, which Granted Containers applies
 
 `fob exec -- terraform plan` in `~/git/acme/billing/infra` then runs with `acme/prod-billing/ReadOnly`. Commands run by a coding agent still name the profile in full (the error says which one the directory would pick), so what they use stays in the command.
 
+### Environments and access levels
+
+`fob list` shows each profile's environment and access level, in red for production, so you and your agents can tell a production admin role from a development read-only one. fob guesses them from the words of the id (`prd`, `staging`, `uat`, `dev`; `AdministratorAccess`, `PowerUserAccess`, `ReadOnly`, `Contributor`, `Reader`) and reads a Cloudflare template's permissions; a `?` marks a guess. `[[labels]]` states them, the first entry that matches and sets a label winning:
+
+```toml
+[[labels]]
+profiles = ["acme/*-prd/*", "acme/prod/*"]
+env = "prod"
+
+[[labels]]
+profiles = ["acme/*/acme-pe"]
+access = "write"
+```
+
+`fob list --json` gives `env`, `access`, where each came from (`env_source` and `access_source`: `config`, `permissions` or `name`) and the integration's `sign_in` (`signed_in`, `needs_check`, `signed_out` or `unknown`). Piped into another program, plain `fob list` prints only the ids.
+
 ## Use
 
 ```sh
@@ -313,7 +329,7 @@ fob login acme            # browser sign-in (kept while it still works), then di
 fob login                 # pick the integration from a fuzzy list (fob logout too)
 fob login acme --force    # sign in again even though the stored sign-in works
 fob login acme --device-code   # approve with a code on another device (automatic over SSH and without a display)
-fob list                  # acme/prod/AdministratorAccess, cf/personal/workers, ...
+fob list                  # acme/prod/AdministratorAccess  prod?  admin?, cf/personal/workers  write, ...
 fob list prod admin       # only the profiles those words match
 fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare
