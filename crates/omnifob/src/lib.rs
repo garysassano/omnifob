@@ -475,6 +475,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             via,
             write,
         }) => {
+            // An unknown name fails before any other integration syncs.
+            app.config.integration(&integration)?;
             app.ensure_synced().await?.report();
             discover_aws(&app, &integration, &via, write).await?;
         }

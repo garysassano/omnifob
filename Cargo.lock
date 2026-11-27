@@ -313,32 +313,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-iam"
-version = "1.140.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd5ce846d376ffe92326098214965a7e5e50b726b028f8d9894cf06089036d7a"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-query",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-schema",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
- "fastrand",
- "http",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
 name = "aws-sdk-signin"
 version = "1.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1978,12 +1952,12 @@ dependencies = [
  "anyhow",
  "apple-native-keyring-store",
  "aws-lc-rs",
- "aws-sdk-iam",
  "aws-sdk-signin",
  "aws-sdk-sso",
  "aws-sdk-ssooidc",
  "aws-sdk-sts",
  "aws-sigv4",
+ "aws-smithy-xml",
  "base64 0.23.1",
  "form_urlencoded",
  "futures",

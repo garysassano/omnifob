@@ -470,4 +470,4 @@ It is a command, `fob discover aws`, rather than part of `fob sync`. It costs tw
 
 Trying `sts:AssumeRole` on each candidate would be exact, but each attempt is a CloudTrail event, and security teams commonly alert on attempts to assume administrator roles, so discovery assumes nothing. It reads trust policies itself because the simulator evaluates only the principal's side, and reports conditions without evaluating them. The skill lets an agent run it, since it only reads, but not with `--write`.
 
-The IAM client is the AWS SDK's, as for STS and Identity Center, so it signs, retries and parses XML the same way; it adds `aws-sdk-iam` to the dependencies.
+The two IAM calls are made directly, signed with `aws-sigv4` (already used for EKS tokens) and read with `aws-smithy-xml` (already built for STS), rather than through `aws-sdk-iam`. The SDK compiles all of IAM's operations for these two: about 327 MB of debug build output, eleven times STS's, for every build of the workspace. The cost is a small Query client of fob's own, with the SDK's endpoints per partition and a retry loop like its adaptive mode.

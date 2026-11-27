@@ -15,24 +15,31 @@
 //! external IDs). A role it finds can still refuse, and one it misses may
 //! work.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
 use anyhow::{Context, anyhow};
-use aws_sdk_iam::error::ProvideErrorMetadata;
 use futures::StreamExt;
 use serde_json::Value;
 
+use super::partition::Partition;
 use super::service_endpoint;
 use crate::config::{AwsSsoConfig, ChainedRole};
-use crate::{Credentials, Result};
+use crate::{Code, Credentials, Result};
 
 /// The variable the AWS CLI and SDKs read for IAM's endpoint.
 pub(crate) const IAM_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_IAM";
 
-/// How many sources are searched at once: each is a handful of IAM calls,
+/// How many accounts are searched at once: each is a handful of IAM calls,
 /// and IAM throttles an account's callers together.
 const CONCURRENCY: usize = 4;
 
 /// How many roles one `SimulatePrincipalPolicy` call evaluates.
 const SIMULATED_PER_CALL: usize = 20;
+
+/// How many times an IAM call is tried when IAM throttles it or fails on
+/// its side, as the AWS SDKs' adaptive retry mode does.
+const ATTEMPTS: u32 = 8;
 
 /// Where to look: an account, its segment in profile ids, and the
 /// permission set whose credentials search it.
@@ -51,6 +58,8 @@ pub struct Found {
     pub role: ChainedRole,
     /// The trust policy has conditions fob did not evaluate.
     pub conditional: bool,
+    /// Other permission sets of the account that may assume it too.
+    pub also_via: Vec<String>,
 }
 
 /// A source fob could not search, and why.
@@ -64,55 +73,159 @@ pub struct Skipped {
 pub struct Discovery {
     pub found: Vec<Found>,
     pub skipped: Vec<Skipped>,
+    /// Roles left out because their trust policy could not be read.
+    pub unreadable: Vec<String>,
 }
 
-/// Searches every source, a few at a time.
-pub async fn discover(integration: &str, config: &AwsSsoConfig, sources: Vec<Source>) -> Discovery {
-    let results: Vec<(Source, Result<Vec<Found>>)> =
-        futures::stream::iter(sources.into_iter().map(|source| async move {
-            let found = search(integration, config, &source).await;
-            (source, found)
+/// Searches every source, a few accounts at a time. A sign-in that has
+/// ended or a locked vault fails the whole search, since no source can
+/// succeed and the caller can sign in or unlock; anything else skips the
+/// sources it concerns, with the reason.
+pub async fn discover(
+    integration: &str,
+    config: &AwsSsoConfig,
+    sources: Vec<Source>,
+) -> Result<Discovery> {
+    let mut accounts: BTreeMap<String, Vec<Source>> = BTreeMap::new();
+    for source in sources {
+        accounts
+            .entry(source.account_id.clone())
+            .or_default()
+            .push(source);
+    }
+    let results: Vec<Result<Discovery>> =
+        futures::stream::iter(accounts.into_values().map(|mut sources| async move {
+            sources.sort_by(|a, b| a.via_role.cmp(&b.via_role));
+            search_account(integration, config, sources).await
         }))
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await;
     let mut discovery = Discovery::default();
-    for (source, result) in results {
-        match result {
-            Ok(found) => discovery.found.extend(found),
-            Err(e) => discovery.skipped.push(Skipped {
-                source,
-                reason: format!("{e:#}"),
-            }),
+    for result in results {
+        let found = result?;
+        discovery.found.extend(found.found);
+        discovery.skipped.extend(found.skipped);
+        discovery.unreadable.extend(found.unreadable);
+    }
+    // A role several permission sets of an account may assume is one table,
+    // from the first of them by name, so the result does not depend on the
+    // order the searches finished in.
+    discovery
+        .found
+        .sort_by(|a, b| (&a.label, &a.role.via_role).cmp(&(&b.label, &b.role.via_role)));
+    let mut kept: Vec<Found> = Vec::new();
+    for found in discovery.found {
+        match kept.last_mut() {
+            Some(last) if last.label == found.label => last.also_via.push(found.role.via_role),
+            _ => kept.push(found),
         }
     }
-    discovery.found.sort_by(|a, b| a.label.cmp(&b.label));
+    discovery.found = kept;
     discovery.skipped.sort_by(|a, b| {
         (&a.source.segment, &a.source.via_role).cmp(&(&b.source.segment, &b.source.via_role))
     });
-    discovery
+    discovery.unreadable.sort();
+    discovery.unreadable.dedup();
+    Ok(discovery)
 }
 
-/// The roles one source may assume in its account.
-async fn search(integration: &str, config: &AwsSsoConfig, source: &Source) -> Result<Vec<Found>> {
+/// Whether `error` concerns every source, not just the one it came from.
+fn stops_everything(error: crate::Error) -> std::result::Result<String, crate::Error> {
+    if matches!(error, crate::Error::NeedsLogin { .. }) {
+        return Err(error);
+    }
+    let error = anyhow::Error::from(error);
+    match crate::classify(&error).0 {
+        Code::LoginRequired | Code::VaultLocked => Err(error.into()),
+        _ => Ok(format!("{error:#}")),
+    }
+}
+
+/// The roles the sources of one account may assume there. The account's
+/// roles are listed once, with the first source whose credentials may.
+async fn search_account(
+    integration: &str,
+    config: &AwsSsoConfig,
+    sources: Vec<Source>,
+) -> Result<Discovery> {
     let partition = config.partition()?;
-    let creds =
-        super::sso::credentials(integration, config, &source.account_id, &source.via_role).await?;
-    let iam = iam_client(&creds, partition.default_region())?;
-    let roles: Vec<aws_sdk_iam::types::Role> = iam
-        .list_roles()
-        .into_paginator()
-        .items()
-        .send()
-        .try_collect()
-        .await
-        .map_err(|e| iam_error("iam:ListRoles", e))?;
-    // The role Identity Center made for the permission set in this account.
+    let mut discovery = Discovery::default();
+    let mut listed = None;
+    let mut refused = Vec::new();
+    for source in &sources {
+        let attempt = async {
+            let creds =
+                super::sso::credentials(integration, config, &source.account_id, &source.via_role)
+                    .await?;
+            let iam = Iam::new(&creds, partition)?;
+            let roles = iam.list_roles().await?;
+            Ok::<_, crate::Error>((iam, roles))
+        };
+        match attempt.await {
+            Ok(found) => {
+                listed = Some(found);
+                break;
+            }
+            Err(e) => refused.push((source, stops_everything(e)?)),
+        }
+    }
+    let Some((iam, roles)) = listed else {
+        discovery.skipped = refused
+            .into_iter()
+            .map(|(source, reason)| Skipped {
+                source: source.clone(),
+                reason,
+            })
+            .collect();
+        return Ok(discovery);
+    };
+    let tried: BTreeSet<&str> = refused.iter().map(|(s, _)| s.via_role.as_str()).collect();
+    for (source, reason) in &refused {
+        discovery.skipped.push(Skipped {
+            source: (*source).clone(),
+            reason: reason.clone(),
+        });
+    }
+    for source in sources
+        .iter()
+        .filter(|s| !tried.contains(s.via_role.as_str()))
+    {
+        match search(&iam, &roles, partition, source).await {
+            Ok((found, unreadable)) => {
+                discovery.found.extend(found);
+                discovery.unreadable.extend(unreadable);
+            }
+            Err(e) => discovery.skipped.push(Skipped {
+                source: source.clone(),
+                reason: stops_everything(e)?,
+            }),
+        }
+    }
+    Ok(discovery)
+}
+
+/// The roles among `roles` that one source may assume, and those whose
+/// trust policy could not be read.
+async fn search(
+    iam: &Iam,
+    roles: &[Role],
+    partition: Partition,
+    source: &Source,
+) -> Result<(Vec<Found>, Vec<String>)> {
+    // The role Identity Center made for the permission set in this account:
+    // `AWSReservedSSO_<permission set>_<16 hex digits>`, so a permission set
+    // named `Admin` does not take `AWSReservedSSO_Admin_ReadOnly_...`.
     let prefix = format!("AWSReservedSSO_{}_", source.via_role);
     let source_arn = roles
         .iter()
-        .find(|r| r.role_name().starts_with(&prefix) && r.path().starts_with("/aws-reserved/"))
-        .map(|r| r.arn().to_string())
+        .find(|r| {
+            r.path.starts_with("/aws-reserved/")
+                && r.name
+                    .strip_prefix(&prefix)
+                    .is_some_and(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .map(|r| r.arn.clone())
         .with_context(|| {
             format!(
                 "no {prefix}* role among the account's roles, so the permission set's role is \
@@ -125,52 +238,38 @@ async fn search(integration: &str, config: &AwsSsoConfig, source: &Source) -> Re
         source.account_id
     );
     let mut candidates = Vec::new();
-    for role in &roles {
-        if role.arn() == source_arn
-            || role.path().starts_with("/aws-service-role/")
-            || role.path().starts_with("/aws-reserved/")
+    let mut unreadable = Vec::new();
+    for role in roles {
+        if role.arn == source_arn
+            || role.path.starts_with("/aws-service-role/")
+            || role.path.starts_with("/aws-reserved/")
         {
             continue;
         }
-        let Some(document) = role.assume_role_policy_document() else {
+        let Some(document) = &role.trust else {
             continue;
         };
-        if let Some(conditional) = trusts(document, &[&root, &source.account_id, &source_arn])
-            .with_context(|| format!("reading the trust policy of {}", role.role_name()))?
-        {
-            candidates.push((role, conditional));
+        match trusts(document, &[&root, &source.account_id, &source_arn]) {
+            Ok(Some(conditional)) => candidates.push((role, conditional)),
+            Ok(None) => {}
+            // One role's policy does not end the account's search.
+            Err(e) => unreadable.push(format!("{} ({e:#})", role.arn)),
         }
     }
-    let mut allowed = std::collections::BTreeSet::new();
+    let mut allowed = BTreeSet::new();
     for chunk in candidates.chunks(SIMULATED_PER_CALL) {
-        let results: Vec<aws_sdk_iam::types::EvaluationResult> = iam
-            .simulate_principal_policy()
-            .policy_source_arn(&source_arn)
-            .action_names("sts:AssumeRole")
-            .set_resource_arns(Some(
-                chunk.iter().map(|(r, _)| r.arn().to_string()).collect(),
-            ))
-            .into_paginator()
-            .items()
-            .send()
-            .try_collect()
-            .await
-            .map_err(|e| iam_error("iam:SimulatePrincipalPolicy", e))?;
-        allowed.extend(allowed_resources(&results));
+        let arns: Vec<&str> = chunk.iter().map(|(r, _)| r.arn.as_str()).collect();
+        allowed.extend(iam.simulate_assume_role(&source_arn, &arns).await?);
     }
-    Ok(candidates
+    let found = candidates
         .into_iter()
-        .filter(|(role, _)| allowed.contains(role.arn()))
+        .filter(|(role, _)| allowed.contains(&role.arn))
         .map(|(role, conditional)| Found {
-            label: format!(
-                "{}-{}",
-                source.segment,
-                crate::profile::slug(role.role_name())
-            ),
+            label: format!("{}-{}", source.segment, crate::profile::slug(&role.name)),
             role: ChainedRole {
                 via_account_id: source.account_id.clone(),
                 via_role: source.via_role.clone(),
-                role_arn: role.arn().to_string(),
+                role_arn: role.arn.clone(),
                 session_name: None,
                 external_id: None,
                 region: None,
@@ -178,8 +277,314 @@ async fn search(integration: &str, config: &AwsSsoConfig, source: &Source) -> Re
                 duration: None,
             },
             conditional,
+            also_via: Vec::new(),
         })
-        .collect())
+        .collect();
+    Ok((found, unreadable))
+}
+
+/// An IAM role as `ListRoles` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Role {
+    path: String,
+    name: String,
+    arn: String,
+    /// The trust policy, URL-encoded JSON.
+    trust: Option<String>,
+}
+
+/// IAM's Query API, signed with a source's credentials. Two calls do not
+/// justify the IAM SDK, which compiles every IAM operation.
+struct Iam {
+    http: reqwest::Client,
+    url: String,
+    region: &'static str,
+    creds: aws_sdk_sts::config::Credentials,
+}
+
+impl Iam {
+    fn new(creds: &Credentials, partition: Partition) -> anyhow::Result<Self> {
+        let get = |k: &str| {
+            creds
+                .env
+                .get(k)
+                .cloned()
+                .with_context(|| format!("{k} missing from the credentials"))
+        };
+        let creds = aws_sdk_sts::config::Credentials::new(
+            get("AWS_ACCESS_KEY_ID")?,
+            get("AWS_SECRET_ACCESS_KEY")?,
+            creds.env.get("AWS_SESSION_TOKEN").cloned(),
+            None,
+            "omnifob",
+        );
+        let url = service_endpoint(IAM_ENDPOINT_VARIABLE)
+            .unwrap_or_else(|| format!("https://{}/", iam_host(partition)));
+        Ok(Self {
+            http: crate::http::client(),
+            url,
+            region: partition.default_region(),
+            creds,
+        })
+    }
+
+    /// Every role in the account (`iam:ListRoles`, all pages).
+    async fn list_roles(&self) -> Result<Vec<Role>> {
+        let action = "iam:ListRoles";
+        let mut roles = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut params = vec![("Action", "ListRoles".to_string())];
+            if let Some(m) = &marker {
+                params.push(("Marker", m.clone()));
+            }
+            let body = self.call(action, &params).await?;
+            let page = parse_list_roles(&body).with_context(|| format!("reading {action}"))?;
+            roles.extend(page.roles);
+            match page.marker {
+                Some(m) if page.truncated => marker = Some(m),
+                _ => return Ok(roles),
+            }
+        }
+    }
+
+    /// The role ARNs among `resources` the policy simulator lets
+    /// `source_arn` call `sts:AssumeRole` on.
+    async fn simulate_assume_role(
+        &self,
+        source_arn: &str,
+        resources: &[&str],
+    ) -> Result<Vec<String>> {
+        let action = "iam:SimulatePrincipalPolicy";
+        let mut allowed = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut params = vec![
+                ("Action", "SimulatePrincipalPolicy".to_string()),
+                ("PolicySourceArn", source_arn.to_string()),
+                ("ActionNames.member.1", "sts:AssumeRole".to_string()),
+            ];
+            let names: Vec<String> = (1..=resources.len())
+                .map(|i| format!("ResourceArns.member.{i}"))
+                .collect();
+            for (name, arn) in names.iter().zip(resources) {
+                params.push((name.as_str(), arn.to_string()));
+            }
+            if let Some(m) = &marker {
+                params.push(("Marker", m.clone()));
+            }
+            let body = self.call(action, &params).await?;
+            let page = parse_simulation(&body).with_context(|| format!("reading {action}"))?;
+            allowed.extend(page.allowed);
+            match page.marker {
+                Some(m) if page.truncated => marker = Some(m),
+                _ => return Ok(allowed),
+            }
+        }
+    }
+
+    /// One signed Query call, tried again with backoff while IAM throttles
+    /// it or fails on its side.
+    async fn call(&self, action: &str, params: &[(&str, String)]) -> Result<String> {
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())))
+            .append_pair("Version", "2010-05-08")
+            .finish();
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let outcome = self.send(&body).await;
+            let retry = match &outcome {
+                Err(e) => e.is_timeout() || e.is_connect(),
+                Ok((status, text)) => {
+                    status.as_u16() == 429
+                        || status.is_server_error()
+                        || matches!(
+                            iam_failure(text).map(|(code, _)| code).as_deref(),
+                            Some("Throttling" | "ThrottlingException" | "RequestLimitExceeded")
+                        )
+                }
+            };
+            if retry && attempt < ATTEMPTS {
+                tokio::time::sleep(backoff(attempt)).await;
+                continue;
+            }
+            let (status, text) = outcome.map_err(|e| anyhow!("{action} failed: {e}"))?;
+            if status.is_success() {
+                return Ok(text);
+            }
+            return Err(match iam_failure(&text) {
+                Some((code, _)) if code == "AccessDenied" || code == "AccessDeniedException" => {
+                    anyhow!("the permission set may not call {action}").into()
+                }
+                Some((code, message)) => anyhow!("{action} failed: {code}: {message}").into(),
+                None => anyhow!("{action} failed with HTTP {status}").into(),
+            });
+        }
+    }
+
+    async fn send(&self, body: &str) -> reqwest::Result<(reqwest::StatusCode, String)> {
+        let headers = match self.sign(body) {
+            Ok(headers) => headers,
+            // Signing fails only on malformed input, which no retry fixes;
+            // reported as the request IAM never saw.
+            Err(e) => {
+                tracing::warn!("signing an IAM request: {e:#}");
+                Vec::new()
+            }
+        };
+        let mut request = self
+            .http
+            .post(&self.url)
+            .header("content-type", FORM)
+            .body(body.to_string());
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        Ok((status, response.text().await?))
+    }
+
+    /// The SigV4 headers for a POST of `body`.
+    fn sign(&self, body: &str) -> anyhow::Result<Vec<(String, String)>> {
+        use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
+        let identity = self.creds.clone().into();
+        let params = aws_sigv4::sign::v4::SigningParams::builder()
+            .identity(&identity)
+            .region(self.region)
+            .name("iam")
+            .time(std::time::SystemTime::now())
+            .settings(SigningSettings::default())
+            .build()
+            .map_err(|e| anyhow!("{e}"))?
+            .into();
+        let request = SignableRequest::new(
+            "POST",
+            self.url.as_str(),
+            [("content-type", FORM)].into_iter(),
+            SignableBody::Bytes(body.as_bytes()),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        let (instructions, _) = sign(request, &params)
+            .map_err(|e| anyhow!("{e}"))?
+            .into_parts();
+        Ok(instructions
+            .headers()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect())
+    }
+}
+
+const FORM: &str = "application/x-www-form-urlencoded; charset=utf-8";
+
+/// IAM's global endpoint in a partition, as the AWS SDKs resolve it; its
+/// signing Region is the partition's default Region.
+fn iam_host(partition: Partition) -> &'static str {
+    match partition {
+        Partition::Aws => "iam.amazonaws.com",
+        Partition::China => "iam.cn-north-1.amazonaws.com.cn",
+        Partition::UsGov => "iam.us-gov.amazonaws.com",
+        Partition::EuropeanSovereign => "iam.eusc-de-east-1.amazonaws.eu",
+    }
+}
+
+/// How long to wait before attempt `attempt + 1`: exponential from 100 ms,
+/// capped at 5 s, with up to half of it random so parallel searches spread.
+fn backoff(attempt: u32) -> Duration {
+    let base = Duration::from_millis(100 * 2u64.pow(attempt.min(6))).min(Duration::from_secs(5));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    base / 2 + base / 2 * (nanos % 1000) / 1000
+}
+
+/// One page of `ListRoles`.
+#[derive(Debug, Default)]
+struct RolesPage {
+    roles: Vec<Role>,
+    truncated: bool,
+    marker: Option<String>,
+}
+
+/// One page of `SimulatePrincipalPolicy`, as the resources it allows.
+#[derive(Debug, Default)]
+struct SimulationPage {
+    allowed: Vec<String>,
+    truncated: bool,
+    marker: Option<String>,
+}
+
+type Decoder<'inp, 'a> = aws_smithy_xml::decode::ScopedDecoder<'inp, 'a>;
+
+fn text(tag: &mut Decoder) -> anyhow::Result<String> {
+    Ok(aws_smithy_xml::decode::try_data(tag)?.into_owned())
+}
+
+/// Calls `each` on every child element of `tag`.
+fn children(
+    tag: &mut Decoder,
+    mut each: impl FnMut(&mut Decoder) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    while let Some(mut child) = tag.next_tag() {
+        each(&mut child)?;
+    }
+    Ok(())
+}
+
+/// Calls `each` on the children of the `<name>` element (a Query
+/// response's `<…Result>`) under the root of `body`.
+fn result_children(
+    body: &str,
+    name: &str,
+    each: impl FnMut(&mut Decoder) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut document = aws_smithy_xml::decode::Document::new(body);
+    let mut root = document.root_element()?;
+    while let Some(mut tag) = root.next_tag() {
+        if tag.start_el().matches(name) {
+            return children(&mut tag, each);
+        }
+    }
+    anyhow::bail!("no {name} in the response")
+}
+
+fn parse_list_roles(body: &str) -> anyhow::Result<RolesPage> {
+    let mut page = RolesPage::default();
+    result_children(body, "ListRolesResult", |tag| {
+        if tag.start_el().matches("IsTruncated") {
+            page.truncated = text(tag)? == "true";
+        } else if tag.start_el().matches("Marker") {
+            page.marker = Some(text(tag)?);
+        } else if tag.start_el().matches("Roles") {
+            children(tag, |member| {
+                let mut role = Role {
+                    path: String::new(),
+                    name: String::new(),
+                    arn: String::new(),
+                    trust: None,
+                };
+                children(member, |field| {
+                    let el = field.start_el();
+                    if el.matches("Path") {
+                        role.path = text(field)?;
+                    } else if el.matches("RoleName") {
+                        role.name = text(field)?;
+                    } else if el.matches("Arn") {
+                        role.arn = text(field)?;
+                    } else if el.matches("AssumeRolePolicyDocument") {
+                        role.trust = Some(text(field)?);
+                    }
+                    Ok(())
+                })?;
+                page.roles.push(role);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })?;
+    Ok(page)
 }
 
 /// The resources the simulator allows. With several resources, IAM gives
@@ -187,73 +592,94 @@ async fn search(integration: &str, config: &AwsSsoConfig, source: &Source) -> Re
 /// (`arn:aws:iam::${Account}:${RelativeId}`) and whose decision is the
 /// strictest, and the answer for each resource in `ResourceSpecificResults`;
 /// with one resource, that resource and its decision are the result's own.
-fn allowed_resources(results: &[aws_sdk_iam::types::EvaluationResult]) -> Vec<String> {
-    use aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed;
-    let mut allowed = Vec::new();
-    for result in results {
-        let specific = result.resource_specific_results();
-        if specific.is_empty() {
-            if result.eval_decision() == &Allowed
-                && let Some(arn) = result.eval_resource_name()
-            {
-                allowed.push(arn.to_string());
+fn parse_simulation(body: &str) -> anyhow::Result<SimulationPage> {
+    let mut page = SimulationPage::default();
+    result_children(body, "SimulatePrincipalPolicyResult", |tag| {
+        if tag.start_el().matches("IsTruncated") {
+            page.truncated = text(tag)? == "true";
+        } else if tag.start_el().matches("Marker") {
+            page.marker = Some(text(tag)?);
+        } else if tag.start_el().matches("EvaluationResults") {
+            children(tag, |member| {
+                let (mut resource, mut decision) = (None, None);
+                let mut specific = Vec::new();
+                children(member, |field| {
+                    let el = field.start_el();
+                    if el.matches("EvalResourceName") {
+                        resource = Some(text(field)?);
+                    } else if el.matches("EvalDecision") {
+                        decision = Some(text(field)?);
+                    } else if el.matches("ResourceSpecificResults") {
+                        children(field, |each| {
+                            let (mut name, mut decision) = (None, None);
+                            children(each, |f| {
+                                if f.start_el().matches("EvalResourceName") {
+                                    name = Some(text(f)?);
+                                } else if f.start_el().matches("EvalResourceDecision") {
+                                    decision = Some(text(f)?);
+                                }
+                                Ok(())
+                            })?;
+                            if let (Some(name), Some(decision)) = (name, decision) {
+                                specific.push((name, decision));
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                })?;
+                if specific.is_empty() {
+                    if decision.as_deref() == Some("allowed")
+                        && let Some(arn) = resource
+                    {
+                        page.allowed.push(arn);
+                    }
+                } else {
+                    page.allowed.extend(
+                        specific
+                            .into_iter()
+                            .filter(|(_, d)| d == "allowed")
+                            .map(|(name, _)| name),
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })?;
+    Ok(page)
+}
+
+/// The code and message of an IAM `ErrorResponse`.
+fn iam_failure(body: &str) -> Option<(String, String)> {
+    let mut document = aws_smithy_xml::decode::Document::new(body);
+    let mut root = document.root_element().ok()?;
+    if !root.start_el().matches("ErrorResponse") {
+        return None;
+    }
+    let mut found = None;
+    while let Some(mut tag) = root.next_tag() {
+        if !tag.start_el().matches("Error") {
+            continue;
+        }
+        let (mut code, mut message) = (None, String::new());
+        while let Some(mut field) = tag.next_tag() {
+            if field.start_el().matches("Code") {
+                code = text(&mut field).ok();
+            } else if field.start_el().matches("Message") {
+                message = text(&mut field).unwrap_or_default();
             }
-        } else {
-            allowed.extend(
-                specific
-                    .iter()
-                    .filter(|r| r.eval_resource_decision() == &Allowed)
-                    .map(|r| r.eval_resource_name().to_string()),
-            );
         }
+        found = code.map(|c| (c, message));
     }
-    allowed
-}
-
-/// An IAM client signed with `creds`, in the partition's IAM Region.
-fn iam_client(creds: &Credentials, region: &str) -> anyhow::Result<aws_sdk_iam::Client> {
-    let get = |k: &str| {
-        creds
-            .env
-            .get(k)
-            .cloned()
-            .with_context(|| format!("{k} missing from the credentials"))
-    };
-    let provider = aws_sdk_iam::config::Credentials::new(
-        get("AWS_ACCESS_KEY_ID")?,
-        get("AWS_SECRET_ACCESS_KEY")?,
-        creds.env.get("AWS_SESSION_TOKEN").cloned(),
-        None,
-        "omnifob",
-    );
-    let mut config = aws_sdk_iam::Config::builder()
-        .region(aws_sdk_iam::config::Region::new(region.to_string()))
-        .credentials_provider(provider)
-        .behavior_version(aws_sdk_iam::config::BehaviorVersion::latest());
-    if let Some(url) = service_endpoint(IAM_ENDPOINT_VARIABLE) {
-        config = config.endpoint_url(url);
-    }
-    Ok(aws_sdk_iam::Client::from_conf(config.build()))
-}
-
-/// An IAM failure, naming the permission the source lacks when IAM says so.
-fn iam_error<E>(action: &str, e: aws_sdk_iam::error::SdkError<E>) -> crate::Error
-where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-{
-    match e.code() {
-        Some("AccessDenied" | "AccessDeniedException") => {
-            anyhow!("the permission set may not call {action}").into()
-        }
-        _ => anyhow!("{action} failed: {}", e.message().unwrap_or("no message")).into(),
-    }
+    found
 }
 
 /// Whether a trust policy (URL-encoded JSON, as IAM returns it) allows one
-/// of `principals` to call `sts:AssumeRole`: `Some(true)` when an allowing
-/// statement has conditions, `None` when none allows it. A `Deny` is left
-/// to the simulator, which sees only the source's side, so a denied role
-/// can still be listed; the simulator's answer is a guess either way.
+/// of `principals` to call `sts:AssumeRole`: `Some(true)` when every
+/// allowing statement has conditions, `None` when none allows it. A `Deny`
+/// is left to the simulator, which sees only the source's side, so a denied
+/// role can still be listed; the simulator's answer is a guess either way.
 fn trusts(document: &str, principals: &[&str]) -> anyhow::Result<Option<bool>> {
     let json = percent_decode(document)?;
     let policy: Value = serde_json::from_str(&json).context("not JSON")?;
@@ -288,7 +714,8 @@ fn trusts(document: &str, principals: &[&str]) -> anyhow::Result<Option<bool>> {
             let conditional = statement
                 .get("Condition")
                 .is_some_and(|c| c.as_object().is_some_and(|o| !o.is_empty()));
-            found = Some(found.unwrap_or(false) || conditional);
+            // Conditional only when every statement that allows it is.
+            found = Some(found.unwrap_or(true) && conditional);
         }
     }
     Ok(found)
@@ -331,6 +758,37 @@ fn percent_decode(text: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_answers_are_read() {
+        let page = parse_list_roles(
+            "<ListRolesResponse><ListRolesResult><IsTruncated>true</IsTruncated><Marker>m&amp;1</Marker>\
+             <Roles><member><Path>/</Path><RoleName>r</RoleName><Arn>arn:aws:iam::1:role/r</Arn>\
+             <AssumeRolePolicyDocument>%7B%7D</AssumeRolePolicyDocument></member></Roles>\
+             </ListRolesResult></ListRolesResponse>",
+        )
+        .unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.marker.as_deref(), Some("m&1"));
+        assert_eq!(
+            page.roles,
+            [Role {
+                path: "/".into(),
+                name: "r".into(),
+                arn: "arn:aws:iam::1:role/r".into(),
+                trust: Some("%7B%7D".into()),
+            }]
+        );
+        assert_eq!(
+            iam_failure(
+                "<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code>\
+                 <Message>no</Message></Error><RequestId>1</RequestId></ErrorResponse>"
+            ),
+            Some(("AccessDenied".into(), "no".into()))
+        );
+        assert_eq!(iam_failure("not xml"), None);
+        assert_eq!(iam_host(Partition::UsGov), "iam.us-gov.amazonaws.com");
+    }
 
     fn encoded(json: &str) -> String {
         json.bytes()
@@ -398,6 +856,11 @@ mod tests {
             r#"{{"Statement":{{"Effect":"Allow","Principal":{{"AWS":"{root}"}},"Action":"sts:TagSession"}}}}"#
         ));
         assert_eq!(trusts(&tagging, &principals).unwrap(), None);
+        // Unconditional once any statement that allows it is.
+        let both = encoded(&format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{root}"}},"Action":"sts:AssumeRole"}},{{"Effect":"Allow","Principal":{{"AWS":"{root}"}},"Action":"sts:AssumeRole","Condition":{{"Bool":{{"aws:MultiFactorAuthPresent":"true"}}}}}}]}}"#
+        ));
+        assert_eq!(trusts(&both, &principals).unwrap(), Some(false));
         assert!(trusts("%zz", &principals).is_err());
     }
 }

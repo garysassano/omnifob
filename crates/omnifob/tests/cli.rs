@@ -2297,7 +2297,7 @@ async fn mount_iam(server: &MockServer) {
                 )
             };
             let members = [
-                role("/aws-reserved/sso.amazonaws.com/", "AWSReservedSSO_Admin_1", &root),
+                role("/aws-reserved/sso.amazonaws.com/", "AWSReservedSSO_Admin_0123456789abcdef", &root),
                 role("/", "admin-root", &root),
                 role("/", "lambda", &trust(r#"{"Service":"lambda.amazonaws.com"}"#)),
             ]
@@ -2343,6 +2343,10 @@ async fn discovery_writes_a_rule_for_a_role_every_account_has() {
         "{stdout}"
     );
     assert!(!stdout.contains("lambda"), "{stdout}");
+    assert!(
+        stderr.contains("chained_rules.admin-root lists every account where Admin was searched"),
+        "{stderr}"
+    );
 
     fob.ok(&["discover", "aws", "acme", "--write"]);
     fob.ok(&["sync"]);
@@ -2360,6 +2364,28 @@ async fn discovery_writes_a_rule_for_a_role_every_account_has() {
         stderr.contains("no Identity Center role of 'acme' to search named Nobody"),
         "{stderr}"
     );
+    let stderr = fob.fails(&["discover", "aws", "nope"]);
+    assert!(stderr.contains("no integration named 'nope'"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_asks_for_a_sign_in_rather_than_finding_nothing() {
+    let (fob, server) = synced_portal("discover-signed-out").await;
+    mount_iam(&server).await;
+    fob.ok(&["logout", "acme"]);
+    let output = fob.run_as_agent(&["discover", "aws", "acme"]);
+    assert!(!output.status.success());
+    let error = error_line(&output);
+    assert_eq!(error["code"], "login_required", "{error}");
+
+    // Under an agent kept from every role, the refusal says so.
+    fob.write_config(&format!(
+        "{}[agent]\nprofiles = [\"other/*\"]\n",
+        portal_config("acme")
+    ));
+    fob.sign_in("acme");
+    let error = error_line(&fob.run_as_agent(&["discover", "aws", "acme"]));
+    assert_eq!(error["code"], "not_open_to_agents", "{error}");
 }
 
 // Providers other than IAM Identity Center, each against a mock of its

@@ -306,24 +306,41 @@ pub(crate) async fn discover_aws(
         );
     };
     let agent_limits = crate::agent::active() && app.config.agent.profiles.is_some();
-    let sources: Vec<Source> = app
+    let all_sources = app
         .cache
         .all()
         .filter(|p| p.integration == integration)
-        .filter(|p| !agent_limits || app.config.agent.allows(&p.id))
         .filter_map(|p| match &p.target {
             omnifob_core::Target::Aws {
                 account_id,
                 role_name,
                 ..
-            } if via.is_empty() || via.contains(role_name) => Some(Source {
-                account_id: account_id.clone(),
-                segment: p.id.split('/').nth(1)?.to_string(),
-                via_role: role_name.clone(),
-            }),
+            } if via.is_empty() || via.contains(role_name) => Some((
+                p,
+                Source {
+                    account_id: account_id.clone(),
+                    segment: p.id.split('/').nth(1)?.to_string(),
+                    via_role: role_name.clone(),
+                },
+            )),
             _ => None,
-        })
-        .collect();
+        });
+    let (open, closed): (Vec<_>, Vec<_>) =
+        all_sources.partition(|(p, _)| !agent_limits || app.config.agent.allows(&p.id));
+    let sources: Vec<Source> = open.into_iter().map(|(_, s)| s).collect();
+    if sources.is_empty() && !closed.is_empty() {
+        return Err(omnifob_core::Coded::new(
+            omnifob_core::Code::NotOpenToAgents,
+            format!(
+                "none of the {} Identity Center role(s) of '{integration}' to search is open to \
+                 agents; ask the user to run `fob discover aws {integration}` or to give agents \
+                 access",
+                closed.len()
+            ),
+        )
+        .with("integration", integration)
+        .into());
+    }
     if sources.is_empty() {
         bail!(
             "no Identity Center role of '{integration}' to search{}; see `fob list {integration}`",
@@ -338,12 +355,17 @@ pub(crate) async fn discover_aws(
         "fob: searching {} role(s) of '{integration}' with iam:ListRoles and the policy simulator",
         sources.len()
     );
-    let discovery = discover(integration, config, sources).await;
+    let discovery = app
+        .with_login(|| discover(integration, config, sources.clone()))
+        .await?;
     for skipped in &discovery.skipped {
         eprintln!(
             "fob: skipped {}/{}/{}: {}",
             integration, skipped.source.segment, skipped.source.via_role, skipped.reason
         );
+    }
+    for role in &discovery.unreadable {
+        eprintln!("fob: left out {role}: its trust policy could not be read");
     }
     let mut chained = std::collections::BTreeMap::new();
     for found in &discovery.found {
@@ -361,10 +383,45 @@ pub(crate) async fn discover_aws(
                 found.label, found.role.role_arn
             );
         }
+        if !found.also_via.is_empty() {
+            eprintln!(
+                "fob: {} ({}): also assumable from {}; written from {}",
+                found.label,
+                found.role.role_arn,
+                found.also_via.join(", "),
+                found.role.via_role
+            );
+        }
         chained.insert(found.label.clone(), found.role.clone());
     }
     let (mut chained, mut rules) = fold_chained(chained);
     keep_new(config, &mut chained, &mut rules);
+    // A rule found in every account its permission set was searched in
+    // could cover accounts added later too, which only the user can judge.
+    for (label, rule) in &rules {
+        let searched: std::collections::BTreeSet<&str> = sources
+            .iter()
+            .filter(|s| s.via_role == rule.via_role)
+            .map(|s| s.account_id.as_str())
+            .collect();
+        let skipped = discovery
+            .skipped
+            .iter()
+            .any(|s| s.source.via_role == rule.via_role);
+        if !skipped
+            && rule
+                .accounts
+                .iter()
+                .map(String::as_str)
+                .eq(searched.iter().copied())
+        {
+            eprintln!(
+                "fob: chained_rules.{label} lists every account where {} was searched; remove \
+                 `accounts` to cover accounts added later as well",
+                rule.via_role
+            );
+        }
+    }
     if chained.is_empty() && rules.is_empty() {
         eprintln!("fob: nothing new found");
         return Ok(());
