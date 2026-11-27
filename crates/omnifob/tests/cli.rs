@@ -452,6 +452,68 @@ async fn mount_device_sign_in(server: &MockServer) {
         .await;
 }
 
+/// `fob login --start` shows the code and returns, so an agent can pass it
+/// on; `--wait` then finishes the sign-in in another process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_sign_in_starts_and_finishes_in_two_steps() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("login-two-step").with_server(&server);
+    fob.write_config(&format!(
+        "{}\n[integrations.tok]\ntype = \"token\"\npreset = \"github\"\n",
+        portal_config("acme")
+    ));
+    mount_device_sign_in(&server).await;
+    mount_portal(&server, &[("111111111111", "Dev")]).await;
+
+    let stderr = fob.fails(&["login", "acme", "--wait"]);
+    assert!(
+        stderr.contains(
+            "no device sign-in was started for 'acme'; run `fob login acme --start` first"
+        ),
+        "{stderr}"
+    );
+    let output = fob.run_as_agent(&["login", "acme", "--start", "--no-browser"]);
+    let (_, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("https://device.example/?code=ABCD-EFGH"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
+    assert!(
+        stderr.contains("then run `fob login acme --wait`"),
+        "{stderr}"
+    );
+    assert!(fob.secret("aws-sso/acme/pending").exists());
+    assert!(!fob.secret("aws-sso/acme/token").exists());
+
+    let output = fob.run_as_agent(&["login", "acme", "--wait"]);
+    let (_, stderr) = texts(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("signed in to 'acme'"), "{stderr}");
+    assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
+    assert!(fob.secret("aws-sso/acme/token").exists());
+    assert!(!fob.secret("aws-sso/acme/pending").exists());
+
+    // Signed in: both steps keep the sign-in rather than start another.
+    for args in [
+        &["login", "acme", "--start"][..],
+        &["login", "acme", "--wait"],
+    ] {
+        let (_, stderr) = fob.ok(args);
+        assert!(stderr.contains("kept the sign-in of 'acme'"), "{stderr}");
+    }
+    assert!(!fob.secret("aws-sso/acme/pending").exists());
+
+    let stderr = fob.fails(&["login", "tok", "--start"]);
+    assert!(
+        stderr.contains("--start and --wait apply to device sign-ins"),
+        "{stderr}"
+    );
+    let stderr = fob.fails(&["login", "acme", "--start", "--wait"]);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn login_signs_in_and_syncs() {
     let server = MockServer::start().await;
@@ -2550,6 +2612,31 @@ async fn an_entra_id_account_signs_in_with_a_code_and_runs_commands() {
 
     fob.ok(&["logout", "work"]);
     assert!(!fob.secret("azure/work/oauth").exists());
+}
+
+/// Entra ID's device sign-in in two steps; `--wait` polls past a pending
+/// answer, as the one-step sign-in does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entra_id_sign_in_starts_and_finishes_in_two_steps() {
+    let server = MockServer::start().await;
+    mount_azure(&server).await;
+    let fob = Fob::new("azure-two-step").with_var("OMNIFOB_AZURE_ENDPOINT", &server.uri());
+    fob.write_config("[integrations.work]\ntype = \"azure\"\n");
+    let (_, stderr) = fob.ok(&["login", "work", "--start", "--no-browser"]);
+    assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
+    assert!(
+        stderr.contains("https://microsoft.com/devicelogin"),
+        "{stderr}"
+    );
+    assert!(fob.secret("azure/work/pending").exists());
+    let (_, stderr) = fob.ok(&["login", "work", "--wait"]);
+    assert!(
+        stderr.contains("signed in to Entra ID as me@contoso.com"),
+        "{stderr}"
+    );
+    assert!(!fob.secret("azure/work/pending").exists());
+    let (stdout, _) = fob.ok(&["list"]);
+    assert_eq!(lines(&stdout), ["work/prod/user"]);
 }
 
 const CF_ACCOUNT: &str = "acct123";

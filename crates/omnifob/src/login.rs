@@ -391,6 +391,75 @@ impl App {
         Ok(())
     }
 
+    /// `fob login --start`: starts a device sign-in, shows where to approve
+    /// it, and returns, leaving `fob login --wait` to finish it. A sign-in
+    /// that still works is kept, as `fob login` keeps it.
+    pub(crate) async fn login_start(
+        &self,
+        name: &str,
+        no_browser: bool,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let integration = self.config.integration(name)?;
+        if !matches!(integration, Integration::AwsSso(_) | Integration::Azure(_)) {
+            bail!(two_step_only(name));
+        }
+        if !force && self.keeps_sign_in(name, integration).await {
+            return Ok(());
+        }
+        let (url, code, expires_at) = match integration {
+            Integration::AwsSso(config) => {
+                let started = aws::sso::start_device_login(name, config).await?;
+                (
+                    started.prompt.url,
+                    started.prompt.user_code.unwrap_or_default(),
+                    started.expires_at,
+                )
+            }
+            Integration::Azure(config) => {
+                let started = azure::start_device_login(name, config).await?;
+                (started.url, started.user_code, started.expires_at)
+            }
+            _ => unreachable!("checked above"),
+        };
+        eprintln!("fob: approve the sign-in for '{name}' on any device");
+        eprintln!("     {url}");
+        eprintln!("     code: {code}");
+        if !no_browser && let Err(e) = crate::browser::open(&self.config, name, &url) {
+            eprintln!("fob: could not open a browser ({e}); open the URL above");
+        }
+        eprintln!(
+            "fob: then run `fob login {name} --wait`, before the code expires at {}",
+            expires_at.strftime("%H:%M UTC")
+        );
+        Ok(())
+    }
+
+    /// `fob login --wait`: finishes the sign-in `--start` began, once the
+    /// person approves it.
+    pub(crate) async fn login_wait(&self, name: &str) -> anyhow::Result<()> {
+        let integration = self.config.integration(name)?;
+        let pending = match integration {
+            Integration::AwsSso(_) => aws::sso::has_pending_login(name)?,
+            Integration::Azure(_) => azure::has_pending_login(name)?,
+            _ => bail!(two_step_only(name)),
+        };
+        // `--start` kept a sign-in that works, so there is nothing to wait for.
+        if !pending && self.keeps_sign_in(name, integration).await {
+            return Ok(());
+        }
+        match integration {
+            Integration::AwsSso(config) => aws::sso::finish_device_login(name, config).await?,
+            Integration::Azure(config) => {
+                let username = azure::finish_device_login(name, config).await?;
+                eprintln!("fob: signed in to Entra ID as {username}");
+            }
+            _ => unreachable!("checked above"),
+        }
+        eprintln!("fob: signed in to '{name}'");
+        Ok(())
+    }
+
     /// Keeps a browser sign-in that still works instead of opening the
     /// browser again; returns whether it did.
     async fn keeps_sign_in(&self, name: &str, integration: &Integration) -> bool {
@@ -489,6 +558,13 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// Why `--start` and `--wait` do not apply to integration `name`.
+fn two_step_only(name: &str) -> String {
+    format!(
+        "--start and --wait apply to device sign-ins (AWS IAM Identity Center and Azure); `fob login {name}` signs in to '{name}' through a browser on this machine instead"
+    )
 }
 
 pub(crate) fn cloudflare_bootstrap_help(token_type: CloudflareTokenType) -> &'static str {

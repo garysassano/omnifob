@@ -131,13 +131,31 @@ fn registration_key(integration: &str, flow: Flow) -> String {
     format!("aws-sso/{integration}/client/{}", flow.as_str())
 }
 
+fn pending_key(integration: &str) -> String {
+    format!("aws-sso/{integration}/pending")
+}
+
 /// Every keychain key an integration uses, for renaming it.
 pub fn keys(integration: &str) -> Vec<String> {
     vec![
         token_key(integration),
         registration_key(integration, Flow::Browser),
         registration_key(integration, Flow::DeviceCode),
+        pending_key(integration),
     ]
+}
+
+/// A device sign-in waiting for approval, kept between `fob login --start`
+/// and `fob login --wait`, which may run in different processes: Identity
+/// Center keeps the authorization, and the device code finds it again. Not
+/// `Debug`: whoever polls with the device code gets the token once the
+/// person approves, so it is kept in the keychain like the token itself.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingDevice {
+    registration: Registration,
+    device_code: String,
+    interval_secs: u64,
+    expires_at: Timestamp,
 }
 
 /// What the user must do to approve a sign-in.
@@ -233,8 +251,81 @@ pub async fn login(
     let oidc = oidc_client(&config.region);
     let (registration, token) = match flow {
         Flow::Browser => browser_sign_in(integration, config, &oidc, prompt).await?,
-        Flow::DeviceCode => device_sign_in(integration, config, &oidc, prompt).await?,
+        Flow::DeviceCode => {
+            let (pending, shown) = start_device(integration, config, &oidc).await?;
+            prompt(&shown);
+            let token = poll_device(&oidc, &pending).await?;
+            (pending.registration, token)
+        }
     };
+    keep_token(integration, config, registration, &token)
+}
+
+/// What `fob login --start` shows: where to approve, and until when.
+#[derive(Debug, Clone)]
+pub struct DeviceStart {
+    pub prompt: SignInPrompt,
+    pub expires_at: Timestamp,
+}
+
+/// Starts a device sign-in and keeps it for [`finish_device_login`], so the
+/// code can be shown and the process end while the person approves it.
+pub async fn start_device_login(
+    integration: &str,
+    config: &AwsSsoConfig,
+) -> anyhow::Result<DeviceStart> {
+    let oidc = oidc_client(&config.region);
+    let (pending, prompt) = start_device(integration, config, &oidc).await?;
+    store::set(&pending_key(integration), &pending)?;
+    Ok(DeviceStart {
+        prompt,
+        expires_at: pending.expires_at,
+    })
+}
+
+/// Whether a device sign-in [`start_device_login`] started is waiting.
+pub fn has_pending_login(integration: &str) -> anyhow::Result<bool> {
+    Ok(store::get::<PendingDevice>(&pending_key(integration))?.is_some())
+}
+
+/// Waits for the sign-in [`start_device_login`] started to be approved,
+/// then keeps it as `login` does. The started sign-in is forgotten once it
+/// ends either way.
+pub async fn finish_device_login(integration: &str, config: &AwsSsoConfig) -> anyhow::Result<()> {
+    let key = pending_key(integration);
+    let Some(pending) = store::get::<PendingDevice>(&key)? else {
+        bail!(
+            "no device sign-in was started for '{integration}'; run `fob login {integration} --start` first"
+        );
+    };
+    if pending.registration.start_url != config.start_url
+        || pending.registration.region != config.region
+    {
+        store::delete(&key)?;
+        bail!(
+            "the sign-in started for '{integration}' was for another portal; run `fob login {integration} --start` again"
+        );
+    }
+    if pending.expires_at <= Timestamp::now() {
+        store::delete(&key)?;
+        bail!(
+            "the code of the sign-in started for '{integration}' expired; run `fob login {integration} --start` again"
+        );
+    }
+    let oidc = oidc_client(&config.region);
+    let polled = poll_device(&oidc, &pending).await;
+    // Approved, refused or expired, the device code is spent.
+    store::delete(&key)?;
+    keep_token(integration, config, pending.registration, &polled?)
+}
+
+/// Stores the session a sign-in produced.
+fn keep_token(
+    integration: &str,
+    config: &AwsSsoConfig,
+    registration: Registration,
+    token: &CreateTokenOutput,
+) -> anyhow::Result<()> {
     let now = Timestamp::now();
     store::set(
         &token_key(integration),
@@ -407,13 +498,13 @@ fn authorize_url(
     format!("{endpoint}?{query}")
 }
 
-/// The device authorization flow: approve on any device with a code.
-async fn device_sign_in(
+/// Starts the device authorization flow: what to show, and what polling
+/// for the approval needs.
+async fn start_device(
     integration: &str,
     config: &AwsSsoConfig,
     oidc: &aws_sdk_ssooidc::Client,
-    prompt: impl FnOnce(&SignInPrompt),
-) -> anyhow::Result<(Registration, CreateTokenOutput)> {
+) -> anyhow::Result<(PendingDevice, SignInPrompt)> {
     let registration = registration(integration, config, oidc, Flow::DeviceCode).await?;
     let device = oidc
         .start_device_authorization()
@@ -423,41 +514,54 @@ async fn device_sign_in(
         .send()
         .await
         .map_err(|e| anyhow!("starting device sign-in: {}", describe(&e)))?;
-    let device_code = device.device_code().context("no device code returned")?;
-    prompt(&SignInPrompt {
+    let prompt = SignInPrompt {
         url: device
             .verification_uri_complete()
             .or(device.verification_uri())
             .context("no verification URL returned")?
             .to_string(),
         user_code: device.user_code().map(str::to_string),
-    });
+    };
+    let pending = PendingDevice {
+        device_code: device
+            .device_code()
+            .context("no device code returned")?
+            .to_string(),
+        interval_secs: device.interval().max(1) as u64,
+        expires_at: after_secs(Timestamp::now(), device.expires_in().into()),
+        registration,
+    };
+    Ok((pending, prompt))
+}
 
-    let deadline = after_secs(Timestamp::now(), device.expires_in().into());
-    let mut interval = Duration::from_secs(device.interval().max(1) as u64);
-    let token = loop {
+/// Polls until the person approves the device sign-in, or its code expires.
+async fn poll_device(
+    oidc: &aws_sdk_ssooidc::Client,
+    pending: &PendingDevice,
+) -> anyhow::Result<CreateTokenOutput> {
+    let mut interval = Duration::from_secs(pending.interval_secs);
+    loop {
         tokio::time::sleep(interval).await;
         let result = oidc
             .create_token()
-            .client_id(&registration.client_id)
-            .client_secret(&registration.client_secret)
+            .client_id(&pending.registration.client_id)
+            .client_secret(&pending.registration.client_secret)
             .grant_type("urn:ietf:params:oauth:grant-type:device_code")
-            .device_code(device_code)
+            .device_code(&pending.device_code)
             .send()
             .await;
         match result {
-            Ok(token) => break token,
+            Ok(token) => return Ok(token),
             Err(e) => match e.as_service_error() {
                 Some(CreateTokenError::AuthorizationPendingException(_)) => {}
                 Some(CreateTokenError::SlowDownException(_)) => interval += Duration::from_secs(5),
                 _ => bail!("waiting for sign-in approval: {}", describe(&e)),
             },
         }
-        if Timestamp::now() > deadline {
+        if Timestamp::now() > pending.expires_at {
             bail!("sign-in was not approved before the code expired");
         }
-    };
-    Ok((registration, token))
+    }
 }
 
 /// Ends the portal session at Identity Center, as `aws sso logout` does, so
@@ -491,6 +595,7 @@ pub async fn end_session(integration: &str, config: &AwsSsoConfig) -> anyhow::Re
 /// Forgets the session. The client registration is kept, as the AWS CLI
 /// keeps it, so the next sign-in reuses it.
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
+    store::delete(&pending_key(integration))?;
     store::delete(&token_key(integration))
 }
 

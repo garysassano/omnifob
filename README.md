@@ -329,6 +329,8 @@ fob login acme            # browser sign-in (kept while it still works), then di
 fob login                 # pick the integration from a fuzzy list (fob logout too)
 fob login acme --force    # sign in again even though the stored sign-in works
 fob login acme --device-code   # approve with a code on another device (automatic over SSH and without a display)
+fob login acme --start    # print the device code and return (Identity Center, Azure) ...
+fob login acme --wait     # ... then finish once it is approved, in another process
 fob list                  # acme/prod/AdministratorAccess  prod?  admin?, cf/personal/workers  write, ...
 fob list prod admin       # only the profiles those words match
 fob exec prod admin -- aws s3 ls
@@ -488,7 +490,7 @@ fob-error: {"code":"login_required","integration":"acme","message":"getting cred
 
 `fob check --json` and `fob status --check --json` give a failed check's `code` too. Codes keep their meaning across releases; new ones may be added.
 
-An agent gets credentials with `fob exec acme/dev/ReadOnly -- aws s3 ls`, or through AWS profiles from `fob export aws-config`, which work without fob in the command. When a sign-in lapses, the agent can ask you to run `fob login <integration>`, or run it itself: the browser opens on your screen for you to approve. Let the agent run `fob exec` per command rather than starting the agent itself inside `fob exec`, which would put the credentials in the environment of every command it runs.
+An agent gets credentials with `fob exec acme/dev/ReadOnly -- aws s3 ls`, or through AWS profiles from `fob export aws-config`, which work without fob in the command. When a sign-in lapses, the agent can ask you to run `fob login <integration>`, or run it itself: the browser opens on your screen for you to approve. Agents see a command's output only when it ends, so for Identity Center and Azure they run `fob login <integration> --start`, which opens the approval page, prints the URL and code and returns, pass the code on to you, and then run `fob login <integration> --wait`. Let the agent run `fob exec` per command rather than starting the agent itself inside `fob exec`, which would put the credentials in the environment of every command it runs.
 
 This guards against accidents, not against the agent, which runs as you; the harness's sandbox and permission rules are the boundary. [`skills/omnifob`](skills/omnifob/SKILL.md) is a skill that teaches agents the above; install it with your agent's skill tooling, for example `npx skills add garysassano/omnifob`. The skill names the fob release it describes (`metadata.fob-version`); `fob status`, and `fob list` under an agent, point out a copy in `~/.agents/skills`, Claude Code's, Codex's or OpenCode's skill folder that describes another release, which `npx skills update` refreshes.
 

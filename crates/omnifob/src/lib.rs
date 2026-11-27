@@ -238,8 +238,19 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             token_stdin,
             from_clipboard,
             force,
+            start,
+            wait,
         } => {
             let integration = app.pick_integration(integration.as_deref(), "login")?;
+            if start {
+                app.login_start(&integration, no_browser, force).await?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            if wait {
+                app.login_wait(&integration).await?;
+                app.sync(std::slice::from_ref(&integration)).await?;
+                return Ok(ExitCode::SUCCESS);
+            }
             app.login(
                 &integration,
                 no_browser,
