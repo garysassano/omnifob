@@ -31,9 +31,8 @@ impl App {
 /// always fails.
 fn needs_a_person(config: &Config, profile: &Profile) -> bool {
     match (config.integration(&profile.integration), &profile.target) {
-        (Ok(Integration::AwsSso(c)), Target::AwsChained { label, .. }) => c
-            .chained
-            .get(label)
+        (Ok(Integration::AwsSso(c)), Target::AwsChained { label, account_id }) => c
+            .chained_role(label, account_id.as_deref())
             .is_some_and(|role| role.mfa_serial.is_some()),
         (Ok(Integration::AwsIam(c)), Target::AwsIamRole { label, .. }) => {
             c.mfa_serial.is_some() && c.roles.get(label).is_some_and(|role| role.no_session)

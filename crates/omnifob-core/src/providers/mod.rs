@@ -340,8 +340,8 @@ pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::Signe
                 .and_then(|t| t.ttl)
                 .unwrap_or(c.ttl),
         ),
-        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
-            let role = c.chained.get(label)?;
+        (Integration::AwsSso(c), Target::AwsChained { label, account_id }) => {
+            let role = c.chained_role(label, account_id.as_deref())?;
             if role.mfa_serial.is_some() {
                 return None;
             }
@@ -465,8 +465,15 @@ async fn fetch(
                 ..
             },
         ) => aws::sso::credentials(&profile.integration, c, account_id, role_name).await?,
-        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => {
-            aws::sso::chained_credentials(&profile.integration, c, label, &profile.id, ttl).await?
+        (Integration::AwsSso(c), Target::AwsChained { label, account_id }) => {
+            aws::sso::chained_credentials(
+                &profile.integration,
+                c,
+                (label, account_id.as_deref()),
+                &profile.id,
+                ttl,
+            )
+            .await?
         }
         (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
             aws::cross_partition::cross_partition_credentials(&profile.integration, c, label, ttl)
@@ -572,9 +579,8 @@ fn aws_console_partition(
     target: &Target,
 ) -> anyhow::Result<Partition> {
     match (integration, target) {
-        (Integration::AwsSso(c), Target::AwsChained { label, .. }) => c
-            .chained
-            .get(label)
+        (Integration::AwsSso(c), Target::AwsChained { label, account_id }) => c
+            .chained_role(label, account_id.as_deref())
             .with_context(|| {
                 format!("no chained role '{label}' in integration '{name}'; run `fob sync`")
             })?

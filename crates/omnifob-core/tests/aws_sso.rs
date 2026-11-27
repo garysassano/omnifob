@@ -500,6 +500,26 @@ async fn discovery_lists_every_account_and_role() {
             "discover/prod/ReadOnly"
         ]
     );
+
+    // A rule's profiles sit next to their account's roles.
+    let mut ruled = config();
+    ruled.chained_rules.insert(
+        "root".into(),
+        toml::from_str("via_role = \"ReadOnly\"\nrole_name = \"root\"").unwrap(),
+    );
+    let profiles = aws::sso::discover("discover", &ruled).await.unwrap();
+    let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "discover/dev/Admin",
+            "discover/dev/ReadOnly",
+            "discover/dev/root",
+            "discover/prod/Admin",
+            "discover/prod/ReadOnly",
+            "discover/prod/root"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -761,9 +781,10 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
     else {
         unreachable!()
     };
-    let creds = aws::sso::chained_credentials("chain", &config, "prod", "chain/prod/Deploy", None)
-        .await
-        .unwrap();
+    let creds =
+        aws::sso::chained_credentials("chain", &config, ("prod", None), "chain/prod/Deploy", None)
+            .await
+            .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIACHAINED");
     assert!(
         !creds.env.contains_key("AWS_REGION"),
@@ -773,7 +794,7 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
     let err = aws::sso::chained_credentials(
         "chain",
         &config,
-        "prod",
+        ("prod", None),
         "chain/prod/Deploy",
         Some(jiff::SignedDuration::from_hours(2)),
     )
@@ -838,14 +859,70 @@ async fn an_agent_s_role_sessions_are_named_for_it_unless_configured() {
     else {
         unreachable!()
     };
-    let creds = aws::sso::chained_credentials("chain", &config, "prod", "chain/prod/Deploy", None)
-        .await
-        .unwrap();
+    let creds =
+        aws::sso::chained_credentials("chain", &config, ("prod", None), "chain/prod/Deploy", None)
+            .await
+            .unwrap();
     assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAAGENT");
-    let creds = aws::sso::chained_credentials("chain", &config, "named", "chain/named/Named", None)
+    let creds =
+        aws::sso::chained_credentials("chain", &config, ("named", None), "chain/named/Named", None)
+            .await
+            .unwrap();
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAME");
+}
+
+#[tokio::test]
+async fn a_chained_rule_assumes_the_role_in_its_profile_account() {
+    use omnifob_core::providers;
+    use omnifob_core::{Profile, Target};
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "rule", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .and(query_param("account_id", "333333333333"))
+        .and(query_param("role_name", "pe"))
+        .respond_with(role_credentials())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=AssumeRole"))
+        .and(body_string_contains(
+            "RoleArn=arn%3Aaws%3Aiam%3A%3A333333333333%3Arole%2Fops%2Froot",
+        ))
+        .respond_with(sts_credentials("AssumeRole", "ASIARULE"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = Config::parse(&format!(
+        r#"
+        [integrations.rule]
+        type = "aws-sso"
+        start_url = "{START_URL}"
+        region = "eu-west-1"
+        [integrations.rule.chained_rules.root]
+        via_role = "pe"
+        role_name = "root"
+        path = "/ops/"
+        "#
+    ))
+    .unwrap();
+    let profile = Profile::new(
+        "rule",
+        "stage",
+        "root",
+        Target::AwsChained {
+            label: "root".into(),
+            account_id: Some("333333333333".into()),
+        },
+    );
+    let creds = providers::credentials(&config, &profile, true, None)
         .await
         .unwrap();
-    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAME");
+    assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIARULE");
+    assert_eq!(creds.env["AWS_ACCOUNT_ID"], "333333333333");
 }
 
 #[tokio::test]

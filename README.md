@@ -81,6 +81,17 @@ region = "us-east-1"         # optional, defaults to the integration's
 mfa_serial = "arn:aws:iam::111111111111:mfa/me"  # optional: asks for a code per session
 duration = "30m"             # optional, 15m to 1h
 
+# The same role name chained from one permission set in every account that has it:
+# one rule instead of a chained table per account, and accounts added later are covered.
+# Profile id: acme/<account>/admin-root, next to that account's Identity Center roles.
+[integrations.acme.chained_rules.root]
+via_role = "PowerUserAccess"     # the permission set to start from
+role_name = "admin-root"         # assumed as arn:aws:iam::<account>:role/admin-root
+path = "/ops/"                   # optional IAM path, "/" by default
+accounts = ["111111111111"]      # optional: only these accounts
+exclude_accounts = []            # optional: leave these out
+# session_name, external_id, region, mfa_serial and duration as for chained roles
+
 # A role in another AWS partition (GovCloud, China, European Sovereign Cloud),
 # reached from an Identity Center role with a web identity token.
 # Profile id: acme/gov-audit/Audit. Setup in both accounts: docs/guides/aws-cross-partition.md.
