@@ -35,9 +35,16 @@ pub fn wsl_interop() -> bool {
 /// Whether an executable file named `program` is in a `PATH` directory, as
 /// the shell would find it, without running it.
 pub fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program)))
-    })
+    find_on_path(program).is_some()
+}
+
+/// The executable file named `program` in the first `PATH` directory that
+/// has one, as the shell would find it, without running it.
+pub fn find_on_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
 }
 
 #[cfg(unix)]
