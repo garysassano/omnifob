@@ -65,8 +65,9 @@ pub struct Source {
 pub struct Found {
     pub label: String,
     pub role: ChainedRole,
-    /// What the trust policy needs that fob could not check, such as an
-    /// external ID or MFA; empty when nothing.
+    /// What the role needs that fob could not check, such as an external
+    /// ID or MFA in its trust policy, or context the source's own policies
+    /// check; empty when nothing.
     pub conditions: Vec<String>,
     /// Other permission sets of the account that may assume it too.
     pub also_via: Vec<String>,
@@ -311,6 +312,11 @@ async fn search(
         partition.arn_name(),
         source.account_id
     );
+    let requester = Requester {
+        account_id: &source.account_id,
+        root: &root,
+        arn: &source_arn,
+    };
     let mut candidates = Vec::new();
     let mut unreadable = Vec::new();
     for role in roles {
@@ -323,23 +329,52 @@ async fn search(
         let Some(document) = &role.trust else {
             continue;
         };
-        let requester = Requester {
-            account_id: &source.account_id,
-            root: &root,
-            arn: &source_arn,
-        };
         match trusts(document, &requester) {
-            Ok(Some(conditions)) => candidates.push((role, conditions)),
+            Ok(Some(trust)) => candidates.push((role, trust)),
             Ok(None) => {}
             // One role's policy does not end the account's search.
             Err(e) => unreadable.push(format!("{} ({e:#})", role.arn)),
         }
     }
     let arns: Vec<&str> = candidates.iter().map(|(r, _)| r.arn.as_str()).collect();
-    let allowed = simulate(clients, lister, source, &source_arn, &arns).await?;
-    let found = candidates
+    let (simulator, decisions) = simulate(clients, lister, source, &requester, &arns).await?;
+    let mut kept = Vec::new();
+    for (role, trust) in candidates {
+        let Some(decision) = decisions.get(&role.arn) else {
+            continue;
+        };
+        let mut conditions = trust.conditions;
+        let assumable = match decision.decision.as_str() {
+            "allowed" => true,
+            // In its own account, a role whose trust policy names the
+            // source's role ARN needs nothing from the source's policies,
+            // unless the organization's SCPs or the permissions boundary
+            // refuse, which the simulator reports for one role at a time.
+            "implicitDeny" if trust.by_arn && decision.boundary != Some(false) => {
+                let iam = clients
+                    .made(&simulator)
+                    .context("the simulating permission set has no client")?;
+                let alone = iam
+                    .simulate_assume_role(&requester, &[role.arn.as_str()])
+                    .await?;
+                alone.iter().any(|(_, d)| d.trust_alone_allows())
+            }
+            // Denied only for want of context the source's policies check.
+            "implicitDeny" if !decision.missing.is_empty() => {
+                conditions.push(format!(
+                    "the permission set's policies check {}, which the simulator was not given",
+                    decision.missing.join(", ")
+                ));
+                true
+            }
+            _ => false,
+        };
+        if assumable {
+            kept.push((role, conditions));
+        }
+    }
+    let found = kept
         .into_iter()
-        .filter(|(role, _)| allowed.contains(&role.arn))
         .map(|(role, conditions)| Found {
             label: format!("{}-{}", source.segment, crate::profile::slug(&role.name)),
             role: ChainedRole {
@@ -359,26 +394,26 @@ async fn search(
     Ok((found, unreadable))
 }
 
-/// The role ARNs among `arns` the simulator lets `source_arn` assume, asked
-/// with `lister`'s credentials, or with the source's own when `lister`'s
-/// may not call the simulator.
+/// The simulator's answer for each of `arns`, asked with `lister`'s
+/// credentials, or with the source's own when `lister`'s may not call the
+/// simulator, and the permission set whose credentials answered.
 async fn simulate(
     clients: &mut Clients<'_>,
     lister: &str,
     source: &Source,
-    source_arn: &str,
+    requester: &Requester<'_>,
     arns: &[&str],
-) -> Result<BTreeSet<String>> {
+) -> Result<(String, BTreeMap<String, Decision>)> {
     if arns.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok((lister.to_string(), BTreeMap::new()));
     }
     let iam = clients
         .made(lister)
         .context("the permission set that listed the roles has no client")?;
-    match simulate_with(iam, source_arn, arns).await {
+    match simulate_with(iam, requester, arns).await {
         Err(e) if is_denied(&e) && source.via_role != lister => {}
         Err(e) if is_denied(&e) => return Err(untested(e, arns.len())),
-        other => return other,
+        other => return other.map(|d| (lister.to_string(), d)),
     }
     let own = match clients.get(source).await? {
         Ok(iam) => iam,
@@ -391,7 +426,7 @@ async fn simulate(
             .into());
         }
     };
-    simulate_with(own, source_arn, arns).await.map_err(|e| {
+    let decisions = simulate_with(own, requester, arns).await.map_err(|e| {
         if is_denied(&e) {
             anyhow!(
                 "neither it nor {lister} may call iam:SimulatePrincipalPolicy; {} role(s) in the \
@@ -402,7 +437,8 @@ async fn simulate(
         } else {
             e
         }
-    })
+    })?;
+    Ok((source.via_role.clone(), decisions))
 }
 
 /// `e`, a refused simulation, with how many roles it left untested.
@@ -410,12 +446,46 @@ fn untested(e: crate::Error, roles: usize) -> crate::Error {
     anyhow!("{e:#}; {roles} role(s) in the account trust it").into()
 }
 
-async fn simulate_with(iam: &Iam, source_arn: &str, arns: &[&str]) -> Result<BTreeSet<String>> {
-    let mut allowed = BTreeSet::new();
+async fn simulate_with(
+    iam: &Iam,
+    requester: &Requester<'_>,
+    arns: &[&str],
+) -> Result<BTreeMap<String, Decision>> {
+    let mut decisions = BTreeMap::new();
     for chunk in arns.chunks(SIMULATED_PER_CALL) {
-        allowed.extend(iam.simulate_assume_role(source_arn, chunk).await?);
+        decisions.extend(iam.simulate_assume_role(requester, chunk).await?);
     }
-    Ok(allowed)
+    Ok(decisions)
+}
+
+/// The simulator's answer for one role.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Decision {
+    /// `allowed`, `explicitDeny` or `implicitDeny`.
+    decision: String,
+    /// Context keys the source's policies check that the simulation lacked.
+    missing: Vec<String>,
+    /// Whether the source's permissions boundary allows it, when it has one.
+    boundary: Option<bool>,
+    /// Whether the organization's SCPs allow it, when IAM says so for this
+    /// role alone (it does only at the top of a result, so only when the
+    /// simulation had one role).
+    organizations: Option<bool>,
+}
+
+impl Decision {
+    /// Whether a trust policy naming the source's role ARN is enough: the
+    /// source's identity policies may lack an allow, but nothing denies it,
+    /// and neither the SCPs nor the permissions boundary withhold it (a
+    /// boundary limits what a policy grants to a role ARN, though not to a
+    /// session ARN).
+    fn trust_alone_allows(&self) -> bool {
+        match self.decision.as_str() {
+            "allowed" => true,
+            "implicitDeny" => self.organizations != Some(false) && self.boundary != Some(false),
+            _ => false,
+        }
+    }
 }
 
 /// IAM refused the call: the permission set may not make it.
@@ -495,22 +565,48 @@ impl Iam {
         }
     }
 
-    /// The role ARNs among `resources` the policy simulator lets
-    /// `source_arn` call `sts:AssumeRole` on.
+    /// The policy simulator's answer for the requester's `sts:AssumeRole`
+    /// on each of `resources`. The context fob knows of the request (the
+    /// source role's ARN, its account and its principal type) is given, so
+    /// policies and SCPs that check those keys see them rather than finding
+    /// them missing.
     async fn simulate_assume_role(
         &self,
-        source_arn: &str,
+        requester: &Requester<'_>,
         resources: &[&str],
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, Decision)>> {
         let action = "iam:SimulatePrincipalPolicy";
-        let mut allowed = Vec::new();
+        let mut decisions = Vec::new();
         let mut marker: Option<String> = None;
+        let context = [
+            ("aws:PrincipalArn", requester.arn),
+            ("aws:PrincipalAccount", requester.account_id),
+            ("aws:PrincipalType", "AssumedRole"),
+        ];
+        let context_params: Vec<(String, String)> = context
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (key, value))| {
+                let entry = format!("ContextEntries.member.{}", i + 1);
+                [
+                    (format!("{entry}.ContextKeyName"), key.to_string()),
+                    (format!("{entry}.ContextKeyType"), "string".to_string()),
+                    (
+                        format!("{entry}.ContextKeyValues.member.1"),
+                        value.to_string(),
+                    ),
+                ]
+            })
+            .collect();
         loop {
             let mut params = vec![
                 ("Action", "SimulatePrincipalPolicy".to_string()),
-                ("PolicySourceArn", source_arn.to_string()),
+                ("PolicySourceArn", requester.arn.to_string()),
                 ("ActionNames.member.1", "sts:AssumeRole".to_string()),
             ];
+            for (name, value) in &context_params {
+                params.push((name.as_str(), value.clone()));
+            }
             let names: Vec<String> = (1..=resources.len())
                 .map(|i| format!("ResourceArns.member.{i}"))
                 .collect();
@@ -522,10 +618,10 @@ impl Iam {
             }
             let body = self.call(action, &params).await?;
             let page = parse_simulation(&body).with_context(|| format!("reading {action}"))?;
-            allowed.extend(page.allowed);
+            decisions.extend(page.decisions);
             match page.marker {
                 Some(m) if page.truncated => marker = Some(m),
-                _ => return Ok(allowed),
+                _ => return Ok(decisions),
             }
         }
     }
@@ -655,10 +751,10 @@ struct RolesPage {
     marker: Option<String>,
 }
 
-/// One page of `SimulatePrincipalPolicy`, as the resources it allows.
+/// One page of `SimulatePrincipalPolicy`, as each resource's answer.
 #[derive(Debug, Default)]
 struct SimulationPage {
-    allowed: Vec<String>,
+    decisions: Vec<(String, Decision)>,
     truncated: bool,
     marker: Option<String>,
 }
@@ -734,11 +830,13 @@ fn parse_list_roles(body: &str) -> anyhow::Result<RolesPage> {
     Ok(page)
 }
 
-/// The resources the simulator allows. With several resources, IAM gives
-/// one result per action whose own resource is the statement's pattern
+/// Each resource's answer. With several resources, IAM gives one result
+/// per action whose own resource is the statement's pattern
 /// (`arn:aws:iam::${Account}:${RelativeId}`) and whose decision is the
 /// strictest, and the answer for each resource in `ResourceSpecificResults`;
-/// with one resource, that resource and its decision are the result's own.
+/// with one resource, that resource and its decision are the result's own,
+/// and it may be in `ResourceSpecificResults` too. The organization's
+/// answer is only at the top, so it is a resource's only when it is alone.
 fn parse_simulation(body: &str) -> anyhow::Result<SimulationPage> {
     let mut page = SimulationPage::default();
     result_children(body, "SimulatePrincipalPolicyResult", |tag| {
@@ -748,26 +846,41 @@ fn parse_simulation(body: &str) -> anyhow::Result<SimulationPage> {
             page.marker = Some(text(tag)?);
         } else if tag.start_el().matches("EvaluationResults") {
             children(tag, |member| {
-                let (mut resource, mut decision) = (None, None);
-                let mut specific = Vec::new();
+                let mut resource = None;
+                let mut top = Decision::default();
+                let mut specific: Vec<(String, Decision)> = Vec::new();
                 children(member, |field| {
                     let el = field.start_el();
                     if el.matches("EvalResourceName") {
                         resource = Some(text(field)?);
                     } else if el.matches("EvalDecision") {
-                        decision = Some(text(field)?);
+                        top.decision = text(field)?;
+                    } else if el.matches("MissingContextValues") {
+                        top.missing = members(field)?;
+                    } else if el.matches("OrganizationsDecisionDetail") {
+                        top.organizations = flag(field, "AllowedByOrganizations")?;
+                    } else if el.matches("PermissionsBoundaryDecisionDetail") {
+                        top.boundary = flag(field, "AllowedByPermissionsBoundary")?;
                     } else if el.matches("ResourceSpecificResults") {
                         children(field, |each| {
-                            let (mut name, mut decision) = (None, None);
+                            let mut name = None;
+                            let mut decision = Decision::default();
                             children(each, |f| {
-                                if f.start_el().matches("EvalResourceName") {
+                                let el = f.start_el();
+                                if el.matches("EvalResourceName") {
                                     name = Some(text(f)?);
-                                } else if f.start_el().matches("EvalResourceDecision") {
-                                    decision = Some(text(f)?);
+                                } else if el.matches("EvalResourceDecision") {
+                                    decision.decision = text(f)?;
+                                } else if el.matches("MissingContextValues") {
+                                    decision.missing = members(f)?;
+                                } else if el.matches("PermissionsBoundaryDecisionDetail") {
+                                    decision.boundary = flag(f, "AllowedByPermissionsBoundary")?;
                                 }
                                 Ok(())
                             })?;
-                            if let (Some(name), Some(decision)) = (name, decision) {
+                            if let Some(name) = name
+                                && !decision.decision.is_empty()
+                            {
                                 specific.push((name, decision));
                             }
                             Ok(())
@@ -775,19 +888,21 @@ fn parse_simulation(body: &str) -> anyhow::Result<SimulationPage> {
                     }
                     Ok(())
                 })?;
-                if specific.is_empty() {
-                    if decision.as_deref() == Some("allowed")
-                        && let Some(arn) = resource
-                    {
-                        page.allowed.push(arn);
+                match specific.len() {
+                    0 => {
+                        if let Some(arn) = resource
+                            && !top.decision.is_empty()
+                        {
+                            page.decisions.push((arn, top));
+                        }
                     }
-                } else {
-                    page.allowed.extend(
-                        specific
-                            .into_iter()
-                            .filter(|(_, d)| d == "allowed")
-                            .map(|(name, _)| name),
-                    );
+                    1 => {
+                        let (arn, mut decision) = specific.remove(0);
+                        decision.organizations = top.organizations;
+                        decision.boundary = decision.boundary.or(top.boundary);
+                        page.decisions.push((arn, decision));
+                    }
+                    _ => page.decisions.extend(specific),
                 }
                 Ok(())
             })?;
@@ -795,6 +910,28 @@ fn parse_simulation(body: &str) -> anyhow::Result<SimulationPage> {
         Ok(())
     })?;
     Ok(page)
+}
+
+/// The text of each `<member>` of a list.
+fn members(tag: &mut Decoder) -> anyhow::Result<Vec<String>> {
+    let mut list = Vec::new();
+    children(tag, |member| {
+        list.push(text(member)?);
+        Ok(())
+    })?;
+    Ok(list)
+}
+
+/// A boolean child of a structure, when present.
+fn flag(tag: &mut Decoder, name: &str) -> anyhow::Result<Option<bool>> {
+    let mut value = None;
+    children(tag, |field| {
+        if field.start_el().matches(name) {
+            value = Some(text(field)? == "true");
+        }
+        Ok(())
+    })?;
+    Ok(value)
 }
 
 /// The code and message of an IAM `ErrorResponse`.
@@ -874,14 +1011,24 @@ impl Answer {
     }
 }
 
+/// What a trust policy that lets the requester in asks of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Trust {
+    /// What the allowing statements need that fob cannot check, empty when
+    /// one needs nothing.
+    conditions: Vec<String>,
+    /// A statement that allows it names the requester's role ARN itself,
+    /// not its account or `*`.
+    by_arn: bool,
+}
+
 /// Whether a trust policy (URL-encoded JSON, as IAM returns it) lets the
 /// requester call `sts:AssumeRole`: `None` when no statement allows it or
-/// one denies it outright, otherwise what the allowing statements need that
-/// fob cannot check, empty when one needs nothing. Conditions on the
+/// one denies it outright. Conditions on the
 /// requester's principal keys (`aws:PrincipalArn`, `aws:PrincipalAccount`,
 /// `aws:PrincipalType`, `aws:PrincipalIsAWSService`) are evaluated; the
 /// others are described.
-fn trusts(document: &str, requester: &Requester) -> anyhow::Result<Option<Vec<String>>> {
+fn trusts(document: &str, requester: &Requester) -> anyhow::Result<Option<Trust>> {
     let json = percent_decode(document)?;
     let policy: Value = serde_json::from_str(&json).context("not JSON")?;
     let statements = match &policy["Statement"] {
@@ -891,8 +1038,14 @@ fn trusts(document: &str, requester: &Requester) -> anyhow::Result<Option<Vec<St
     };
     let mut allowed: Option<Answer> = None;
     let mut denied = BTreeSet::new();
+    let mut by_arn = false;
     for statement in &statements {
         let answer = applies(statement, requester);
+        if statement["Effect"] == "Allow" && answer != Answer::No {
+            by_arn |= statement["Principal"]
+                .get("AWS")
+                .is_some_and(|aws| strings(aws).iter().any(|p| p == requester.arn));
+        }
         match (statement["Effect"].as_str(), answer) {
             (_, Answer::No) => {}
             (Some("Deny"), Answer::Yes) => return Ok(None),
@@ -917,14 +1070,15 @@ fn trusts(document: &str, requester: &Requester) -> anyhow::Result<Option<Vec<St
             _ => {}
         }
     }
-    Ok(match allowed {
-        None | Some(Answer::No) => None,
-        Some(Answer::Yes) => Some(denied.into_iter().collect()),
+    let conditions: Vec<String> = match allowed {
+        None | Some(Answer::No) => return Ok(None),
+        Some(Answer::Yes) => denied.into_iter().collect(),
         Some(Answer::Unknown(mut notes)) => {
             notes.extend(denied);
-            Some(notes.into_iter().collect())
+            notes.into_iter().collect()
         }
-    })
+    };
+    Ok(Some(Trust { conditions, by_arn }))
 }
 
 /// Whether a statement concerns the requester's `sts:AssumeRole`, its
@@ -1126,6 +1280,74 @@ mod tests {
         assert_eq!(iam_host(Partition::UsGov), "iam.us-gov.amazonaws.com");
     }
 
+    #[test]
+    fn simulator_answers_are_read_per_role() {
+        let result = |inner: &str| {
+            format!(
+                "<SimulatePrincipalPolicyResponse><SimulatePrincipalPolicyResult>\
+                 <IsTruncated>false</IsTruncated><EvaluationResults><member>{inner}</member>\
+                 </EvaluationResults></SimulatePrincipalPolicyResult></SimulatePrincipalPolicyResponse>"
+            )
+        };
+        // Several roles: each one's answer, without the organization's.
+        let page = parse_simulation(&result(
+            "<EvalActionName>sts:AssumeRole</EvalActionName>\
+             <EvalResourceName>arn:aws:iam::${Account}:${RelativeId}</EvalResourceName>\
+             <EvalDecision>implicitDeny</EvalDecision>\
+             <OrganizationsDecisionDetail><AllowedByOrganizations>false</AllowedByOrganizations></OrganizationsDecisionDetail>\
+             <ResourceSpecificResults>\
+             <member><EvalResourceName>arn:aws:iam::1:role/a</EvalResourceName><EvalResourceDecision>allowed</EvalResourceDecision></member>\
+             <member><EvalResourceName>arn:aws:iam::1:role/b</EvalResourceName><EvalResourceDecision>implicitDeny</EvalResourceDecision>\
+             <MissingContextValues><member>aws:PrincipalTag/team</member></MissingContextValues>\
+             <PermissionsBoundaryDecisionDetail><AllowedByPermissionsBoundary>true</AllowedByPermissionsBoundary></PermissionsBoundaryDecisionDetail></member>\
+             </ResourceSpecificResults>",
+        ))
+        .unwrap();
+        assert_eq!(
+            page.decisions,
+            [
+                (
+                    "arn:aws:iam::1:role/a".to_string(),
+                    Decision {
+                        decision: "allowed".into(),
+                        ..Decision::default()
+                    }
+                ),
+                (
+                    "arn:aws:iam::1:role/b".to_string(),
+                    Decision {
+                        decision: "implicitDeny".into(),
+                        missing: vec!["aws:PrincipalTag/team".into()],
+                        boundary: Some(true),
+                        organizations: None,
+                    }
+                ),
+            ]
+        );
+        // One role: the organization's answer is its own.
+        let page = parse_simulation(&result(
+            "<EvalActionName>sts:AssumeRole</EvalActionName>\
+             <EvalResourceName>arn:aws:iam::1:role/a</EvalResourceName>\
+             <EvalDecision>implicitDeny</EvalDecision>\
+             <OrganizationsDecisionDetail><AllowedByOrganizations>false</AllowedByOrganizations></OrganizationsDecisionDetail>\
+             <ResourceSpecificResults><member><EvalResourceName>arn:aws:iam::1:role/a</EvalResourceName>\
+             <EvalResourceDecision>implicitDeny</EvalResourceDecision></member></ResourceSpecificResults>",
+        ))
+        .unwrap();
+        assert_eq!(page.decisions[0].1.organizations, Some(false));
+        assert!(!page.decisions[0].1.trust_alone_allows());
+        let alone = |decision: &str, organizations, boundary| Decision {
+            decision: decision.into(),
+            missing: Vec::new(),
+            boundary,
+            organizations,
+        };
+        assert!(alone("implicitDeny", Some(true), None).trust_alone_allows());
+        assert!(alone("implicitDeny", None, Some(true)).trust_alone_allows());
+        assert!(!alone("implicitDeny", Some(true), Some(false)).trust_alone_allows());
+        assert!(!alone("explicitDeny", Some(true), Some(true)).trust_alone_allows());
+    }
+
     fn encoded(json: &str) -> String {
         json.bytes()
             .map(|b| match b {
@@ -1158,7 +1380,7 @@ mod tests {
             r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
             statements.join(",")
         ));
-        trusts(&doc, &REQUESTER).unwrap()
+        trusts(&doc, &REQUESTER).unwrap().map(|t| t.conditions)
     }
 
     fn allow(principal: &str, fields: &str) -> Option<Vec<String>> {
@@ -1188,6 +1410,18 @@ mod tests {
             r#"{"Statement":{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}}"#,
         );
         assert_eq!(trusts(&service, &REQUESTER).unwrap(), None);
+        // Named by its ARN, or only through its account.
+        let by_arn = |principal: &str| {
+            let doc = encoded(&format!(
+                r#"{{"Statement":[{}]}}"#,
+                statement("Allow", principal, "")
+            ));
+            trusts(&doc, &REQUESTER).unwrap().unwrap().by_arn
+        };
+        assert!(by_arn(&quoted(SOURCE)));
+        assert!(by_arn(&format!("[\"{ROOT}\",\"{SOURCE}\"]")));
+        assert!(!by_arn(&quoted(ROOT)));
+        assert!(!by_arn("\"*\""));
         let tagging = encoded(&format!(
             r#"{{"Statement":{{"Effect":"Allow","Principal":{{"AWS":"{ROOT}"}},"Action":"sts:TagSession"}}}}"#
         ));

@@ -2142,6 +2142,138 @@ async fn discovery_simulates_a_permission_set_that_may_not_list_roles() {
 }
 
 #[tokio::test]
+async fn discovery_trusts_a_role_that_names_the_permission_set_and_notes_missing_context() {
+    use omnifob_core::providers::aws::discover::{Source, discover};
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "context", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .mount(&server)
+        .await;
+    let sso = "/aws-reserved/sso.amazonaws.com/";
+    let source = format!("arn:aws:iam::111111111111:role{sso}AWSReservedSSO_pe_0123456789abcdef");
+    let root = r#"{"AWS":"arn:aws:iam::111111111111:root"}"#;
+    let by_source = format!(r#"{{"AWS":"{source}"}}"#);
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListRoles"))
+        .respond_with(iam_roles(&[
+            (sso, "AWSReservedSSO_pe_0123456789abcdef", root),
+            ("/", "deployer", &by_source),
+            ("/", "guarded", &by_source),
+            ("/", "plain", root),
+            ("/", "tagged", root),
+        ]))
+        .mount(&server)
+        .await;
+    let response = |results: &str| {
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"<SimulatePrincipalPolicyResponse><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName>{results}</member></EvaluationResults></SimulatePrincipalPolicyResult></SimulatePrincipalPolicyResponse>"#
+        ))
+    };
+    let specific = |role: &str, extra: &str| {
+        format!(
+            "<member><EvalResourceName>arn:aws:iam::111111111111:role/{role}</EvalResourceName>\
+             <EvalResourceDecision>implicitDeny</EvalResourceDecision>{extra}</member>"
+        )
+    };
+    // The source's own policies allow none of them; the simulator is given
+    // what fob knows of the request.
+    let batch = response(&format!(
+        "<EvalResourceName>arn:aws:iam::${{Account}}:${{RelativeId}}</EvalResourceName>\
+         <EvalDecision>implicitDeny</EvalDecision><ResourceSpecificResults>{}{}{}{}</ResourceSpecificResults>",
+        specific("deployer", ""),
+        specific("guarded", ""),
+        specific("plain", ""),
+        specific(
+            "tagged",
+            "<MissingContextValues><member>aws:PrincipalTag/team</member></MissingContextValues>"
+        ),
+    ));
+    let context = form_urlencoded::Serializer::new(String::new())
+        .append_pair("ContextEntries.member.1.ContextKeyName", "aws:PrincipalArn")
+        .append_pair("ContextEntries.member.1.ContextKeyType", "string")
+        .append_pair("ContextEntries.member.1.ContextKeyValues.member.1", &source)
+        .append_pair(
+            "ContextEntries.member.2.ContextKeyName",
+            "aws:PrincipalAccount",
+        )
+        .append_pair(
+            "ContextEntries.member.3.ContextKeyValues.member.1",
+            "AssumedRole",
+        )
+        .finish();
+    let pairs: Vec<String> = context.split('&').map(str::to_string).collect();
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .and(body_string_contains("ResourceArns.member.2"))
+        .and(move |r: &Request| {
+            let body = String::from_utf8_lossy(&r.body);
+            pairs.iter().all(|p| body.contains(p.as_str()))
+        })
+        .respond_with(batch)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Asked alone, the roles that name the source's role: SCPs allow
+    // `deployer`, and refuse `guarded`.
+    let alone = |role: &'static str, organizations: &str| {
+        let matcher = move |r: &Request| {
+            let body = String::from_utf8_lossy(&r.body);
+            !body.contains("ResourceArns.member.2") && body.contains(&format!("role%2F{role}"))
+        };
+        let answer = response(&format!(
+            "<EvalResourceName>arn:aws:iam::111111111111:role/{role}</EvalResourceName>\
+             <EvalDecision>implicitDeny</EvalDecision><OrganizationsDecisionDetail>\
+             <AllowedByOrganizations>{organizations}</AllowedByOrganizations></OrganizationsDecisionDetail>\
+             <ResourceSpecificResults>{}</ResourceSpecificResults>",
+            specific(role, "")
+        ));
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+            .and(matcher)
+            .respond_with(answer)
+            .expect(1)
+    };
+    alone("deployer", "true").mount(&server).await;
+    alone("guarded", "false").mount(&server).await;
+
+    let discovery = discover(
+        "context",
+        &config(),
+        vec![Source {
+            account_id: "111111111111".into(),
+            segment: "dev".into(),
+            via_role: "pe".into(),
+            profile_id: "context/dev/pe".into(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    let found: Vec<_> = discovery
+        .found
+        .iter()
+        .map(|f| (f.label.as_str(), f.conditions.clone()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("dev-deployer", Vec::new()),
+            (
+                "dev-tagged",
+                vec![
+                    "the permission set's policies check aws:PrincipalTag/team, which the \
+                     simulator was not given"
+                        .to_string()
+                ]
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn discovery_without_a_sign_in_asks_for_one() {
     use omnifob_core::providers::aws::discover::{Source, discover};
 

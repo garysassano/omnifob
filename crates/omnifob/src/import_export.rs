@@ -389,7 +389,7 @@ pub(crate) async fn discover_aws(
         }
         if !found.conditions.is_empty() {
             eprintln!(
-                "fob: {} ({}): trust-policy conditions fob did not check: {}",
+                "fob: {} ({}): conditions fob did not check: {}",
                 found.label,
                 found.role.role_arn,
                 found.conditions.join("; ")
