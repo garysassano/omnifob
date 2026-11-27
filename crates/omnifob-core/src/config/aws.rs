@@ -28,6 +28,12 @@ pub struct AwsSsoConfig {
     /// that becomes the middle of the profile id.
     #[serde(default)]
     pub chained: BTreeMap<String, ChainedRole>,
+    /// Roles chained the same way in every account where Identity Center
+    /// gives a permission set: one rule stands for a `chained` table per
+    /// account, and covers accounts added later. Keyed by a label of the
+    /// rule's own; profile ids take the account's segment and the role name.
+    #[serde(default)]
+    pub chained_rules: BTreeMap<String, ChainedRule>,
     /// Roles in another AWS partition, reached with a web identity token
     /// that one of this portal's roles requests, keyed by a label that
     /// becomes the middle of the profile id.
@@ -67,6 +73,15 @@ impl AwsSsoConfig {
             role.validate(&self.region)
                 .map_err(|e| format!("chained.{label}: {e}"))?;
         }
+        for (label, rule) in &self.chained_rules {
+            if self.chained.contains_key(label) {
+                return Err(format!(
+                    "chained.{label} and chained_rules.{label} share a label; rename one of them"
+                ));
+            }
+            rule.validate(&self.region)
+                .map_err(|e| format!("chained_rules.{label}: {e}"))?;
+        }
         for (label, role) in &self.cross_partition {
             role.validate(label, self)
                 .map_err(|e| format!("cross_partition.{label}: {e}"))?;
@@ -100,6 +115,25 @@ impl AwsSsoConfig {
     /// The partition of the portal, which its roles' credentials belong to.
     pub fn partition(&self) -> anyhow::Result<Partition> {
         Partition::of_region(&self.region)
+    }
+
+    /// The chained role a profile labelled `label` assumes: its `chained`
+    /// table, else its `chained_rules` rule applied to `account_id`, the
+    /// account the profile was synced for. `None` when neither table has the
+    /// label, or a rule's profile has no account.
+    pub fn chained_role(
+        &self,
+        label: &str,
+        account_id: Option<&str>,
+    ) -> Option<std::borrow::Cow<'_, ChainedRole>> {
+        if let Some(role) = self.chained.get(label) {
+            return Some(std::borrow::Cow::Borrowed(role));
+        }
+        let rule = self.chained_rules.get(label)?;
+        let partition = self.partition().ok()?;
+        Some(std::borrow::Cow::Owned(
+            rule.role_for(account_id?, partition),
+        ))
     }
 }
 
@@ -242,6 +276,122 @@ impl ChainedRole {
             );
         }
         Ok(())
+    }
+}
+
+/// One role name chained from a permission set in every account that has
+/// it (`[integrations.<name>.chained_rules.<label>]`): discovery adds a
+/// chained profile for each account where Identity Center lists `via_role`,
+/// assuming `arn:<partition>:iam::<account>:role<path><role_name>` there.
+/// Profiles are named like the account's Identity Center roles, with
+/// `role_name` as the leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ChainedRule {
+    /// Name of the Identity Center role (permission set) to start from; the
+    /// rule applies in every account where Identity Center gives it.
+    pub via_role: String,
+    /// Name of the IAM role to assume in each of those accounts.
+    pub role_name: String,
+    /// The role's IAM path, starting and ending with `/`; `/` unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Only these accounts (12-digit IDs); every account with `via_role`
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<String>,
+    /// Accounts (12-digit IDs) the rule leaves out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_accounts: Vec<String>,
+    /// `RoleSessionName`; defaults to "omnifob", or "omnifob-agent" for
+    /// sessions a coding agent starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Region exported for these roles; defaults to the integration's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// MFA device the roles' trust policies require; a code is asked for
+    /// each new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa_serial: Option<String>,
+    /// Session length, 15 minutes to 1 hour (AWS caps role-chaining sessions
+    /// at one hour); defaults to one hour.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_duration"
+    )]
+    #[cfg_attr(test, schemars(with = "Option<String>"))]
+    pub duration: Option<SignedDuration>,
+}
+
+impl ChainedRule {
+    /// Whether the rule covers `account_id`.
+    pub fn applies_to(&self, account_id: &str) -> bool {
+        (self.accounts.is_empty() || self.accounts.iter().any(|a| a == account_id))
+            && !self.exclude_accounts.iter().any(|a| a == account_id)
+    }
+
+    /// The chained role the rule gives `account_id` in `partition`.
+    pub fn role_for(&self, account_id: &str, partition: Partition) -> ChainedRole {
+        let path = self.path.as_deref().unwrap_or("/");
+        ChainedRole {
+            via_account_id: account_id.to_string(),
+            via_role: self.via_role.clone(),
+            role_arn: format!(
+                "arn:{}:iam::{account_id}:role{path}{}",
+                partition.arn_name(),
+                self.role_name
+            ),
+            session_name: self.session_name.clone(),
+            external_id: self.external_id.clone(),
+            region: self.region.clone(),
+            mfa_serial: self.mfa_serial.clone(),
+            duration: self.duration,
+        }
+    }
+
+    /// The checks a rule gets when the config loads, for a portal in
+    /// `portal_region`: its own keys, then those of the chained role it
+    /// would give an account, so a rule fails where a `chained` table with
+    /// the same keys would.
+    pub(crate) fn validate(&self, portal_region: &str) -> Result<(), String> {
+        let partition = Partition::of_region(portal_region).map_err(|_| {
+            format!(
+                "the portal's region {portal_region} is in a partition omnifob does not model, \
+                 so it cannot write the roles' ARNs; use `chained` tables instead"
+            )
+        })?;
+        if self.role_name.is_empty()
+            || self.role_name.len() > 64
+            || !self
+                .role_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+        {
+            return Err(format!(
+                "role_name '{}' must be an IAM role name: 1 to 64 letters, digits and +=,.@_- \
+                 (put a path in `path`)",
+                self.role_name
+            ));
+        }
+        if let Some(path) = &self.path
+            && !(path.starts_with('/') && path.ends_with('/') && path.len() <= 512)
+        {
+            return Err(format!("path '{path}' must start and end with '/'"));
+        }
+        for account in self.accounts.iter().chain(&self.exclude_accounts) {
+            check_account_id("accounts", account)?;
+        }
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
+        }
+        self.role_for("000000000000", partition)
+            .validate(portal_region)
+            .map_err(|e| e.replace("via_account_id", "accounts"))
     }
 }
 
@@ -1150,6 +1300,98 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn chained_rules_are_checked_when_the_config_loads() {
+        let parse = |region: &str, rule: &str| {
+            Config::parse(&format!(
+                "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+                 region = \"{region}\"\n[integrations.acme.chained_rules.root]\n{rule}\n"
+            ))
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+        };
+        let ok = "via_role = \"pe\"\nrole_name = \"root\"";
+        assert!(parse("eu-west-1", ok).is_ok());
+        assert!(
+            parse(
+                "eu-west-1",
+                &format!(
+                    "{ok}\npath = \"/ops/\"\naccounts = [\"111111111111\"]\nduration = \"30m\""
+                )
+            )
+            .is_ok()
+        );
+        for (rule, expected) in [
+            (
+                "via_role = \"pe\"\nrole_name = \"ops/root\"".to_string(),
+                "chained_rules.root: role_name 'ops/root' must be an IAM role name",
+            ),
+            (
+                format!("{ok}\npath = \"ops\""),
+                "chained_rules.root: path 'ops' must start and end with '/'",
+            ),
+            (
+                format!("{ok}\nexclude_accounts = [\"123\"]"),
+                "chained_rules.root: accounts '123' must be a 12-digit AWS account ID",
+            ),
+            (
+                format!("{ok}\nduration = \"2h\""),
+                "chained_rules.root: duration must be between 15m and 1h",
+            ),
+            (
+                "via_role = \" \"\nrole_name = \"root\"".to_string(),
+                "chained_rules.root: via_role must name",
+            ),
+        ] {
+            let error = parse("eu-west-1", &rule).unwrap_err();
+            assert!(error.contains(expected), "{rule}: {error}");
+        }
+
+        // A label in both tables would make a profile's role ambiguous.
+        let error = Config::parse(
+            "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+             region = \"eu-west-1\"\n[integrations.acme.chained.root]\nvia_account_id = \"111111111111\"\n\
+             via_role = \"pe\"\nrole_arn = \"arn:aws:iam::111111111111:role/root\"\n\
+             [integrations.acme.chained_rules.root]\nvia_role = \"pe\"\nrole_name = \"root\"\n",
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
+        .unwrap_err();
+        assert!(
+            error.contains("chained.root and chained_rules.root share a label"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_chained_rule_gives_each_account_its_role() {
+        let Integration::AwsSso(config) = Config::parse(
+            "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://ac.awsapps.com/start\"\n\
+             region = \"us-gov-west-1\"\n[integrations.acme.chained_rules.root]\nvia_role = \"pe\"\n\
+             role_name = \"root\"\npath = \"/ops/\"\nexclude_accounts = [\"333333333333\"]\n",
+        )
+        .unwrap()
+        .integrations
+        .remove("acme")
+        .unwrap() else {
+            unreachable!()
+        };
+        let role = config.chained_role("root", Some("222222222222")).unwrap();
+        assert_eq!(
+            role.role_arn,
+            "arn:aws-us-gov:iam::222222222222:role/ops/root"
+        );
+        assert_eq!(
+            (role.via_account_id.as_str(), role.via_role.as_str()),
+            ("222222222222", "pe")
+        );
+        assert!(config.chained_rules["root"].applies_to("222222222222"));
+        assert!(!config.chained_rules["root"].applies_to("333333333333"));
+        // A rule's profile names its account; without one there is no role.
+        assert!(config.chained_role("root", None).is_none());
+        assert!(config.chained_role("other", Some("222222222222")).is_none());
     }
 
     #[test]

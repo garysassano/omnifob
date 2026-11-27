@@ -228,6 +228,62 @@
       ],
       "type": "object"
     },
+    "ChainedRule": {
+      "additionalProperties": false,
+      "description": "One role name chained from a permission set in every account that has\nit (`[integrations.<name>.chained_rules.<label>]`): discovery adds a\nchained profile for each account where Identity Center lists `via_role`,\nassuming `arn:<partition>:iam::<account>:role<path><role_name>` there.\nProfiles are named like the account's Identity Center roles, with\n`role_name` as the leaf.",
+      "properties": {
+        "accounts": {
+          "description": "Only these accounts (12-digit IDs); every account with `via_role`\nwhen empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "duration": {
+          "description": "Session length, 15 minutes to 1 hour (AWS caps role-chaining sessions\nat one hour); defaults to one hour.",
+          "type": "string"
+        },
+        "exclude_accounts": {
+          "description": "Accounts (12-digit IDs) the rule leaves out.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "external_id": {
+          "type": "string"
+        },
+        "mfa_serial": {
+          "description": "MFA device the roles' trust policies require; a code is asked for\neach new session.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The role's IAM path, starting and ending with `/`; `/` unless set.",
+          "type": "string"
+        },
+        "region": {
+          "description": "Region exported for these roles; defaults to the integration's.",
+          "type": "string"
+        },
+        "role_name": {
+          "description": "Name of the IAM role to assume in each of those accounts.",
+          "type": "string"
+        },
+        "session_name": {
+          "description": "`RoleSessionName`; defaults to \"omnifob\", or \"omnifob-agent\" for\nsessions a coding agent starts.",
+          "type": "string"
+        },
+        "via_role": {
+          "description": "Name of the Identity Center role (permission set) to start from; the\nrule applies in every account where Identity Center gives it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "via_role",
+        "role_name"
+      ],
+      "type": "object"
+    },
     "CloudflareTemplate": {
       "additionalProperties": false,
       "description": "A named set of permissions, written as they appear in the dashboard's API\nnames (e.g. \"Workers Scripts Write\"), never as IDs.",
@@ -530,6 +586,14 @@
               },
               "default": {},
               "description": "Roles reached by assuming them from one of this portal's roles\n(`role_arn` + `source_profile` in `~/.aws/config`), keyed by a label\nthat becomes the middle of the profile id.",
+              "type": "object"
+            },
+            "chained_rules": {
+              "additionalProperties": {
+                "$ref": "#/definitions/ChainedRule"
+              },
+              "default": {},
+              "description": "Roles chained the same way in every account where Identity Center\ngives a permission set: one rule stands for a `chained` table per\naccount, and covers accounts added later. Keyed by a label of the\nrule's own; profile ids take the account's segment and the role name.",
               "type": "object"
             },
             "console_duration": {

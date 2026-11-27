@@ -111,9 +111,8 @@ pub(crate) fn export_aws_config(
                 return None;
             };
             let region = match &p.target {
-                omnifob_core::Target::AwsChained { label, .. } => c
-                    .chained
-                    .get(label)
+                omnifob_core::Target::AwsChained { label, account_id } => c
+                    .chained_role(label, account_id.as_deref())
                     .and_then(|r| r.region.clone())
                     .or_else(|| c.default_region.clone()),
                 // Always set: the destination partition's Region, which the

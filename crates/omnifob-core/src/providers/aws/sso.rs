@@ -1128,6 +1128,7 @@ fn add_configured(
         )?;
         profiles.push(profile);
     }
+    add_rules(integration, config, profiles)?;
     for (label, role) in &config.cross_partition {
         let target = Target::AwsCrossPartition {
             label: label.clone(),
@@ -1141,6 +1142,78 @@ fn add_configured(
             profiles,
         )?;
         profiles.push(profile);
+    }
+    Ok(())
+}
+
+/// Adds a chained profile for every account where a `chained_rules` rule's
+/// `via_role` is an Identity Center role, named like that role with the
+/// rule's `role_name` as the leaf. An account whose `chained` tables already
+/// assume the same role ARN keeps that profile instead. When the id is an
+/// Identity Center role's, the profile takes `-chained` after the account
+/// segment, as a `chained` table's would, and fails when that is taken too.
+fn add_rules(
+    integration: &str,
+    config: &AwsSsoConfig,
+    profiles: &mut Vec<Profile>,
+) -> anyhow::Result<()> {
+    if config.chained_rules.is_empty() {
+        return Ok(());
+    }
+    let partition = config.partition()?;
+    for (label, rule) in &config.chained_rules {
+        let sources: Vec<(String, String)> = profiles
+            .iter()
+            .filter_map(|p| match &p.target {
+                Target::Aws {
+                    account_id,
+                    role_name,
+                    ..
+                } if *role_name == rule.via_role && rule.applies_to(account_id) => {
+                    let segment = p.id.split('/').nth(1)?.to_string();
+                    Some((segment, account_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (segment, account_id) in sources {
+            let role_arn = rule.role_for(&account_id, partition).role_arn;
+            if config.chained.values().any(|c| c.role_arn == role_arn) {
+                continue;
+            }
+            let target = Target::AwsChained {
+                label: label.clone(),
+                account_id: Some(account_id.clone()),
+            };
+            let taken = |id: &str| profiles.iter().any(|p| p.id == id);
+            let mut profile = Profile::new(integration, &segment, &rule.role_name, target.clone());
+            if taken(&profile.id) {
+                let suffixed = Profile::new(
+                    integration,
+                    &format!("{segment}-chained"),
+                    &rule.role_name,
+                    target,
+                );
+                if taken(&suffixed.id) {
+                    bail!(
+                        "the chained rule '{label}' of '{integration}' would give account \
+                         {account_id} the profile {} or {}, and both are taken by other profiles; \
+                         leave the account out with exclude_accounts in \
+                         [integrations.{integration}.chained_rules.{label}]",
+                        profile.id,
+                        suffixed.id
+                    );
+                }
+                tracing::warn!(
+                    "{} is already an Identity Center or configured profile, so the chained \
+                     rule '{label}' gives account {account_id} {}",
+                    profile.id,
+                    suffixed.id
+                );
+                profile = suffixed;
+            }
+            profiles.push(profile);
+        }
     }
     Ok(())
 }
@@ -1186,11 +1259,11 @@ fn configured_profile(
 pub async fn chained_credentials(
     integration: &str,
     config: &AwsSsoConfig,
-    label: &str,
+    (label, account_id): (&str, Option<&str>),
     profile_id: &str,
     ttl: Option<SignedDuration>,
 ) -> Result<Credentials> {
-    let role = config.chained.get(label).with_context(|| {
+    let role = config.chained_role(label, account_id).with_context(|| {
         format!("no chained role '{label}' in integration '{integration}'; run `fob sync`")
     })?;
     let duration = ttl.or(role.duration).unwrap_or(CHAINED_MAX);
@@ -1251,6 +1324,94 @@ mod tests {
                 role_name: "Admin".into(),
             },
         )
+    }
+
+    fn sso_config(text: &str) -> AwsSsoConfig {
+        match crate::Config::parse(&format!(
+            "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
+             region = \"eu-west-1\"\n{text}"
+        ))
+        .unwrap()
+        .integrations
+        .remove("acme")
+        .unwrap()
+        {
+            crate::Integration::AwsSso(c) => c,
+            _ => unreachable!(),
+        }
+    }
+
+    fn with_role(mut profile: Profile, role: &str) -> Profile {
+        if let Target::Aws { role_name, .. } = &mut profile.target {
+            *role_name = role.into();
+        }
+        profile.id = format!("{}/{role}", profile.id.rsplit_once('/').unwrap().0);
+        profile
+    }
+
+    #[test]
+    fn chained_rules_add_a_profile_per_account() {
+        let config = sso_config(
+            "[integrations.acme.chained_rules.root]\nvia_role = \"Admin\"\nrole_name = \"root\"\n\
+             exclude_accounts = [\"444444444444\"]\n\
+             [integrations.acme.chained.prod-root]\nvia_account_id = \"222222222222\"\n\
+             via_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/root\"\n",
+        );
+        let mut profiles = vec![
+            role("dev", "111111111111"),
+            role("prod", "222222222222"),
+            // Taken by an Identity Center role: the rule's profile is suffixed.
+            role("stage", "333333333333"),
+            with_role(role("stage", "333333333333"), "root"),
+            role("sandbox", "444444444444"),
+            with_role(role("audit", "555555555555"), "ReadOnly"),
+        ];
+        add_configured("acme", &config, &mut profiles).unwrap();
+        let chained: Vec<_> = profiles
+            .iter()
+            .filter_map(|p| match &p.target {
+                Target::AwsChained { label, account_id } => {
+                    Some((p.id.as_str(), label.as_str(), account_id.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chained,
+            [
+                // The account's own table wins over the rule.
+                ("acme/prod-root/root", "prod-root", Some("222222222222")),
+                ("acme/dev/root", "root", Some("111111111111")),
+                ("acme/stage-chained/root", "root", Some("333333333333")),
+            ]
+        );
+
+        // Both ids taken: the error points at exclude_accounts.
+        let mut profiles = vec![
+            role("dev", "111111111111"),
+            with_role(role("dev", "111111111111"), "root"),
+            with_role(role("dev-chained", "666666666666"), "root"),
+        ];
+        let error = add_configured("acme", &config, &mut profiles).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "the chained rule 'root' of 'acme' would give account 111111111111 the profile \
+                 acme/dev/root or acme/dev-chained/root"
+            ) && error.to_string().contains("exclude_accounts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn chained_rules_can_name_their_accounts() {
+        let config = sso_config(
+            "[integrations.acme.chained_rules.root]\nvia_role = \"Admin\"\nrole_name = \"root\"\n\
+             accounts = [\"222222222222\"]\n",
+        );
+        let mut profiles = vec![role("dev", "111111111111"), role("prod", "222222222222")];
+        add_configured("acme", &config, &mut profiles).unwrap();
+        let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["acme/dev/Admin", "acme/prod/Admin", "acme/prod/root"]);
     }
 
     #[test]
