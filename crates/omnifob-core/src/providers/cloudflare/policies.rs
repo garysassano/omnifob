@@ -221,7 +221,9 @@ pub async fn resolve_ips(ips: &[String], api_base: &str) -> anyhow::Result<Vec<S
         }
         resolved.push(ip_range(ip)?);
     }
-    resolved.dedup();
+    // Duplicates anywhere, not only next to each other, in their order.
+    let mut seen = std::collections::HashSet::new();
+    resolved.retain(|range| seen.insert(range.clone()));
     Ok(resolved)
 }
 

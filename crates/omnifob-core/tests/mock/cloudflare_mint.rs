@@ -1354,3 +1354,62 @@ async fn accounts_named_alike_get_their_ids() {
     assert_eq!(all.len(), count, "no two profiles share an id");
     assert!(profiles.iter().all(|p| !p.id.starts_with("cf/acme-eu/")));
 }
+
+/// Signing in with another token never deletes the previous one when it had
+/// no session: that token is the user's own, made in the dashboard.
+#[tokio::test]
+async fn a_new_sign_in_keeps_the_users_own_token() {
+    let server = MockServer::start().await;
+    let endpoints = Endpoints {
+        cloudflare_api: Some(server.uri()),
+        ..Default::default()
+    };
+    let _scratch = Scratch::new("omnifob-cf-own-token", endpoints);
+    for token in ["first", "second"] {
+        Mock::given(method("GET"))
+            .and(path("/user/tokens/verify"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(ok(json!({ "id": token, "status": "active" })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("DELETE"))
+        .respond_with(ok(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // The second sign-in starts a session, which edits its own token.
+    Mock::given(method("GET"))
+        .and(path("/user/tokens/second"))
+        .respond_with(ok(json!({
+            "id": "second", "name": "mine", "status": "active", "policies": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/user/tokens/second"))
+        .respond_with(ok(json!({ "id": "second" })))
+        .mount(&server)
+        .await;
+    let config = config("user", r#""Workers Scripts Write""#);
+    cloudflare::login("cf", &config, "first").await.unwrap();
+    let Integration::Cloudflare(with_session) =
+        Config::parse("[integrations.cf]\ntype = \"cloudflare-token\"\nsession = \"8h\"\n")
+            .unwrap()
+            .integrations
+            .remove("cf")
+            .unwrap()
+    else {
+        unreachable!()
+    };
+    let expires = cloudflare::login("cf", &with_session, "second")
+        .await
+        .unwrap();
+    assert!(expires.is_some());
+    assert_eq!(
+        store::get::<String>("cloudflare/cf/bootstrap")
+            .unwrap()
+            .as_deref(),
+        Some("second")
+    );
+}

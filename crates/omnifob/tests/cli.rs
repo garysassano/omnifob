@@ -3117,6 +3117,21 @@ async fn a_cloudflare_token_signs_in_from_stdin_and_mints_per_command() {
     assert!(!fob.secret("cloudflare/cf/bootstrap").exists());
 }
 
+/// `fob revoke --all` deletes the user tokens fob minted even when the
+/// profile cache that names the accounts is gone, rather than forgetting
+/// them while they stay alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_everything_survives_a_lost_profile_cache() {
+    let server = MockServer::start().await;
+    mount_cloudflare(&server).await;
+    let fob = cloudflare_fob("cf-revoke-all", &server);
+    fob.ok_with_stdin(&["login", "cf", "--token-stdin"], "boot-secret\n");
+    exec_child(&fob, "cf/acme/dev", &[], &["CLOUDFLARE_API_TOKEN"]);
+    std::fs::write(fob.root.join("state/omnifob/profiles.json"), "{").unwrap();
+    fob.ok(&["revoke", "--all"]);
+    assert_eq!(deleted_tokens(&server).await, ["minted-1"]);
+}
+
 /// `fob exec --revoke` deletes the token when fob is stopped with SIGTERM,
 /// which it passes on to the command, and after Ctrl-C, which the terminal
 /// sends to both.

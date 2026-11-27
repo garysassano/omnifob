@@ -128,6 +128,26 @@ impl OauthError {
         .trim()
         .to_string()
     }
+
+    /// Whether the refresh token itself is dead, in any tenant: expired
+    /// after inactivity (AADSTS70008, AADSTS700082), revoked (AADSTS50173)
+    /// or expired outright (AADSTS700084). Other refusals in another tenant
+    /// (its MFA or conditional access) concern that tenant alone.
+    fn ends_the_sign_in(&self) -> bool {
+        let code = self
+            .error_description
+            .as_deref()
+            .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        self.error == "invalid_grant"
+            && matches!(
+                code,
+                "AADSTS70008" | "AADSTS700082" | "AADSTS50173" | "AADSTS700084"
+            )
+    }
 }
 
 enum Exchange {
@@ -369,7 +389,8 @@ async fn start_device(tenant: &str) -> anyhow::Result<(PendingDevice, String, St
     let pending = PendingDevice {
         tenant: tenant.to_string(),
         device_code: device.device_code,
-        interval_secs: device.interval.unwrap_or(5),
+        // At least a second, so a `0` cannot make polling spin.
+        interval_secs: device.interval.unwrap_or(5).max(1),
         expires_at,
     };
     Ok((pending, device.user_code, device.verification_uri))
@@ -481,7 +502,10 @@ async fn scope_token(integration: &str, tenant: &str, scope: &str) -> Result<(St
     }
     let response = match exchange(tenant, &form, session.as_deref()).await? {
         Exchange::Ok(r) => r,
-        Exchange::Refused(e) if e.error == "invalid_grant" && tenant == stored.tenant_id => {
+        Exchange::Refused(e)
+            if (e.error == "invalid_grant" && tenant == stored.tenant_id)
+                || e.ends_the_sign_in() =>
+        {
             drop_if_current(integration, &stored.refresh_token);
             return Err(Error::needs_login(
                 integration,
@@ -525,6 +549,19 @@ pub fn session_matches(integration: &str, config: &AzureConfig) -> anyhow::Resul
     )
 }
 
+/// Fails with a needed login when the stored sign-in is for another tenant
+/// than `tenant` names now, so an edited config does not keep working
+/// against the old tenant.
+fn same_tenant(integration: &str, config: &AzureConfig) -> Result<()> {
+    if is_signed_in(integration)? && !session_matches(integration, config)? {
+        return Err(Error::needs_login(
+            integration,
+            format!("the sign-in of '{integration}' is for another tenant than its config names"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn account(integration: &str) -> anyhow::Result<Option<String>> {
     Ok(store::get::<Stored>(&token_key(integration))?.map(|s| s.username))
 }
@@ -536,7 +573,8 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
     store::delete(&token_key(integration))
 }
 
-pub async fn check(integration: &str) -> Result<String> {
+pub async fn check(integration: &str, config: &AzureConfig) -> Result<String> {
+    same_tenant(integration, config)?;
     let stored = stored(integration)?;
     arm_token(integration, &stored.tenant_id).await?;
     Ok(format!("signed in as {}", stored.username))
@@ -631,6 +669,7 @@ struct Subscription {
 /// refuses a token or fails to list its subscriptions is skipped with a
 /// warning.
 pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Profile>> {
+    same_tenant(integration, config)?;
     let stored = stored(integration)?;
     let http = crate::http::client();
     let (home_token, _) = arm_token(integration, &stored.tenant_id).await?;
@@ -688,10 +727,14 @@ pub async fn discover(integration: &str, config: &AzureConfig) -> Result<Vec<Pro
                 ids.iter()
                     .any(|id| id.eq_ignore_ascii_case(&sub.subscription_id))
             });
-            let enabled = sub.state.as_deref().is_none_or(|s| s != "Disabled");
+            // Enabled, Warned and PastDue still work; Disabled and Deleted
+            // ones refuse every call.
+            let enabled = sub.state.as_deref().is_none_or(|s| {
+                !s.eq_ignore_ascii_case("Disabled") && !s.eq_ignore_ascii_case("Deleted")
+            });
             // A subscription reachable from two tenants keeps the first, as az does.
             let seen = profiles.iter().any(|p| {
-                matches!(&p.target, Target::Azure { subscription_id, .. } if *subscription_id == sub.subscription_id)
+                matches!(&p.target, Target::Azure { subscription_id, .. } if subscription_id.eq_ignore_ascii_case(&sub.subscription_id))
             });
             if wanted && enabled && !seen {
                 let target = Target::Azure {
@@ -776,6 +819,23 @@ pub fn console_url(subscription_id: &str, tenant_id: &str) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn a_dead_refresh_token_ends_the_sign_in_in_any_tenant() {
+        let refused = |error: &str, description: &str| OauthError {
+            error: error.into(),
+            error_description: Some(description.into()),
+        };
+        for code in ["AADSTS70008", "AADSTS700082", "AADSTS50173", "AADSTS700084"] {
+            assert!(
+                refused("invalid_grant", &format!("{code}: gone.\r\nTrace ID: x"))
+                    .ends_the_sign_in()
+            );
+        }
+        // MFA or conditional access in a guest tenant concerns that tenant.
+        assert!(!refused("invalid_grant", "AADSTS50076: MFA needed.").ends_the_sign_in());
+        assert!(!refused("interaction_required", "AADSTS70008: x").ends_the_sign_in());
+    }
 
     #[test]
     fn claims_name_the_account_and_tenant() {

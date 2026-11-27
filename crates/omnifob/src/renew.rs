@@ -37,6 +37,8 @@ fn needs_a_person(config: &Config, profile: &Profile) -> bool {
         (Ok(Integration::AwsIam(c)), Target::AwsIamRole { label, .. }) => {
             c.mfa_serial.is_some() && c.roles.get(label).is_some_and(|role| role.no_session)
         }
+        // A new session asks for a code.
+        (Ok(Integration::AwsIam(c)), Target::AwsIamSession { .. }) => c.mfa_serial.is_some(),
         (Ok(Integration::AwsLogin(c)), Target::AwsLoginRole { label, .. }) => c
             .roles
             .get(label)

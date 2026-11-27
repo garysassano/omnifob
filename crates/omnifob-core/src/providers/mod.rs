@@ -62,9 +62,33 @@ pub async fn revoke_all(
     let Integration::Cloudflare(config) = integration else {
         return Ok(0);
     };
+    // The configured account too: `profiles.json` may be missing or reset.
+    let mut accounts: Vec<String> = account_ids.to_vec();
+    if let Some(id) = &config.account_id
+        && !accounts.contains(id)
+    {
+        accounts.push(id.clone());
+    }
+    let user_tokens = config.minting() == crate::config::CloudflareTokenType::User;
+    if accounts.is_empty() {
+        if user_tokens {
+            // Listed once, under the user, whatever the account.
+            accounts.push(String::new());
+        } else if cloudflare::has_minted(name) {
+            // Without an account the tokens cannot be listed, and forgetting
+            // them would leave them alive and untracked.
+            return Err(anyhow::anyhow!(
+                "no Cloudflare account is known for '{name}', so its tokens cannot be listed; \
+                 run `fob sync {name}` and try again"
+            )
+            .into());
+        } else {
+            return Ok(0);
+        }
+    }
     let mut deleted = 0;
     let mut result = Ok(());
-    for account_id in account_ids {
+    for account_id in &accounts {
         match cloudflare::revoke(name, config, None, account_id).await {
             Ok(n) => deleted += n,
             Err(e) => {
@@ -80,7 +104,7 @@ pub async fn revoke_all(
         }
         // `minting()`, not `token_type`: OAuth leaves `token_type` at its
         // default (user) but mints account-owned tokens, listed per account.
-        if config.minting() == crate::config::CloudflareTokenType::User {
+        if user_tokens {
             break; // user tokens are listed once, not per account
         }
     }
@@ -297,10 +321,12 @@ pub async fn credentials(
     }
 
     let fresh = fetch(config, profile, ttl, !use_cache).await?;
-    // Console sign-in credentials may come from the stored session, issued
-    // earlier; the others were issued now.
+    // Console sign-in credentials and an IAM user's session may come from
+    // the stored session, issued earlier; the others were issued now.
     let issued_at = match profile.target {
-        Target::AwsLogin { .. } => fresh.issued_at.or(Some(Timestamp::now())),
+        Target::AwsLogin { .. } | Target::AwsIamSession { .. } => {
+            fresh.issued_at.or(Some(Timestamp::now()))
+        }
         _ => Some(Timestamp::now()),
     };
     let fresh = Credentials { issued_at, ..fresh };
@@ -501,7 +527,7 @@ async fn fetch(
                 .await?
         }
         (Integration::AwsIam(c), Target::AwsIamSession { .. }) => {
-            aws::iam::session_credentials(&profile.integration, c, &profile.id, ttl).await?
+            aws::iam::session_credentials(&profile.integration, c, &profile.id, ttl, renew).await?
         }
         (Integration::AwsIam(c), Target::AwsIamRole { label, .. }) => {
             aws::iam::role_credentials(&profile.integration, c, label, &profile.id, ttl).await?
@@ -974,7 +1000,7 @@ pub async fn check_sign_in(name: &str, integration: &Integration) -> Result<Stri
         Integration::AwsIam(config) => aws::iam::check(name, config).await,
         Integration::AwsLogin(config) => aws::login::check(name, config).await,
         Integration::Gcp(config) => gcp::check(name, config).await,
-        Integration::Azure(_) => azure::check(name).await,
+        Integration::Azure(config) => azure::check(name, config).await,
         Integration::Cloudflare(config) => cloudflare::check(name, config).await,
         Integration::Token(config) => token::check(name, config).await,
         Integration::Command(config) => command::check(name, config).await,
@@ -1081,6 +1107,11 @@ pub async fn revoke(config: &Config, profile: &Profile) -> Result<Revoked> {
         (Integration::Cloudflare(c), Target::Cloudflare { account_id, .. }) => Revoked::Tokens(
             cloudflare::revoke(&profile.integration, c, Some(&profile.id), account_id).await?,
         ),
+        // The session profile hands out the kept session itself.
+        (Integration::AwsIam(_), Target::AwsIamSession { .. }) => {
+            aws::iam::forget_session(&profile.integration)?;
+            Revoked::CacheOnly
+        }
         _ => Revoked::CacheOnly,
     };
     store::delete(&store::credentials_key(&profile.id))?;

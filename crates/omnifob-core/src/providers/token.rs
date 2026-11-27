@@ -67,6 +67,19 @@ const fn bearer(url: &'static str, secret: &'static str) -> Option<Verify> {
     })
 }
 
+/// [`bearer`] for a provider whose narrowly scoped tokens get 403 from the
+/// endpoint while an invalid one gets 401: a GitHub Actions or app token on
+/// `/user`, a Neon organization or project key on `/users/me`, a
+/// DigitalOcean token without `account:read` on `/v2/account`.
+const fn bearer_scoped(url: &'static str, secret: &'static str) -> Option<Verify> {
+    Some(Verify {
+        url,
+        secret,
+        scheme: AuthScheme::Bearer,
+        forbidden_is_valid: true,
+    })
+}
+
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "hetzner",
@@ -83,7 +96,7 @@ pub const PRESETS: &[Preset] = &[
             &["DIGITALOCEAN_ACCESS_TOKEN", "DIGITALOCEAN_TOKEN"],
         )],
         vars: &[],
-        verify: bearer("https://api.digitalocean.com/v2/account", "token"),
+        verify: bearer_scoped("https://api.digitalocean.com/v2/account", "token"),
         console: Some("https://cloud.digitalocean.com"),
     },
     Preset {
@@ -198,7 +211,7 @@ pub const PRESETS: &[Preset] = &[
         name: "neon",
         secrets: &[("api_key", &["NEON_API_KEY"])],
         vars: &[],
-        verify: bearer("https://console.neon.tech/api/v2/users/me", "api_key"),
+        verify: bearer_scoped("https://console.neon.tech/api/v2/users/me", "api_key"),
         console: Some("https://console.neon.tech"),
     },
     Preset {
@@ -213,7 +226,7 @@ pub const PRESETS: &[Preset] = &[
         // gh prefers GH_TOKEN; most other tools read GITHUB_TOKEN.
         secrets: &[("token", &["GH_TOKEN", "GITHUB_TOKEN"])],
         vars: &[],
-        verify: bearer("https://api.github.com/user", "token"),
+        verify: bearer_scoped("https://api.github.com/user", "token"),
         console: Some("https://github.com"),
     },
 ];
@@ -594,6 +607,17 @@ mod tests {
         assert_eq!(scaleway.scheme, AuthScheme::Header("X-Auth-Token"));
         assert_eq!(scaleway.secret, "secret_key");
         assert!(scaleway.forbidden_is_valid);
+        // Narrowly scoped tokens get 403 there; invalid ones get 401.
+        for scoped in ["github", "neon", "digitalocean"] {
+            let check = verification(&config(&format!("preset = \"{scoped}\"")))
+                .unwrap()
+                .unwrap();
+            assert!(check.forbidden_is_valid, "{scoped}");
+        }
+        let hetzner = verification(&config("preset = \"hetzner\""))
+            .unwrap()
+            .unwrap();
+        assert!(!hetzner.forbidden_is_valid);
         let upstash = verification(&config("preset = \"upstash\""))
             .unwrap()
             .unwrap();

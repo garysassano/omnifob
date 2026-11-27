@@ -139,7 +139,7 @@ async fn one_mfa_code_covers_parallel_calls_and_every_role() {
         // Signed with the user's key.
         .and(header_regex("authorization", "Credential=AKIAEXAMPLE/"))
         .respond_with(sts("GetSessionToken", &temporary("ASIASESSION")))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -166,11 +166,16 @@ async fn one_mfa_code_covers_parallel_calls_and_every_role() {
         assert_eq!(creds.env["AWS_ACCESS_KEY_ID"], "ASIAROLE");
         assert_eq!(creds.env["AWS_REGION"], "eu-west-1");
     }
-    let session = aws::iam::session_credentials("mfa", &config, "mfa/x/session", None)
+    let session = aws::iam::session_credentials("mfa", &config, "mfa/x/session", None, false)
         .await
         .unwrap();
     assert_eq!(session.env["AWS_ACCESS_KEY_ID"], "ASIASESSION");
     assert_eq!(prompts.load(Ordering::SeqCst), 1);
+    // Renewing (`--no-cache`, `fob renew`) starts a new session, with a code.
+    aws::iam::session_credentials("mfa", &config, "mfa/x/session", None, true)
+        .await
+        .unwrap();
+    assert_eq!(prompts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -416,9 +421,15 @@ async fn a_refused_session_is_started_again_once() {
         .await;
     assert_eq!(key(&config, &role, None).await, "ASIAROLE");
     // The new session is the one kept (past the profile's own cache).
-    let kept = providers::credentials(&config, &session, false, None)
-        .await
-        .unwrap();
+    let kept = aws::iam::session_credentials(
+        "refused",
+        &integration(&config, "refused"),
+        &session.id,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(kept.env["AWS_ACCESS_KEY_ID"], "ASIANEWSESSION");
 }
 

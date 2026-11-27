@@ -338,17 +338,21 @@ const RENEW_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 ///
 /// Under a lock that `login` takes too, so a sign-in stored while this one
 /// renews is never overwritten with the renewed old one.
-async fn renew(integration: &str, config: &GcpConfig) -> Result<Stored> {
+///
+/// With `replacing`, the access token the caller found lacking: when the
+/// stored one is another, still fresh, a process renewed it meanwhile and it
+/// is used as it is.
+async fn renew(integration: &str, config: &GcpConfig, replacing: Option<&str>) -> Result<Stored> {
     let _lock = store::lock(&lock_name(integration), RENEW_LOCK_TIMEOUT).await?;
-    let mut stored = stored(integration)?;
-    let (client_id, client_secret) = client(config);
-    if stored.client_id != client_id {
-        return Err(Error::needs_login(
-            integration,
-            format!("'{integration}' now names a different OAuth client than it signed in with"),
-        ));
-    }
+    let mut stored = stored_for(integration, config)?;
     let now = Timestamp::now();
+    if let Some(lacking) = replacing
+        && stored.access_token != lacking
+        && stored.expires_at.duration_since(now) > RENEW_MARGIN
+    {
+        return Ok(stored);
+    }
+    let (client_id, client_secret) = client(config);
     let response = exchange(&[
         ("grant_type", "refresh_token"),
         ("refresh_token", &stored.refresh_token),
@@ -359,6 +363,11 @@ async fn renew(integration: &str, config: &GcpConfig) -> Result<Stored> {
     let response = match response {
         Ok(r) => r,
         Err(ExchangeError::Refused(e)) if e.error == "invalid_grant" => {
+            // Revoked or expired: forgotten, so `fob status` stops showing
+            // it as signed in. Under the lock, so it is the one just read.
+            if let Err(e) = store::delete(&token_key(integration)) {
+                tracing::debug!("could not forget the ended Google sign-in: {e:#}");
+            }
             let reason = if e.subtype.as_deref() == Some("invalid_rapt") {
                 "Google Cloud session control wants you to sign in again".to_string()
             } else {
@@ -385,11 +394,27 @@ async fn renew(integration: &str, config: &GcpConfig) -> Result<Stored> {
 
 /// An access token for omnifob's own calls, reused while it lasts.
 async fn access_token(integration: &str, config: &GcpConfig) -> Result<String> {
-    let stored = stored(integration)?;
+    let stored = stored_for(integration, config)?;
     if stored.expires_at.duration_since(Timestamp::now()) > RENEW_MARGIN {
         return Ok(stored.access_token);
     }
-    Ok(renew(integration, config).await?.access_token)
+    Ok(renew(integration, config, Some(&stored.access_token))
+        .await?
+        .access_token)
+}
+
+/// The stored sign-in, if it belongs to the configured OAuth client: its
+/// tokens were issued to that client, and its refresh token renews only
+/// with it.
+fn stored_for(integration: &str, config: &GcpConfig) -> Result<Stored> {
+    let stored = stored(integration)?;
+    if stored.client_id != client(config).0 {
+        return Err(Error::needs_login(
+            integration,
+            format!("'{integration}' now names a different OAuth client than it signed in with"),
+        ));
+    }
+    Ok(stored)
 }
 
 /// Google rejected the access token (401), which happens before its time
@@ -406,10 +431,10 @@ where
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     let token = access_token(integration, config).await?;
-    match call(token).await {
+    match call(token.clone()).await {
         Err(e) if e.is::<Unauthorized>() => {
             tracing::debug!("Google rejected the stored access token; renewing it");
-            let token = renew(integration, config).await?.access_token;
+            let token = renew(integration, config, Some(&token)).await?.access_token;
             Ok(call(token).await?)
         }
         result => Ok(result?),
@@ -437,10 +462,10 @@ pub async fn id_token(integration: &str, config: &GcpConfig) -> Result<(String, 
         let expiry = id_token_expiry(&token)?;
         (expiry.duration_since(Timestamp::now()) > RENEW_MARGIN).then_some((token, expiry))
     };
-    if let Some(found) = current(&stored(integration)?) {
+    if let Some(found) = current(&stored_for(integration, config)?) {
         return Ok(found);
     }
-    let renewed = renew(integration, config).await?;
+    let renewed = renew(integration, config, None).await?;
     current(&renewed).ok_or_else(|| {
         anyhow!("Google returned no ID token; sign in again with `fob login {integration} --force`")
             .into()
@@ -509,7 +534,7 @@ async fn token_info(access_token: &str) -> anyhow::Result<TokenInfo> {
 
 /// Checks the stored sign-in by renewing it.
 pub async fn check(integration: &str, config: &GcpConfig) -> Result<String> {
-    let stored = renew(integration, config).await?;
+    let stored = renew(integration, config, None).await?;
     Ok(format!("signed in as {}", stored.email))
 }
 
@@ -662,7 +687,7 @@ pub async fn user_credentials(
     config: &GcpConfig,
     project_id: &str,
 ) -> Result<Credentials> {
-    let stored = renew(integration, config).await?;
+    let stored = renew(integration, config, None).await?;
     Ok(token_credentials(
         stored.access_token,
         Some(project_id),
