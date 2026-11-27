@@ -9,8 +9,11 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
+/// `$<var>`, else `<home>/<fallback>`. A relative value is ignored, as
+/// the XDG Base Directory spec asks, since it would put files wherever the
+/// command happens to run.
 fn xdg(var: &str, fallback: &str) -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+    if let Some(dir) = std::env::var_os(var).filter(|v| std::path::Path::new(v).is_absolute()) {
         return Ok(PathBuf::from(dir));
     }
     let home = std::env::home_dir()

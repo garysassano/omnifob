@@ -44,11 +44,28 @@ pub fn record(entry: &Entry<'_>) -> anyhow::Result<()> {
     }
     let mut line = serde_json::to_vec(entry)?;
     line.push(b'\n');
+    // The log is appended to in place, so a link at its path would send
+    // every line elsewhere.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        anyhow::bail!(
+            "{} is a symbolic link; not writing the audit log through it",
+            path.display()
+        );
+    }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path)?;
+    // A log created before, or by hand, readable by others is narrowed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o600))?;
+        }
+    }
     file.write_all(&line)?;
     Ok(())
 }

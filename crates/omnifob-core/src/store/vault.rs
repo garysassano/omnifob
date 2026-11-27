@@ -61,9 +61,11 @@ const KEY_CACHE_SERVICE: &str = "omnifob-vault-key";
 
 /// The vault's directory from what follows [`NAME`] in `OMNIFOB_KEYRING`:
 /// nothing (the `encrypted` directory in `state_dir`) or `:<absolute dir>`.
-pub fn dir(rest: &str, state_dir: &Path) -> anyhow::Result<PathBuf> {
+/// `state_dir` is needed only for the default directory, so an explicit
+/// absolute one works without a state directory.
+pub fn dir(rest: &str, state_dir: anyhow::Result<&Path>) -> anyhow::Result<PathBuf> {
     if rest.is_empty() {
-        return Ok(state_dir.join("encrypted"));
+        return Ok(state_dir?.join("encrypted"));
     }
     let Some(dir) = rest.strip_prefix(':').filter(|d| !d.is_empty()) else {
         bail!("OMNIFOB_KEYRING={NAME}{rest} is not a store: use {NAME}, or {NAME}:<absolute dir>");
@@ -143,7 +145,7 @@ impl Vault {
     }
 
     fn read_header(&self) -> anyhow::Result<Option<Header>> {
-        let text = match std::fs::read_to_string(self.header_path()) {
+        let text = match crate::files::retry_busy(|| std::fs::read_to_string(self.header_path())) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -180,6 +182,19 @@ impl Vault {
         let salt = BASE64
             .decode(&header.salt)
             .context("the vault's salt is not base64")?;
+        // A tampered header must neither make every unlock take hours nor
+        // weaken the key with a short salt or few iterations.
+        if salt.len() < SALT_LEN {
+            anyhow::bail!("the vault's salt is shorter than {SALT_LEN} bytes");
+        }
+        if !(ITERATIONS / 2..=ITERATIONS * 10).contains(&header.iterations) {
+            anyhow::bail!(
+                "the vault's iteration count {} is outside {}..={}",
+                header.iterations,
+                ITERATIONS / 2,
+                ITERATIONS * 10
+            );
+        }
         let iterations =
             NonZeroU32::new(header.iterations).context("the vault has 0 iterations")?;
         let cache_id = BASE64.encode(&salt);
@@ -274,7 +289,14 @@ impl Vault {
         if let Some(passphrase) = &self.unlock.passphrase {
             return Ok(passphrase.clone());
         }
-        let Some(prompt) = &self.unlock.prompt else {
+        // While a command runs (the endpoints `fob exec` serves), a prompt
+        // would fight the command for the terminal.
+        let prompt = self
+            .unlock
+            .prompt
+            .as_ref()
+            .filter(|_| !crate::prompt::is_unattended());
+        let Some(prompt) = prompt else {
             // An agent is not pointed at the variable: the passphrase is the
             // person's, entered in their terminal.
             let variable = if crate::Context::current().agent().is_some() {
@@ -538,14 +560,18 @@ mod tests {
     #[test]
     fn the_directory_is_the_state_dirs_or_an_absolute_one() {
         let state = std::env::temp_dir().join("state");
-        assert_eq!(dir("", &state).unwrap(), state.join("encrypted"));
+        assert_eq!(dir("", Ok(&state)).unwrap(), state.join("encrypted"));
         let absolute = std::env::temp_dir().join("vault");
+        let named = format!(":{}", absolute.display());
+        assert_eq!(dir(&named, Ok(&state)).unwrap(), absolute);
+        // An absolute directory needs no state directory.
         assert_eq!(
-            dir(&format!(":{}", absolute.display()), &state).unwrap(),
+            dir(&named, Err(anyhow::anyhow!("no state directory"))).unwrap(),
             absolute
         );
+        assert!(dir("", Err(anyhow::anyhow!("no state directory"))).is_err());
         for rest in [":", "x", ":relative"] {
-            assert!(dir(rest, &state).is_err(), "{rest:?}");
+            assert!(dir(rest, Ok(&state)).is_err(), "{rest:?}");
         }
     }
 

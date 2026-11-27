@@ -122,15 +122,23 @@ where
 {
     use futures_util::StreamExt;
     let mut connections = futures_util::stream::FuturesUnordered::new();
+    // After a failed accept (out of file descriptors, say), accepting waits
+    // a while; the open connections keep being answered meanwhile, which is
+    // what frees descriptors again.
+    let mut resume: Option<tokio::time::Instant> = None;
     loop {
+        let accepting = resume.is_none() && connections.len() < MAX_CONNECTIONS;
         tokio::select! {
-            accepted = listener.accept(), if connections.len() < MAX_CONNECTIONS => match accepted {
+            accepted = listener.accept(), if accepting => match accepted {
                 Ok((stream, _)) => connections.push(answer(stream, &handler)),
                 Err(e) => {
                     tracing::debug!("accepting a connection: {e}");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    resume = Some(tokio::time::Instant::now() + ACCEPT_BACKOFF);
                 }
             },
+            () = tokio::time::sleep_until(resume.unwrap_or_else(tokio::time::Instant::now)), if resume.is_some() => {
+                resume = None;
+            }
             Some(()) = connections.next(), if !connections.is_empty() => {}
         }
     }
@@ -199,14 +207,21 @@ async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Request> {
     if length > MAX_BODY {
         bail!("request body too large");
     }
+    // The body in one buffer of its declared length, filled in place, so a
+    // client sending a byte at a time costs no allocation per read.
     let mut body = buf[head_end + 4..].to_vec();
-    while body.len() < length {
-        let mut chunk = vec![0u8; length - body.len()];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            bail!("connection closed before the body ended");
-        }
-        body.extend_from_slice(&chunk[..n]);
+    if body.len() < length {
+        let had = body.len();
+        body.resize(length, 0);
+        stream
+            .read_exact(&mut body[had..])
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    anyhow::anyhow!("connection closed before the body ended")
+                }
+                _ => e.into(),
+            })?;
     }
     body.truncate(length);
     request.body = body;

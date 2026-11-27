@@ -149,7 +149,7 @@ fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
 /// context: the encrypted vault (its directory and passphrase).
 fn use_named_store(cx: &Context, name: &str) -> anyhow::Result<Arc<CredentialStore>> {
     if let Some(rest) = name.strip_prefix(vault::NAME) {
-        let dir = vault::dir(rest, cx.state_dir()?)?;
+        let dir = vault::dir(rest, cx.state_dir())?;
         return Ok(vault::Store::new(&dir, cx.vault_unlock().clone())? as Arc<CredentialStore>);
     }
     use_store(name)
@@ -242,6 +242,10 @@ pub fn delete(key: &str) -> anyhow::Result<bool> {
 
 /// Moves a value to another key; returns whether there was one.
 pub fn rename(old: &str, new: &str) -> anyhow::Result<bool> {
+    if old == new {
+        // Setting then deleting the same key would lose the value.
+        return Ok(get::<serde_json::Value>(old)?.is_some());
+    }
     let Some(value) = get::<serde_json::Value>(old)? else {
         return Ok(false);
     };
@@ -263,7 +267,7 @@ pub fn description() -> anyhow::Result<String> {
     if let Some(rest) = store.strip_prefix(vault::NAME) {
         return Ok(format!(
             "files encrypted with a passphrase in {}",
-            vault::dir(rest, cx.state_dir()?)?.display()
+            vault::dir(rest, cx.state_dir())?.display()
         ));
     }
     Ok(if wsl::enabled(&cx) {
@@ -362,7 +366,16 @@ mod wsl {
     }
 
     pub fn write_if_missing(cx: &Context, key: &str, json: &str) -> anyhow::Result<()> {
-        if persisted(key) && !file(cx, key)?.exists() && enabled(cx) {
+        // The cheap checks first: off Linux, with DPAPI turned off, or for a
+        // key never persisted there is no file to look for, and no state
+        // directory needs to exist (an embedder's in-memory keychain).
+        if !cfg!(target_os = "linux") || !cx.wsl_dpapi() || !persisted(key) {
+            return Ok(());
+        }
+        if let Ok(file) = file(cx, key)
+            && !file.exists()
+            && enabled(cx)
+        {
             write(cx, key, json)?;
         }
         Ok(())
@@ -720,5 +733,16 @@ mod tests {
             super::lock_file_name("credentials-a/b_c/d"),
             super::lock_file_name("credentials-a/b/c_d")
         );
+    }
+
+    #[test]
+    fn renaming_a_key_to_itself_keeps_its_value() {
+        let cx = crate::Context::builder()
+            .keychain(super::Keychain::Memory)
+            .build();
+        let _entered = cx.enter();
+        super::set("k", &"v").unwrap();
+        assert!(super::rename("k", "k").unwrap());
+        assert_eq!(super::get::<String>("k").unwrap().as_deref(), Some("v"));
     }
 }

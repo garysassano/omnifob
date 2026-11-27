@@ -14,8 +14,14 @@ pub const USER_AGENT: &str = concat!("omnifob/", env!("CARGO_PKG_VERSION"));
 
 /// A builder with the user agent and timeouts set, for a caller that needs
 /// more settings or a shorter timeout.
+///
+/// Redirects are not followed: reqwest would send custom headers such as a
+/// key in `X-Auth-Token` to the new host, and repeat a POST of secrets on a
+/// 307 or 308, and no API omnifob calls answers with one, so a redirect
+/// comes back as the response it is.
 pub fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TIMEOUT)

@@ -31,6 +31,11 @@ pub fn unattended<F: Future>(future: F) -> impl Future<Output = F::Output> + use
     })
 }
 
+/// Whether prompts are off here, inside an [`unattended`] future.
+pub(crate) fn is_unattended() -> bool {
+    UNATTENDED.get()
+}
+
 /// A six-digit code from the MFA device `serial`, for `what` (a profile id).
 pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
     if UNATTENDED.get() {

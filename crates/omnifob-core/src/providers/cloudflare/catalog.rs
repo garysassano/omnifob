@@ -272,6 +272,11 @@ pub(super) fn save_changes(
 /// tokens minted for its profiles filed under their new IDs (`<new>/...`),
 /// so `fob revoke` still finds them. Renaming back undoes it exactly.
 pub fn rename_catalog(old: &str, new: &str) -> anyhow::Result<()> {
+    if old == new {
+        // The second lock would wait for the first, then the file would be
+        // written and removed.
+        return Ok(());
+    }
     // Both locks, always in the same order, so two renames cannot deadlock.
     let (first, second) = if old < new { (old, new) } else { (new, old) };
     let _first = lock_catalog(first)?;

@@ -23,7 +23,9 @@ pub fn file() -> anyhow::Result<PathBuf> {
 impl History {
     /// Loads the history; a missing or unreadable file is an empty history.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        // Through `retry_busy`: on Windows, a read refused while another
+        // process replaces the file would otherwise start the history over.
+        crate::files::retry_busy(|| std::fs::read_to_string(path))
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
