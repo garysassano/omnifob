@@ -6,7 +6,7 @@ use dialoguer::console::Term;
 use jiff::Timestamp;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::SyncedProfiles;
-use omnifob_core::{Error, Integration, Profile, paths, providers};
+use omnifob_core::{Code, Coded, Error, Integration, Profile, paths, providers};
 
 use crate::{App, agent, interactive, profiles_file};
 
@@ -209,14 +209,24 @@ impl App {
             from_directory = self.directory_default()?;
             if let Some((dir, id)) = &from_directory {
                 if agent::active() {
-                    bail!(
-                        "name a profile by its full id; this directory's default ({dir}) is {id}"
-                    );
+                    return Err(Coded::new(
+                        Code::ProfileAmbiguous,
+                        format!(
+                            "name a profile by its full id; this directory's default ({dir}) is {id}"
+                        ),
+                    )
+                    .with("candidates", vec![id.clone()])
+                    .into());
                 }
                 if !self.cache.all().any(|p| p.id == *id) {
-                    bail!(
-                        "{id}, the default profile of {dir} in [directories], is not a profile; see `fob list`"
-                    );
+                    return Err(Coded::new(
+                        Code::ProfileNotFound,
+                        format!(
+                            "{id}, the default profile of {dir} in [directories], is not a profile; see `fob list`"
+                        ),
+                    )
+                    .with("query", id.as_str())
+                    .into());
                 }
             }
         }
@@ -240,26 +250,52 @@ impl App {
             // Only now can a skipped integration be the reason.
             skipped.report();
         }
+        // The failure for a query that names no single profile, with the
+        // candidates a caller can choose from.
+        let ambiguous = |message: String| -> anyhow::Error {
+            let mut error = Coded::new(Code::ProfileAmbiguous, message)
+                .with("matches", candidates.len())
+                .with("candidates", candidate_ids(&candidates));
+            if let Some(q) = query {
+                error = error.with("query", q);
+            }
+            error.into()
+        };
         let profile = match candidates.as_slice() {
-            [] if query.is_some() => bail!(
-                "no profile matches '{}'; see `fob list`",
-                query.unwrap_or_default()
-            ),
-            [] => bail!("no profiles yet; run `fob login <integration>`"),
+            [] if query.is_some() => {
+                let q = query.unwrap_or_default();
+                return Err(Coded::new(
+                    Code::ProfileNotFound,
+                    format!("no profile matches '{q}'; see `fob list`"),
+                )
+                .with("query", q)
+                .into());
+            }
+            [] => {
+                return Err(Coded::new(
+                    Code::ProfileNotFound,
+                    "no profiles yet; run `fob login <integration>`",
+                )
+                .into());
+            }
             [one] if !agent::active() || precise || query == Some(one.id.as_str()) => {
                 (*one).clone()
             }
-            _ if agent::active() => match query {
-                None => bail!("name a profile by its full id; `fob list` shows them"),
-                Some(q) => bail!(
-                    "name the profile by its full id: '{q}' matches {}",
-                    listing(&candidates)
-                ),
-            },
-            _ if !interactive() => match query {
-                None => bail!("name a profile; `fob list` shows them"),
-                Some(q) => bail!("'{q}' matches {}; name one in full", listing(&candidates)),
-            },
+            _ if agent::active() => {
+                return Err(ambiguous(match query {
+                    None => "name a profile by its full id; `fob list` shows them".to_string(),
+                    Some(q) => format!(
+                        "name the profile by its full id: '{q}' matches {}",
+                        listing(&candidates)
+                    ),
+                }));
+            }
+            _ if !interactive() => {
+                return Err(ambiguous(match query {
+                    None => "name a profile; `fob list` shows them".to_string(),
+                    Some(q) => format!("'{q}' matches {}; name one in full", listing(&candidates)),
+                }));
+            }
             _ => {
                 let picked = dialoguer::FuzzySelect::new()
                     .with_prompt("Profile")
@@ -271,10 +307,15 @@ impl App {
             }
         };
         if agent::active() && !self.config.agent.allows(&profile.id) {
-            bail!(
-                "{} is not open to agents; ask the user to run the command or to give agents access",
-                profile.id
-            );
+            return Err(Coded::new(
+                Code::NotOpenToAgents,
+                format!(
+                    "{} is not open to agents; ask the user to run the command or to give agents access",
+                    profile.id
+                ),
+            )
+            .with("profile", profile.id.as_str())
+            .into());
         }
         Ok(profile)
     }
@@ -399,9 +440,17 @@ fn picker_rows(profiles: &[&Profile]) -> Vec<String> {
         .collect()
 }
 
+/// The ids a caller can pick from, as many as [`listing`] shows.
+fn candidate_ids(profiles: &[&Profile]) -> Vec<String> {
+    profiles.iter().take(LISTED).map(|p| p.id.clone()).collect()
+}
+
+/// How many profiles an error lists.
+const LISTED: usize = 10;
+
 /// "3 profiles: a, b, c", up to ten ids, then how many more.
 fn listing(profiles: &[&Profile]) -> String {
-    const SHOWN: usize = 10;
+    const SHOWN: usize = LISTED;
     let ids: Vec<&str> = profiles.iter().take(SHOWN).map(|p| p.id.as_str()).collect();
     let more = profiles.len().saturating_sub(SHOWN);
     let noun = if profiles.len() == 1 {

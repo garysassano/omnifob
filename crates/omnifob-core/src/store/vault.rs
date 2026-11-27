@@ -282,16 +282,20 @@ impl Vault {
             } else {
                 ", or set OMNIFOB_VAULT_PASSPHRASE"
             };
-            if new {
-                bail!(
+            let message = if new {
+                format!(
                     "creating the encrypted vault in {} needs a passphrase: run fob in a terminal{variable}",
                     self.dir.display()
-                );
-            }
-            bail!(
-                "the encrypted vault in {} is locked: run any fob command in a terminal to enter its passphrase (once per boot){variable}",
-                self.dir.display()
-            );
+                )
+            } else {
+                format!(
+                    "the encrypted vault in {} is locked: run any fob command in a terminal to enter its passphrase (once per boot){variable}",
+                    self.dir.display()
+                )
+            };
+            return Err(crate::Coded::new(crate::Code::VaultLocked, message)
+                .with("vault", self.dir.display().to_string())
+                .into());
         };
         let passphrase = prompt(&PassphraseRequest {
             vault: self.dir.clone(),
@@ -451,7 +455,12 @@ struct Sealed {
 }
 
 fn platform(e: anyhow::Error) -> Error {
-    Error::PlatformFailure(e.into())
+    // A coded failure (the vault is locked) goes in as itself, so callers
+    // still find its code through the keyring's error.
+    match e.downcast::<crate::Coded>() {
+        Ok(coded) => Error::PlatformFailure(Box::new(coded)),
+        Err(e) => Error::PlatformFailure(e.into()),
+    }
 }
 
 impl CredentialApi for Sealed {
@@ -584,6 +593,10 @@ mod tests {
             .get_password()
             .unwrap_err();
         assert!(locked.to_string().contains("is locked"), "{locked}");
+        assert_eq!(
+            crate::classify(&anyhow::Error::from(locked)).0,
+            crate::Code::VaultLocked
+        );
 
         // A file moved to another key's name, or changed, does not open.
         std::fs::copy(&file, dir.join("aws-sso%2Fother%2Ftoken.sealed")).unwrap();

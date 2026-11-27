@@ -28,12 +28,12 @@ impl App {
         output: Output,
     ) -> anyhow::Result<ExitCode> {
         // (what, is it a profile, the result)
-        let mut results: Vec<(String, bool, Result<String, String>)> = Vec::new();
+        let mut results: Vec<(String, bool, Result<String, Failure>)> = Vec::new();
         if let Some(query) = query {
             let profile = self.select(Some(query)).await?;
             let result = providers::check_profile(&self.config, &profile)
                 .await
-                .map_err(|e| format!("{e:#}"));
+                .map_err(Failure::from);
             results.push((profile.id, true, result));
         } else {
             if self.config.integrations.is_empty() {
@@ -63,11 +63,7 @@ impl App {
             )
             .await;
             for ((name, _), result) in checked.iter().zip(outcomes) {
-                results.push((
-                    name.to_string(),
-                    false,
-                    result.map_err(|e| format!("{e:#}")),
-                ));
+                results.push((name.to_string(), false, result.map_err(Failure::from)));
             }
         }
         let failed = results.iter().any(|(_, _, r)| r.is_err());
@@ -77,7 +73,7 @@ impl App {
                 for (what, _, result) in &results {
                     match result {
                         Ok(detail) => println!("ok   {what}: {detail}"),
-                        Err(error) => println!("FAIL {what}: {error}"),
+                        Err(failure) => println!("FAIL {what}: {}", failure.message),
                     }
                 }
             }
@@ -85,12 +81,7 @@ impl App {
                 let rows: Vec<serde_json::Value> = results
                     .iter()
                     .map(|(what, is_profile, result)| {
-                        let mut row = json!({
-                            "ok": result.is_ok(),
-                            "detail": match result {
-                                Ok(d) | Err(d) => d,
-                            },
-                        });
+                        let mut row = check_json(result);
                         row[if *is_profile {
                             "profile"
                         } else {
@@ -123,7 +114,7 @@ impl App {
         }
         let secrets = omnifob_core::store::description()?;
         // Before reading the stored state, which a check may renew.
-        let mut checked: Vec<Option<Result<String, String>>> = if check {
+        let mut checked: Vec<Option<Result<String, Failure>>> = if check {
             futures::future::join_all(
                 self.config
                     .integrations
@@ -132,7 +123,7 @@ impl App {
             )
             .await
             .into_iter()
-            .map(|r| Some(r.map_err(|e| format!("{e:#}"))))
+            .map(|r| Some(r.map_err(Failure::from)))
             .collect()
         } else {
             vec![None; self.config.integrations.len()]
@@ -149,7 +140,7 @@ impl App {
             let synced = self.cache.integrations.get(name);
             let state = match &checked {
                 Some(Ok(detail)) => format!("works: {detail}"),
-                Some(Err(error)) => format!("FAILS: {error}"),
+                Some(Err(failure)) => format!("FAILS: {}", failure.message),
                 None => describe(integration, sign_in, account.as_deref(), now),
             };
             rows.push(Row {
@@ -200,12 +191,7 @@ impl App {
                         "renews": renews,
                         "account": row.account,
                         "state": row.state,
-                        "check": row.checked.as_ref().map(|result| json!({
-                            "ok": result.is_ok(),
-                            "detail": match result {
-                                Ok(d) | Err(d) => d,
-                            },
-                        })),
+                        "check": row.checked.as_ref().map(check_json),
                         "profiles": row.profiles,
                         "synced_at": row.synced_at,
                     })
@@ -272,6 +258,35 @@ impl App {
     }
 }
 
+/// A failed check: its message, and its code for programs.
+#[derive(Clone)]
+struct Failure {
+    message: String,
+    code: omnifob_core::Code,
+}
+
+impl From<omnifob_core::Error> for Failure {
+    fn from(e: omnifob_core::Error) -> Self {
+        let e = anyhow::Error::from(e);
+        Self {
+            message: format!("{e:#}"),
+            code: omnifob_core::classify(&e).0,
+        }
+    }
+}
+
+/// A check's result as JSON: `ok`, `detail`, and a failure's `code`.
+fn check_json(result: &Result<String, Failure>) -> serde_json::Value {
+    match result {
+        Ok(detail) => json!({ "ok": true, "detail": detail }),
+        Err(failure) => json!({
+            "ok": false,
+            "detail": failure.message,
+            "code": failure.code.as_str(),
+        }),
+    }
+}
+
 /// Whether the stored state cannot tell if the sign-in still works: its
 /// token expired and renews only while a session fob cannot see lasts.
 fn needs_check(sign_in: SignIn, now: Timestamp) -> bool {
@@ -287,7 +302,7 @@ struct Row<'a> {
     profiles: usize,
     synced_at: Option<Timestamp>,
     /// What `--check` found.
-    checked: Option<Result<String, String>>,
+    checked: Option<Result<String, Failure>>,
 }
 
 /// The profile `fob use` made active in this shell, and when its

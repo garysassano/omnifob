@@ -83,10 +83,31 @@ pub fn main() -> ExitCode {
     match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("fob: {e:#}");
+            report(&e);
             failed
         }
     }
+}
+
+/// Prints a failure for the person, and under an agent (or with
+/// `OMNIFOB_ERROR_FORMAT=json`) a last line for programs: `fob-error: ` and
+/// JSON with the failure's `code`, its `message` and the values that go with
+/// the code, such as the command to `run`.
+fn report(e: &anyhow::Error) {
+    eprintln!("fob: {e:#}");
+    if agent::active() || std::env::var("OMNIFOB_ERROR_FORMAT").is_ok_and(|v| v == "json") {
+        eprintln!("fob-error: {}", error_json(e));
+    }
+}
+
+/// A failure as JSON: `code`, `message`, and the code's values.
+fn error_json(e: &anyhow::Error) -> serde_json::Value {
+    let (code, details) = omnifob_core::classify(e);
+    let mut object = serde_json::Map::new();
+    object.insert("code".into(), code.as_str().into());
+    object.insert("message".into(), format!("{e:#}").into());
+    object.extend(details);
+    object.into()
 }
 
 /// The command line, named after the binary that was run (`fob` or `omnifob`),
@@ -164,9 +185,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Use { .. } | Command::Unuse if agent::active() => {
-            bail!(
-                "each command an agent runs starts in a new shell, so `fob use` cannot carry over; run commands as `fob exec <profile> -- <command>`"
-            );
+            return Err(omnifob_core::Coded::new(
+                omnifob_core::Code::UseExec,
+                "each command an agent runs starts in a new shell, so `fob use` cannot carry over; run commands as `fob exec <profile> -- <command>`",
+            )
+            .with("run", "fob exec <profile> -- <command>")
+            .into());
         }
         Command::Use { .. } | Command::Unuse => {
             let shell = Shell::detect();
@@ -324,7 +348,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             // As `env` does: 125 when fob fails, so it is not mistaken for the
             // command's own status.
             return Ok(result.unwrap_or_else(|e| {
-                eprintln!("fob: {e:#}");
+                report(&e);
                 ExitCode::from(exec::FOB_FAILED)
             }));
         }
