@@ -3,6 +3,7 @@
 
 pub mod console;
 pub mod cross_partition;
+pub mod discover;
 pub mod iam;
 pub mod login;
 pub mod partition;
@@ -17,7 +18,7 @@ pub(crate) fn endpoint_override() -> Option<String> {
 
 /// Where to send the calls of one AWS API: `OMNIFOB_AWS_ENDPOINT`, else the
 /// service's own variable (`AWS_ENDPOINT_URL_SSO_OIDC`, `AWS_ENDPOINT_URL_SSO`,
-/// `AWS_ENDPOINT_URL_STS` or `AWS_ENDPOINT_URL_SIGNIN`), which points the AWS
+/// `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL_SIGNIN` or `AWS_ENDPOINT_URL_IAM`), which points the AWS
 /// CLI at a VPC endpoint whose private DNS is off, as the current context's
 /// [`Endpoints`](crate::Endpoints) hold them.
 pub(crate) fn service_endpoint(variable: &str) -> Option<String> {

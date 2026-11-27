@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 anyhow = "1.0.104"
 aws-lc-rs = "1.19.0"
+aws-sdk-iam = { version = "1.140.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-signin = { version = "1.36.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-sso = { version = "1.119.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ssooidc = { version = "1.121.0", default-features = false, features = ["default-https-client", "rt-tokio"] }

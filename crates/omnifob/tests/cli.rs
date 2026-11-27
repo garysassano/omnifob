@@ -2258,6 +2258,110 @@ fn import_folds_a_role_every_account_has_into_a_rule_once() {
     );
 }
 
+/// The account whose role signed an AWS request, from the access key ID
+/// `mount_role_credentials` hands out (`ASIA<account>`).
+fn signing_account(request: &Request) -> String {
+    let auth = request.headers["authorization"].to_str().unwrap();
+    let key = auth.split("Credential=").nth(1).unwrap();
+    key.trim_start_matches("ASIA")[..12].to_string()
+}
+
+/// Mocks IAM for `fob discover aws`: in each account, the permission set's
+/// role, an `admin-root` role trusting the account, which the simulator
+/// allows, and a `lambda` role trusting a service.
+async fn mount_iam(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListRoles"))
+        .respond_with(|r: &Request| {
+            let account = signing_account(r);
+            let trust = |principal: &str| {
+                format!(
+                    r#"{{"Statement":{{"Effect":"Allow","Principal":{principal},"Action":"sts:AssumeRole"}}}}"#
+                )
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+            };
+            let root = trust(&format!(r#"{{"AWS":"arn:aws:iam::{account}:root"}}"#));
+            let role = |path: &str, name: &str, trust: &str| {
+                format!(
+                    "<member><Path>{path}</Path><RoleName>{name}</RoleName><RoleId>AROA{name}</RoleId>\
+                     <Arn>arn:aws:iam::{account}:role{path}{name}</Arn><CreateDate>2020-01-01T00:00:00Z</CreateDate>\
+                     <AssumeRolePolicyDocument>{trust}</AssumeRolePolicyDocument></member>"
+                )
+            };
+            let members = [
+                role("/aws-reserved/sso.amazonaws.com/", "AWSReservedSSO_Admin_1", &root),
+                role("/", "admin-root", &root),
+                role("/", "lambda", &trust(r#"{"Service":"lambda.amazonaws.com"}"#)),
+            ]
+            .concat();
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(format!(
+                    r#"<ListRolesResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{members}</Roles></ListRolesResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></ListRolesResponse>"#
+                ))
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .respond_with(|r: &Request| {
+            let account = signing_account(r);
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(format!(
+                    r#"<SimulatePrincipalPolicyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::{account}:role/admin-root</EvalResourceName><EvalDecision>allowed</EvalDecision></member></EvaluationResults></SimulatePrincipalPolicyResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SimulatePrincipalPolicyResponse>"#
+                ))
+        })
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_writes_a_rule_for_a_role_every_account_has() {
+    let (fob, server) = synced_portal("discover").await;
+    mount_iam(&server).await;
+    let (stdout, stderr) = fob.ok(&["discover", "aws", "acme", "--via", "Admin"]);
+    assert!(
+        stderr.contains("found 0 chained role(s) and 1 chained rule(s)"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.starts_with("# Found by `fob discover aws`"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[integrations.acme.chained_rules.\"admin-root\"]"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("lambda"), "{stdout}");
+
+    fob.ok(&["discover", "aws", "acme", "--write"]);
+    fob.ok(&["sync"]);
+    let (stdout, _) = fob.ok(&["list", "root"]);
+    assert_eq!(
+        lines(&stdout),
+        ["acme/dev/admin-root", "acme/prod/admin-root"]
+    );
+    // Found again, it is configured already.
+    let (_, stderr) = fob.ok(&["discover", "aws", "acme"]);
+    assert!(stderr.contains("nothing new found"), "{stderr}");
+
+    let stderr = fob.fails(&["discover", "aws", "acme", "--via", "Nobody"]);
+    assert!(
+        stderr.contains("no Identity Center role of 'acme' to search named Nobody"),
+        "{stderr}"
+    );
+}
+
 // Providers other than IAM Identity Center, each against a mock of its
 // APIs: sign-in, discovery, `fob exec`, `fob console` and sign-out.
 

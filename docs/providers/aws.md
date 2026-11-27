@@ -57,6 +57,18 @@ Tried live on 2026-11-15 in one commercial account, with the AWS CLI and an Iden
 
 Not yet tried live, because no account in a second partition is available: the exchange against a real trust policy, whether such sessions count as role chaining (which would cap `duration` at one hour; the `AssumeRoleWithWebIdentity` reference states no such cap, so up to 12 hours is accepted), and `fob console` in the destination partition. `OMNIFOB_AWS_ENDPOINT` sends both STS calls to the mock, which tells them apart by `Action`.
 
+## Discovering chained roles
+
+`fob discover aws <integration>` finds IAM roles an Identity Center role may assume in its own account, which Identity Center does not list. For each Identity Center role of the integration, or those named with `--via`, it gets the role's credentials and:
+
+1. Lists the account's roles with `iam:ListRoles` and finds the permission set's own role among them (`AWSReservedSSO_<permission set>_*` under `/aws-reserved/`), since the simulator needs its ARN.
+2. Keeps the roles whose trust policy has an `Allow` statement for `sts:AssumeRole` (or `sts:*`, `*`) with the account (`arn:<partition>:iam::<account>:root` or the bare ID), the permission set's role, or `*` as an AWS principal, leaving out service-linked and Identity Center roles. Conditions are noted, not evaluated.
+3. Asks `iam:SimulatePrincipalPolicy`, with the permission set's role as the policy source, whether `sts:AssumeRole` on each candidate is allowed, 20 roles per call.
+
+Four sources are searched at a time. A source whose permission set may not call either action is skipped with the reason. What is found becomes chained tables, folded into rules as `fob import aws` folds them, minus what the config already has; it is printed for review, and `--write` appends it. Under an agent, only profiles open to it search.
+
+It assumes no role, so no `AssumeRole` attempt reaches CloudTrail, where security teams often alert on administrator roles. The price is that the answer is a guess. The simulator evaluates the source's identity policies, permissions boundary and the service control policies it can see, but not resource control policies, and fob does not evaluate trust-policy conditions (MFA, principal tags, external IDs, source IP), so a found role can still refuse. Only the source's own account is searched, since fob can read trust policies only where it has a role; a role in another account that trusts the permission set stays unseen. IAM is global, so calls go to the partition's IAM Region, or to `AWS_ENDPOINT_URL_IAM`.
+
 ## The AWS config file
 
 `fob import aws` reads `sso-session` sections, legacy `sso_start_url` profiles, granted's keys and `aws login` profiles from `~/.aws/config`, and writes integrations and chained roles.

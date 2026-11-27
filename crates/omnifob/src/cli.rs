@@ -284,6 +284,9 @@ pub(crate) enum Command {
     /// Create integrations from other tools' configuration
     #[command(subcommand)]
     Import(ImportCommand),
+    /// Find roles your sign-ins may assume that the provider does not list
+    #[command(subcommand)]
+    Discover(DiscoverCommand),
     /// Write configuration for other tools
     #[command(subcommand)]
     Export(ExportCommand),
@@ -332,6 +335,23 @@ pub(crate) enum ImportCommand {
         #[arg(long)]
         file: Option<std::path::PathBuf>,
         /// Append the new integrations to the omnifob config instead of printing them
+        #[arg(long)]
+        write: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DiscoverCommand {
+    /// IAM roles an Identity Center role may assume in its own account, found
+    /// with iam:ListRoles and the policy simulator (needs both; assumes nothing)
+    Aws {
+        /// The aws-sso integration to search
+        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        integration: String,
+        /// Search with this permission set only (repeatable); every one when left out
+        #[arg(long = "via", value_name = "PERMISSION_SET")]
+        via: Vec<String>,
+        /// Append what was found to the config instead of printing it
         #[arg(long)]
         write: bool,
     },

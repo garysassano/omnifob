@@ -1715,3 +1715,179 @@ async fn cross_partition_profiles_check_in_the_destination_and_open_its_console(
         .unwrap();
     assert!(!form(&federation).contains_key("SessionDuration"));
 }
+
+/// Percent-encodes a policy document as IAM returns it.
+fn iam_encoded(json: &str) -> String {
+    json.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// An IAM `ListRoles` answer with `(path, name, trusted principal)` roles in
+/// account 111111111111.
+fn iam_roles(roles: &[(&str, &str, &str)]) -> ResponseTemplate {
+    let members: String = roles
+        .iter()
+        .map(|(path, name, principal)| {
+            let trust = iam_encoded(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{principal},"Action":"sts:AssumeRole"}}]}}"#
+            ));
+            format!(
+                "<member><Path>{path}</Path><RoleName>{name}</RoleName><RoleId>AROA{name}</RoleId>\
+                 <Arn>arn:aws:iam::111111111111:role{path}{name}</Arn><CreateDate>2020-01-01T00:00:00Z</CreateDate>\
+                 <AssumeRolePolicyDocument>{trust}</AssumeRolePolicyDocument></member>"
+            )
+        })
+        .collect();
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/xml")
+        .set_body_string(format!(
+            r#"<ListRolesResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{members}</Roles></ListRolesResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></ListRolesResponse>"#
+        ))
+}
+
+#[tokio::test]
+async fn discovery_finds_roles_the_permission_set_may_assume_in_its_account() {
+    use omnifob_core::providers::aws::discover::{Source, discover};
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "find", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .mount(&server)
+        .await;
+    let sso = "/aws-reserved/sso.amazonaws.com/eu-west-1/";
+    let source = format!("arn:aws:iam::111111111111:role{sso}AWSReservedSSO_pe_0123");
+    let root = r#"{"AWS":"arn:aws:iam::111111111111:root"}"#;
+    let by_source = format!(r#"{{"AWS":"{source}"}}"#);
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListRoles"))
+        .respond_with(iam_roles(&[
+            (sso, "AWSReservedSSO_pe_0123", root),
+            ("/", "admin-root", root),
+            ("/ops/", "deployer", &by_source),
+            ("/", "developer", root),
+            ("/", "lambda", r#"{"Service":"lambda.amazonaws.com"}"#),
+            (
+                "/",
+                "partner",
+                r#"{"AWS":"arn:aws:iam::999999999999:root"}"#,
+            ),
+        ]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The simulator allows two of the three roles the account trusts, and
+    // is never asked about the others.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .and(body_string_contains("AWSReservedSSO_pe_0123"))
+        .respond_with(|r: &Request| {
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            assert!(!body.contains("lambda") && !body.contains("partner"), "{body}");
+            let result = |role: &str, decision: &str| {
+                format!(
+                    "<member><EvalActionName>sts:AssumeRole</EvalActionName>\
+                     <EvalResourceName>arn:aws:iam::111111111111:role{role}</EvalResourceName>\
+                     <EvalDecision>{decision}</EvalDecision></member>"
+                )
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(format!(
+                    r#"<SimulatePrincipalPolicyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults>{}{}{}</EvaluationResults></SimulatePrincipalPolicyResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SimulatePrincipalPolicyResponse>"#,
+                    result("/admin-root", "allowed"),
+                    result("/ops/deployer", "allowed"),
+                    result("/developer", "implicitDeny"),
+                ))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let discovery = discover(
+        "find",
+        &config(),
+        vec![Source {
+            account_id: "111111111111".into(),
+            segment: "dev".into(),
+            via_role: "pe".into(),
+        }],
+    )
+    .await;
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    let found: Vec<_> = discovery
+        .found
+        .iter()
+        .map(|f| {
+            (
+                f.label.as_str(),
+                f.role.role_arn.as_str(),
+                f.role.via_role.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "dev-admin-root",
+                "arn:aws:iam::111111111111:role/admin-root",
+                "pe"
+            ),
+            (
+                "dev-deployer",
+                "arn:aws:iam::111111111111:role/ops/deployer",
+                "pe"
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn discovery_skips_a_permission_set_iam_refuses() {
+    use omnifob_core::providers::aws::discover::{Source, discover};
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "refused", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListRoles"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "text/xml")
+                .set_body_string(
+                    r#"<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>not allowed</Message></Error><RequestId>1</RequestId></ErrorResponse>"#,
+                ),
+        )
+        .mount(&server)
+        .await;
+    let discovery = discover(
+        "refused",
+        &config(),
+        vec![Source {
+            account_id: "111111111111".into(),
+            segment: "dev".into(),
+            via_role: "ReadOnly".into(),
+        }],
+    )
+    .await;
+    assert!(discovery.found.is_empty());
+    assert_eq!(
+        discovery.skipped[0].reason,
+        "the permission set may not call iam:ListRoles"
+    );
+}
