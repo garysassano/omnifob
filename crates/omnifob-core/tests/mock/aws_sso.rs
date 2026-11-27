@@ -1760,9 +1760,11 @@ async fn discovery_finds_roles_the_permission_set_may_assume_in_its_account() {
 
     let (_guard, server) = setup().await;
     device_login(&server, "find", 3600).await;
+    // The second search uses the credentials the first cached.
     Mock::given(method("GET"))
         .and(path("/federation/credentials"))
         .respond_with(role_credentials())
+        .expect(1)
         .mount(&server)
         .await;
     let sso = "/aws-reserved/sso.amazonaws.com/eu-west-1/";
@@ -1772,6 +1774,7 @@ async fn discovery_finds_roles_the_permission_set_may_assume_in_its_account() {
     Mock::given(method("POST"))
         .and(path("/"))
         .and(body_string_contains("Action=ListRoles"))
+        .and(body_string_contains("MaxItems=1000"))
         .respond_with(iam_roles(&[
             (sso, "AWSReservedSSO_pe_0123456789abcdef", root),
             ("/", "admin-root", root),
@@ -1784,7 +1787,7 @@ async fn discovery_finds_roles_the_permission_set_may_assume_in_its_account() {
                 r#"{"AWS":"arn:aws:iam::999999999999:root"}"#,
             ),
         ]))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     // The simulator allows two of the three roles the account trusts, and
@@ -1814,21 +1817,20 @@ async fn discovery_finds_roles_the_permission_set_may_assume_in_its_account() {
                     specific("/developer", "implicitDeny"),
                 ))
         })
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
-    let discovery = discover(
-        "find",
-        &config(),
-        vec![Source {
-            account_id: "111111111111".into(),
-            segment: "dev".into(),
-            via_role: "pe".into(),
-        }],
-    )
-    .await
-    .unwrap();
+    let source = Source {
+        account_id: "111111111111".into(),
+        segment: "dev".into(),
+        via_role: "pe".into(),
+        profile_id: "find/dev/pe".into(),
+    };
+    discover("find", &config(), vec![source.clone()])
+        .await
+        .unwrap();
+    let discovery = discover("find", &config(), vec![source]).await.unwrap();
     assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
     let found: Vec<_> = discovery
         .found
@@ -1888,6 +1890,7 @@ async fn discovery_skips_a_permission_set_iam_refuses() {
             account_id: "111111111111".into(),
             segment: "dev".into(),
             via_role: "ReadOnly".into(),
+            profile_id: "refused/dev/ReadOnly".into(),
         }],
     )
     .await
@@ -1964,6 +1967,7 @@ async fn discovery_lists_an_account_once_and_keeps_one_table_per_role() {
         account_id: "111111111111".into(),
         segment: "dev".into(),
         via_role: via_role.into(),
+        profile_id: format!("once/dev/{via_role}"),
     };
     let discovery = discover("once", &config(), vec![source("pe"), source("ops")])
         .await
@@ -2041,6 +2045,7 @@ fn in_dev(via_role: &str) -> omnifob_core::providers::aws::discover::Source {
         account_id: "111111111111".into(),
         segment: "dev".into(),
         via_role: via_role.into(),
+        profile_id: format!("dev/{via_role}"),
     }
 }
 
@@ -2148,6 +2153,7 @@ async fn discovery_without_a_sign_in_asks_for_one() {
             account_id: "111111111111".into(),
             segment: "dev".into(),
             via_role: "pe".into(),
+            profile_id: "signed-out/dev/pe".into(),
         }],
     )
     .await
