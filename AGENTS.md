@@ -9,7 +9,7 @@
 
 ## Pull requests
 
-Changes go through a pull request, squash-merged after CI passes on Linux, macOS and Windows; `main` carries one commit per PR. In a stack of pull requests, the Linux, macOS and Windows jobs run only on the top PR, whose tree contains every layer, so the stack is merged once CI passes there. A small change (a typo, a log line) may go straight to `main`. Split work into separate PRs when the changes need independent revert, release or bisect boundaries.
+Changes go through a pull request, squash-merged after CI passes on Linux, macOS and Windows; `main` carries one commit per PR. Independent changes are separate PRs off `main`, each merged as soon as it is green, without waiting for the others; a change that cannot build without another may be stacked on it, and in a stack the Linux, macOS and Windows jobs run only on the top PR, which is merged with the PRs below it once CI passes there. A small change (a typo, a log line) may go straight to `main`. Releases batch the merged PRs in their notes.
 
 Before pushing, run `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo deny --locked check`. Format Markdown and YAML with `biome format --write`, then run `biome check .` and `shellcheck docs/tools/refresh.sh`, as CI does.
 
