@@ -51,6 +51,30 @@ pub(crate) struct ExecOptions {
     pub(crate) token_file: bool,
 }
 
+impl ExecOptions {
+    /// Fails when an option does not fit the profile, before any credential
+    /// is fetched or minted.
+    pub(crate) fn check(&self, profile: &Profile) -> anyhow::Result<()> {
+        if self.server && !profile.target.is_aws() {
+            bail!(
+                "--server serves AWS credentials; {} is not an AWS profile",
+                profile.id
+            );
+        }
+        let google = matches!(
+            profile.target,
+            Target::Gcp { .. } | Target::GcpServiceAccount { .. }
+        );
+        if self.token_file && !google {
+            bail!(
+                "--token-file is for Google Cloud profiles; {} is not one",
+                profile.id
+            );
+        }
+        Ok(())
+    }
+}
+
 impl App {
     /// The lifetime to ask for: `ttl`, capped at `[agent] max_ttl` for an
     /// agent where the profile's lifetime is omnifob's to choose.
@@ -76,6 +100,19 @@ impl App {
         ttl: Option<jiff::SignedDuration>,
         via: &str,
     ) -> anyhow::Result<Credentials> {
+        let creds = self.unaudited_credentials(profile, use_cache, ttl).await?;
+        self.audit(profile, via, creds.expires_at, creds.token_id.as_deref());
+        Ok(creds)
+    }
+
+    /// [`App::credentials`] for a caller that writes the audit entry itself,
+    /// once it knows every way they are handed over.
+    pub(crate) async fn unaudited_credentials(
+        &self,
+        profile: &Profile,
+        use_cache: bool,
+        ttl: Option<jiff::SignedDuration>,
+    ) -> anyhow::Result<Credentials> {
         let ttl = self.agent_ttl(profile, ttl);
         let creds = self
             .with_login(|| providers::credentials(&self.config, profile, use_cache, ttl))
@@ -85,7 +122,6 @@ impl App {
             spawn_renewal(&self.config, profile);
         }
         record_use(&profile.id);
-        self.audit(profile, via, creds.expires_at, creds.token_id.as_deref());
         Ok(creds)
     }
 
@@ -127,16 +163,13 @@ impl App {
         ttl: Option<jiff::SignedDuration>,
         options: ExecOptions,
     ) -> anyhow::Result<(Provision, Vec<&'static str>)> {
+        options.check(profile)?;
         let mut provision = Provision::default();
         let mut via = Vec::new();
         let target = &profile.target;
+        // The agent's cap, as for the variables.
+        let ttl = self.agent_ttl(profile, ttl);
         if options.server {
-            if !target.is_aws() {
-                bail!(
-                    "--server serves AWS credentials; {} is not an AWS profile",
-                    profile.id
-                );
-            }
             provision.merge(
                 provision::aws_container_endpoint(self.config.clone(), profile.clone(), ttl)
                     .await?,
@@ -147,15 +180,7 @@ impl App {
             target,
             Target::Gcp { .. } | Target::GcpServiceAccount { .. }
         );
-        // The agent's cap, as for the variables.
-        let ttl = self.agent_ttl(profile, ttl);
         if options.token_file {
-            if !google {
-                bail!(
-                    "--token-file is for Google Cloud profiles; {} is not one",
-                    profile.id
-                );
-            }
             provision.merge(provision::gcp_token_file(
                 self.config.clone(),
                 profile.clone(),

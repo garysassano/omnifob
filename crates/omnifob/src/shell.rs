@@ -128,8 +128,10 @@ pub fn activation_line(shell: Shell) -> &'static str {
 
 /// A `fob` wrapper function: `fob use [profile]` and `fob unuse` change the
 /// current shell; everything else runs the binary. Global options before the
-/// command (`fob --config x use p`) are passed on. Also registers
-/// completions, which ask the binary for profile ids as you type.
+/// command (`fob --config x use p`) are passed on. `--help` and `--version`
+/// go to the binary as they are, since their output is not shell code, and
+/// the shell evaluates nothing when fob fails. Also registers completions,
+/// which ask the binary for profile ids as you type.
 pub fn activate(shell: Shell) -> &'static str {
     match shell {
         Shell::Posix => {
@@ -143,13 +145,28 @@ pub fn activate(shell: Shell) -> &'static str {
     esac
   done
   case "${1:-}" in
+    use|unuse)
+      local __fob_arg
+      for __fob_arg in "$@"; do
+        case "$__fob_arg" in
+          -h|--help|-V|--version)
+            command fob ${__fob_config:+"$__fob_config"} "$@"
+            return
+            ;;
+        esac
+      done
+      ;;
+  esac
+  case "${1:-}" in
     use)
       shift
       local __fob_env
       __fob_env="$(command fob ${__fob_config:+"$__fob_config"} env --shell posix "$@")" && eval "$__fob_env"
       ;;
     unuse)
-      eval "$(command fob ${__fob_config:+"$__fob_config"} env --shell posix --unset)"
+      shift
+      local __fob_env
+      __fob_env="$(command fob ${__fob_config:+"$__fob_config"} env --shell posix --unset "$@")" && eval "$__fob_env"
       ;;
     *)
       command fob ${__fob_config:+"$__fob_config"} "$@"
@@ -179,12 +196,21 @@ fi
         break
     end
   end
+  if contains -- "$argv[1]" use unuse
+    for __fob_arg in $argv[2..-1]
+      if contains -- $__fob_arg -h --help -V --version
+        command fob $__fob_global $argv
+        return
+      end
+    end
+  end
   switch "$argv[1]"
     case use
       set -l __fob_env (command fob $__fob_global env --shell fish $argv[2..-1]); or return
       printf '%s\n' $__fob_env | source
     case unuse
-      command fob $__fob_global env --shell fish --unset | source
+      set -l __fob_env (command fob $__fob_global env --shell fish --unset $argv[2..-1]); or return
+      printf '%s\n' $__fob_env | source
     case '*'
       command fob $__fob_global $argv
   end
@@ -208,12 +234,15 @@ function fob {
       break
     }
   }
-  if ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'use') {
-    $rest = @($fobArgs | Select-Object -Skip 1)
+  $rest = @($fobArgs | Select-Object -Skip 1)
+  $plain = @($rest | Where-Object { "$_" -cin @('-h', '--help', '-V', '--version') }).Count -gt 0
+  if ($fobArgs.Count -gt 0 -and $fobArgs[0] -in @('use', 'unuse') -and $plain) {
+    & $global:__fob_bin @args
+  } elseif ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'use') {
     $code = (& $global:__fob_bin @fobGlobal env --shell powershell @rest) -join "`n"
     if ($LASTEXITCODE -eq 0 -and $code) { Invoke-Expression $code }
   } elseif ($fobArgs.Count -gt 0 -and $fobArgs[0] -eq 'unuse') {
-    $code = (& $global:__fob_bin @fobGlobal env --shell powershell --unset) -join "`n"
+    $code = (& $global:__fob_bin @fobGlobal env --shell powershell --unset @rest) -join "`n"
     if ($LASTEXITCODE -eq 0 -and $code) { Invoke-Expression $code }
   } else {
     & $global:__fob_bin @args

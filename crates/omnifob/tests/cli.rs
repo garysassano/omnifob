@@ -1443,6 +1443,19 @@ async fn the_audit_log_records_handouts_without_secrets() {
     assert_eq!(lines[1]["command"], "exec");
     assert_eq!(lines[1]["agent"], "CLAUDECODE");
     assert_eq!(lines[1]["expires_at"], "2100-01-01T00:00:00Z");
+
+    // A flag that does not fit the profile fails before anything is handed
+    // out, and `--server` is one entry naming the endpoint alone.
+    let output = fob.run(&["exec", "acme/dev/Admin", "--token-file", "--", "true"]);
+    assert_eq!(output.status.code(), Some(125));
+    fob.ok(&["exec", "acme/dev/Admin", "--server", "--", "true"]);
+    let log = std::fs::read_to_string(fob.root.join("state/omnifob/audit.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    assert_eq!(lines[2]["via"], "aws-container");
 }
 
 /// What an earlier `fob use` or another tool left in the shell does not
@@ -1927,6 +1940,14 @@ fob --config "$1" use acme/prod/Admin || exit 1
 echo "profile=$OMNIFOB_PROFILE"
 fob --config="$1" unuse || exit 1
 echo "after=${OMNIFOB_PROFILE:-none}"
+fob --config "$1" use acme/prod/Admin || exit 1
+# Help is printed, not run as shell code, and leaves the profile active.
+fob use --help | grep -q '^Usage: fob use' || exit 2
+fob unuse --help >/dev/null || exit 3
+echo "kept=$OMNIFOB_PROFILE"
+# A failing `unuse` fails the wrapper too.
+fob --config "$1" unuse extra 2>/dev/null && exit 4
+echo "still=$OMNIFOB_PROFILE"
 "#;
     let output = bash
         .env("PATH", path)
@@ -1935,7 +1956,15 @@ echo "after=${OMNIFOB_PROFILE:-none}"
         .unwrap();
     let (stdout, stderr) = texts(&output);
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert_eq!(lines(&stdout), ["profile=acme/prod/Admin", "after=none"]);
+    assert_eq!(
+        lines(&stdout),
+        [
+            "profile=acme/prod/Admin",
+            "after=none",
+            "kept=acme/prod/Admin",
+            "still=acme/prod/Admin"
+        ]
+    );
 }
 
 /// `fob status --json` and `fob check --json` for scripts and status bars,

@@ -151,7 +151,7 @@ pub(crate) enum Command {
         #[arg(long, value_enum, default_value_t = Shell::detect())]
         shell: Shell,
         /// Print code that removes the variables of the active profile instead
-        #[arg(long, conflicts_with = "profile")]
+        #[arg(long, conflicts_with_all = ["profile", "account_id", "role", "no_cache", "ttl"])]
         unset: bool,
         /// Get new credentials even if cached ones are still valid
         #[arg(long)]

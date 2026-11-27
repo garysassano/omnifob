@@ -345,23 +345,37 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     ..by.pick(&words)
                 };
                 let profile = app.select(pick).await?;
+                // Before anything is fetched, so a wrong flag mints nothing.
+                options.check(&profile)?;
                 // Under an agent with `[agent] auto_revoke`, each command
-                // gets a Cloudflare token of its own, deleted afterwards.
+                // gets a Cloudflare token of its own, deleted afterwards;
+                // `--no-cache` does not opt out of it.
                 let auto_revoke = agent::active()
                     && app.config.agent.auto_revoke
-                    && !no_cache
                     && matches!(profile.target, omnifob_core::Target::Cloudflare { .. });
                 if revoke || auto_revoke {
                     return app.exec_and_revoke(&profile, ttl, &command).await;
                 }
                 // With `--server` too, so a sign-in it needs happens now and
                 // the endpoint starts from cached credentials.
-                let creds = app.credentials(&profile, !no_cache, ttl, "env").await?;
+                let creds = app.unaudited_credentials(&profile, !no_cache, ttl).await?;
                 let (provision, via) = app.provision(&profile, &creds, ttl, options).await?;
+                // One audit entry, naming every way the command gets them;
+                // `--server` hands AWS credentials over by the endpoint alone.
+                let mut handed = Vec::new();
+                if !server {
+                    handed.push("env");
+                }
+                handed.extend(via.iter().copied());
+                app.audit(
+                    &profile,
+                    &handed.join(", "),
+                    creds.expires_at,
+                    creds.token_id.as_deref(),
+                );
                 if via.is_empty() {
                     return exec(&profile, &creds, &command);
                 }
-                app.audit(&profile, &via.join(", "), creds.expires_at, None);
                 exec::run_to_end(&profile, &creds, &command, provision).await
             }
             .await;
