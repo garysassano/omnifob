@@ -54,8 +54,6 @@ struct ApiMessage {
 #[derive(Deserialize)]
 pub(super) struct ResultInfo {
     #[serde(default)]
-    page: Option<u32>,
-    #[serde(default)]
     total_pages: Option<u32>,
 }
 
@@ -208,10 +206,12 @@ impl Client {
         loop {
             let query = [("page", page.to_string()), ("per_page", "50".to_string())];
             let (items, info): (Vec<T>, _) = self.call(Method::GET, path, &query, None).await?;
+            // The page asked for, not the one echoed back, so an answer
+            // that echoes a wrong page cannot repeat or skip pages.
             let done = items.is_empty()
                 || info
-                    .and_then(|i| Some(i.page? >= i.total_pages?))
-                    .unwrap_or(true);
+                    .and_then(|i| i.total_pages)
+                    .is_none_or(|total| page >= total);
             all.extend(items);
             if done {
                 return Ok(all);

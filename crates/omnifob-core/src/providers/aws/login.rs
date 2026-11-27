@@ -310,6 +310,9 @@ pub async fn login(
         dpop_key: stored_key,
         ..from_token(&token, now, None)?
     };
+    // Under the renewal's lock, so a renewal of the previous sign-in that
+    // is under way cannot store the old session over this one.
+    let _lock = store::lock(&format!("aws-login-{integration}"), REFRESH_LOCK_TIMEOUT).await?;
     store::set(&session_key(integration), &session)?;
     Ok(login_session)
 }

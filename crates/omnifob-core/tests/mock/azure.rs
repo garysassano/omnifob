@@ -241,7 +241,10 @@ async fn discovery_walks_tenants_and_skips_refusing_ones() {
             "value": [{ "subscriptionId": "sub-a", "displayName": "Prod" },
                       { "subscriptionId": "sub-c", "displayName": "Partner" },
                       // Named like the home tenant's, so both get their IDs.
-                      { "subscriptionId": "sub-d", "displayName": "Dev-Box" }],
+                      { "subscriptionId": "sub-d", "displayName": "Dev-Box" },
+                      // Deleted, and the home tenant's again in capitals.
+                      { "subscriptionId": "sub-e", "displayName": "Gone", "state": "Deleted" },
+                      { "subscriptionId": "SUB-A", "displayName": "Prod Again" }],
         })))
         .mount(&server)
         .await;
@@ -264,6 +267,15 @@ async fn discovery_walks_tenants_and_skips_refusing_ones() {
             subscription_name: "Partner".into(),
             tenant_id: GUEST.into(),
         }
+    );
+
+    // A config now naming another tenant needs a new sign-in.
+    let err = azure::discover("work", &azure_config("tenant = \"contoso.example\""))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, omnifob_core::Error::NeedsLogin { .. }),
+        "{err:?}"
     );
 }
 

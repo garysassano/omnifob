@@ -303,6 +303,11 @@ pub fn forget_catalog(integration: &str) {
 
 /// Forgets every tracked token ID, once all the accounts' minted tokens are
 /// deleted: the IDs left belong to tokens no listing showed.
+/// Whether the catalog tracks any token omnifob minted.
+pub fn has_minted(integration: &str) -> bool {
+    !load_catalog(integration).minted.is_empty()
+}
+
 pub fn forget_minted(integration: &str) -> anyhow::Result<()> {
     update_catalog(integration, |c| c.minted.clear())
 }

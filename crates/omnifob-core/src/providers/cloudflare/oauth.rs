@@ -8,7 +8,7 @@
 //! 2026-10-09: an OAuth access token can create and delete account tokens in
 //! every account approved on the consent page).
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -298,7 +298,7 @@ fn stored(
 ) -> anyhow::Result<Stored> {
     let lifetime = SignedDuration::from_secs(response.expires_in.unwrap_or(3600));
     let scopes = match &response.scope {
-        Some(granted) => granted.split(' ').map(str::to_string).collect(),
+        Some(granted) => granted.split_whitespace().map(str::to_string).collect(),
         None => previous_scopes.to_vec(),
     };
     Ok(Stored {
@@ -334,8 +334,16 @@ fn load(integration: &str) -> Result<Stored> {
     Ok(stored)
 }
 
+/// Whether the access token can be used as it is. One already cut to the
+/// session's end is used until then: renewing would give a token cut to
+/// the same moment, and rotate the refresh token on every call.
 fn lasts(stored: &Stored, now: Timestamp) -> bool {
-    stored.expires_at.duration_since(now) > RENEW_MARGIN
+    let left = stored.expires_at.duration_since(now);
+    left > RENEW_MARGIN
+        || (left > jiff::SignedDuration::ZERO
+            && stored
+                .session_ends
+                .is_some_and(|end| stored.expires_at >= end))
 }
 
 /// Deletes the stored sign-in if it still holds `refresh_token`, so a
@@ -483,23 +491,37 @@ pub async fn revoke(integration: &str, config: &CloudflareConfig) -> anyhow::Res
         tokens.insert(0, ("refresh_token", refresh));
     }
     let http = crate::http::client();
+    // Each token is revoked even when the other fails; the first failure
+    // is reported once both were tried.
+    let mut failed = None;
     for (hint, token) in tokens {
         let mut body = reqwest::Url::parse("http://localhost/").expect("valid URL");
         body.query_pairs_mut()
             .append_pair("token", &token)
             .append_pair("token_type_hint", hint)
             .append_pair("client_id", &client_id);
-        let response = http
+        let outcome = http
             .post(format!("{}/oauth2/revoke", dash()))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body.query().unwrap_or_default().to_string())
             .send()
-            .await?;
-        if !response.status().is_success() {
-            bail!("revoking the {hint} failed ({})", response.status());
+            .await;
+        let problem = match outcome {
+            Ok(response) if response.status().is_success() => None,
+            Ok(response) => Some(anyhow!(
+                "revoking the {hint} failed ({})",
+                response.status()
+            )),
+            Err(e) => Some(anyhow!("revoking the {hint} failed: {}", e.without_url())),
+        };
+        if failed.is_none() {
+            failed = problem;
         }
     }
-    Ok(true)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(true),
+    }
 }
 
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
@@ -513,6 +535,27 @@ pub fn rename(old: &str, new: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_cut_to_the_session_end_is_used_until_then() {
+        let now = Timestamp::now();
+        let stored = |expires_in: i64, session_ends: Option<i64>| Stored {
+            access_token: "a".into(),
+            expires_at: now
+                .checked_add(SignedDuration::from_secs(expires_in))
+                .unwrap(),
+            refresh_token: Some("r".into()),
+            session_ends: session_ends
+                .map(|s| now.checked_add(SignedDuration::from_secs(s)).unwrap()),
+            scopes: Vec::new(),
+        };
+        assert!(lasts(&stored(3600, None), now));
+        assert!(!lasts(&stored(30, None), now));
+        // Renewing could not go past the session's end.
+        assert!(lasts(&stored(30, Some(30)), now));
+        assert!(!lasts(&stored(30, Some(600)), now));
+        assert!(!lasts(&stored(-1, Some(-1)), now));
+    }
 
     #[test]
     fn permissions_map_to_scopes() {

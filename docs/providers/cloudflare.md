@@ -62,7 +62,8 @@ From developers.cloudflare.com/fundamentals/oauth:
 
 ## Sessions (2026-10-07)
 
-- A dashboard-made token with "Account API Tokens Edit" can edit itself: setting and removing its own `expires_on` worked live, and the token stayed active. `session` uses this right after login, keeping the token's name, policies and IP condition.
+- A dashboard-made token with "Account API Tokens Edit" can edit itself: setting and removing its own `expires_on` worked live, and the token stayed active. `session` uses this right after login, keeping the token's name, policies and IP condition. Signing in with another token deletes the previous bootstrap only when it was a session's, and only once the new one is stored; a token without a session is the user's own. A new token also clears the cached user tag and permission groups, which may be another user's. Signing out after a session has expired deletes nothing, since Cloudflare ended it.
+- An OAuth access token cut to the session's end is used until then rather than renewed, since a renewal could not outlast the session and would rotate the refresh token on every call. Signing out revokes the access token even when revoking the refresh token fails.
 - The same holds for anyone holding the token, so a session limits a stolen copy's lifetime but cannot stop an intruder during the session from removing the expiry or minting long-lived tokens.
 - Template URLs cannot pre-fill an expiry or IP filter (only `permissionGroupKeys`, `name`, and for user tokens `accountId` and `zoneId`), which is why fob sets the expiry itself.
 - Cloudflare has no second factor for API token creation and (until the 2026-10-09 finding below) no OAuth scope that creates tokens for third-party clients; the dashboard sign-in is the only Cloudflare-enforced second factor, hence a new bootstrap per session.

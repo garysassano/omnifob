@@ -208,21 +208,34 @@ pub async fn login(
         .verify(config.minting(), account_id)
         .await
         .context("the token was rejected")?;
-    let previous = load_catalog(integration)
-        .bootstrap
-        .map(|b| b.id)
-        .filter(|p| *p != id);
+    let replaced = load_catalog(integration).bootstrap.filter(|b| b.id != id);
+    let tokens = Client::tokens_path(config.minting(), account_id);
     let expires_at = match config.session {
-        Some(session) => {
-            let tokens = Client::tokens_path(config.minting(), account_id);
-            Some(start_session(&client, &tokens, &id, session, previous.as_deref()).await?)
-        }
+        Some(session) => Some(start_session(&client, &tokens, &id, session, None).await?),
         None => None,
     };
     store::set(&bootstrap_key(integration), &token.trim())?;
     update_catalog(integration, |c| {
-        c.bootstrap = Some(Bootstrap { id, expires_at })
+        c.bootstrap = Some(Bootstrap { id, expires_at });
+        // Another token may belong to another user, with other groups.
+        if replaced.is_some() {
+            c.user_tag = None;
+            c.permission_groups.clear();
+        }
     })?;
+    // Only once the new token is stored, and only a session's bootstrap: a
+    // token without a session is the user's own, made in the dashboard,
+    // and may be needed elsewhere.
+    if let Some(Bootstrap {
+        id: previous,
+        expires_at: Some(_),
+    }) = replaced
+    {
+        match delete_token(&client, &tokens, &previous).await {
+            Ok(()) => tracing::debug!("deleted the previous session's bootstrap token"),
+            Err(e) => tracing::debug!("previous bootstrap token not deleted: {e:#}"),
+        }
+    }
     Ok(expires_at)
 }
 
@@ -275,11 +288,16 @@ pub async fn end_session(integration: &str, config: &CloudflareConfig) -> Result
     }
     let Some(Bootstrap {
         id,
-        expires_at: Some(_),
+        expires_at: Some(expires_at),
     }) = load_catalog(integration).bootstrap
     else {
         return Ok(false);
     };
+    // An expired session's token can no longer sign the call, and Cloudflare
+    // has ended it already.
+    if expires_at <= Timestamp::now() {
+        return Ok(false);
+    }
     let client = bootstrap_client(integration, config).await?;
     let tokens = Client::tokens_path(
         config.minting(),
@@ -787,13 +805,19 @@ pub async fn prune_expired(
 ) -> anyhow::Result<(usize, Vec<String>)> {
     let all: Vec<Token> = client.get_all(tokens).await?;
     let mut deleted = 0;
+    // One token that cannot be deleted (gone already, or refused) does not
+    // keep the others; it stays tracked for the next cleanup.
     for token in &all {
         let ours = catalog.is_tracked(&token.id) || token.name.starts_with(LEGACY_NAME_PREFIX);
         let expired = token.status == "expired" || token.expires_on.is_some_and(|at| at <= now);
         if ours && expired {
-            delete_token(client, tokens, &token.id).await?;
-            catalog.untrack(&token.id);
-            deleted += 1;
+            match delete_token(client, tokens, &token.id).await {
+                Ok(()) => {
+                    catalog.untrack(&token.id);
+                    deleted += 1;
+                }
+                Err(e) => tracing::debug!("expired token {} not deleted: {e:#}", token.id),
+            }
         }
     }
     Ok((deleted, all.into_iter().map(|t| t.id).collect()))

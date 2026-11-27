@@ -258,7 +258,7 @@ pub async fn login(
             (pending.registration, token)
         }
     };
-    keep_token(integration, config, registration, &token)
+    keep_token(integration, config, registration, &token).await
 }
 
 /// What `fob login --start` shows: where to approve, and until when.
@@ -316,16 +316,19 @@ pub async fn finish_device_login(integration: &str, config: &AwsSsoConfig) -> an
     let polled = poll_device(&oidc, &pending).await;
     // Approved, refused or expired, the device code is spent.
     store::delete(&key)?;
-    keep_token(integration, config, pending.registration, &polled?)
+    keep_token(integration, config, pending.registration, &polled?).await
 }
 
-/// Stores the session a sign-in produced.
-fn keep_token(
+/// Stores the session a sign-in produced, under the renewal's lock, so a
+/// renewal of the previous session that is under way cannot store the old
+/// session over it.
+async fn keep_token(
     integration: &str,
     config: &AwsSsoConfig,
     registration: Registration,
     token: &CreateTokenOutput,
 ) -> anyhow::Result<()> {
+    let _lock = store::lock(&format!("aws-sso-{integration}"), REFRESH_LOCK_TIMEOUT).await?;
     let now = Timestamp::now();
     store::set(
         &token_key(integration),
@@ -618,7 +621,14 @@ pub fn session_has_scopes(integration: &str, config: &AwsSsoConfig) -> anyhow::R
         if let Ok(Some(r)) = store::get::<Registration>(&registration_key(integration, flow))
             && r.client_id == token.client_id
         {
-            return Ok(r.scopes == config.scopes);
+            // The same scopes in any order.
+            let sorted = |scopes: &[String]| {
+                let mut scopes = scopes.to_vec();
+                scopes.sort();
+                scopes.dedup();
+                scopes
+            };
+            return Ok(sorted(&r.scopes) == sorted(&config.scopes));
         }
     }
     Ok(true)

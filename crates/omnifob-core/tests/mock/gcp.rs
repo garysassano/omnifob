@@ -432,6 +432,8 @@ async fn session_control_asks_for_a_new_sign_in() {
         }
         other => panic!("{other:?}"),
     }
+    // The ended sign-in is forgotten, so `fob status` stops counting it.
+    assert!(!gcp::is_signed_in("g").unwrap());
 }
 
 #[tokio::test]

@@ -94,6 +94,9 @@ pub async fn login(
         .await
         .context("checking the access key")?
         .arn;
+    // Under the session's lock, so a session being started with the
+    // earlier key is not stored after this one is gone.
+    let _lock = store::lock(&format!("aws-iam-{integration}"), SESSION_LOCK_TIMEOUT).await?;
     store::set(&key_key(integration), &key)?;
     // A session from an earlier key must not outlive it.
     store::delete(&session_key(integration))?;
@@ -166,16 +169,16 @@ pub async fn session_credentials(
     config: &AwsIamConfig,
     profile_id: &str,
     ttl: Option<SignedDuration>,
+    renew: bool,
 ) -> Result<Credentials> {
-    if ttl.is_none()
-        && let Some(session) = fresh_session(integration)
-    {
+    // `renew` (`--no-cache`, `fob renew`) starts a new session, as it gets
+    // new credentials for every other profile.
+    let reuse = ttl.is_none() && !renew;
+    if reuse && let Some(session) = fresh_session(integration) {
         return Ok(session);
     }
     let _lock = store::lock(&format!("aws-iam-{integration}"), SESSION_LOCK_TIMEOUT).await?;
-    if ttl.is_none()
-        && let Some(session) = fresh_session(integration)
-    {
+    if reuse && let Some(session) = fresh_session(integration) {
         return Ok(session);
     }
 
@@ -211,6 +214,11 @@ pub async fn session_credentials(
         store::set(&session_key(integration), &session)?;
     }
     Ok(session)
+}
+
+/// Forgets the user's kept session, so the next command starts a new one.
+pub fn forget_session(integration: &str) -> anyhow::Result<()> {
+    store::delete(&session_key(integration)).map(drop)
 }
 
 fn fresh_session(integration: &str) -> Option<Credentials> {
@@ -269,7 +277,7 @@ pub async fn role_credentials(
     // The role's credentials outlive the session they came from (tried
     // live), so the duration is not shortened to what is left of it.
     let cached = fresh_session(integration).is_some();
-    let session = session_credentials(integration, config, profile_id, None).await?;
+    let session = session_credentials(integration, config, profile_id, None, false).await?;
     let request = RoleRequest {
         role_arn: &role.role_arn,
         session_name: role.session_name.as_deref(),
@@ -285,7 +293,7 @@ pub async fn role_credentials(
         Err(e) if cached && e.downcast_ref::<sts::CredentialsRejected>().is_some() => {
             tracing::debug!("starting a new session: STS refused the kept one: {e:#}");
             forget_session_if_current(integration, &session).await?;
-            let session = session_credentials(integration, config, profile_id, None).await?;
+            let session = session_credentials(integration, config, profile_id, None, false).await?;
             Ok(sts::assume_role(&session, &request, sts_region(config), region).await?)
         }
         result => Ok(result?),
@@ -311,7 +319,9 @@ async fn forget_session_if_current(integration: &str, session: &Credentials) -> 
 /// `GetFederationToken` takes. User names and `Name` allow the same
 /// characters; a name shorter than `Name`'s two is padded with `-fob`.
 fn federation_name(user_arn: &str) -> String {
-    let user = user_arn.rsplit('/').next().unwrap_or_default();
+    // `user/<path>/<name>`, or `root` for the account's root user, whose
+    // ARN ends `:root` and has no `/`.
+    let user = user_arn.rsplit(['/', ':']).next().unwrap_or_default();
     let mut name: String = user.chars().take(32).collect();
     if name.chars().count() < 2 {
         name.push_str("-fob");
@@ -382,5 +392,6 @@ mod tests {
         let long = format!("arn:aws:iam::123456789012:user/{}", "a".repeat(64));
         assert_eq!(federation_name(&long), "a".repeat(32));
         assert_eq!(federation_name("arn:aws:iam::123456789012:user/x"), "x-fob");
+        assert_eq!(federation_name("arn:aws:iam::123456789012:root"), "root");
     }
 }
