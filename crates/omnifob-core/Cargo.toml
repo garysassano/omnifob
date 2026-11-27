@@ -24,7 +24,7 @@ aws-sigv4 = "1.6.6"
 base64 = "0.23.1"
 form_urlencoded = "1.2.2"
 futures = "0.3.34"
-jiff = { version = "0.2.40", features = ["serde"] }
+jiff = { version = "1.0.3", features = ["serde"] }
 keyring-core = "1.0.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["form", "json", "query", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
