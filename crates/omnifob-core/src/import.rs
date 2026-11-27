@@ -32,6 +32,10 @@ pub struct AwsPortal {
     /// Roles assumed from this portal's roles (`role_arn` + `source_profile`),
     /// keyed by a label made from the profile name.
     pub chained: BTreeMap<String, crate::config::ChainedRole>,
+    /// Chained roles folded into rules: the same role name assumed from the
+    /// same permission set in that permission set's own account, in two or
+    /// more accounts.
+    pub chained_rules: BTreeMap<String, crate::config::ChainedRule>,
 }
 
 /// A profile with an IAM user's access key that other profiles assume roles
@@ -537,6 +541,7 @@ pub fn aws_import(text: &str) -> AwsImport {
                 })
                 .max_by_key(|(region, count)| (*count, std::cmp::Reverse(region.clone())))
                 .map(|(region, _)| region);
+            let (chained, chained_rules) = fold_chained(f.chained);
             AwsPortal {
                 name,
                 start_url,
@@ -544,7 +549,8 @@ pub fn aws_import(text: &str) -> AwsImport {
                 default_region,
                 scopes: f.scopes,
                 profiles: f.profiles,
-                chained: f.chained,
+                chained,
+                chained_rules,
             }
         })
         .collect();
@@ -652,6 +658,102 @@ fn toml_key(s: &str) -> String {
     toml_edit::Key::new(s).display_repr().into_owned()
 }
 
+/// How many accounts must assume the same role from the same permission
+/// set before `fob import aws` writes a rule for them instead of tables.
+const FOLD_MIN: usize = 2;
+
+/// Splits imported chained roles into the ones kept as tables and rules for
+/// the rest: roles assumed in the source permission set's own account,
+/// grouped by permission set, role name and path and every other key, become
+/// one rule per group of [`FOLD_MIN`] or more, limited with `accounts` to
+/// the accounts the file names, so the rule gives exactly the profiles the
+/// tables would have. Removing `accounts` then covers every account.
+pub fn fold_chained(
+    chained: BTreeMap<String, crate::config::ChainedRole>,
+) -> (
+    BTreeMap<String, crate::config::ChainedRole>,
+    BTreeMap<String, crate::config::ChainedRule>,
+) {
+    type Key = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<jiff::SignedDuration>,
+    );
+    let mut groups: BTreeMap<Key, Vec<String>> = BTreeMap::new();
+    for (label, role) in &chained {
+        let Some((account, path, name)) = same_account_role(role) else {
+            continue;
+        };
+        if account != role.via_account_id {
+            continue;
+        }
+        let key = (
+            role.via_role.clone(),
+            path,
+            name,
+            role.session_name.clone(),
+            role.external_id.clone(),
+            role.region.clone(),
+            role.mfa_serial.clone(),
+            role.duration,
+        );
+        groups.entry(key).or_default().push(label.clone());
+    }
+    let mut chained = chained;
+    let mut rules = BTreeMap::new();
+    for (key, labels) in groups {
+        if labels.len() < FOLD_MIN {
+            continue;
+        }
+        let (via_role, path, role_name, session_name, external_id, region, mfa_serial, duration) =
+            key;
+        let mut accounts: Vec<String> = labels
+            .iter()
+            .filter_map(|l| chained.remove(l))
+            .map(|r| r.via_account_id)
+            .collect();
+        accounts.sort();
+        accounts.dedup();
+        let base = crate::profile::slug(&role_name);
+        let mut label = base.clone();
+        let mut n = 1;
+        while rules.contains_key(&label) || chained.contains_key(&label) {
+            n += 1;
+            label = format!("{base}-{n}");
+        }
+        rules.insert(
+            label,
+            crate::config::ChainedRule {
+                via_role,
+                role_name,
+                path: (path != "/").then_some(path),
+                accounts,
+                exclude_accounts: Vec::new(),
+                session_name,
+                external_id,
+                region,
+                mfa_serial,
+                duration,
+            },
+        );
+    }
+    (chained, rules)
+}
+
+/// The account, IAM path and name of a chained role's `role_arn`
+/// (`arn:aws:iam::<account>:role/<path><name>`), when it has that shape.
+fn same_account_role(role: &crate::config::ChainedRole) -> Option<(String, String, String)> {
+    let account = role.account_id()?.to_string();
+    let resource = role.role_arn.split(':').nth(5)?.strip_prefix("role")?;
+    let (path, name) = resource.rsplit_once('/')?;
+    Some((account, format!("{path}/"), name.to_string()))
+}
+
 /// TOML for an `aws-sso` integration and its chained roles, ready to append
 /// to the config file.
 pub fn aws_portal_toml(portal: &AwsPortal) -> String {
@@ -671,6 +773,7 @@ pub fn aws_portal_toml(portal: &AwsPortal) -> String {
         out.push_str(&format!("scopes = [{}]\n", list.join(", ")));
     }
     out.push_str(&chained_toml(&portal.name, &portal.chained));
+    out.push_str(&chained_rules_toml(&portal.name, &portal.chained_rules));
     out
 }
 
@@ -718,6 +821,23 @@ pub fn chained_toml(
         let table = toml::to_string(role).expect("a chained role serializes");
         out.push_str(&format!(
             "\n[integrations.{}.chained.{}]\n{table}",
+            toml_key(integration),
+            toml_str(label)
+        ));
+    }
+    out
+}
+
+/// `[integrations.<name>.chained_rules."<label>"]` tables.
+pub fn chained_rules_toml(
+    integration: &str,
+    rules: &BTreeMap<String, crate::config::ChainedRule>,
+) -> String {
+    let mut out = String::new();
+    for (label, rule) in rules {
+        let table = toml::to_string(rule).expect("a chained rule serializes");
+        out.push_str(&format!(
+            "\n[integrations.{}.chained_rules.{}]\n{table}",
             toml_key(integration),
             toml_str(label)
         ));
@@ -1565,6 +1685,66 @@ credential_process = /usr/bin/creds
             config.integrations["elsewhere"],
             crate::Integration::AwsLogin(_)
         ));
+    }
+
+    #[test]
+    fn the_same_role_in_each_permission_sets_own_account_becomes_a_rule() {
+        let mut text = String::from(
+            "[sso-session acme]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = eu-west-1\n",
+        );
+        for (name, account) in [
+            ("dev", "111111111111"),
+            ("prd", "222222222222"),
+            ("ops", "333333333333"),
+        ] {
+            text.push_str(&format!(
+                "[profile {name}-pe]\nsso_session = acme\nsso_account_id = {account}\nsso_role_name = pe\n\
+                 [profile {name}-root]\nsource_profile = {name}-pe\nrole_arn = arn:aws:iam::{account}:role/ops/root\n"
+            ));
+        }
+        // Another account's role, and one whose session name differs, stay tables.
+        text.push_str(
+            "[profile cross]\nsource_profile = dev-pe\nrole_arn = arn:aws:iam::222222222222:role/ops/root\n\
+             [profile ops-named]\nsource_profile = ops-pe\nrole_arn = arn:aws:iam::333333333333:role/Deploy\n\
+             role_session_name = me\n",
+        );
+        let import = aws_import(&text);
+        let portal = &import.portals[0];
+        assert_eq!(
+            portal.chained.keys().collect::<Vec<_>>(),
+            ["cross", "ops-named"]
+        );
+        let rule = &portal.chained_rules["root"];
+        assert_eq!(
+            (
+                rule.via_role.as_str(),
+                rule.role_name.as_str(),
+                rule.path.as_deref()
+            ),
+            ("pe", "root", Some("/ops/"))
+        );
+        assert_eq!(
+            rule.accounts,
+            ["111111111111", "222222222222", "333333333333"]
+        );
+        let toml = aws_portal_toml(portal);
+        assert!(
+            toml.contains("[integrations.acme.chained_rules.\"root\"]"),
+            "{toml}"
+        );
+        let config = crate::Config::parse(&toml).unwrap();
+        let crate::Integration::AwsSso(sso) = &config.integrations["acme"] else {
+            unreachable!()
+        };
+        assert_eq!(sso.chained_rules["root"], *rule);
+
+        // One account alone keeps its table.
+        let (chained, rules) = fold_chained(BTreeMap::from([(
+            "one".to_string(),
+            portal.chained["ops-named"].clone(),
+        )]));
+        assert!(rules.is_empty());
+        assert_eq!(chained.len(), 1);
     }
 
     #[test]

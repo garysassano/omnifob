@@ -2186,6 +2186,54 @@ fn import_brings_in_console_sign_ins_and_skips_what_the_config_would_refuse() {
     assert!(stderr.contains("nothing new to import"), "{stderr}");
 }
 
+#[test]
+fn import_folds_a_role_every_account_has_into_a_rule_once() {
+    let fob = Fob::new("import-rules");
+    fob.write_config("");
+    let mut text = String::from(
+        "[sso-session acme]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = eu-west-1\n",
+    );
+    for (name, account) in [("dev", "111111111111"), ("prd", "222222222222")] {
+        text.push_str(&format!(
+            "[profile {name}-pe]\nsso_session = acme\nsso_account_id = {account}\nsso_role_name = pe\n\
+             [profile {name}-root]\nsource_profile = {name}-pe\nrole_arn = arn:aws:iam::{account}:role/root\n"
+        ));
+    }
+    std::fs::write(fob.aws_config(), &text).unwrap();
+    let (_, stderr) = fob.ok(&["import", "aws", "--write"]);
+    assert!(
+        stderr.contains("0 chained role(s), 1 chained rule(s)"),
+        "{stderr}"
+    );
+    let config = omnifob_core::Config::load(&fob.config_file()).unwrap();
+    let omnifob_core::Integration::AwsSso(portal) = &config.integrations["acme"] else {
+        panic!("{:?}", config.integrations.keys());
+    };
+    assert_eq!(
+        portal.chained_rules["root"].accounts,
+        ["111111111111", "222222222222"]
+    );
+    assert!(portal.chained.is_empty());
+
+    // A third account's role is one the rule does not cover yet, so it comes
+    // in as a table; the two the rule gives are not imported again.
+    text.push_str(
+        "[profile ops-pe]\nsso_session = acme\nsso_account_id = 333333333333\nsso_role_name = pe\n\
+         [profile ops-root]\nsource_profile = ops-pe\nrole_arn = arn:aws:iam::333333333333:role/root\n",
+    );
+    std::fs::write(fob.aws_config(), &text).unwrap();
+    let (stdout, stderr) = fob.ok(&["import", "aws"]);
+    assert!(
+        stderr.contains("1 chained role(s) and 0 chained rule(s) to add"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("chained.\"root-333333333333\"]")
+            && stdout.contains("arn:aws:iam::333333333333:role/root"),
+        "{stdout}"
+    );
+}
+
 // Providers other than IAM Identity Center, each against a mock of its
 // APIs: sign-in, discovery, `fob exec`, `fob console` and sign-out.
 

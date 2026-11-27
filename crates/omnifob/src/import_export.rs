@@ -182,14 +182,69 @@ fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
     name.into()
 }
 
+/// Leaves out of an imported portal what a configured one already has:
+/// chained roles one of its rules gives, including the accounts of an
+/// imported rule for the same permission set, role name and path (the rest
+/// of that rule's accounts come in as tables, since the configured rule is
+/// not rewritten). Imported rules get labels of their own where theirs is
+/// taken by a configured table or rule.
+fn keep_new_rules(
+    existing: &omnifob_core::config::AwsSsoConfig,
+    portal: &mut omnifob_core::import::AwsPortal,
+) {
+    let Ok(partition) = existing.partition() else {
+        return;
+    };
+    // A rule matching a configured one may name accounts that one does not
+    // cover; it comes in as a table per account, filtered with the rest.
+    let rules = std::mem::take(&mut portal.chained_rules);
+    for (label, rule) in rules {
+        if !existing.chained_rules.values().any(|r| {
+            r.via_role == rule.via_role && r.role_name == rule.role_name && r.path == rule.path
+        }) {
+            portal.chained_rules.insert(label, rule);
+            continue;
+        }
+        for account in &rule.accounts {
+            portal.chained.insert(
+                format!("{label}-{account}"),
+                rule.role_for(account, partition),
+            );
+        }
+    }
+    portal.chained.retain(|_, role| {
+        !existing.chained_rules.values().any(|rule| {
+            rule.via_role == role.via_role
+                && rule.applies_to(&role.via_account_id)
+                && rule.role_for(&role.via_account_id, partition).role_arn == role.role_arn
+        })
+    });
+    let rules = std::mem::take(&mut portal.chained_rules);
+    for (label, rule) in rules {
+        let taken = |l: &str| {
+            existing.chained.contains_key(l)
+                || existing.chained_rules.contains_key(l)
+                || portal.chained.contains_key(l)
+                || portal.chained_rules.contains_key(l)
+        };
+        let mut unique = label.clone();
+        let mut n = 1;
+        while taken(&unique) {
+            n += 1;
+            unique = format!("{label}-{n}");
+        }
+        portal.chained_rules.insert(unique, rule);
+    }
+}
+
 pub(crate) fn import_aws(
     config: &Config,
     file: Option<std::path::PathBuf>,
     write: bool,
 ) -> anyhow::Result<()> {
     use omnifob_core::import::{
-        aws_iam_user_toml, aws_import, aws_login_toml, aws_portal_toml, chained_toml,
-        iam_roles_toml, normalize_start_url,
+        aws_iam_user_toml, aws_import, aws_login_toml, aws_portal_toml, chained_rules_toml,
+        chained_toml, iam_roles_toml, normalize_start_url,
     };
     let file = aws_config_file(file)?;
     let text =
@@ -232,32 +287,37 @@ pub(crate) fn import_aws(
             // Labels become lowercase in ids, so `Prod` there is `prod` here.
             let labels: Vec<String> = existing.chained.keys().map(|l| slug(l)).collect();
             portal.chained.retain(|label, _| !labels.contains(label));
-            if portal.chained.is_empty() {
+            keep_new_rules(existing, &mut portal);
+            if portal.chained.is_empty() && portal.chained_rules.is_empty() {
                 eprintln!(
                     "fob: {} is already configured as '{name}'",
                     portal.start_url
                 );
             } else {
                 eprintln!(
-                    "fob: {} is configured as '{name}'; {} chained role(s) to add",
+                    "fob: {} is configured as '{name}'; {} chained role(s) and {} chained rule(s) to add",
                     portal.start_url,
-                    portal.chained.len()
+                    portal.chained.len(),
+                    portal.chained_rules.len()
                 );
-                new_chained += portal.chained.len();
-                sections.push(chained_toml(name, &portal.chained).trim_start().to_string());
+                new_chained += portal.chained.len() + portal.chained_rules.len();
+                let mut toml = chained_toml(name, &portal.chained);
+                toml.push_str(&chained_rules_toml(name, &portal.chained_rules));
+                sections.push(toml.trim_start().to_string());
             }
             continue;
         }
         unique(&mut portal.name);
         eprintln!(
-            "fob: {} as '{}': {} profile(s), {} chained role(s)",
+            "fob: {} as '{}': {} profile(s), {} chained role(s), {} chained rule(s)",
             portal.start_url,
             portal.name,
             portal.profiles,
-            portal.chained.len()
+            portal.chained.len(),
+            portal.chained_rules.len()
         );
         new_portals += 1;
-        new_chained += portal.chained.len();
+        new_chained += portal.chained.len() + portal.chained_rules.len();
         sections.push(aws_portal_toml(&portal));
     }
     for mut user in import.iam_users {
@@ -369,7 +429,7 @@ pub(crate) fn import_aws(
     Config::parse(&updated).context("the result would not be a valid config; nothing written")?;
     write_atomically(&path, &updated)?;
     eprintln!(
-        "fob: added {} integration(s) and {new_chained} role(s) to {}; run `fob sync`, or `fob login <name>` for new integrations{key_hint}",
+        "fob: added {} integration(s) and {new_chained} role(s) or rule(s) to {}; run `fob sync`, or `fob login <name>` for new integrations{key_hint}",
         new_portals + new_users.len() + new_logins.len(),
         path.display()
     );
