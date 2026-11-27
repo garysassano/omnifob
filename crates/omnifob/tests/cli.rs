@@ -2378,6 +2378,12 @@ async fn discovery_asks_for_a_sign_in_rather_than_finding_nothing() {
     let error = error_line(&output);
     assert_eq!(error["code"], "login_required", "{error}");
 
+    // Never synced, since it was never signed in: the same code.
+    let fresh = Fob::new("discover-never-signed-in").with_server(&server);
+    fresh.write_config(&portal_config("acme"));
+    let error = error_line(&fresh.run_as_agent(&["discover", "aws", "acme"]));
+    assert_eq!(error["code"], "login_required", "{error}");
+
     // Under an agent kept from every role, the refusal says so.
     fob.write_config(&format!(
         "{}[agent]\nprofiles = [\"other/*\"]\n",

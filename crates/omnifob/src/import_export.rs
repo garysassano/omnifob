@@ -341,6 +341,15 @@ pub(crate) async fn discover_aws(
         .with("integration", integration)
         .into());
     }
+    // Never synced because it is not signed in: say so, with the code an
+    // agent acts on, rather than that it has no roles.
+    if sources.is_empty() && !app.cache.integrations.contains_key(integration) {
+        return Err(omnifob_core::Error::needs_login(
+            integration,
+            format!("'{integration}' is not signed in, so its roles are not known"),
+        )
+        .into());
+    }
     if sources.is_empty() {
         bail!(
             "no Identity Center role of '{integration}' to search{}; see `fob list {integration}`",
