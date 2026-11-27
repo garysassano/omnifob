@@ -104,11 +104,16 @@ pub fn write(text: &str) -> anyhow::Result<&'static str> {
             tried.push(program);
             continue;
         };
-        let written = child
-            .stdin
-            .take()
-            .map(|mut stdin| stdin.write_all(text.as_bytes()))
-            .transpose();
+        // A helper that exits without reading (no display for it) must not
+        // end fob through SIGPIPE, which `main` restores for stdout's sake,
+        // before the next helper is tried.
+        let written = without_sigpipe(|| {
+            child
+                .stdin
+                .take()
+                .map(|mut stdin| stdin.write_all(text.as_bytes()))
+                .transpose()
+        });
         if written.is_ok() && child.wait().is_ok_and(|s| s.success()) {
             return Ok("to the clipboard");
         }
@@ -167,6 +172,39 @@ fn check_secret(text: String) -> anyhow::Result<String> {
     Ok(text)
 }
 
+/// Runs `write` with SIGPIPE blocked on this thread, so writing to a pipe
+/// whose reader is gone fails with `BrokenPipe` instead of ending fob, and
+/// discards the SIGPIPE the write left pending.
+#[cfg(unix)]
+fn without_sigpipe<T>(write: impl FnOnce() -> T) -> T {
+    // SAFETY: plain signal-mask calls on zero-initialised `sigset_t`s this
+    // function owns; the mask is restored before it returns.
+    unsafe {
+        let mut pipe: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut pipe);
+        libc::sigaddset(&mut pipe, libc::SIGPIPE);
+        let pending = || {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigpending(&mut set) == 0 && libc::sigismember(&set, libc::SIGPIPE) == 1
+        };
+        let already = pending();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &pipe, &mut old);
+        let result = write();
+        if !already && pending() {
+            let mut signal = 0;
+            libc::sigwait(&pipe, &mut signal);
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        result
+    }
+}
+
+#[cfg(not(unix))]
+fn without_sigpipe<T>(write: impl FnOnce() -> T) -> T {
+    write()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +223,22 @@ mod tests {
         for bad in ["", "two words", "https://example.com/token", "HTTP://x"] {
             assert!(check_secret(bad.into()).is_err(), "{bad}");
         }
+    }
+
+    /// With SIGPIPE's default action, as `main` sets it, a helper that
+    /// exits without reading fails the write instead of ending fob.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_reads_nothing_does_not_end_fob() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        child.wait().unwrap();
+        // SAFETY: the test harness's own disposition is restored below.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let written = without_sigpipe(|| stdin.write_all(&[0; 1 << 20]));
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        assert_eq!(written.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 }
