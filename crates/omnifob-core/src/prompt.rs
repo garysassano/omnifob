@@ -34,21 +34,35 @@ pub fn unattended<F: Future>(future: F) -> impl Future<Output = F::Output> + use
 /// A six-digit code from the MFA device `serial`, for `what` (a profile id).
 pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
     if UNATTENDED.get() {
-        bail!(
-            "{what} needs a code from the MFA device {serial}, which cannot be asked for while a command runs; run `fob exec {what} -- true` in a terminal first, which asks for it"
-        );
+        return Err(mfa_needed(
+            what,
+            format!(
+                "{what} needs a code from the MFA device {serial}, which cannot be asked for while a command runs; run `fob exec {what} -- true` in a terminal first, which asks for it"
+            ),
+        ));
     }
     let cx = crate::Context::current();
     let Some(prompt) = cx.mfa_prompt() else {
-        bail!(
-            "{what} needs a code from the MFA device {serial}; run `fob exec {what} -- true` in a terminal first, which asks for it"
-        );
+        return Err(mfa_needed(
+            what,
+            format!(
+                "{what} needs a code from the MFA device {serial}; run `fob exec {what} -- true` in a terminal first, which asks for it"
+            ),
+        ));
     };
     let code = prompt(serial)?.trim().to_string();
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         bail!("an MFA code is six digits");
     }
     Ok(code)
+}
+
+/// The failure for a code no one can enter now.
+fn mfa_needed(profile: &str, message: String) -> anyhow::Error {
+    crate::Coded::new(crate::Code::MfaRequired, message)
+        .with("profile", profile)
+        .with("run", format!("fob exec {profile} -- true"))
+        .into()
 }
 
 #[cfg(test)]
@@ -63,7 +77,9 @@ mod tests {
         let _entered = cx.enter();
         assert_eq!(mfa_code("arn:mfa", "p").unwrap(), "123456");
         let asked = futures::executor::block_on(unattended(async { mfa_code("arn:mfa", "p") }));
-        let err = asked.unwrap_err().to_string();
+        let err = asked.unwrap_err();
+        assert_eq!(crate::classify(&err).0, crate::Code::MfaRequired);
+        let err = err.to_string();
         assert!(err.contains("while a command runs"), "{err}");
         // Only while it is polled.
         assert_eq!(mfa_code("arn:mfa", "p").unwrap(), "123456");

@@ -684,6 +684,84 @@ async fn an_agent_names_profiles_in_full_and_within_its_allowlist() {
     fob.ok(&["creds", "acme/prod/Admin", "--format", "credential-process"]);
 }
 
+/// The `fob-error:` line that ends stderr under an agent, as JSON.
+fn error_line(output: &Output) -> Value {
+    let (_, stderr) = texts(output);
+    let last = stderr.lines().last().unwrap_or_default();
+    let json = last
+        .strip_prefix("fob-error: ")
+        .unwrap_or_else(|| panic!("no fob-error line: {stderr}"));
+    serde_json::from_str(json).unwrap()
+}
+
+/// Under an agent, or with `OMNIFOB_ERROR_FORMAT=json`, a failure ends with
+/// a line programs read: its code and the values to act on, so the agent
+/// does not depend on the wording.
+#[tokio::test(flavor = "multi_thread")]
+async fn failures_carry_a_code_for_agents_and_scripts() {
+    let (fob, _server) = synced_portal("error-codes").await;
+    let output = fob.run_as_agent(&["exec", "prod", "--", "true"]);
+    assert_eq!(output.status.code(), Some(125));
+    let error = error_line(&output);
+    assert_eq!(error["code"], "profile_ambiguous", "{error}");
+    assert_eq!(error["query"], "prod", "{error}");
+    assert_eq!(error["candidates"], json!(["acme/prod/Admin"]), "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("name the profile by its full id"),
+        "{error}"
+    );
+
+    let error = error_line(&fob.run_as_agent(&["exec", "nothing-like-it", "--", "true"]));
+    assert_eq!(error["code"], "profile_not_found", "{error}");
+    let error = error_line(&fob.run_as_agent(&["creds", "acme/prod/Admin"]));
+    assert_eq!(error["code"], "use_exec", "{error}");
+    assert_eq!(
+        error["run"], "fob exec acme/prod/Admin -- <command>",
+        "{error}"
+    );
+    let error = error_line(&fob.run_as_agent(&["login", "nope"]));
+    assert_eq!(error["code"], "integration_not_found", "{error}");
+    assert_eq!(error["configured"], json!(["acme"]), "{error}");
+
+    // People see the message alone, unless they ask for the line.
+    let stderr = fob.fails(&["exec", "nothing-like-it", "--", "true"]);
+    assert!(!stderr.contains("fob-error"), "{stderr}");
+    let output = fob
+        .command(&["exec", "nothing-like-it", "--", "true"])
+        .env("OMNIFOB_ERROR_FORMAT", "json")
+        .output()
+        .unwrap();
+    assert_eq!(error_line(&output)["code"], "profile_not_found");
+
+    let mut config = portal_config("acme");
+    config.push_str("\n[agent]\nprofiles = [\"acme/dev/*\"]\n");
+    fob.write_config(&config);
+    let error = error_line(&fob.run_as_agent(&["exec", "acme/prod/Admin", "--", "true"]));
+    assert_eq!(error["code"], "not_open_to_agents", "{error}");
+    assert_eq!(error["profile"], "acme/prod/Admin", "{error}");
+
+    fob.write_config(&portal_config("acme"));
+    std::fs::remove_file(fob.secret("aws-sso/acme/token")).unwrap();
+    let error = error_line(&fob.run_as_agent(&["exec", "acme/dev/Admin", "--", "true"]));
+    assert_eq!(error["code"], "login_required", "{error}");
+    assert_eq!(error["integration"], "acme", "{error}");
+    assert_eq!(error["run"], "fob login acme", "{error}");
+    let (stdout, _) = texts(&fob.run(&["check", "--json"]));
+    let rows: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(rows[0]["code"], "login_required", "{rows}");
+
+    fob.write_config("[integrations.acme\nbroken");
+    let error = error_line(&fob.run_as_agent(&["list"]));
+    assert_eq!(error["code"], "config_invalid", "{error}");
+    assert!(
+        error["path"].as_str().unwrap().ends_with("config.toml"),
+        "{error}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ambiguous_queries_list_the_matches() {
     let (fob, _server) = synced_portal("ambiguous").await;

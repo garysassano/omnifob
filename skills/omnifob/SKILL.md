@@ -37,16 +37,21 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 
 ## When fob says no
 
-- "run `fob login <integration>`": the sign-in lapsed. Either ask the user to run it, or run `fob login <integration>` yourself with a 15-minute timeout (a browser sign-in waits up to ten minutes, an Entra ID device code up to fifteen) and tell the user to approve the sign-in in the browser window that opens on their screen. If it is still valid, it returns at once without opening anything.
-- "name the profile by its full id": use one of the ids it lists. "this directory's default (...) is <id>": the user mapped the working directory to that profile; name it in full.
-- "the default profile of ... is not a profile": the user's `[directories]` entry is stale; tell them, and name a profile from `fob list`.
-- "is not open to agents": the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
-- "needs a code from the MFA device": ask the user to run the `fob exec ... -- true` command it names in their terminal, then retry.
-- "the encrypted vault ... is locked": the user keeps secrets in an encrypted vault that has not been unlocked since boot. Ask them to run any `fob` command (`fob status`) in their terminal to enter the passphrase, then retry; never ask for the passphrase or set `OMNIFOB_VAULT_PASSPHRASE` yourself.
+When fob fails, the last line of its stderr is `fob-error: ` followed by JSON: a `code`, the `message`, and the values that go with the code. Act on the code, not the wording:
+
+- `login_required` (`integration`, `run`): the sign-in lapsed. Either ask the user to run `fob login <integration>`, or run it yourself with a 15-minute timeout (a browser sign-in waits up to ten minutes, an Entra ID device code up to fifteen) and tell the user to approve the sign-in in the browser window that opens on their screen. If it is still valid, it returns at once without opening anything.
+- `profile_ambiguous` (`candidates`, `matches`, `query`): name the profile by one of the full ids in `candidates`. With a single candidate from "this directory's default", the user mapped the working directory to that profile; name it in full.
+- `profile_not_found` (`query`): no profile matches; look in `fob list`. When the query came from `[directories]`, the user's entry is stale; tell them.
+- `not_open_to_agents` (`profile`): the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
+- `mfa_required` (`profile`, `run`): ask the user to run the `run` command (`fob exec <profile> -- true`) in their terminal, then retry.
+- `vault_locked`: the user keeps secrets in an encrypted vault that has not been unlocked since boot. Ask them to run any `fob` command (`fob status`) in their terminal to enter the passphrase, then retry; never ask for the passphrase or set `OMNIFOB_VAULT_PASSPHRASE` yourself.
+- `use_exec` (`run`): the command would print credentials or change a shell you do not keep; run what you need as `fob exec <profile> -- <command>`.
+- `config_invalid` (`path`): the message names the key and why (`chained.prod: duration must be...`). Tell the user; do not edit the config yourself.
+- `integration_not_found` (`configured`): use one of the configured names.
+- `other`: read the message. Some it may be:
+  - "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.
+  - "could not check the token ... try again later" or "could not reach": the provider is down or unreachable, and the token may be fine; retry later. "the token was rejected" means the token itself is refused and the user must replace it.
 - `fob login` printing a URL and a code instead of opening a browser: this session looks remote, in a container or (on Linux) without a display. Pass both to the user to approve on any device, and keep the command running until it returns.
-- "parsing .../config.toml" followed by a key (`chained.prod: duration must be...`): the config is invalid. Tell the user which key and why; do not edit the config yourself.
-- "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.
-- "could not check the token ... try again later" or "could not reach": the provider is down or unreachable, and the token may be fine; retry later. "the token was rejected" means the token itself is refused and the user must replace it.
 - AWS `AccessDenied` right after the user was given access: Identity Center takes a minute to propagate; retry once, then report.
 - `fob check` (exit status 1 if a sign-in fails; `--integration <name>` for one, `--json` for structured output), `fob check <profile>` (what the credentials act as) and `fob status --check` diagnose without printing secrets. Plain `fob status` shows only what is stored: a sign-in whose token "renews on next use if the portal session is still open" (`"needs_check": true` in `--json`) may have ended, so check before telling the user it works.
 - "the omnifob skill in ... describes fob ...": this skill is out of date or ahead of fob. Tell the user, who updates it (`npx skills update`) or fob; meanwhile prefer what `fob <command> --help` says over this file.

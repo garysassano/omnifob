@@ -244,7 +244,15 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        parse(&text).with_context(|| format!("parsing {}", path.display()))
+        parse(&text).map_err(|e| {
+            crate::Coded::wrap(
+                crate::Code::ConfigInvalid,
+                format!("parsing {}", path.display()),
+                e,
+            )
+            .with("path", path.display().to_string())
+            .into()
+        })
     }
 
     /// Parses a config. Integration names may contain only letters, digits,
@@ -352,12 +360,18 @@ impl Config {
     }
 
     pub fn integration(&self, name: &str) -> anyhow::Result<&Integration> {
-        self.integrations.get(name).with_context(|| {
+        self.integrations.get(name).ok_or_else(|| {
             let known: Vec<_> = self.integrations.keys().map(String::as_str).collect();
-            format!(
-                "no integration named '{name}' (configured: {})",
-                known.join(", ")
+            crate::Coded::new(
+                crate::Code::IntegrationNotFound,
+                format!(
+                    "no integration named '{name}' (configured: {})",
+                    known.join(", ")
+                ),
             )
+            .with("integration", name)
+            .with("configured", known)
+            .into()
         })
     }
 }

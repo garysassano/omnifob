@@ -11,8 +11,6 @@
 use std::ffi::OsString;
 use std::sync::OnceLock;
 
-use anyhow::anyhow;
-
 /// Variables coding agents set in the commands they run, each checked
 /// against the agent's documentation or source on 2026-11-25.
 /// `OMNIFOB_AGENT` covers the others, and turns detection off with `0`.
@@ -93,9 +91,15 @@ fn detect(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
 /// The error for a command that would print credentials into the agent's
 /// output.
 pub(crate) fn refuse_to_print(profile_id: &str) -> anyhow::Error {
-    anyhow!(
-        "not printing credentials into an agent's output; run the command as `fob exec {profile_id} -- <command>`"
+    omnifob_core::Coded::new(
+        omnifob_core::Code::UseExec,
+        format!(
+            "not printing credentials into an agent's output; run the command as `fob exec {profile_id} -- <command>`"
+        ),
     )
+    .with("profile", profile_id)
+    .with("run", format!("fob exec {profile_id} -- <command>"))
+    .into()
 }
 
 #[cfg(test)]
