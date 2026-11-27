@@ -2,7 +2,7 @@
 name: omnifob
 description: Get cloud credentials through fob (omnifob) when the user has it set up — run AWS, Google Cloud, Azure, Cloudflare and token-based CLIs with `fob exec`, find profiles, and handle sign-in errors. Use whenever a command needs cloud credentials and `fob` is installed, and on errors such as no credentials, expired token, ExpiredToken, "not signed in" or "run `fob login`".
 metadata:
-  fob-version: "0.12.0"
+  fob-version: "0.13.0"
 ---
 
 # Cloud credentials with fob
