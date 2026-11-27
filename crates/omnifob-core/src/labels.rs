@@ -86,21 +86,26 @@ fn leaf(id: &str) -> &str {
 }
 
 /// The words of `text` in lower case, split at anything but letters and
-/// digits and where a capital follows a lower-case letter or digit:
-/// `acme-media-ac-prd` gives `acme media ac prd`, `AdministratorAccess`
-/// gives `administrator access`.
+/// digits, where a capital follows a lower-case letter or digit, and before
+/// the last capital of an acronym followed by lower case: `acme-media-ac-prd`
+/// gives `acme media ac prd`, `AdministratorAccess` gives `administrator
+/// access`, and `IAMReadOnlyAccess` gives `iam read only access`.
 fn words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut previous: Option<char> = None;
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
         if !c.is_alphanumeric() {
             if !word.is_empty() {
                 words.push(std::mem::take(&mut word));
             }
         } else {
+            let next_is_lower = chars.peek().is_some_and(|n| n.is_lowercase());
             let boundary = c.is_uppercase()
-                && previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit());
+                && previous.is_some_and(|p| {
+                    p.is_lowercase() || p.is_ascii_digit() || (p.is_uppercase() && next_is_lower)
+                });
             if boundary && !word.is_empty() {
                 words.push(std::mem::take(&mut word));
             }
@@ -163,8 +168,9 @@ fn guess_access(name: &str) -> Option<Access> {
     access.or_else(|| has("root").then_some(Access::Admin))
 }
 
-/// A Cloudflare profile's access from its template's permissions: write
-/// when any required permission writes or edits, read when all read.
+/// A Cloudflare profile's access from its template's permissions, optional
+/// ones included since a mint grants those it can: write when any of them
+/// writes or edits, read when all read.
 fn template_access(config: &Config, profile: &Profile) -> Option<Access> {
     let Target::Cloudflare { template, .. } = &profile.target else {
         return None;
@@ -174,8 +180,13 @@ fn template_access(config: &Config, profile: &Profile) -> Option<Access> {
         return None;
     };
     let templates = crate::providers::cloudflare::templates(cloudflare);
-    let permissions = &templates.get(template)?.permissions;
-    if permissions.is_empty() {
+    let template = templates.get(template)?;
+    let permissions: Vec<&String> = template
+        .permissions
+        .iter()
+        .chain(&template.optional)
+        .collect();
+    if template.permissions.is_empty() {
         return None;
     }
     if permissions
@@ -201,6 +212,12 @@ mod tests {
         assert_eq!(words("acme/dev/ReadOnly"), ["acme", "dev", "read", "only"]);
         assert_eq!(words("S3FullAccess"), ["s3", "full", "access"]);
         assert_eq!(words("PROD_EU"), ["prod", "eu"]);
+        assert_eq!(
+            words("IAMReadOnlyAccess"),
+            ["iam", "read", "only", "access"]
+        );
+        assert_eq!(words("DBAdmin"), ["db", "admin"]);
+        assert_eq!(words("EUProd"), ["eu", "prod"]);
     }
 
     #[test]
@@ -232,6 +249,10 @@ mod tests {
         // A read-only role in the organization's root account.
         assert_eq!(guess_access("root-prd-readonly"), Some(Access::Read));
         assert_eq!(guess_access("Owner"), Some(Access::Admin));
+        assert_eq!(guess_access("AWSAdministratorAccess"), Some(Access::Admin));
+        assert_eq!(guess_access("SREAdmin"), Some(Access::Admin));
+        assert_eq!(guess_access("AWSReadOnlyAccess"), Some(Access::Read));
+        assert_eq!(guess_env("acme/USStaging/Admin"), Some("staging"));
         assert_eq!(guess_access("dns-edit"), Some(Access::Write));
         assert_eq!(guess_access("ReadWrite"), Some(Access::Write));
         assert_eq!(guess_access("acme-pe"), None);

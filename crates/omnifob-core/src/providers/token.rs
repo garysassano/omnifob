@@ -380,7 +380,8 @@ pub(crate) async fn verify(
         let value = values
             .get(&name)
             .with_context(|| format!("missing a value for '{name}'"))?;
-        let encoded: String = form_urlencoded::byte_serialize(value.as_bytes()).collect();
+        // RFC 3986, as values go into paths too, where `+` is a plus sign.
+        let encoded = crate::oauth::percent_encode(value);
         url = url.replace(&format!("{{{name}}}"), &encoded);
     }
     let request = crate::http::client().get(&url);
@@ -399,7 +400,14 @@ pub(crate) async fn verify(
     let response = request
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("could not reach {} to check the token: {e}", check.url))?;
+        // Without the URL, which may carry a secret in a placeholder.
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not reach {} to check the token: {}",
+                check.url,
+                e.without_url()
+            )
+        })?;
     let status = response.status();
     match status.as_u16() {
         _ if status.is_success() => Ok(Verified::Accepted(format!(

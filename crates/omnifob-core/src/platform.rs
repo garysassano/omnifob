@@ -39,12 +39,38 @@ pub fn on_path(program: &str) -> bool {
 }
 
 /// The executable file named `program` in the first `PATH` directory that
-/// has one, as the shell would find it, without running it.
+/// has one, as the shell would find it, without running it. Empty and
+/// relative `PATH` entries, which the shell reads as the current directory,
+/// are skipped, so nothing in the directory a command runs in is picked up;
+/// on Windows, `PATHEXT`'s extensions are tried as `cmd.exe` tries them.
 pub fn find_on_path(program: &str) -> Option<std::path::PathBuf> {
+    if program.is_empty() || program.contains(['/', '\\']) {
+        return None;
+    }
     let path = std::env::var_os("PATH")?;
+    let names = program_names(program);
     std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|candidate| is_executable(candidate))
+}
+
+#[cfg(windows)]
+fn program_names(program: &str) -> Vec<String> {
+    if std::path::Path::new(program).extension().is_some() {
+        return vec![program.to_string()];
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    pathext
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| format!("{program}{}", ext.to_ascii_lowercase()))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn program_names(program: &str) -> Vec<String> {
+    vec![program.to_string()]
 }
 
 #[cfg(unix)]
@@ -68,5 +94,9 @@ mod tests {
         assert!(on_path("sh"));
         assert!(!on_path("omnifob-no-such-program"));
         assert!(!on_path("."));
+        // A path is not a program name to look up.
+        assert!(!on_path("/bin/sh"));
+        assert!(!on_path("bin/sh"));
+        assert!(!on_path(""));
     }
 }

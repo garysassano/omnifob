@@ -110,8 +110,11 @@ const TOKEN_FILE_REWRITE: SignedDuration = SignedDuration::from_hours(1);
 fn run_dir() -> anyhow::Result<PathBuf> {
     let dir = crate::paths::state_dir()?.join("run");
     crate::files::create_private_dir(&dir)?;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        let stale = std::time::SystemTime::now() - STALE_TOKEN_FILE;
+    // `checked_sub`: a clock set to the first hours of 1970 skips cleaning.
+    if let (Ok(entries), Some(stale)) = (
+        std::fs::read_dir(&dir),
+        std::time::SystemTime::now().checked_sub(STALE_TOKEN_FILE),
+    ) {
         for entry in entries.flatten() {
             let old = entry
                 .metadata()
@@ -219,8 +222,12 @@ pub fn aws_container_body(creds: &Credentials) -> anyhow::Result<Value> {
         "AccessKeyId": get("AWS_ACCESS_KEY_ID")?,
         "SecretAccessKey": get("AWS_SECRET_ACCESS_KEY")?,
         "Token": get("AWS_SESSION_TOKEN")?,
-        "Expiration": creds.expires_at,
     });
+    // Left out rather than `null` for credentials that do not expire (a
+    // `command` helper's), which some SDKs refuse to parse.
+    if let Some(expires_at) = creds.expires_at {
+        body["Expiration"] = expires_at.to_string().into();
+    }
     if let Some(account) = creds.env.get("AWS_ACCOUNT_ID") {
         body["AccountId"] = account.clone().into();
     }

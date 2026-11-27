@@ -77,6 +77,16 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> anyhow::Result<
     write(path, contents.as_ref(), Access::Private)
 }
 
+/// Where a symbolic link that points at nothing yet would lead, or `path`
+/// itself when it is no link.
+fn dangling_target(path: &Path) -> PathBuf {
+    match std::fs::read_link(path) {
+        Ok(link) if link.is_absolute() => link,
+        Ok(link) => path.parent().unwrap_or(Path::new("")).join(link),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Access {
     /// An existing file's permissions, else the owner's only.
@@ -86,10 +96,17 @@ enum Access {
 }
 
 fn write(path: &Path, contents: &[u8], access: Access) -> anyhow::Result<()> {
-    let target = match std::fs::canonicalize(path) {
-        Ok(target) => target,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    let target = match access {
+        // A private file is replaced where it is: a link left at its path
+        // must not send the secret, and the directory's `0700`, elsewhere.
+        Access::Private => path.to_path_buf(),
+        // A user's file may be a link into their dotfiles; the file it
+        // points to is replaced, the link kept, even while it dangles.
+        Access::Keep => match std::fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => dangling_target(path),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        },
     };
     let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
@@ -321,6 +338,32 @@ mod tests {
         let fresh = dir.join("fresh");
         write_atomically(&fresh, "x\n").unwrap();
         assert_eq!(mode(&fresh), 0o600);
+
+        // A link to a file not written yet creates that file.
+        let later = dir.join("later");
+        std::os::unix::fs::symlink("not-yet", &later).unwrap();
+        write_atomically(&later, "y\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&later)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("not-yet")).unwrap(), "y\n");
+
+        // A private file replaces a link at its path instead of following it.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::write(&elsewhere, "keep\n").unwrap();
+        let secret = dir.join("secret");
+        std::os::unix::fs::symlink(&elsewhere, &secret).unwrap();
+        write_private(&secret, "s").unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&secret)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "keep\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

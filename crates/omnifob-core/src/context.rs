@@ -63,8 +63,11 @@ struct Inner {
     /// One client for every request, so they share TLS setup and pooled
     /// connections. `None` builds one per request: the fallback context
     /// may serve several runtimes, and a pooled connection belongs to the
-    /// runtime that opened it.
-    http: Option<reqwest::Client>,
+    /// runtime that opened it. Built on first use, since loading the
+    /// system's root certificates is wasted on commands that make no
+    /// request (`fob activate` at every shell start, `fob list`, cached
+    /// credentials).
+    http: Option<OnceLock<reqwest::Client>>,
     mfa: Option<Box<MfaPrompt>>,
     vault: VaultUnlock,
     endpoints: Endpoints,
@@ -284,9 +287,7 @@ impl ContextBuilder {
     }
 
     pub fn build(self) -> Context {
-        let http = self
-            .shared_http
-            .then(|| crate::http::builder().build().expect("HTTP client"));
+        let http = self.shared_http.then(OnceLock::new);
         Context(Arc::new(Inner {
             config_file: self.config_file,
             state_dir: self.state_dir,
@@ -426,9 +427,10 @@ impl Context {
 
     /// The HTTP client, with omnifob's user agent and timeouts.
     pub fn http(&self) -> reqwest::Client {
+        let build = || crate::http::builder().build().expect("HTTP client");
         match &self.0.http {
-            Some(client) => client.clone(),
-            None => crate::http::builder().build().expect("HTTP client"),
+            Some(client) => client.get_or_init(build).clone(),
+            None => build(),
         }
     }
 

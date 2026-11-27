@@ -230,7 +230,7 @@ pub struct SyncedProfiles {
 
 impl ProfileCache {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
+        match crate::files::retry_busy(|| std::fs::read_to_string(path)) {
             Ok(text) => serde_json::from_str(&text).with_context(|| {
                 format!("parsing {}; delete it and run `fob sync`", path.display())
             }),
@@ -311,6 +311,11 @@ impl ProfileCache {
             .filter(|w| !w.is_empty())
             .map(str::to_lowercase)
             .collect();
+        // A query of nothing but spaces or slashes names no profile, rather
+        // than every one.
+        if words.is_empty() {
+            return Vec::new();
+        }
         let scored: Vec<(u8, &Profile)> = self
             .all()
             .filter_map(|p| match_quality(p, &words).map(|q| (q, p)))
@@ -399,6 +404,10 @@ mod tests {
         );
         assert_eq!(cache.find("admin").len(), 2);
         assert!(cache.find("dev").is_empty());
+        // Nothing but separators names no profile.
+        for nothing in ["", "   ", "/", " / "] {
+            assert!(cache.find(nothing).is_empty(), "{nothing:?}");
+        }
     }
 
     #[test]
