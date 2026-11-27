@@ -9,7 +9,7 @@ use dialoguer::console::{Term, style};
 use jiff::Timestamp;
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::SyncedProfiles;
-use omnifob_core::{Code, Coded, Error, Integration, Profile, labels, paths, providers};
+use omnifob_core::{Code, Coded, Error, Integration, Profile, Target, labels, paths, providers};
 
 use crate::{App, agent, interactive, profiles_file};
 
@@ -150,7 +150,12 @@ impl App {
         Ok(skipped)
     }
 
-    pub(crate) async fn list(&mut self, query: Option<&str>, json: bool) -> anyhow::Result<()> {
+    pub(crate) async fn list(
+        &mut self,
+        query: Option<&str>,
+        json: bool,
+        account: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.ensure_synced().await?.report();
         // The skill has agents start here, so an out-of-date copy of it,
         // which teaches commands and messages that changed, is noticed.
@@ -162,10 +167,18 @@ impl App {
                 eprintln!("fob: {problem}");
             }
         }
-        let profiles: Vec<&Profile> = match query {
+        let mut profiles: Vec<&Profile> = match query {
             Some(q) => self.cache.find(q),
             None => self.cache.all().collect(),
         };
+        if let Some(account) = account {
+            let account = self.account_of(account)?;
+            profiles.retain(|p| p.target.account_id() == Some(account.as_str()));
+            // Least access first, so the next role up follows the one denied.
+            let rank = |p: &&Profile| labels::of(&self.config, p).access.map(|(a, _)| a);
+            profiles.sort_by_key(|p| rank(p));
+        }
+        let via = |p: &Profile| self.via_profile(p);
         // An agent sees every profile, so it can tell the user which one to
         // open to it, but the ones `[agent] profiles` keeps from it are
         // marked, so it does not try them.
@@ -189,6 +202,9 @@ impl App {
                     row["access"] = found.access.map(|(a, _)| a.as_str()).into();
                     row["access_source"] = found.access.map(|(_, s)| s.as_str()).into();
                     row["sign_in"] = sign_ins[p.integration.as_str()].as_str().into();
+                    if let Some(via) = via(p) {
+                        row["via"] = via.into();
+                    }
                     if marks {
                         row["open_to_agents"] = (!closed(p)).into();
                     }
@@ -231,10 +247,13 @@ impl App {
                 let mut notes = Vec::new();
                 match sign_ins[p.integration.as_str()] {
                     SignInState::SignedIn => {}
-                    state => notes.push(state.describe()),
+                    state => notes.push(state.describe().to_string()),
                 }
                 if closed(p) {
-                    notes.push("not open to agents");
+                    notes.push("not open to agents".to_string());
+                }
+                if let Some(via) = via(p) {
+                    notes.push(format!("via {via}"));
                 }
                 let notes = if notes.is_empty() {
                     String::new()
@@ -270,6 +289,56 @@ impl App {
             );
         }
         Ok(())
+    }
+
+    /// The account `account` names for `fob list --account`: itself when a
+    /// profile acts in it, else the account of the one profile it matches.
+    fn account_of(&self, account: &str) -> anyhow::Result<String> {
+        if self
+            .cache
+            .all()
+            .any(|p| p.target.account_id() == Some(account))
+        {
+            return Ok(account.to_string());
+        }
+        let found = self.cache.find(account);
+        match found.as_slice() {
+            [profile] => profile
+                .target
+                .account_id()
+                .map(str::to_string)
+                .with_context(|| format!("{} has no account", profile.id)),
+            [] => Err(Coded::new(
+                Code::ProfileNotFound,
+                format!("no profile or account matches '{account}'; see `fob list`"),
+            )
+            .with("query", account)
+            .into()),
+            many => Err(Coded::new(
+                Code::ProfileAmbiguous,
+                format!(
+                    "'{account}' matches {} profiles; give an account ID or a full profile id",
+                    many.len()
+                ),
+            )
+            .with("query", account)
+            .with("candidates", candidate_ids(many))
+            .into()),
+        }
+    }
+
+    /// The id of the profile a chained or cross-partition profile is
+    /// reached from, when that Identity Center role is a profile too.
+    fn via_profile(&self, profile: &Profile) -> Option<String> {
+        let (via_account, via_role) = providers::via_role(&self.config, profile)?;
+        self.cache
+            .all()
+            .find(|p| {
+                p.integration == profile.integration
+                    && matches!(&p.target, Target::Aws { account_id, role_name, .. }
+                        if *account_id == via_account && *role_name == via_role)
+            })
+            .map(|p| p.id.clone())
     }
 
     /// Resolves a profile query, asking the user to pick when it is missing

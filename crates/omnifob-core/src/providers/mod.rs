@@ -377,6 +377,27 @@ pub fn chosen_lifetime(config: &Config, profile: &Profile) -> Option<jiff::Signe
     }
 }
 
+/// The Identity Center role a chained or cross-partition profile is
+/// reached from, as `(account ID, permission set)`, so callers can name the
+/// profile it starts from. `None` for other profiles, and for one whose
+/// table or rule has left the config.
+pub fn via_role(config: &Config, profile: &Profile) -> Option<(String, String)> {
+    match (
+        config.integration(&profile.integration).ok()?,
+        &profile.target,
+    ) {
+        (Integration::AwsSso(c), Target::AwsChained { label, account_id }) => {
+            let role = c.chained_role(label, account_id.as_deref())?;
+            Some((role.via_account_id.clone(), role.via_role.clone()))
+        }
+        (Integration::AwsSso(c), Target::AwsCrossPartition { label, .. }) => {
+            let role = c.cross_partition.get(label)?;
+            Some((role.via_account_id.clone(), role.via_role.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// The `ttl` to ask for so credentials last at most `max`: `max` when the
 /// requested or chosen lifetime is longer, else the requested `ttl`. A
 /// profile whose provider sets the lifetime keeps it.

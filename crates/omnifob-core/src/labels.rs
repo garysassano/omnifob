@@ -138,14 +138,15 @@ fn guess_env(id: &str) -> Option<&'static str> {
 /// suggests several (`ReadWrite` is write): AWS's managed job roles
 /// (`AdministratorAccess`, `PowerUserAccess`, `ReadOnlyAccess`,
 /// `ViewOnlyAccess`, `SecurityAudit`), Azure's and Google's basic roles
-/// (owner, contributor or editor, reader or viewer), and the usual words.
+/// (owner, contributor or editor, reader or viewer), and the usual words;
+/// `root` is admin when no other word says otherwise.
 fn guess_access(name: &str) -> Option<Access> {
     let words = words(name);
     let has = |w: &str| words.iter().any(|word| word == w);
     let mut access = None;
     for word in &words {
         let found = match word.as_str() {
-            "admin" | "administrator" | "administrators" | "owner" => Access::Admin,
+            "admin" | "administrator" | "administrators" | "owner" | "superuser" => Access::Admin,
             "write" | "edit" | "editor" | "deploy" | "deployer" | "developer" | "contributor"
             | "operator" | "rw" => Access::Write,
             "power" if has("user") => Access::Write,
@@ -156,7 +157,10 @@ fn guess_access(name: &str) -> Option<Access> {
         };
         access = access.max(Some(found));
     }
-    access
+    // `root` alone is an account's break-glass role (`itv-root`); next to
+    // another word it often names the organization's root account instead
+    // (`root-prd-readonly`), so that word decides.
+    access.or_else(|| has("root").then_some(Access::Admin))
 }
 
 /// A Cloudflare profile's access from its template's permissions: write
@@ -222,6 +226,11 @@ mod tests {
         assert_eq!(guess_access("itv-readonly"), Some(Access::Read));
         assert_eq!(guess_access("itv-read-only"), Some(Access::Read));
         assert_eq!(guess_access("Contributor"), Some(Access::Write));
+        // An account's break-glass role, often chained from a power user's.
+        assert_eq!(guess_access("itvstudios-root"), Some(Access::Admin));
+        assert_eq!(guess_access("itv-root"), Some(Access::Admin));
+        // A read-only role in the organization's root account.
+        assert_eq!(guess_access("root-prd-readonly"), Some(Access::Read));
         assert_eq!(guess_access("Owner"), Some(Access::Admin));
         assert_eq!(guess_access("dns-edit"), Some(Access::Write));
         assert_eq!(guess_access("ReadWrite"), Some(Access::Write));

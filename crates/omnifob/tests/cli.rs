@@ -634,6 +634,66 @@ async fn sync_and_list() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn one_account_is_listed_by_access_with_the_role_each_chained_one_comes_from() {
+    let server = MockServer::start().await;
+    let fob = Fob::new("account").with_server(&server);
+    fob.write_config(&format!(
+        "{}[integrations.acme.chained_rules.root]\nvia_role = \"Admin\"\nrole_name = \"root\"\n",
+        portal_config("acme")
+    ));
+    fob.sign_in("acme");
+    mount_portal(
+        &server,
+        &[("111111111111", "Dev"), ("222222222222", "Prod")],
+    )
+    .await;
+    fob.ok(&["sync"]);
+
+    let rows = |args: &[&str]| -> Vec<(String, Value, Value)> {
+        let (stdout, _) = fob.ok(args);
+        let rows: Value = serde_json::from_str(&stdout).unwrap();
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["access"].clone(),
+                    r["via"].clone(),
+                )
+            })
+            .collect()
+    };
+    let prod = vec![
+        ("acme/prod/Admin".to_string(), json!("admin"), Value::Null),
+        (
+            "acme/prod/root".to_string(),
+            json!("admin"),
+            json!("acme/prod/Admin"),
+        ),
+    ];
+    // By a profile in the account, or by the account ID.
+    assert_eq!(
+        rows(&["list", "--json", "--account", "acme/prod/Admin"]),
+        prod
+    );
+    assert_eq!(rows(&["list", "--json", "--account", "222222222222"]), prod);
+    // The rule covers every account with the permission set.
+    assert_eq!(
+        rows(&["list", "--json", "--account", "dev root"])[1].2,
+        json!("acme/dev/Admin")
+    );
+
+    let stderr = fob.fails(&["list", "--account", "nothing"]);
+    assert!(
+        stderr.contains("no profile or account matches 'nothing'"),
+        "{stderr}"
+    );
+    let stderr = fob.fails(&["list", "--account", "acme"]);
+    assert!(stderr.contains("'acme' matches 4 profiles"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn credential_process_output_names_the_account() {
     let (fob, _server) = synced_portal("creds").await;
     let (stdout, _) = fob.ok(&["creds", "acme/prod/Admin", "--format", "credential-process"]);
