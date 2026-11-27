@@ -1462,6 +1462,7 @@ fn an_integration_opens_in_its_browser() {
     fob.write_config(&format!(
         r#"
 [browsers.work]
+type = "command"
 command = ['{}', "browser_child_records_its_url", "--exact", "--ignored", "{{url}}"]
 
 [integrations.status]

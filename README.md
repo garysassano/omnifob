@@ -226,11 +226,13 @@ The program runs without a shell, so arguments need no quoting and nothing in th
 Sign-ins and consoles open in the system's default browser. To keep each identity's sessions in a browser, or a browser profile, of its own, define the browsers once and name one in each integration with `browser`; it applies to `fob login` and `fob console` alike, and integrations without it keep the default.
 
 ```toml
-[browsers.personal]
-command = ["firefox", "-P", "personal", "{url}"]
+[browsers.work]
+type = "chrome"            # fob finds it, also Windows Chrome from WSL
+profile = "Profile 1"      # optional: the Chrome profile folder sign-ins use, as chrome://version shows it
 
-[browsers.work]   # Windows Chrome from WSL; the profile is its folder, shown in chrome://version
-command = ["/mnt/c/Program Files/Google/Chrome/Application/chrome.exe", "--profile-directory=Profile 1", "{url}"]
+[browsers.personal]
+type = "zen"
+profile = "personal"       # optional: the Firefox profile name
 
 [integrations.acme]
 type = "aws-sso"
@@ -239,23 +241,44 @@ region = "eu-central-1"
 browser = "work"
 ```
 
-The command runs without a shell, with `{url}` in any argument replaced by the URL. Chromium-based browsers (Chrome, Edge, Brave) pick a profile with `--profile-directory=<folder>`, Firefox with `-P <name>`. A sign-in must still open on this machine, since the browser returns to a listener on `127.0.0.1`.
+`type` names the browser. fob looks for it where its installers put it: Program Files and `%LOCALAPPDATA%` on Windows (from WSL too, before any Linux browser, since the Windows browser is the desktop's), `/Applications` and `~/Applications` on macOS, and the program names below on `PATH` on Linux, Flatpak app ids included. Set `path` when it is elsewhere: an absolute path (a macOS `.app` bundle or the program in it), one under `~/`, or a name on `PATH`. A sign-in must still open on this machine, since the browser returns to a listener on `127.0.0.1`.
 
-The AWS console signs out one identity when another signs in, so opening a second profile's console logs out the first. Set `isolate` on a browser to open each AWS profile's console apart from the others:
+The AWS console signs out one identity when another signs in, so a second profile's console would log out the first. fob opens each AWS profile's console apart from the others, in the way the browser supports:
+
+| `type`      | Browser        | Engine   | Linux programs                                       | Consoles kept apart |
+| ----------- | -------------- | -------- | ---------------------------------------------------- | ------------------- |
+| `chrome`    | Google Chrome  | Chromium | `google-chrome-stable`, `google-chrome`              | `profile`           |
+| `edge`      | Microsoft Edge | Chromium | `microsoft-edge-stable`, `microsoft-edge`            | `profile`           |
+| `brave`     | Brave          | Chromium | `brave-browser`, `brave`                             | `profile`           |
+| `vivaldi`   | Vivaldi        | Chromium | `vivaldi-stable`, `vivaldi`                          | `profile`           |
+| `chromium`  | Chromium       | Chromium | `chromium`, `chromium-browser`, `ungoogled-chromium` | `profile`           |
+| `helium`    | Helium         | Chromium | `helium`, `helium-browser`                           | `profile`           |
+| `thorium`   | Thorium        | Chromium | `thorium-browser`, `thorium`                         | `profile`           |
+| `opera`     | Opera          | Chromium | `opera`                                              | no                  |
+| `arc`       | Arc            | Chromium | (macOS only)                                         | no                  |
+| `firefox`   | Firefox        | Gecko    | `firefox`, `firefox-esr`, Developer Edition, Nightly | `container`         |
+| `zen`       | Zen            | Gecko    | `zen-browser`, `zen`                                 | `container`         |
+| `librewolf` | LibreWolf      | Gecko    | `librewolf`                                          | `container`         |
+| `waterfox`  | Waterfox       | Gecko    | `waterfox`                                           | `container`         |
+| `floorp`    | Floorp         | Gecko    | `floorp`                                             | `container`         |
+| `safari`    | Safari         | WebKit   | (macOS only)                                         | no                  |
+| `orion`     | Orion          | WebKit   | (macOS only)                                         | no                  |
+
+- `profile`: a browser profile per fob profile, `--profile-directory=fob <integration> <account> <role>`, which the browser creates on first use and reuses after; delete one in the browser's profile manager.
+- `container`: a container (Firefox's Container Tabs) per fob profile, opened as `ext+granted-containers:name=<profile id>&url=<console URL>`. It needs the [Granted Containers](https://addons.mozilla.org/en-US/firefox/addon/granted/) add-on in that browser, which creates the container, named after the profile, the first time.
+
+`isolate = "none"` opens every console in the browser profile sign-ins use instead. Asking a browser for a kind of isolation it does not have (`isolate = "container"` on Chrome) fails when the config loads. fob knows no reliable command-line switch for Opera's and Arc's profiles, and Safari and Orion take none, so their consoles are not kept apart. Sign-ins and other providers' consoles open in the browser profile `profile` names, since they rely on the session already there.
+
+Any other browser, a Flatpak or Snap wrapper or a script, is `type = "command"`: the program and its arguments, run without a shell, with `{url}` in any argument replaced by the URL. `engine` says what the browser is built on, which gives its consoles that engine's isolation (`chromium`: `profile`, replacing any `--profile-directory` in the command; `gecko`: `container`; `webkit`: none); without it they are not kept apart.
 
 ```toml
-[browsers.work]
-command = ["/mnt/c/Program Files/Google/Chrome/Application/chrome.exe", "{url}"]
-isolate = "chromium-profile"    # a Chromium profile per fob profile, e.g. "fob acme prod Admin"
-
-[browsers.personal]
-command = ["firefox", "-P", "personal", "{url}"]
-isolate = "firefox-container"   # a container per fob profile, through the Granted Containers extension
+[browsers.flatpak-firefox]
+type = "command"
+command = ["flatpak", "run", "org.mozilla.firefox", "-P", "work", "{url}"]
+engine = "gecko"
 ```
 
-`chromium-profile` replaces any `--profile-directory` in the command with `--profile-directory=fob <integration> <account> <role>`, which Chrome creates on first use and reuses after; delete one in Chrome's profile manager. `firefox-container` opens `ext+granted-containers:name=<profile id>&url=<console URL>`, which needs the [Granted Containers](https://addons.mozilla.org/en-US/firefox/addon/granted/) extension; the extension creates the container, named after the profile, the first time. Sign-ins and other providers' consoles keep opening as the command says, since they rely on the session already in that browser profile.
-
-Containers can be told apart at a glance by colour and icon, set per profile pattern (`*` matches within one part of the id, as in `[agent] profiles`); the first entry that matches wins, and unmatched containers get the extension's own colour:
+Containers can be told apart at a glance by colour and icon, set per profile pattern (`*` matches within one part of the id, as in `[agent] profiles`); the first entry that matches wins, and unmatched containers get the add-on's own colour:
 
 ```toml
 [[browsers.personal.containers]]

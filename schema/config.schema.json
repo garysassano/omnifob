@@ -40,31 +40,142 @@
     },
     "Browser": {
       "additionalProperties": false,
-      "description": "How to open a URL in one browser, or one profile of a browser, so that\neach integration's sign-in sessions stay in the profile it belongs to.",
+      "description": "A browser, or one profile of a browser, that integrations open their\nsign-ins and consoles in, so that each integration's sessions stay where\nthey belong.",
       "properties": {
         "command": {
-          "description": "The program and its arguments, run without a shell; `{url}` in an\nargument is replaced by the URL, e.g.\n`[\"firefox\", \"-P\", \"work\", \"{url}\"]`.",
+          "default": [],
+          "description": "With `type = \"command\"`: the program and its arguments, run without a\nshell; `{url}` in an argument is replaced by the URL, e.g.\n`[\"flatpak\", \"run\", \"org.mozilla.firefox\", \"{url}\"]`.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "containers": {
-          "description": "The colour and icon of the Firefox containers of the profiles each\nentry matches, the first match winning (`isolate =\n\"firefox-container\"`). Unmatched containers get the extension's own.",
+          "description": "The colour and icon of the Firefox containers of the profiles each\nentry matches, the first match winning (`isolate = \"container\"`).\nUnmatched containers get the add-on's own.",
           "items": {
             "$ref": "#/definitions/ContainerStyle"
           },
           "type": "array"
         },
+        "engine": {
+          "$ref": "#/definitions/Engine",
+          "description": "With `type = \"command\"`: the engine the program's browser is built\non, which decides how its consoles can be kept apart. Without it,\nthey are not."
+        },
         "isolate": {
           "$ref": "#/definitions/Isolation",
-          "description": "Opens each AWS profile's console apart from the others, so that\nsigning in as one does not sign the console out of another."
+          "description": "How each AWS profile's console is kept apart from the others, so that\nsigning in as one does not sign the console out of another. Defaults\nto what the browser supports: `profile` for Chromium-based browsers,\n`container` for Firefox-based ones, `none` for the rest."
+        },
+        "path": {
+          "description": "Where the browser is, when fob does not find it on its own: an\nabsolute path (a macOS `.app` bundle or the program inside it), one\nunder `~/`, or a program name on `PATH`. Not for `command`.",
+          "type": "string"
+        },
+        "profile": {
+          "description": "The browser's own profile that sign-ins and other providers' consoles\nopen in: a Chromium profile folder, as `chrome://version` shows it\n(`Default`, `Profile 1`), or a Firefox profile name. Not for\n`command`.",
+          "type": "string"
+        },
+        "type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BrowserType"
+            }
+          ],
+          "description": "Which browser this is. fob finds the browsers it knows where they are\ninstalled and knows how to open them; `command` runs any other\nprogram."
         }
       },
       "required": [
-        "command"
+        "type"
       ],
       "type": "object"
+    },
+    "BrowserType": {
+      "description": "The browsers fob knows, and `command` for any other.",
+      "oneOf": [
+        {
+          "const": "chrome",
+          "description": "Google Chrome (Chromium).",
+          "type": "string"
+        },
+        {
+          "const": "edge",
+          "description": "Microsoft Edge (Chromium).",
+          "type": "string"
+        },
+        {
+          "const": "brave",
+          "description": "Brave (Chromium).",
+          "type": "string"
+        },
+        {
+          "const": "vivaldi",
+          "description": "Vivaldi (Chromium).",
+          "type": "string"
+        },
+        {
+          "const": "chromium",
+          "description": "Chromium, and ungoogled-chromium.",
+          "type": "string"
+        },
+        {
+          "const": "helium",
+          "description": "Helium (Chromium).",
+          "type": "string"
+        },
+        {
+          "const": "thorium",
+          "description": "Thorium (Chromium).",
+          "type": "string"
+        },
+        {
+          "const": "opera",
+          "description": "Opera (Chromium); its consoles are not kept apart.",
+          "type": "string"
+        },
+        {
+          "const": "arc",
+          "description": "Arc (Chromium); its consoles are not kept apart.",
+          "type": "string"
+        },
+        {
+          "const": "firefox",
+          "description": "Firefox, with its Developer Edition, Nightly and ESR (Gecko).",
+          "type": "string"
+        },
+        {
+          "const": "zen",
+          "description": "Zen (Gecko).",
+          "type": "string"
+        },
+        {
+          "const": "librewolf",
+          "description": "LibreWolf (Gecko).",
+          "type": "string"
+        },
+        {
+          "const": "waterfox",
+          "description": "Waterfox (Gecko).",
+          "type": "string"
+        },
+        {
+          "const": "floorp",
+          "description": "Floorp (Gecko).",
+          "type": "string"
+        },
+        {
+          "const": "safari",
+          "description": "Safari (WebKit, macOS); its consoles are not kept apart.",
+          "type": "string"
+        },
+        {
+          "const": "orion",
+          "description": "Orion (WebKit, macOS); its consoles are not kept apart.",
+          "type": "string"
+        },
+        {
+          "const": "command",
+          "description": "Any other program, given as `command`.",
+          "type": "string"
+        }
+      ]
     },
     "ChainedRole": {
       "additionalProperties": false,
@@ -301,6 +412,26 @@
         "region"
       ],
       "type": "object"
+    },
+    "Engine": {
+      "description": "The browser engine a browser is built on.",
+      "oneOf": [
+        {
+          "const": "chromium",
+          "description": "Chromium (Blink): profiles, chosen with `--profile-directory`.",
+          "type": "string"
+        },
+        {
+          "const": "gecko",
+          "description": "Mozilla's Gecko: Container Tabs, through the Granted Containers\nadd-on.",
+          "type": "string"
+        },
+        {
+          "const": "webkit",
+          "description": "Apple's WebKit: nothing a command line can choose.",
+          "type": "string"
+        }
+      ]
     },
     "GcpServiceAccount": {
       "additionalProperties": false,
@@ -836,16 +967,21 @@
       ]
     },
     "Isolation": {
-      "description": "How a browser keeps AWS consoles apart, one per profile.",
+      "description": "How a browser keeps AWS consoles apart, one per fob profile.",
       "oneOf": [
         {
-          "const": "chromium-profile",
-          "description": "A Chromium profile per fob profile (`--profile-directory`), in place\nof any the command names; Chrome creates it on first use.",
+          "const": "profile",
+          "description": "A browser profile per fob profile (`--profile-directory`), which the\nbrowser creates on first use. Chromium-based browsers.",
           "type": "string"
         },
         {
-          "const": "firefox-container",
-          "description": "A Firefox container per fob profile, opened through the Granted\nContainers extension's `ext+granted-containers:` URLs.",
+          "const": "container",
+          "description": "A container (Firefox's Container Tabs) per fob profile, opened\nthrough the Granted Containers add-on's `ext+granted-containers:`\nURLs. Firefox-based browsers with the add-on.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "Every console in the browser profile sign-ins open in, so signing in\nas one AWS profile signs the console out of another.",
           "type": "string"
         }
       ]

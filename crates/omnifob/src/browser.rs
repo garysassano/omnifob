@@ -9,7 +9,7 @@ use omnifob_core::{Config, Profile};
 /// or in the system's default browser.
 pub(crate) fn open(config: &Config, name: &str, url: &str) -> anyhow::Result<()> {
     match config.browser_for(name)? {
-        Some(browser) => run(browser.command_for(url)),
+        Some(browser) => run(browser.command_for(url)?),
         None => open_default(url),
     }
 }
@@ -19,7 +19,7 @@ pub(crate) fn open(config: &Config, name: &str, url: &str) -> anyhow::Result<()>
 /// or in the system's default browser.
 pub(crate) fn open_console(config: &Config, profile: &Profile, url: &str) -> anyhow::Result<()> {
     match config.browser_for(&profile.integration)? {
-        Some(browser) => run(browser.console_command_for(url, profile)),
+        Some(browser) => run(browser.console_command_for(url, profile)?),
         None => open_default(url),
     }
 }
@@ -34,14 +34,14 @@ fn open_default(url: &str) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if omnifob_core::platform::is_wsl() => {
             tracing::debug!("no Linux browser opener ({e}); trying explorer.exe");
-            run(("explorer.exe", vec![url.to_string()]))
+            run(("explorer.exe".to_string(), vec![url.to_string()]))
         }
         Err(e) => Err(e.into()),
     }
 }
 
-fn run((program, args): (&str, Vec<String>)) -> anyhow::Result<()> {
-    let mut command = Command::new(program);
+fn run((program, args): (String, Vec<String>)) -> anyhow::Result<()> {
+    let mut command = Command::new(&program);
     command
         .args(args)
         .stdin(Stdio::null())
