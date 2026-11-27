@@ -156,13 +156,7 @@ async fn search(integration: &str, config: &AwsSsoConfig, source: &Source) -> Re
             .try_collect()
             .await
             .map_err(|e| iam_error("iam:SimulatePrincipalPolicy", e))?;
-        for result in results {
-            if result.eval_decision() == &aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed
-                && let Some(arn) = result.eval_resource_name()
-            {
-                allowed.insert(arn.to_string());
-            }
-        }
+        allowed.extend(allowed_resources(&results));
     }
     Ok(candidates
         .into_iter()
@@ -186,6 +180,34 @@ async fn search(integration: &str, config: &AwsSsoConfig, source: &Source) -> Re
             conditional,
         })
         .collect())
+}
+
+/// The resources the simulator allows. With several resources, IAM gives
+/// one result per action whose own resource is the statement's pattern
+/// (`arn:aws:iam::${Account}:${RelativeId}`) and whose decision is the
+/// strictest, and the answer for each resource in `ResourceSpecificResults`;
+/// with one resource, that resource and its decision are the result's own.
+fn allowed_resources(results: &[aws_sdk_iam::types::EvaluationResult]) -> Vec<String> {
+    use aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed;
+    let mut allowed = Vec::new();
+    for result in results {
+        let specific = result.resource_specific_results();
+        if specific.is_empty() {
+            if result.eval_decision() == &Allowed
+                && let Some(arn) = result.eval_resource_name()
+            {
+                allowed.push(arn.to_string());
+            }
+        } else {
+            allowed.extend(
+                specific
+                    .iter()
+                    .filter(|r| r.eval_resource_decision() == &Allowed)
+                    .map(|r| r.eval_resource_name().to_string()),
+            );
+        }
+    }
+    allowed
 }
 
 /// An IAM client signed with `creds`, in the partition's IAM Region.

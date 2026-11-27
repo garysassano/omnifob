@@ -1793,20 +1793,22 @@ async fn discovery_finds_roles_the_permission_set_may_assume_in_its_account() {
         .respond_with(|r: &Request| {
             let body = String::from_utf8_lossy(&r.body).into_owned();
             assert!(!body.contains("lambda") && !body.contains("partner"), "{body}");
-            let result = |role: &str, decision: &str| {
+            // Several resources: one result for the action, with the
+            // statement's pattern and the strictest decision, and the
+            // answer for each role in ResourceSpecificResults, as IAM gives.
+            let specific = |role: &str, decision: &str| {
                 format!(
-                    "<member><EvalActionName>sts:AssumeRole</EvalActionName>\
-                     <EvalResourceName>arn:aws:iam::111111111111:role{role}</EvalResourceName>\
-                     <EvalDecision>{decision}</EvalDecision></member>"
+                    "<member><EvalResourceName>arn:aws:iam::111111111111:role{role}</EvalResourceName>\
+                     <EvalResourceDecision>{decision}</EvalResourceDecision></member>"
                 )
             };
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/xml")
                 .set_body_string(format!(
-                    r#"<SimulatePrincipalPolicyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults>{}{}{}</EvaluationResults></SimulatePrincipalPolicyResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SimulatePrincipalPolicyResponse>"#,
-                    result("/admin-root", "allowed"),
-                    result("/ops/deployer", "allowed"),
-                    result("/developer", "implicitDeny"),
+                    r#"<SimulatePrincipalPolicyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::${{Account}}:${{RelativeId}}</EvalResourceName><EvalDecision>implicitDeny</EvalDecision><ResourceSpecificResults>{}{}{}</ResourceSpecificResults></member></EvaluationResults></SimulatePrincipalPolicyResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SimulatePrincipalPolicyResponse>"#,
+                    specific("/admin-root", "allowed"),
+                    specific("/ops/deployer", "allowed"),
+                    specific("/developer", "implicitDeny"),
                 ))
         })
         .expect(1)

@@ -63,7 +63,7 @@ Not yet tried live, because no account in a second partition is available: the e
 
 1. Lists the account's roles with `iam:ListRoles` and finds the permission set's own role among them (`AWSReservedSSO_<permission set>_*` under `/aws-reserved/`), since the simulator needs its ARN.
 2. Keeps the roles whose trust policy has an `Allow` statement for `sts:AssumeRole` (or `sts:*`, `*`) with the account (`arn:<partition>:iam::<account>:root` or the bare ID), the permission set's role, or `*` as an AWS principal, leaving out service-linked and Identity Center roles. Conditions are noted, not evaluated.
-3. Asks `iam:SimulatePrincipalPolicy`, with the permission set's role as the policy source, whether `sts:AssumeRole` on each candidate is allowed, 20 roles per call.
+3. Asks `iam:SimulatePrincipalPolicy`, with the permission set's role as the policy source, whether `sts:AssumeRole` on each candidate is allowed, 20 roles per call. With several roles in a call, IAM answers with one result for the action, whose resource is the policy statement's pattern (`arn:aws:iam::${Account}:${RelativeId}`) and whose decision is the strictest, and gives each role's own decision in `ResourceSpecificResults`, which is what fob reads; with one role, the result is that role's.
 
 Four sources are searched at a time. A source whose permission set may not call either action is skipped with the reason. What is found becomes chained tables, folded into rules as `fob import aws` folds them, minus what the config already has; it is printed for review, and `--write` appends it. Under an agent, only profiles open to it search.
 

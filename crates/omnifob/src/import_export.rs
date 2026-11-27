@@ -374,8 +374,9 @@ pub(crate) async fn discover_aws(
          # these roles. Trust-policy conditions and resource control policies are not checked,\n\
          # so a role can still refuse.\n",
     );
-    toml.push_str(chained_toml(integration, &chained).trim_start());
-    toml.push_str(&chained_rules_toml(integration, &rules));
+    let mut found = chained_toml(integration, &chained);
+    found.push_str(&chained_rules_toml(integration, &rules));
+    toml.push_str(found.trim_start());
     eprintln!(
         "fob: found {} chained role(s) and {} chained rule(s)",
         chained.len(),
