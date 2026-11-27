@@ -98,12 +98,16 @@ impl CloudflareConfig {
                     .to_string(),
             );
         }
-        if self
-            .account_id
-            .as_deref()
-            .is_some_and(|id| id.trim().is_empty())
-        {
-            return Err("account_id must not be empty".to_string());
+        if let Some(id) = self.account_id.as_deref() {
+            if id.trim().is_empty() {
+                return Err("account_id must not be empty".to_string());
+            }
+            // It becomes part of API paths (`/accounts/<id>/tokens`).
+            if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(format!(
+                    "account_id '{id}' must be a Cloudflare account ID: letters and digits only"
+                ));
+            }
         }
         check_cloudflare_ttl("ttl", self.ttl)?;
         check_ips("ips", &self.ips)?;
@@ -221,6 +225,24 @@ impl CloudflareTemplate {
         if self.r2_buckets.iter().any(|b| b.trim().is_empty()) {
             return Err("r2_buckets must not contain an empty name".to_string());
         }
+        // "name" or "<jurisdiction>/name"; the jurisdiction becomes part of
+        // the S3 endpoint's host name.
+        if let Some(bad) = self.r2_buckets.iter().find(|b| {
+            let mut parts = b.split('/');
+            let (first, second, more) = (parts.next(), parts.next(), parts.next());
+            more.is_some()
+                || first.is_none_or(str::is_empty)
+                || second.is_some_and(str::is_empty)
+                || (second.is_some()
+                    && !first
+                        .unwrap_or_default()
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric()))
+        }) {
+            return Err(format!(
+                "r2_buckets entry '{bad}' must be a bucket name, or \"<jurisdiction>/<name>\" such as \"eu/logs\""
+            ));
+        }
         for zone in &self.zones {
             if zone.trim().is_empty() || zone.contains(['/', ' ', '*']) {
                 return Err(format!(
@@ -262,6 +284,28 @@ mod tests {
                 .is_err()
         );
         assert!(Config::parse("[integrations.c]\ntype = \"cloudflare\"\n").is_err());
+    }
+
+    #[test]
+    fn account_ids_and_buckets_fit_their_urls() {
+        let cf = |extra: &str| {
+            Config::parse(&format!(
+                "[integrations.c]\ntype = \"cloudflare-token\"\n{extra}\n"
+            ))
+            .map_err(|e| format!("{e:#}"))
+        };
+        assert!(cf("account_id = \"0123abcd\"").is_ok());
+        assert!(cf("account_id = \"../zones\"").is_err());
+        let bucket = |name: &str| {
+            cf(&format!(
+                "[integrations.c.templates.r2]\npermissions = [\"Workers R2 Storage Bucket Item Write\"]\nr2_buckets = [\"{name}\"]"
+            ))
+        };
+        assert!(bucket("logs").is_ok());
+        assert!(bucket("eu/logs").is_ok());
+        for bad in ["/logs", "eu/", "a/b/c", "e.u/logs"] {
+            assert!(bucket(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

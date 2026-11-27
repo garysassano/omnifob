@@ -65,14 +65,15 @@ impl GcpConfig {
 
 /// Fails unless `email` looks like a service account's email: one `@`
 /// between non-empty parts, and none of the characters that would change
-/// the IAM Credentials URL it goes into (`/`, `?`, `#`, `%`), whitespace or
-/// control characters.
+/// the IAM Credentials URL it goes into (`/`, `?`, `#`, `%`, and `:`, which
+/// would turn `.../serviceAccounts/<email>:generateAccessToken` into another
+/// method), whitespace or control characters.
 fn check_service_account_email(key: &str, email: &str) -> Result<(), String> {
     let well_formed = email.split_once('@').is_some_and(|(name, domain)| {
         !name.is_empty() && !domain.is_empty() && !domain.contains('@')
     }) && !email
         .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '%'));
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '%' | ':'));
     if !well_formed {
         return Err(format!(
             "{key} '{email}' must be a service account's email, such as \

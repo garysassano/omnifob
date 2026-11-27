@@ -41,7 +41,8 @@ When fob fails, the last line of its stderr is `fob-error: ` followed by JSON: a
 
 - `login_required` (`integration`, `run`): the sign-in lapsed. Either ask the user to run `fob login <integration>`, or sign in yourself:
   - Identity Center (`aws-sso`) and Azure: run `fob login <integration> --start`. It opens the approval page on the user's screen, prints the URL and code, and returns at once. Tell the user both, then run `fob login <integration> --wait` with a 15-minute timeout; it returns once they approve.
-  - Other integrations: run `fob login <integration>` with a 15-minute timeout and tell the user to approve the sign-in in the browser window that opens on their screen.
+  - Google Cloud, Cloudflare OAuth and `aws-login`: run `fob login <integration>` with a 15-minute timeout and tell the user to approve the sign-in in the browser window that opens on their screen. Where fob cannot open a browser (over SSH, in a container) it prints a URL instead; pass it to the user.
+  - Tokens, IAM users' keys and Cloudflare bootstrap tokens (`token`, `aws-iam`, `cloudflare-token`) and `command` helpers: fob asks for the secret in the user's terminal, which you cannot answer. Ask the user to run `fob login <integration>` themselves.
 
   Either returns at once, without opening anything, while the sign-in still works.
 - `profile_ambiguous` (`candidates`, `matches`, `query`): name the profile by one of the full ids in `candidates`. With a single candidate from "this directory's default", the user mapped the working directory to that profile; name it in full.

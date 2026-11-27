@@ -984,25 +984,25 @@ mod tests {
 region = eu-west-1
 
 # granted-style profiles
-[profile gary-test]
+[profile me-test]
 granted_sso_start_url = https://d-111.awsapps.com/start/
 granted_sso_region = eu-central-1
 granted_sso_account_id = 111111111111
 granted_sso_role_name = Admin
 region = eu-central-1
 
-[profile gary-mgmt]
+[profile me-mgmt]
 granted_sso_start_url = https://D-111.awsapps.com/start
 granted_sso_region = eu-central-1
 region = eu-central-1 # the home Region
 
-[profile gary-no-role]
+[profile me-no-role]
 granted_sso_start_url = https://d-111.awsapps.com/start
 granted_sso_region = eu-central-1
 
 [profile half-chained]
 role_arn = arn:aws:iam::666666666666:role/X
-source_profile = gary-no-role
+source_profile = me-no-role
 
 ; inline sso profile
 [profile client-dev]
@@ -1033,10 +1033,10 @@ aws_secret_access_key = do-not-print-this-secret
 region = us-west-2
 mfa_serial = arn:aws:iam::555555555555:mfa/user
 
-[profile gary-test-deploy]
+[profile me-test-deploy]
 role_arn = arn:aws:iam::222222222222:role/Deploy
-source_profile = gary-test
-role_session_name = gary
+source_profile = me-test
+role_session_name = me
 region = us-east-1
 
 [profile client-prd-deploy]
@@ -1046,13 +1046,13 @@ external_id = xyz
 
 [profile needs-mfa]
 role_arn = arn:aws:iam::444444444444:role/Admin
-source_profile = gary-test
+source_profile = me-test
 mfa_serial = arn:aws:iam::111111111111:mfa/me
 duration_seconds = 1800
 
 [profile too-long-from-sso]
 role_arn = arn:aws:iam::444444444444:role/Admin
-source_profile = gary-test
+source_profile = me-test
 duration_seconds = 7200
 
 [profile from-static-keys]
@@ -1078,7 +1078,7 @@ source_profile = keys-elsewhere
 
 [profile chain-of-chains]
 role_arn = arn:aws:iam::888888888888:role/Deeper
-source_profile = gary-test-deploy
+source_profile = me-test-deploy
 
 [profile from-process]
 role_arn = arn:aws:iam::888888888888:role/X
@@ -1116,24 +1116,24 @@ credential_process = /usr/bin/creds
         assert_eq!(client.profiles, 4);
         assert_eq!(client.default_region.as_deref(), Some("eu-west-2"));
 
-        let gary = portal(&import, "d-111");
-        assert_eq!(gary.name, "d-111");
-        assert_eq!(gary.profiles, 7);
-        assert_eq!(gary.default_region.as_deref(), Some("eu-central-1"));
+        let mine = portal(&import, "d-111");
+        assert_eq!(mine.name, "d-111");
+        assert_eq!(mine.profiles, 7);
+        assert_eq!(mine.default_region.as_deref(), Some("eu-central-1"));
     }
 
     #[test]
     fn imports_chained_roles() {
         let import = aws_import(CONFIG);
-        let gary = portal(&import, "d-111");
-        let deploy = &gary.chained["gary-test-deploy"];
+        let mine = portal(&import, "d-111");
+        let deploy = &mine.chained["me-test-deploy"];
         assert_eq!(deploy.via_account_id, "111111111111");
         assert_eq!(deploy.via_role, "Admin");
-        assert_eq!(deploy.session_name.as_deref(), Some("gary"));
+        assert_eq!(deploy.session_name.as_deref(), Some("me"));
         assert_eq!(deploy.region.as_deref(), Some("us-east-1"));
         assert_eq!(deploy.role_name(), "Deploy");
-        assert_eq!(gary.chained.len(), 2, "{:?}", gary.chained.keys());
-        let mfa = &gary.chained["needs-mfa"];
+        assert_eq!(mine.chained.len(), 2, "{:?}", mine.chained.keys());
+        let mfa = &mine.chained["needs-mfa"];
         assert_eq!(
             mfa.mfa_serial.as_deref(),
             Some("arn:aws:iam::111111111111:mfa/me")
@@ -1165,7 +1165,7 @@ credential_process = /usr/bin/creds
             ]
         );
         assert!(
-            skipped["chain-of-chains"].contains("'gary-test-deploy' is itself a role"),
+            skipped["chain-of-chains"].contains("'me-test-deploy' is itself a role"),
             "{}",
             skipped["chain-of-chains"]
         );
@@ -1279,8 +1279,8 @@ credential_process = /usr/bin/creds
     #[test]
     fn drops_inline_comments_as_the_sdks_do() {
         let import = aws_import(CONFIG);
-        let gary = portal(&import, "d-111");
-        assert_eq!(gary.default_region.as_deref(), Some("eu-central-1"));
+        let mine = portal(&import, "d-111");
+        assert_eq!(mine.default_region.as_deref(), Some("eu-central-1"));
         let client = portal(&import, "client");
         assert_eq!(client.default_region.as_deref(), Some("eu-west-2"));
 
