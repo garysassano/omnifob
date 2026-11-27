@@ -486,7 +486,7 @@ pub async fn gcp_adc_endpoint(
 /// new token ten minutes before the old one ends, since gcloud reads it on
 /// every run. `CLOUDSDK_AUTH_ACCESS_TOKEN` is removed, because gcloud reads
 /// it first. A token that lasts longer is written again every
-/// [`TOKEN_FILE_REWRITE`], so [`run_dir`] never takes the file for a stale
+/// `TOKEN_FILE_REWRITE`, so `run_dir` never takes the file for a stale
 /// one. `ttl` caps the lifetime of a service account's new tokens, as for
 /// `fob exec`.
 pub fn gcp_token_file(

@@ -15,7 +15,29 @@ permissions:
   contents: read
 
 jobs:
+  # A tag that does not name the version in Cargo.toml would publish
+  # binaries reporting another version.
+  version:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag against Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
   build:
+    needs: version
+    # Also by hand (workflow_dispatch), when `version` is skipped.
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/build.yml
     with:
       version: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}

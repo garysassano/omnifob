@@ -1,7 +1,7 @@
 //! The `fob` / `omnifob` command line.
 //!
 //! `main` parses the command line and hands each command to a method of
-//! [`App`], which holds the config and the discovered profiles. The commands
+//! `App`, which holds the config and the discovered profiles. The commands
 //! live in modules named after them.
 
 mod agent;

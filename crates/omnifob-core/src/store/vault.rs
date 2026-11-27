@@ -89,7 +89,7 @@ struct Header {
 
 const KDF: &str = "pbkdf2-hmac-sha256";
 
-/// The store: its entries share one [`Vault`], so the vault is unlocked
+/// The store: its entries share one `Vault`, so the vault is unlocked
 /// once per process.
 #[derive(Debug)]
 pub struct Store(Arc<Vault>);

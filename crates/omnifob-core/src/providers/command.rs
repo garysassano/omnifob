@@ -4,7 +4,7 @@
 //! the vault's passphrase) plus `OMNIFOB_PROFILE` (and
 //! `OMNIFOB_TTL_SECONDS` when a lifetime is asked for), the terminal's
 //! stdin and stderr, so it can prompt and report, and a time limit. Only
-//! its stdout is read, up to [`MAX_OUTPUT`], and it never appears in an
+//! its stdout is read, up to `MAX_OUTPUT`, and it never appears in an
 //! error message, since it holds the credentials.
 
 use std::collections::BTreeMap;

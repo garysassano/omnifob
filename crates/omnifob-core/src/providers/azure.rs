@@ -438,7 +438,7 @@ fn resource_scope(resource: &str) -> String {
 }
 
 /// A token for `resource` (Key Vault, Storage, Graph, an AKS cluster's
-/// server app) in `tenant`, from the stored sign-in; see [`scope_token`].
+/// server app) in `tenant`, from the stored sign-in; see `scope_token`.
 /// The Azure CLI's client is pre-authorized for Azure's own resources.
 pub async fn resource_token(
     integration: &str,

@@ -8,9 +8,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a PR replaces its run; every push to main keeps its own, so
+# each commit on main has a result.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +47,29 @@ jobs:
         run: cargo clippy --locked --all-targets
       - name: Test
         run: cargo test --locked
+
+  # The library's documentation, and both crates as crates.io would get them.
+  docs:
+    name: Docs and packaging
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.stack == null ||
+      github.event.pull_request.stack.position == github.event.pull_request.stack.size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: Package
+        run: cargo package --workspace --locked --no-verify
 
   msrv:
     name: MSRV (${{ matrix.os }})

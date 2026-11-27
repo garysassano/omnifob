@@ -5,8 +5,11 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # Minor and patch updates together; a major update gets its own PR,
+      # so one breaking change does not hold the rest back.
       cargo:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

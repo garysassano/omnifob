@@ -349,6 +349,19 @@ async fn synced_portal(name: &str) -> (Fob, MockServer) {
     (fob, server)
 }
 
+/// The crates ship their own copy of the licence, since a symbolic link
+/// checks out on Windows as a file holding the link's target.
+#[test]
+fn each_crate_ships_the_licence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let licence = std::fs::read_to_string(root.join("LICENSE")).unwrap();
+    for krate in ["omnifob", "omnifob-core"] {
+        let copy =
+            std::fs::read_to_string(root.join("crates").join(krate).join("LICENSE")).unwrap();
+        assert_eq!(copy, licence, "copy LICENSE to crates/{krate}/LICENSE");
+    }
+}
+
 #[test]
 fn help_and_version() {
     let fob = Fob::new("help");

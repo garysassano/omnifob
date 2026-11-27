@@ -923,7 +923,7 @@ const KEEP_MARGIN: jiff::SignedDuration = jiff::SignedDuration::from_mins(15);
 /// Whether `fob login` can keep the stored sign-in instead of opening the
 /// browser again, as granted does: it works (checked as `fob check` does, so
 /// it may renew), was made for the configured portal and scopes, and does not
-/// end within [`KEEP_MARGIN`]. Returns the check's description when it can.
+/// end within `KEEP_MARGIN`. Returns the check's description when it can.
 ///
 /// Only the browser sign-ins (Identity Center, console sign-in, Google,
 /// Azure and Cloudflare OAuth) are kept; for the others `fob login` is how a

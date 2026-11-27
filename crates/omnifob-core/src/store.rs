@@ -7,7 +7,7 @@
 //! is unavailable, as on WSL or headless machines, the kernel keyutils store
 //! is used instead; it keeps secrets until reboot. On WSL, sessions and
 //! bootstrap tokens are also written to files encrypted with Windows DPAPI
-//! (see [`wsl`]), so they survive reboots; keyutils stays the fast cache.
+//! (see `wsl`), so they survive reboots; keyutils stays the fast cache.
 //! `OMNIFOB_KEYRING` forces a store: `keychain`, `windows`, `secret-service`
 //! or `keyutils`, or `encrypted-file` for files encrypted with a passphrase
 //! (see [`vault`]), which survive reboots where no keychain does. For tests
