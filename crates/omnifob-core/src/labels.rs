@@ -87,7 +87,7 @@ fn leaf(id: &str) -> &str {
 
 /// The words of `text` in lower case, split at anything but letters and
 /// digits and where a capital follows a lower-case letter or digit:
-/// `itv-brdcst-ac-prd` gives `itv brdcst ac prd`, `AdministratorAccess`
+/// `acme-media-ac-prd` gives `acme media ac prd`, `AdministratorAccess`
 /// gives `administrator access`.
 fn words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
@@ -157,7 +157,7 @@ fn guess_access(name: &str) -> Option<Access> {
         };
         access = access.max(Some(found));
     }
-    // `root` alone is an account's break-glass role (`itv-root`); next to
+    // `root` alone is an account's break-glass role (`acme-root`); next to
     // another word it often names the organization's root account instead
     // (`root-prd-readonly`), so that word decides.
     access.or_else(|| has("root").then_some(Access::Admin))
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn words_split_at_separators_and_case() {
-        assert_eq!(words("itv-brdcst-ac-prd"), ["itv", "brdcst", "ac", "prd"]);
+        assert_eq!(words("acme-media-ac-prd"), ["acme", "media", "ac", "prd"]);
         assert_eq!(words("AdministratorAccess"), ["administrator", "access"]);
         assert_eq!(words("acme/dev/ReadOnly"), ["acme", "dev", "read", "only"]);
         assert_eq!(words("S3FullAccess"), ["s3", "full", "access"]);
@@ -205,9 +205,9 @@ mod tests {
 
     #[test]
     fn environments_are_guessed_only_when_the_id_names_one() {
-        assert_eq!(guess_env("itv/itv-brdcst-ac-prd/itv-pe"), Some("prod"));
+        assert_eq!(guess_env("acme/acme-media-ac-prd/acme-pe"), Some("prod"));
         assert_eq!(guess_env("acme/production/Admin"), Some("prod"));
-        assert_eq!(guess_env("gary/test/AdministratorAccess"), Some("test"));
+        assert_eq!(guess_env("mine/test/AdministratorAccess"), Some("test"));
         assert_eq!(guess_env("acme/StagingEu/Deploy"), Some("staging"));
         assert_eq!(guess_env("cf/personal/workers"), None);
         // Two environments: no guess rather than a wrong one.
@@ -223,18 +223,18 @@ mod tests {
         assert_eq!(guess_access("ReadOnlyAccess"), Some(Access::Read));
         assert_eq!(guess_access("ViewOnlyAccess"), Some(Access::Read));
         assert_eq!(guess_access("SecurityAudit"), Some(Access::Read));
-        assert_eq!(guess_access("itv-readonly"), Some(Access::Read));
-        assert_eq!(guess_access("itv-read-only"), Some(Access::Read));
+        assert_eq!(guess_access("acme-readonly"), Some(Access::Read));
+        assert_eq!(guess_access("acme-read-only"), Some(Access::Read));
         assert_eq!(guess_access("Contributor"), Some(Access::Write));
         // An account's break-glass role, often chained from a power user's.
-        assert_eq!(guess_access("itvstudios-root"), Some(Access::Admin));
-        assert_eq!(guess_access("itv-root"), Some(Access::Admin));
+        assert_eq!(guess_access("acme-media-root"), Some(Access::Admin));
+        assert_eq!(guess_access("acme-root"), Some(Access::Admin));
         // A read-only role in the organization's root account.
         assert_eq!(guess_access("root-prd-readonly"), Some(Access::Read));
         assert_eq!(guess_access("Owner"), Some(Access::Admin));
         assert_eq!(guess_access("dns-edit"), Some(Access::Write));
         assert_eq!(guess_access("ReadWrite"), Some(Access::Write));
-        assert_eq!(guess_access("itv-pe"), None);
+        assert_eq!(guess_access("acme-pe"), None);
         assert_eq!(guess_access("workers"), None);
     }
 
@@ -266,7 +266,7 @@ mod tests {
             env = "production"
 
             [[labels]]
-            profiles = ["*/*/itv-pe", "acme/*/*"]
+            profiles = ["*/*/acme-pe", "acme/*/*"]
             access = "write"
             env = "ignored, the first entry set it"
             "#,

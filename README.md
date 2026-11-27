@@ -333,7 +333,7 @@ access = "write"
 
 `fob list --json` gives `env`, `access`, where each came from (`env_source` and `access_source`: `config`, `permissions` or `name`) and the integration's `sign_in` (`signed_in`, `needs_check`, `signed_out` or `unknown`); a chained or cross-partition profile also has `via`, the Identity Center profile it is assumed from, which the table shows as a note. Piped into another program, plain `fob list` prints only the ids.
 
-`fob list --account <account ID or profile>` lists the profiles of one account, from least to most access, with the roles chained from them: where to look when a role is denied.
+`fob list --account <account ID or profile>` lists the profiles of one account, from least to most access and those without an access label last, with the roles chained from them: where to look when a role is denied.
 
 ## Use
 

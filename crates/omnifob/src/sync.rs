@@ -174,8 +174,13 @@ impl App {
         if let Some(account) = account {
             let account = self.account_of(account)?;
             profiles.retain(|p| p.target.account_id() == Some(account.as_str()));
-            // Least access first, so the next role up follows the one denied.
-            let rank = |p: &&Profile| labels::of(&self.config, p).access.map(|(a, _)| a);
+            // Least access first, so the next role up follows the one
+            // denied. A profile without a label may be anything, so it
+            // comes last rather than first.
+            let rank = |p: &&Profile| match labels::of(&self.config, p).access {
+                Some((a, _)) => (false, Some(a)),
+                None => (true, None),
+            };
             profiles.sort_by_key(|p| rank(p));
         }
         let via = |p: &Profile| self.via_profile(p);
@@ -692,8 +697,8 @@ mod tests {
 
     #[test]
     fn picker_rows_align_the_parts_of_each_id() {
-        let a = aws("gary", "management", "AdministratorAccess", "111111111111");
-        let b = aws("itvstudios", "am-dev", "itvstudios-pe", "222222222222");
+        let a = aws("mine", "management", "AdministratorAccess", "111111111111");
+        let b = aws("acme-media", "am-dev", "acme-media-pe", "222222222222");
         let token = Profile {
             id: "tok/prod".into(),
             integration: "tok".into(),
@@ -702,8 +707,8 @@ mod tests {
         assert_eq!(
             picker_rows(&[&a, &b, &token]),
             [
-                "gary        management  AdministratorAccess  111111111111",
-                "itvstudios  am-dev      itvstudios-pe        222222222222",
+                "mine        management  AdministratorAccess  111111111111",
+                "acme-media  am-dev      acme-media-pe        222222222222",
                 "tok         prod",
             ]
         );
