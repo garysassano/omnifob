@@ -11,6 +11,7 @@ mod cloudflare;
 mod command;
 mod edit;
 mod gcp;
+mod labels;
 mod token;
 
 pub use self::agent::*;
@@ -21,6 +22,7 @@ pub use self::cloudflare::*;
 pub use self::command::*;
 pub use self::edit::*;
 pub use self::gcp::*;
+pub use self::labels::*;
 pub use self::token::*;
 
 use std::collections::BTreeMap;
@@ -52,6 +54,10 @@ pub struct Config {
     /// named. The longest matching directory wins.
     #[serde(default)]
     pub directories: BTreeMap<String, String>,
+    /// The environment and access level of profiles, by pattern, which
+    /// `fob list` shows; profiles no entry labels get guesses from their id.
+    #[serde(default)]
+    pub labels: Vec<Label>,
 }
 
 /// An identity source: something you sign in to once and that yields many
@@ -295,6 +301,11 @@ impl Config {
         let config: Self = toml::from_str(text)?;
         if let Err(e) = config.agent.validate() {
             bail!("[agent] {e}");
+        }
+        for (i, label) in config.labels.iter().enumerate() {
+            if let Err(e) = label.validate() {
+                bail!("labels[{i}]: {e}");
+            }
         }
         for (dir, profile) in &config.directories {
             if let Err(e) = check_directory(dir, profile) {

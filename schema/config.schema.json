@@ -3,6 +3,15 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
+    "Access": {
+      "description": "What a profile may do, from least to most.",
+      "enum": [
+        "read",
+        "write",
+        "admin"
+      ],
+      "type": "string"
+    },
     "AgentConfig": {
       "additionalProperties": false,
       "description": "Limits on what a coding agent can get, under `[agent]`.",
@@ -986,6 +995,31 @@
         }
       ]
     },
+    "Label": {
+      "additionalProperties": false,
+      "description": "Labels for the profiles matching `profiles`. For each label, the first\nentry that matches a profile and sets it wins; profiles no entry labels\nget what fob can tell or guess from their id.",
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/Access",
+          "description": "What the profiles may do: \"read\", \"write\" or \"admin\"."
+        },
+        "env": {
+          "description": "The environment, e.g. \"prod\", \"staging\" or \"dev\". `fob list` marks\n\"prod\" and \"production\", and agents ask before using them.",
+          "type": "string"
+        },
+        "profiles": {
+          "description": "Profile ids this applies to, as patterns in which `*` stands for any\ncharacters within one `/`-separated segment, e.g. `\"acme/*-prd/*\"`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "type": "object"
+    },
     "LoginRole": {
       "additionalProperties": false,
       "description": "A role assumed with the credentials of a console sign-in\n(`[integrations.<name>.roles.<label>]` of an `aws-login` integration).",
@@ -1071,6 +1105,13 @@
         "$ref": "#/definitions/Integration"
       },
       "type": "object"
+    },
+    "labels": {
+      "description": "The environment and access level of profiles, by pattern, which\n`fob list` shows; profiles no entry labels get guesses from their id.",
+      "items": {
+        "$ref": "#/definitions/Label"
+      },
+      "type": "array"
     }
   },
   "title": "omnifob config.toml",

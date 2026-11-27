@@ -17,6 +17,7 @@ pub mod files;
 pub mod history;
 pub(crate) mod http;
 pub mod import;
+pub mod labels;
 pub mod oauth;
 pub mod paths;
 pub mod platform;
