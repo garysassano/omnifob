@@ -1,7 +1,7 @@
 //! `fob import aws` and `fob export aws-config`: moving configuration between
 //! omnifob and the AWS config file.
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use omnifob_core::profile::slug;
 use omnifob_core::{Config, Integration, Profile, paths};
 
@@ -182,32 +182,34 @@ fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
     name.into()
 }
 
-/// Leaves out of an imported portal what a configured one already has:
-/// chained roles with a configured table's label or role, chained roles one
-/// of its rules gives, including the accounts of an imported rule for the
-/// same permission set, role name and path (the rest of that rule's
-/// accounts come in as tables, since the configured rule is not rewritten).
-/// What remains gets labels of its own where theirs is taken by a
-/// configured table or rule, so the config still parses once it is added.
+/// Leaves out of imported or discovered tables and rules what a configured
+/// portal already has: chained roles with a configured table's label or
+/// role, chained roles one of its rules gives, including the accounts of an
+/// imported rule for the same permission set, role name and path (the rest
+/// of that rule's accounts come in as tables, since the configured rule is
+/// not rewritten). What remains gets labels of its own where theirs is
+/// taken by a configured table or rule, so the config still parses once it
+/// is added.
 fn keep_new(
     existing: &omnifob_core::config::AwsSsoConfig,
-    portal: &mut omnifob_core::import::AwsPortal,
+    chained: &mut std::collections::BTreeMap<String, omnifob_core::config::ChainedRole>,
+    chained_rules: &mut std::collections::BTreeMap<String, omnifob_core::config::ChainedRule>,
 ) {
     let Ok(partition) = existing.partition() else {
         return;
     };
     // A rule matching a configured one may name accounts that one does not
     // cover; it comes in as a table per account, filtered with the rest.
-    let rules = std::mem::take(&mut portal.chained_rules);
+    let rules = std::mem::take(chained_rules);
     for (label, rule) in rules {
         if !existing.chained_rules.values().any(|r| {
             r.via_role == rule.via_role && r.role_name == rule.role_name && r.path == rule.path
         }) {
-            portal.chained_rules.insert(label, rule);
+            chained_rules.insert(label, rule);
             continue;
         }
         for account in &rule.accounts {
-            portal.chained.insert(
+            chained.insert(
                 format!("{label}-{account}"),
                 rule.role_for(account, partition),
             );
@@ -215,7 +217,7 @@ fn keep_new(
     }
     // Labels become lowercase in ids, so `Prod` there is `prod` here.
     let tables: Vec<String> = existing.chained.keys().map(|l| slug(l)).collect();
-    portal.chained.retain(|label, role| {
+    chained.retain(|label, role| {
         let given_by_rule = existing.chained_rules.values().any(|rule| {
             rule.via_role == role.via_role
                 && rule.applies_to(&role.via_account_id)
@@ -234,25 +236,21 @@ fn keep_new(
         .chain(existing.chained_rules.keys())
         .map(|l| slug(l))
         .collect();
-    let chained = std::mem::take(&mut portal.chained);
-    for (label, role) in chained {
+    for (label, role) in std::mem::take(chained) {
         let taken = |l: &str| {
             configured.contains(&slug(l))
-                || portal.chained.contains_key(l)
-                || portal.chained_rules.contains_key(l)
+                || chained.contains_key(l)
+                || chained_rules.contains_key(l)
         };
-        portal.chained.insert(unique_label(&label, taken), role);
+        chained.insert(unique_label(&label, taken), role);
     }
-    let rules = std::mem::take(&mut portal.chained_rules);
-    for (label, rule) in rules {
+    for (label, rule) in std::mem::take(chained_rules) {
         let taken = |l: &str| {
             configured.contains(&slug(l))
-                || portal.chained.contains_key(l)
-                || portal.chained_rules.contains_key(l)
+                || chained.contains_key(l)
+                || chained_rules.contains_key(l)
         };
-        portal
-            .chained_rules
-            .insert(unique_label(&label, taken), rule);
+        chained_rules.insert(unique_label(&label, taken), rule);
     }
 }
 
@@ -265,6 +263,205 @@ fn unique_label(label: &str, taken: impl Fn(&str) -> bool) -> String {
         unique = format!("{label}-{n}");
     }
     unique
+}
+
+/// Appends `toml` to the config file, after checking that the result is a
+/// valid config; returns the file's path.
+fn append_to_config(toml: &str) -> anyhow::Result<std::path::PathBuf> {
+    let path = paths::config_file()?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    let updated = format!("{existing}{separator}{toml}");
+    Config::parse(&updated).context("the result would not be a valid config; nothing written")?;
+    write_atomically(&path, &updated)?;
+    Ok(path)
+}
+
+/// `fob discover aws`: searches the integration's Identity Center roles (or
+/// those of the `via` permission sets) for IAM roles they may assume in
+/// their own account, and prints what is not configured yet as chained
+/// tables, folding a role found in several accounts into a rule, as
+/// `fob import aws` does. Under an agent, only profiles open to it search.
+pub(crate) async fn discover_aws(
+    app: &App,
+    integration: &str,
+    via: &[String],
+    write: bool,
+) -> anyhow::Result<()> {
+    use omnifob_core::import::{chained_rules_toml, chained_toml, fold_chained};
+    use omnifob_core::providers::aws::discover::{Source, discover};
+    let Integration::AwsSso(config) = app.config.integration(integration)? else {
+        bail!(
+            "'{integration}' is not an aws-sso integration; discovery searches Identity Center roles"
+        );
+    };
+    let agent_limits = crate::agent::active() && app.config.agent.profiles.is_some();
+    let all_sources = app
+        .cache
+        .all()
+        .filter(|p| p.integration == integration)
+        .filter_map(|p| match &p.target {
+            omnifob_core::Target::Aws {
+                account_id,
+                role_name,
+                ..
+            } if via.is_empty() || via.contains(role_name) => Some((
+                p,
+                Source {
+                    account_id: account_id.clone(),
+                    segment: p.id.split('/').nth(1)?.to_string(),
+                    via_role: role_name.clone(),
+                },
+            )),
+            _ => None,
+        });
+    let (open, closed): (Vec<_>, Vec<_>) =
+        all_sources.partition(|(p, _)| !agent_limits || app.config.agent.allows(&p.id));
+    let sources: Vec<Source> = open.into_iter().map(|(_, s)| s).collect();
+    if sources.is_empty() && !closed.is_empty() {
+        return Err(omnifob_core::Coded::new(
+            omnifob_core::Code::NotOpenToAgents,
+            format!(
+                "none of the {} Identity Center role(s) of '{integration}' to search is open to \
+                 agents; ask the user to run `fob discover aws {integration}` or to give agents \
+                 access",
+                closed.len()
+            ),
+        )
+        .with("integration", integration)
+        .into());
+    }
+    // Never synced because it is not signed in: say so, with the code an
+    // agent acts on, rather than that it has no roles.
+    if sources.is_empty() && !app.cache.integrations.contains_key(integration) {
+        return Err(omnifob_core::Error::needs_login(
+            integration,
+            format!("'{integration}' is not signed in, so its roles are not known"),
+        )
+        .into());
+    }
+    if sources.is_empty() {
+        bail!(
+            "no Identity Center role of '{integration}' to search{}; see `fob list {integration}`",
+            if via.is_empty() {
+                String::new()
+            } else {
+                format!(" named {}", via.join(" or "))
+            }
+        );
+    }
+    eprintln!(
+        "fob: searching {} role(s) of '{integration}' with iam:ListRoles and the policy simulator",
+        sources.len()
+    );
+    let discovery = app
+        .with_login(|| discover(integration, config, sources.clone()))
+        .await?;
+    for skipped in &discovery.skipped {
+        eprintln!(
+            "fob: skipped {}/{}/{}: {}",
+            integration, skipped.source.segment, skipped.source.via_role, skipped.reason
+        );
+    }
+    for role in &discovery.unreadable {
+        eprintln!("fob: left out {role}: its trust policy could not be read");
+    }
+    let mut chained = std::collections::BTreeMap::new();
+    for found in &discovery.found {
+        // Already a table, under any label.
+        if config
+            .chained
+            .values()
+            .any(|c| c.role_arn == found.role.role_arn)
+        {
+            continue;
+        }
+        if found.conditional {
+            eprintln!(
+                "fob: {} ({}): its trust policy has conditions fob did not check",
+                found.label, found.role.role_arn
+            );
+        }
+        if !found.also_via.is_empty() {
+            eprintln!(
+                "fob: {} ({}): also assumable from {}; written from {}",
+                found.label,
+                found.role.role_arn,
+                found.also_via.join(", "),
+                found.role.via_role
+            );
+        }
+        chained.insert(found.label.clone(), found.role.clone());
+    }
+    let (mut chained, mut rules) = fold_chained(chained);
+    keep_new(config, &mut chained, &mut rules);
+    // A rule found in every account its permission set was searched in
+    // could cover accounts added later too, which only the user can judge.
+    for (label, rule) in &rules {
+        let searched: std::collections::BTreeSet<&str> = sources
+            .iter()
+            .filter(|s| s.via_role == rule.via_role)
+            .map(|s| s.account_id.as_str())
+            .collect();
+        let skipped = discovery
+            .skipped
+            .iter()
+            .any(|s| s.source.via_role == rule.via_role);
+        if !skipped
+            && rule
+                .accounts
+                .iter()
+                .map(String::as_str)
+                .eq(searched.iter().copied())
+        {
+            eprintln!(
+                "fob: chained_rules.{label} lists every account where {} was searched; remove \
+                 `accounts` to cover accounts added later as well",
+                rule.via_role
+            );
+        }
+    }
+    if chained.is_empty() && rules.is_empty() {
+        eprintln!("fob: nothing new found");
+        return Ok(());
+    }
+    let mut toml = String::from(
+        "# Found by `fob discover aws`: the policy simulator lets the permission set assume\n\
+         # these roles. Trust-policy conditions and resource control policies are not checked,\n\
+         # so a role can still refuse.\n",
+    );
+    let mut found = chained_toml(integration, &chained);
+    found.push_str(&chained_rules_toml(integration, &rules));
+    toml.push_str(found.trim_start());
+    eprintln!(
+        "fob: found {} chained role(s) and {} chained rule(s)",
+        chained.len(),
+        rules.len()
+    );
+    if !write {
+        print!("{toml}");
+        eprintln!(
+            "fob: review them, then run again with --write to append them to {}",
+            paths::config_file()?.display()
+        );
+        return Ok(());
+    }
+    let path = append_to_config(&toml)?;
+    eprintln!(
+        "fob: added them to {}; run `fob sync {integration}`",
+        path.display()
+    );
+    Ok(())
 }
 
 pub(crate) fn import_aws(
@@ -314,7 +511,7 @@ pub(crate) fn import_aws(
     }
     for mut portal in import.portals {
         if let Some((name, existing)) = configured.get(&portal.start_url) {
-            keep_new(existing, &mut portal);
+            keep_new(existing, &mut portal.chained, &mut portal.chained_rules);
             if portal.chained.is_empty() && portal.chained_rules.is_empty() {
                 eprintln!(
                     "fob: {} is already configured as '{name}'",
@@ -439,22 +636,7 @@ pub(crate) fn import_aws(
         );
         return Ok(());
     }
-    let path = paths::config_file()?;
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
-        ""
-    } else if existing.ends_with('\n') {
-        "\n"
-    } else {
-        "\n\n"
-    };
-    let updated = format!("{existing}{separator}{toml}");
-    Config::parse(&updated).context("the result would not be a valid config; nothing written")?;
-    write_atomically(&path, &updated)?;
+    let path = append_to_config(&toml)?;
     eprintln!(
         "fob: added {} integration(s) and {new_chained} role(s) or rule(s) to {}; run `fob sync`, or `fob login <name>` for new integrations{key_hint}",
         new_portals + new_users.len() + new_logins.len(),

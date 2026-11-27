@@ -34,9 +34,11 @@ use omnifob_core::profile::ProfileCache;
 use omnifob_core::providers;
 use omnifob_core::{Config, Error, paths};
 
-use crate::cli::{Cli, CloudflareCommand, Command, CredsFormat, ExportCommand, ImportCommand};
+use crate::cli::{
+    Cli, CloudflareCommand, Command, CredsFormat, DiscoverCommand, ExportCommand, ImportCommand,
+};
 use crate::exec::{creds_output, exec, expiry_note};
-use crate::import_export::{export_aws_config, export_gcp_adc, import_aws};
+use crate::import_export::{discover_aws, export_aws_config, export_gcp_adc, import_aws};
 use crate::logging::log_subscriber;
 use crate::shell::Shell;
 
@@ -467,6 +469,16 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Cloudflare(command) => app.cloudflare(command).await?,
         Command::Import(ImportCommand::Aws { file, write }) => {
             import_aws(&app.config, file, write)?
+        }
+        Command::Discover(DiscoverCommand::Aws {
+            integration,
+            via,
+            write,
+        }) => {
+            // An unknown name fails before any other integration syncs.
+            app.config.integration(&integration)?;
+            app.ensure_synced().await?.report();
+            discover_aws(&app, &integration, &via, write).await?;
         }
         Command::Export(ExportCommand::AwsConfig {
             prefix,

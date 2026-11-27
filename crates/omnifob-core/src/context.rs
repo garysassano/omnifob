@@ -128,7 +128,8 @@ pub struct Endpoints {
     pub aws: Option<String>,
     /// One AWS API each, keyed by the variable the AWS CLI and SDKs read for
     /// it: `AWS_ENDPOINT_URL_SSO_OIDC`, `AWS_ENDPOINT_URL_SSO`,
-    /// `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL_SIGNIN`. `aws` wins.
+    /// `AWS_ENDPOINT_URL_STS`, `AWS_ENDPOINT_URL_SIGNIN`, `AWS_ENDPOINT_URL_IAM`.
+    /// `aws` wins.
     pub aws_services: BTreeMap<String, String>,
     /// Microsoft Entra ID and Azure Resource Manager. `OMNIFOB_AZURE_ENDPOINT`.
     pub azure: Option<String>,
@@ -141,11 +142,12 @@ pub struct Endpoints {
 }
 
 /// The AWS APIs whose endpoint variable is read.
-const AWS_SERVICE_VARIABLES: [&str; 4] = [
+const AWS_SERVICE_VARIABLES: [&str; 5] = [
     "AWS_ENDPOINT_URL_SSO_OIDC",
     "AWS_ENDPOINT_URL_SSO",
     "AWS_ENDPOINT_URL_STS",
     "AWS_ENDPOINT_URL_SIGNIN",
+    "AWS_ENDPOINT_URL_IAM",
 ];
 
 impl Endpoints {
