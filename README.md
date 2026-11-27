@@ -319,7 +319,7 @@ fob adds them to the URL as `color` and `icon`, which Granted Containers applies
 
 ### Environments and access levels
 
-`fob list` shows each profile's environment and access level, in red for production, so you and your agents can tell a production admin role from a development read-only one. fob guesses them from the words of the id (`prd`, `staging`, `uat`, `dev`; `AdministratorAccess`, `PowerUserAccess`, `ReadOnly`, `Contributor`, `Reader`) and reads a Cloudflare template's permissions; a `?` marks a guess. `[[labels]]` states them, the first entry that matches and sets a label winning:
+`fob list` shows each profile's environment and access level, in red for production, so you and your agents can tell a production admin role from a development read-only one. fob guesses them from the words of the id (`prd`, `staging`, `uat`, `dev`; `AdministratorAccess`, `PowerUserAccess`, `ReadOnly`, `Contributor`, `Reader`, and `root` when no other word says otherwise) and reads a Cloudflare template's permissions; a `?` marks a guess. `[[labels]]` states them, the first entry that matches and sets a label winning:
 
 ```toml
 [[labels]]
@@ -331,7 +331,9 @@ profiles = ["acme/*/acme-pe"]
 access = "write"
 ```
 
-`fob list --json` gives `env`, `access`, where each came from (`env_source` and `access_source`: `config`, `permissions` or `name`) and the integration's `sign_in` (`signed_in`, `needs_check`, `signed_out` or `unknown`). Piped into another program, plain `fob list` prints only the ids.
+`fob list --json` gives `env`, `access`, where each came from (`env_source` and `access_source`: `config`, `permissions` or `name`) and the integration's `sign_in` (`signed_in`, `needs_check`, `signed_out` or `unknown`); a chained or cross-partition profile also has `via`, the Identity Center profile it is assumed from, which the table shows as a note. Piped into another program, plain `fob list` prints only the ids.
+
+`fob list --account <account ID or profile>` lists the profiles of one account, from least to most access and those without an access label last, with the roles chained from them: where to look when a role is denied.
 
 ## Use
 
@@ -344,6 +346,7 @@ fob login acme --start    # print the device code and return (Identity Center, A
 fob login acme --wait     # ... then finish once it is approved, in another process
 fob list                  # acme/prod/AdministratorAccess  prod?  admin?, cf/personal/workers  write, ...
 fob list prod admin       # only the profiles those words match
+fob list --account acme/prod/ReadOnly   # every role in that account, least access first
 fob exec prod admin -- aws s3 ls
 fob exec cf workers -- wrangler deploy   # like granted's `assume -x`, for Cloudflare
 fob exec cf workers --ttl 4h -- wrangler dev   # longer-lived token for a long session

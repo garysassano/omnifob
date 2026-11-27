@@ -134,6 +134,10 @@ pub(crate) enum Command {
         /// Print JSON with each profile's account and role, for scripts and agents
         #[arg(long)]
         json: bool,
+        /// Only the profiles in one account (an account ID, or a profile in it),
+        /// from least to most access: where to look when a role is denied
+        #[arg(long, value_name = "ACCOUNT_OR_PROFILE")]
+        account: Option<String>,
     },
     /// Print shell code exporting a profile's credentials (pick one when omitted)
     Env {

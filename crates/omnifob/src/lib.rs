@@ -287,7 +287,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Rename { old, new } => app.rename(&old, &new)?,
         Command::Sync { integrations } => app.sync(&integrations).await?,
-        Command::List { query: words, json } => app.list(query(&words).as_deref(), json).await?,
+        Command::List {
+            query: words,
+            json,
+            account,
+        } => {
+            app.list(query(&words).as_deref(), json, account.as_deref())
+                .await?
+        }
         Command::Env {
             profile,
             by,
