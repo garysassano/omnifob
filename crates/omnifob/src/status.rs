@@ -109,7 +109,9 @@ impl App {
         })
     }
 
-    pub(crate) fn status(&self, json: bool) -> anyhow::Result<()> {
+    /// What is configured and whether each sign-in is stored; with `check`,
+    /// whether each one works, asking the providers as `fob check` does.
+    pub(crate) async fn status(&self, json: bool, check: bool) -> anyhow::Result<ExitCode> {
         let now = Timestamp::now();
         let active = active_profile();
         if self.config.integrations.is_empty() && !json {
@@ -117,11 +119,27 @@ impl App {
                 "No integrations configured in {}",
                 paths::config_file()?.display()
             );
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         let secrets = omnifob_core::store::description()?;
+        // Before reading the stored state, which a check may renew.
+        let mut checked: Vec<Option<Result<String, String>>> = if check {
+            futures::future::join_all(
+                self.config
+                    .integrations
+                    .iter()
+                    .map(|(name, integration)| providers::check_sign_in(name, integration)),
+            )
+            .await
+            .into_iter()
+            .map(|r| Some(r.map_err(|e| format!("{e:#}"))))
+            .collect()
+        } else {
+            vec![None; self.config.integrations.len()]
+        };
         let mut rows = Vec::new();
-        for (name, integration) in &self.config.integrations {
+        for ((name, integration), checked) in self.config.integrations.iter().zip(checked.drain(..))
+        {
             let sign_in = providers::sign_in(name, integration)?;
             let account = match (sign_in, integration) {
                 (SignIn::Token, Integration::Gcp(_)) => gcp::account(name)?,
@@ -129,21 +147,34 @@ impl App {
                 _ => None,
             };
             let synced = self.cache.integrations.get(name);
+            let state = match &checked {
+                Some(Ok(detail)) => format!("works: {detail}"),
+                Some(Err(error)) => format!("FAILS: {error}"),
+                None => describe(integration, sign_in, account.as_deref(), now),
+            };
             rows.push(Row {
                 name,
                 kind: integration.kind(),
-                state: describe(integration, sign_in, account.as_deref(), now),
+                state,
                 sign_in,
                 account,
                 profiles: synced.map_or(0, |s| s.profiles.len()),
                 synced_at: synced.map(|s| s.synced_at),
+                checked,
             });
         }
+        let skills = crate::skill::installed();
+        let failed = rows.iter().any(|row| matches!(row.checked, Some(Err(_))));
+        let code = if failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
         if json {
             let integrations: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|row| {
-                    let (signed_in, expires_at, renews) = match row.sign_in {
+                    let (mut signed_in, expires_at, renews) = match row.sign_in {
                         SignIn::SignedOut => (false, None, false),
                         SignIn::Token => (true, None, false),
                         SignIn::Session {
@@ -155,16 +186,38 @@ impl App {
                             refreshable,
                         ),
                     };
+                    let mut needs_check = needs_check(row.sign_in, now);
+                    if let Some(result) = &row.checked {
+                        signed_in = result.is_ok();
+                        needs_check = false;
+                    }
                     json!({
                         "name": row.name,
                         "type": row.kind,
                         "signed_in": signed_in,
+                        "needs_check": needs_check,
                         "expires_at": expires_at,
                         "renews": renews,
                         "account": row.account,
                         "state": row.state,
+                        "check": row.checked.as_ref().map(|result| json!({
+                            "ok": result.is_ok(),
+                            "detail": match result {
+                                Ok(d) | Err(d) => d,
+                            },
+                        })),
                         "profiles": row.profiles,
                         "synced_at": row.synced_at,
+                    })
+                })
+                .collect();
+            let skills: Vec<serde_json::Value> = skills
+                .iter()
+                .map(|copy| {
+                    json!({
+                        "path": copy.path,
+                        "fob_version": copy.version,
+                        "current": copy.is_current(),
                     })
                 })
                 .collect();
@@ -174,9 +227,10 @@ impl App {
                 "active_profile": active.as_ref().map(|a| &a.0),
                 "active_expires_at": active.as_ref().and_then(|a| a.1),
                 "integrations": integrations,
+                "skills": skills,
             });
             println!("{}", serde_json::to_string_pretty(&value)?);
-            return Ok(());
+            return Ok(code);
         }
         println!("Secrets: {secrets}");
         if let Some((id, expires_at)) = &active {
@@ -186,6 +240,9 @@ impl App {
                 None => String::new(),
             };
             println!("Active in this shell: {id}{until}");
+        }
+        for problem in skills.iter().filter_map(crate::skill::Copy::problem) {
+            println!("Note: {problem}");
         }
         let name_width = rows
             .iter()
@@ -203,8 +260,22 @@ impl App {
                 row.name, row.kind, row.state, row.profiles
             );
         }
-        Ok(())
+        if rows
+            .iter()
+            .any(|row| row.checked.is_none() && needs_check(row.sign_in, now))
+        {
+            println!(
+                "Sign-ins that renew \"if still open\" may have ended since; `fob status --check` asks the providers."
+            );
+        }
+        Ok(code)
     }
+}
+
+/// Whether the stored state cannot tell if the sign-in still works: its
+/// token expired and renews only while a session fob cannot see lasts.
+fn needs_check(sign_in: SignIn, now: Timestamp) -> bool {
+    matches!(sign_in, SignIn::Session { expires_at, refreshable: true } if expires_at <= now)
 }
 
 struct Row<'a> {
@@ -215,6 +286,8 @@ struct Row<'a> {
     account: Option<String>,
     profiles: usize,
     synced_at: Option<Timestamp>,
+    /// What `--check` found.
+    checked: Option<Result<String, String>>,
 }
 
 /// The profile `fob use` made active in this shell, and when its
@@ -263,7 +336,8 @@ fn describe(
             )
         }
         SignIn::Session {
-            refreshable: true, ..
+            expires_at,
+            refreshable: true,
         } => {
             let session = match integration {
                 Integration::AwsSso(_) => "the portal session",
@@ -271,7 +345,12 @@ fn describe(
                 Integration::Cloudflare(_) => "the browser sign-in",
                 _ => "the sign-in",
             };
-            format!("signed in; renews on next use while {session} lasts")
+            // Saying "signed in" here misled: the portal session usually
+            // ends after 8 hours, and only the provider knows whether it has.
+            format!(
+                "token expired {} ago; renews on next use if {session} is still open",
+                age(now.duration_since(expires_at))
+            )
         }
         SignIn::Session { .. } => "session expired".to_string(),
     }

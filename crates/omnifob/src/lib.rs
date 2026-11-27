@@ -17,6 +17,7 @@ mod login;
 mod rename;
 mod renew;
 mod shell;
+mod skill;
 mod status;
 mod sync;
 mod templates;
@@ -231,7 +232,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let integration = app.pick_integration(integration.as_deref(), "logout")?;
             app.logout(&integration).await?;
         }
-        Command::Status { json } => app.status(json)?,
+        Command::Status { json, check } => return app.status(json, check).await,
         Command::Check {
             profile,
             integration,

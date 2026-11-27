@@ -32,7 +32,7 @@ Mocks cover the API calls (`wiremock` in `crates/omnifob-core/tests`), and `crat
 
 Release notes live only in GitHub releases; there is no CHANGELOG.md. They are written once, in the signed tag's message, and the release workflow copies them into the release.
 
-1. Bump `version` in the workspace `Cargo.toml` and the `omnifob-core` requirement in `crates/omnifob/Cargo.toml`; build so `Cargo.lock` follows. Commit and push.
+1. Bump `version` in the workspace `Cargo.toml`, the `omnifob-core` requirement in `crates/omnifob/Cargo.toml` and `metadata.fob-version` in `skills/omnifob/SKILL.md` (a test checks it); build so `Cargo.lock` follows. Commit and push.
 2. Wait for CI to pass on that commit.
 3. Write the notes: first line `omnifob vX.Y.Z`, a blank line, then Markdown with `### Added`, `### Changed`, `### Fixed`, `### Security` as needed, written for users rather than as a commit list.
 4. Tag with **`--cleanup=verbatim`**, otherwise Git drops every line starting with `#` and the headings disappear:

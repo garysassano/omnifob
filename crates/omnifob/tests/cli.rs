@@ -31,6 +31,7 @@ impl Fob {
         let root = std::env::temp_dir().join(format!("omnifob-e2e-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("aws")).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
         Self {
             root,
             endpoint: None,
@@ -89,6 +90,10 @@ impl Fob {
 
     fn config_file(&self) -> PathBuf {
         self.root.join("config.toml")
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
     }
 
     fn keyring(&self) -> PathBuf {
@@ -170,6 +175,8 @@ impl Fob {
                 || name.starts_with("CLOUDFLARE_")
                 || remote
                 || name == "COMPLETE"
+                // Where installed agent skills are looked for.
+                || ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME"].contains(&&*name)
                 || proxy
                 || agent
             {
@@ -179,6 +186,8 @@ impl Fob {
         // A proxy must not get between fob and the local mock.
         cmd.env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost");
+        // A home of its own, so skills installed on the machine stay out.
+        cmd.env("HOME", self.home()).env("USERPROFILE", self.home());
         cmd.env("OMNIFOB_CONFIG", self.config_file())
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env(
@@ -1548,6 +1557,97 @@ async fn the_config_flag_names_the_config_file() {
         stdout.contains("acme  aws-sso  signed in until 2100-01-01"),
         "{stdout}"
     );
+}
+
+/// `fob status` says when the token of a sign-in that renews has expired,
+/// rather than "signed in", and `--check` asks the provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_does_not_call_a_lapsed_portal_session_signed_in() {
+    let (fob, _server) = synced_portal("status-lapsed").await;
+    let token = fob.secret("aws-sso/acme/token");
+    let mut stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&token).unwrap()).unwrap();
+    stored["expires_at"] = json!("2020-01-01T00:00:00Z");
+    stored["refresh_token"] = json!("refresh-1");
+    std::fs::write(&token, stored.to_string()).unwrap();
+    let (stdout, _) = fob.ok(&["status"]);
+    assert!(stdout.contains("acme  aws-sso  token expired"), "{stdout}");
+    assert!(
+        stdout.contains("if the portal session is still open"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("fob status --check"), "{stdout}");
+    let (stdout, _) = fob.ok(&["status", "--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    let acme = &value["integrations"][0];
+    assert_eq!(acme["needs_check"], json!(true), "{acme}");
+    assert_eq!(acme["renews"], json!(true), "{acme}");
+    assert_eq!(acme["check"], Value::Null, "{acme}");
+}
+
+/// With `--check`, the state comes from the provider, as in `fob check`.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_check_asks_the_provider() {
+    let (fob, _server) = synced_portal("status-check").await;
+    let (stdout, _) = fob.ok(&["status", "--check"]);
+    assert!(stdout.contains("acme  aws-sso  works: "), "{stdout}");
+    assert!(!stdout.contains("fob status --check"), "{stdout}");
+    let (stdout, _) = fob.ok(&["status", "--check", "--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    let acme = &value["integrations"][0];
+    assert_eq!(acme["check"]["ok"], json!(true), "{acme}");
+    assert_eq!(acme["signed_in"], json!(true), "{acme}");
+    assert_eq!(acme["needs_check"], json!(false), "{acme}");
+
+    std::fs::remove_file(fob.secret("aws-sso/acme/token")).unwrap();
+    let output = fob.run(&["status", "--check"]);
+    let (stdout, _) = texts(&output);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("FAILS: not signed in to 'acme'"),
+        "{stdout}"
+    );
+}
+
+/// A copy of the agent skill from another release is pointed out, once
+/// however many skill folders link to it: by `fob status`, and to agents
+/// by `fob list`, the first command the skill has them run.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_out_of_date_agent_skill_is_pointed_out() {
+    let (fob, _server) = synced_portal("skill").await;
+    let skill = |dir: &str, version: &str| {
+        let dir = fob.home().join(dir).join("omnifob");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: omnifob\nmetadata:\n  fob-version: \"{version}\"\n---\n"),
+        )
+        .unwrap();
+    };
+    skill(".claude/skills", env!("CARGO_PKG_VERSION"));
+    let (stdout, _) = fob.ok(&["status"]);
+    assert!(!stdout.contains("Note:"), "{stdout}");
+    skill(".agents/skills", "0.0.1");
+    let (stdout, _) = fob.ok(&["status"]);
+    let notes: Vec<&str> = stdout.lines().filter(|l| l.starts_with("Note:")).collect();
+    assert_eq!(notes.len(), 1, "{stdout}");
+    assert!(notes[0].contains("describes fob 0.0.1"), "{stdout}");
+    assert!(notes[0].contains("npx skills update"), "{stdout}");
+    let (stdout, _) = fob.ok(&["status", "--json"]);
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    let current: Vec<bool> = value["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["current"].as_bool().unwrap())
+        .collect();
+    assert_eq!(current, [false, true], "{value}");
+
+    let (_, stderr) = fob.ok(&["list"]);
+    assert!(!stderr.contains("skill"), "{stderr}");
+    let output = fob.run_as_agent(&["list"]);
+    let (_, stderr) = texts(&output);
+    assert!(stderr.contains("describes fob 0.0.1"), "{stderr}");
 }
 
 /// A path given with `--config` has to exist, and `fob exec` fails with 125

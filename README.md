@@ -327,6 +327,7 @@ fob console prod admin --service ec2 --region eu-west-1 --duration 8h
 fob console prod admin --copy   # copy the sign-in URL instead (over SSH, to your terminal's clipboard)
 fob status                # sign-ins, profile counts, when each was synced, and the active profile
 fob status --json         # the same for scripts and status bars
+fob status --check        # also ask each provider whether the sign-in still works
 fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts, --json)
 fob check --integration acme   # only this sign-in
 fob check prod admin      # do this profile's credentials work, and what do they act as?
@@ -451,7 +452,7 @@ Coding agents run each command in a new shell with no one at the terminal, and w
 
 An agent gets credentials with `fob exec acme/dev/ReadOnly -- aws s3 ls`, or through AWS profiles from `fob export aws-config`, which work without fob in the command. When a sign-in lapses, the agent can ask you to run `fob login <integration>`, or run it itself: the browser opens on your screen for you to approve. Let the agent run `fob exec` per command rather than starting the agent itself inside `fob exec`, which would put the credentials in the environment of every command it runs.
 
-This guards against accidents, not against the agent, which runs as you; the harness's sandbox and permission rules are the boundary. [`skills/omnifob`](skills/omnifob/SKILL.md) is a skill that teaches agents the above; install it with your agent's skill tooling, for example `npx skills add garysassano/omnifob`.
+This guards against accidents, not against the agent, which runs as you; the harness's sandbox and permission rules are the boundary. [`skills/omnifob`](skills/omnifob/SKILL.md) is a skill that teaches agents the above; install it with your agent's skill tooling, for example `npx skills add garysassano/omnifob`. The skill names the fob release it describes (`metadata.fob-version`); `fob status`, and `fob list` under an agent, point out a copy in `~/.agents/skills`, Claude Code's, Codex's or OpenCode's skill folder that describes another release, which `npx skills update` refreshes.
 
 ### Audit log
 

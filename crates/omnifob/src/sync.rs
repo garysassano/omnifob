@@ -149,6 +149,16 @@ impl App {
 
     pub(crate) async fn list(&mut self, query: Option<&str>, json: bool) -> anyhow::Result<()> {
         self.ensure_synced().await?.report();
+        // The skill has agents start here, so an out-of-date copy of it,
+        // which teaches commands and messages that changed, is noticed.
+        if agent::active() {
+            for problem in crate::skill::installed()
+                .iter()
+                .filter_map(crate::skill::Copy::problem)
+            {
+                eprintln!("fob: {problem}");
+            }
+        }
         let profiles: Vec<&Profile> = match query {
             Some(q) => self.cache.find(q),
             None => self.cache.all().collect(),

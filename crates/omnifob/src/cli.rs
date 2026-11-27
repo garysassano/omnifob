@@ -69,9 +69,16 @@ pub(crate) enum Command {
         /// Print JSON, for scripts and status bars
         #[arg(long)]
         json: bool,
+        /// Also ask each provider whether the sign-in still works, as `fob
+        /// check` does; the stored state alone cannot tell whether a session
+        /// that renews (an Identity Center portal session) has ended
+        #[arg(long)]
+        check: bool,
     },
     /// Check that sign-ins work, or that a profile's credentials do (never signs in)
     Check {
+        /// The profile whose credentials to check, by its id or words of it;
+        /// without it, every integration's sign-in
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         /// Check this integration's sign-in only; repeat for more
@@ -90,12 +97,15 @@ pub(crate) enum Command {
     },
     /// Rename an integration, keeping its sign-in and discovered profiles
     Rename {
+        /// The integration's current name
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
         old: String,
+        /// Its new name: letters, digits, `.`, `_` and `-`
         new: String,
     },
     /// Discover profiles (every integration when none is given)
     Sync {
+        /// The integrations to discover; without them, every one
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integrations: Vec<String>,
     },
@@ -105,15 +115,19 @@ pub(crate) enum Command {
         /// Words that the profiles must match, as other commands take them
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         query: Vec<String>,
+        /// Print JSON with each profile's account and role, for scripts and agents
         #[arg(long)]
         json: bool,
     },
     /// Print shell code exporting a profile's credentials (pick one when omitted)
     Env {
+        /// The profile, by its id or words of it; without it, the working
+        /// directory's default from `[directories]`, else pick one from a list
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         #[command(flatten)]
         by: ByAccount,
+        /// The shell the code is for (default: the one running fob)
         #[arg(long, value_enum, default_value_t = Shell::detect())]
         shell: Shell,
         /// Print code that removes the variables of the active profile instead
@@ -136,6 +150,7 @@ pub(crate) enum Command {
         profile: Vec<String>,
         #[command(flatten)]
         by: ByAccount,
+        /// Get new credentials even if cached ones are still valid
         #[arg(long)]
         no_cache: bool,
         /// Lifetime of new credentials instead of the configured one, e.g. "4h";
@@ -161,11 +176,13 @@ pub(crate) enum Command {
         /// (Google Cloud)
         #[arg(long)]
         token_file: bool,
+        /// The command and its arguments, after `--`
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
     /// Open the provider's web console as a profile
     Console {
+        /// The profile, by its id or words of it; without it, pick one from a list
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         #[command(flatten)]
@@ -192,6 +209,7 @@ pub(crate) enum Command {
     },
     /// Print credentials for other tools (fnox, AWS credential_process, scripts)
     Creds {
+        /// The profile, by its id or words of it
         #[arg(
             required_unless_present_any = ["account_id", "role"],
             add = ArgValueCandidates::new(profile_candidates)
@@ -199,6 +217,7 @@ pub(crate) enum Command {
         profile: Vec<String>,
         #[command(flatten)]
         by: ByAccount,
+        /// What to print, for the tool that reads it
         #[arg(long, value_enum, default_value_t = CredsFormat::Json)]
         format: CredsFormat,
         /// The EKS cluster's name, for `--format k8s-exec` with an AWS profile
@@ -208,6 +227,7 @@ pub(crate) enum Command {
         /// k8s-exec` (default: the profile's, else us-east-1)
         #[arg(long)]
         region: Option<String>,
+        /// Get new credentials even if cached ones are still valid
         #[arg(long)]
         no_cache: bool,
         /// Lifetime of new credentials instead of the configured one, e.g. "4h";
@@ -219,6 +239,7 @@ pub(crate) enum Command {
     /// Revoke the credentials omnifob handed out for a profile (Cloudflare
     /// tokens are deleted; AWS role credentials can only be forgotten)
     Revoke {
+        /// The profile, by its id or words of it
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         /// Every profile: deletes every token omnifob minted and clears every
@@ -228,13 +249,18 @@ pub(crate) enum Command {
     },
     /// Switch the current shell to a profile (needs the shell integration from `fob activate`)
     Use {
+        /// The profile, by its id or words of it; without it, the working
+        /// directory's default from `[directories]`, else pick one from a list
         #[arg(add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
     },
     /// Remove the active profile's variables from the current shell (needs `fob activate`)
     Unuse,
     /// Print shell integration: adds `fob use <profile>` and `fob unuse`
-    Activate { shell: Shell },
+    Activate {
+        /// The shell to print the integration for
+        shell: Shell,
+    },
     /// Create integrations from other tools' configuration
     #[command(subcommand)]
     Import(ImportCommand),
@@ -314,6 +340,7 @@ pub(crate) enum ExportCommand {
     /// gcp-executable` and exchange the account's ID token through a
     /// workload identity pool; holds no token
     GcpAdc {
+        /// The Google profile whose account the file signs in as
         #[arg(required = true, add = ArgValueCandidates::new(profile_candidates))]
         profile: Vec<String>,
         /// The workload identity pool provider that trusts
@@ -334,6 +361,7 @@ pub(crate) enum ExportCommand {
 pub(crate) enum CloudflareCommand {
     /// List the permission names templates can use
     Permissions {
+        /// The Cloudflare integration
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integration: String,
         /// Only show permissions whose name contains this
@@ -341,12 +369,14 @@ pub(crate) enum CloudflareCommand {
     },
     /// List templates and their permissions
     Templates {
+        /// The Cloudflare integration
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integration: String,
     },
     /// Create a template: pick services and their access level from the
     /// account's permissions, or name the permissions with --permission
     AddTemplate {
+        /// The Cloudflare integration
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
         integration: String,
         /// Template name; profiles become <integration>/<account>/<name>
@@ -448,4 +478,38 @@ pub(crate) fn integration_candidates() -> Vec<CompletionCandidate> {
         .iter()
         .map(|(name, i)| CompletionCandidate::new(name).help(Some(i.kind().into())))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    /// Every argument says what it is for in `--help`, which is how agents
+    /// and people learn a command.
+    #[test]
+    fn every_argument_has_help() {
+        fn walk(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            if command.is_hide_set() {
+                return;
+            }
+            let path = format!("{path} {}", command.get_name());
+            for arg in command.get_arguments() {
+                let id = arg.get_id().as_str();
+                if arg.is_hide_set() || id == "help" || id == "version" {
+                    continue;
+                }
+                if arg.get_help().is_none() && arg.get_long_help().is_none() {
+                    missing.push(format!("{path} {id}"));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, &path, missing);
+            }
+        }
+        let mut missing = Vec::new();
+        walk(&Cli::command(), "", &mut missing);
+        assert!(missing.is_empty(), "arguments without help: {missing:?}");
+    }
 }
