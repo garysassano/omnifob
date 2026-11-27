@@ -34,8 +34,13 @@ pub(crate) const IAM_ENDPOINT_VARIABLE: &str = "AWS_ENDPOINT_URL_IAM";
 /// and IAM throttles an account's callers together.
 const CONCURRENCY: usize = 4;
 
-/// How many roles one `SimulatePrincipalPolicy` call evaluates.
-const SIMULATED_PER_CALL: usize = 20;
+/// How many roles one `SimulatePrincipalPolicy` call evaluates. IAM
+/// documents no limit and answered 1,000 in one call when tried; 100 keeps
+/// requests small.
+const SIMULATED_PER_CALL: usize = 100;
+
+/// The most items IAM returns in one page, instead of its default of 100.
+const MAX_ITEMS: &str = "1000";
 
 /// How many times an IAM call is tried when IAM throttles it or fails on
 /// its side, as the AWS SDKs' adaptive retry mode does.
@@ -48,6 +53,9 @@ pub struct Source {
     pub account_id: String,
     pub segment: String,
     pub via_role: String,
+    /// The profile of the account and permission set, whose cached
+    /// credentials are used while they are fresh.
+    pub profile_id: String,
 }
 
 /// A role a source may assume, as a chained role, labelled after the
@@ -221,13 +229,7 @@ impl Clients<'_> {
     async fn get(&mut self, source: &Source) -> Result<std::result::Result<&Iam, String>> {
         if !self.made.contains_key(&source.via_role) {
             let made = async {
-                let creds = super::sso::credentials(
-                    self.integration,
-                    self.config,
-                    &source.account_id,
-                    &source.via_role,
-                )
-                .await?;
+                let creds = source_credentials(self.integration, self.config, source).await?;
                 Ok::<_, crate::Error>(Iam::new(&creds, self.partition)?)
             }
             .await;
@@ -244,6 +246,32 @@ impl Clients<'_> {
     fn made(&self, via_role: &str) -> Option<&Iam> {
         self.made.get(via_role).and_then(|m| m.as_ref().ok())
     }
+}
+
+/// A source's credentials: those cached for its profile while they are
+/// fresh, as `fob exec` would use them, or new ones, which are cached.
+async fn source_credentials(
+    integration: &str,
+    config: &AwsSsoConfig,
+    source: &Source,
+) -> Result<Credentials> {
+    let key = crate::store::credentials_key(&source.profile_id);
+    let now = jiff::Timestamp::now();
+    match crate::store::get::<Credentials>(&key) {
+        Ok(Some(cached)) if cached.is_fresh(now) => return Ok(cached),
+        Ok(_) => {}
+        Err(e) => tracing::debug!("ignoring unreadable cached credentials: {e:#}"),
+    }
+    let fresh =
+        super::sso::credentials(integration, config, &source.account_id, &source.via_role).await?;
+    let fresh = Credentials {
+        issued_at: Some(now),
+        ..fresh
+    };
+    if let Err(e) = crate::store::set(&key, &fresh) {
+        tracing::warn!("could not cache credentials: {e:#}");
+    }
+    Ok(fresh)
 }
 
 /// The roles among `roles` that one source may assume, and those whose
@@ -443,7 +471,10 @@ impl Iam {
         let mut roles = Vec::new();
         let mut marker: Option<String> = None;
         loop {
-            let mut params = vec![("Action", "ListRoles".to_string())];
+            let mut params = vec![
+                ("Action", "ListRoles".to_string()),
+                ("MaxItems", MAX_ITEMS.to_string()),
+            ];
             if let Some(m) = &marker {
                 params.push(("Marker", m.clone()));
             }

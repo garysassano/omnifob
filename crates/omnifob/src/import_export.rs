@@ -321,6 +321,7 @@ pub(crate) async fn discover_aws(
                     account_id: account_id.clone(),
                     segment: p.id.split('/').nth(1)?.to_string(),
                     via_role: role_name.clone(),
+                    profile_id: p.id.clone(),
                 },
             )),
             _ => None,
