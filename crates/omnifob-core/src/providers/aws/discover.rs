@@ -140,6 +140,23 @@ pub async fn discover(
     Ok(discovery)
 }
 
+/// Whether a role is one that tooling assumes for itself, which a person
+/// rarely wants as a profile: the CDK bootstrap roles
+/// (`cdk-<qualifier>-{deploy,file-publishing,image-publishing,lookup,cfn-exec}-role-<account>-<region>`),
+/// which the CDK CLI assumes on its own, and CloudFormation's StackSet
+/// execution role.
+pub fn is_tooling(role_name: &str) -> bool {
+    const CDK: [&str; 5] = [
+        "-deploy-role-",
+        "-file-publishing-role-",
+        "-image-publishing-role-",
+        "-lookup-role-",
+        "-cfn-exec-role-",
+    ];
+    (role_name.starts_with("cdk-") && CDK.iter().any(|kind| role_name.contains(kind)))
+        || role_name == "AWSCloudFormationStackSetExecutionRole"
+}
+
 /// Whether `error` concerns every source, not just the one it came from.
 fn stops_everything(error: crate::Error) -> std::result::Result<String, crate::Error> {
     if matches!(error, crate::Error::NeedsLogin { .. }) {
@@ -1167,6 +1184,27 @@ mod tests {
 
     fn quoted(s: &str) -> String {
         format!("\"{s}\"")
+    }
+
+    #[test]
+    fn tooling_roles_are_recognised() {
+        for name in [
+            "cdk-hnb659fds-deploy-role-111111111111-eu-west-1",
+            "cdk-hnb659fds-file-publishing-role-111111111111-eu-west-1",
+            "cdk-custom-image-publishing-role-111111111111-us-east-1",
+            "cdk-hnb659fds-lookup-role-111111111111-eu-west-1",
+            "AWSCloudFormationStackSetExecutionRole",
+        ] {
+            assert!(is_tooling(name), "{name}");
+        }
+        for name in [
+            "OrganizationAccountAccessRole",
+            "cdk-admin",
+            "deploy-role-prod",
+            "admin-root",
+        ] {
+            assert!(!is_tooling(name), "{name}");
+        }
     }
 
     #[test]

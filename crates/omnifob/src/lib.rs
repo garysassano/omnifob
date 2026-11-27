@@ -38,7 +38,9 @@ use crate::cli::{
     Cli, CloudflareCommand, Command, CredsFormat, DiscoverCommand, ExportCommand, ImportCommand,
 };
 use crate::exec::{creds_output, exec, expiry_note};
-use crate::import_export::{discover_aws, export_aws_config, export_gcp_adc, import_aws};
+use crate::import_export::{
+    DiscoverOutput, discover_aws, export_aws_config, export_gcp_adc, import_aws,
+};
 use crate::logging::log_subscriber;
 use crate::shell::Shell;
 
@@ -504,11 +506,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             integration,
             via,
             write,
+            all,
+            json,
         }) => {
             // An unknown name fails before any other integration syncs.
             app.config.integration(&integration)?;
             app.ensure_synced().await?.report();
-            discover_aws(&app, &integration, &via, write).await?;
+            let output = if json {
+                DiscoverOutput::Json
+            } else if write {
+                DiscoverOutput::Write
+            } else {
+                DiscoverOutput::Print
+            };
+            discover_aws(&app, &integration, &via, all, output).await?;
         }
         Command::Export(ExportCommand::AwsConfig {
             prefix,
