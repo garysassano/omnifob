@@ -378,21 +378,48 @@ impl ChainedRule {
                 self.role_name
             ));
         }
-        if let Some(path) = &self.path
-            && !(path.starts_with('/') && path.ends_with('/') && path.len() <= 512)
-        {
-            return Err(format!("path '{path}' must start and end with '/'"));
+        if let Some(path) = &self.path {
+            check_role_path(path)?;
         }
-        for account in self.accounts.iter().chain(&self.exclude_accounts) {
+        for account in &self.accounts {
             check_account_id("accounts", account)?;
+        }
+        for account in &self.exclude_accounts {
+            check_account_id("exclude_accounts", account)?;
         }
         if let Some(region) = &self.region {
             check_region("region", region)?;
+            if let Ok(of_region) = Partition::of_region(region)
+                && of_region != partition
+            {
+                return Err(format!(
+                    "region {region} is in the {of_region} partition, but the portal and the \
+                     roles are in {partition}"
+                ));
+            }
         }
+        // What is left to check (session name, duration) names no ARN, so
+        // the placeholder account never shows in an error.
         self.role_for("000000000000", partition)
             .validate(portal_region)
-            .map_err(|e| e.replace("via_account_id", "accounts"))
     }
+}
+
+/// Fails unless `path` is an IAM role path: `/`, or `/` + printable ASCII
+/// + `/`, at most 512 characters, with no empty segment.
+fn check_role_path(path: &str) -> Result<(), String> {
+    if !(path.starts_with('/') && path.ends_with('/')) {
+        return Err(format!("path '{path}' must start and end with '/'"));
+    }
+    if path.len() > 512 {
+        return Err(format!("path '{path}' is longer than IAM's 512 characters"));
+    }
+    if !path.bytes().all(|b| (0x21..=0x7e).contains(&b)) || path.contains("//") {
+        return Err(format!(
+            "path '{path}' must be printable ASCII without spaces or empty segments ('//')"
+        ));
+    }
+    Ok(())
 }
 
 /// A role in another AWS partition, reached from an Identity Center role
@@ -1334,7 +1361,24 @@ mod tests {
             ),
             (
                 format!("{ok}\nexclude_accounts = [\"123\"]"),
+                "chained_rules.root: exclude_accounts '123' must be a 12-digit AWS account ID",
+            ),
+            (
+                format!("{ok}\naccounts = [\"123\"]"),
                 "chained_rules.root: accounts '123' must be a 12-digit AWS account ID",
+            ),
+            (
+                format!("{ok}\npath = \"/{}/\"", "a".repeat(511)),
+                "is longer than IAM's 512 characters",
+            ),
+            (
+                format!("{ok}\npath = \"/ops team/\""),
+                "chained_rules.root: path '/ops team/' must be printable ASCII",
+            ),
+            (format!("{ok}\npath = \"/ops//\""), "empty segments"),
+            (
+                format!("{ok}\nregion = \"us-gov-west-1\""),
+                "chained_rules.root: region us-gov-west-1 is in the aws-us-gov partition, but the portal and the roles are in aws",
             ),
             (
                 format!("{ok}\nduration = \"2h\""),

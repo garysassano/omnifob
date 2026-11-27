@@ -939,6 +939,9 @@ pub async fn discover(integration: &str, config: &AwsSsoConfig) -> Result<Vec<Pr
     profiles.sort_by(|a, b| a.id.cmp(&b.id));
     disambiguate(&mut profiles);
     add_configured(integration, config, &mut profiles)?;
+    // Again, so a rule's profiles sit next to their account's Identity
+    // Center roles rather than at the end.
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(profiles)
 }
 

@@ -500,6 +500,26 @@ async fn discovery_lists_every_account_and_role() {
             "discover/prod/ReadOnly"
         ]
     );
+
+    // A rule's profiles sit next to their account's roles.
+    let mut ruled = config();
+    ruled.chained_rules.insert(
+        "root".into(),
+        toml::from_str("via_role = \"ReadOnly\"\nrole_name = \"root\"").unwrap(),
+    );
+    let profiles = aws::sso::discover("discover", &ruled).await.unwrap();
+    let ids: Vec<_> = profiles.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "discover/dev/Admin",
+            "discover/dev/ReadOnly",
+            "discover/dev/root",
+            "discover/prod/Admin",
+            "discover/prod/ReadOnly",
+            "discover/prod/root"
+        ]
+    );
 }
 
 #[tokio::test]
