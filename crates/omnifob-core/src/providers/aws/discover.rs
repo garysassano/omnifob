@@ -11,9 +11,10 @@
 //! The answer is a guess: the simulator evaluates the source role's
 //! identity policies, permissions boundary and the organization's service
 //! control policies it can see, but not resource control policies, and
-//! fob does not evaluate the conditions of a trust policy (MFA, tags,
-//! external IDs). A role it finds can still refuse, and one it misses may
-//! work.
+//! fob evaluates only the trust-policy conditions on the source's own
+//! principal keys (its ARN, account and type), describing the others (MFA,
+//! tags, external IDs). A role it finds can still refuse, and one it misses
+//! may work.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -64,8 +65,9 @@ pub struct Source {
 pub struct Found {
     pub label: String,
     pub role: ChainedRole,
-    /// The trust policy has conditions fob did not evaluate.
-    pub conditional: bool,
+    /// What the trust policy needs that fob could not check, such as an
+    /// external ID or MFA; empty when nothing.
+    pub conditions: Vec<String>,
     /// Other permission sets of the account that may assume it too.
     pub also_via: Vec<String>,
 }
@@ -321,8 +323,13 @@ async fn search(
         let Some(document) = &role.trust else {
             continue;
         };
-        match trusts(document, &[&root, &source.account_id, &source_arn]) {
-            Ok(Some(conditional)) => candidates.push((role, conditional)),
+        let requester = Requester {
+            account_id: &source.account_id,
+            root: &root,
+            arn: &source_arn,
+        };
+        match trusts(document, &requester) {
+            Ok(Some(conditions)) => candidates.push((role, conditions)),
             Ok(None) => {}
             // One role's policy does not end the account's search.
             Err(e) => unreadable.push(format!("{} ({e:#})", role.arn)),
@@ -333,7 +340,7 @@ async fn search(
     let found = candidates
         .into_iter()
         .filter(|(role, _)| allowed.contains(&role.arn))
-        .map(|(role, conditional)| Found {
+        .map(|(role, conditions)| Found {
             label: format!("{}-{}", source.segment, crate::profile::slug(&role.name)),
             role: ChainedRole {
                 via_account_id: source.account_id.clone(),
@@ -345,7 +352,7 @@ async fn search(
                 mfa_serial: None,
                 duration: None,
             },
-            conditional,
+            conditions,
             also_via: Vec::new(),
         })
         .collect();
@@ -815,12 +822,66 @@ fn iam_failure(body: &str) -> Option<(String, String)> {
     found
 }
 
-/// Whether a trust policy (URL-encoded JSON, as IAM returns it) allows one
-/// of `principals` to call `sts:AssumeRole`: `Some(true)` when every
-/// allowing statement has conditions, `None` when none allows it. A `Deny`
-/// is left to the simulator, which sees only the source's side, so a denied
-/// role can still be listed; the simulator's answer is a guess either way.
-fn trusts(document: &str, principals: &[&str]) -> anyhow::Result<Option<bool>> {
+/// What fob knows of a source's `sts:AssumeRole` request, to read a trust
+/// policy with: the principals it is (the account's root, the bare account
+/// ID and the source role's ARN) and the condition keys it can answer.
+struct Requester<'a> {
+    account_id: &'a str,
+    root: &'a str,
+    arn: &'a str,
+}
+
+impl Requester<'_> {
+    fn is(&self, principal: &str) -> bool {
+        principal == "*" || [self.root, self.account_id, self.arn].contains(&principal)
+    }
+
+    /// The request's value for a condition key (lower case), when fob knows
+    /// it: an Identity Center role session's principal keys.
+    fn value(&self, key: &str) -> Option<&str> {
+        match key {
+            // The role's ARN, path included, not the session's.
+            "aws:principalarn" => Some(self.arn),
+            "aws:principalaccount" => Some(self.account_id),
+            "aws:principaltype" => Some("AssumedRole"),
+            "aws:principalisawsservice" => Some("false"),
+            _ => None,
+        }
+    }
+}
+
+/// How a condition, a statement or a policy answers a request fob knows
+/// only in part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answer {
+    Yes,
+    No,
+    /// It depends on what fob cannot check, described for the user.
+    Unknown(BTreeSet<String>),
+}
+
+impl Answer {
+    /// Both must hold.
+    fn and(self, other: Answer) -> Answer {
+        match (self, other) {
+            (Answer::No, _) | (_, Answer::No) => Answer::No,
+            (Answer::Yes, other) | (other, Answer::Yes) => other,
+            (Answer::Unknown(mut a), Answer::Unknown(b)) => {
+                a.extend(b);
+                Answer::Unknown(a)
+            }
+        }
+    }
+}
+
+/// Whether a trust policy (URL-encoded JSON, as IAM returns it) lets the
+/// requester call `sts:AssumeRole`: `None` when no statement allows it or
+/// one denies it outright, otherwise what the allowing statements need that
+/// fob cannot check, empty when one needs nothing. Conditions on the
+/// requester's principal keys (`aws:PrincipalArn`, `aws:PrincipalAccount`,
+/// `aws:PrincipalType`, `aws:PrincipalIsAWSService`) are evaluated; the
+/// others are described.
+fn trusts(document: &str, requester: &Requester) -> anyhow::Result<Option<Vec<String>>> {
     let json = percent_decode(document)?;
     let policy: Value = serde_json::from_str(&json).context("not JSON")?;
     let statements = match &policy["Statement"] {
@@ -828,37 +889,172 @@ fn trusts(document: &str, principals: &[&str]) -> anyhow::Result<Option<bool>> {
         Value::Object(_) => vec![policy["Statement"].clone()],
         _ => return Ok(None),
     };
-    let mut found = None;
-    for statement in statements {
-        if statement["Effect"] != "Allow" {
-            continue;
-        }
-        let actions = strings(&statement["Action"]);
-        if !actions.iter().any(|a| {
-            matches!(
-                a.to_ascii_lowercase().as_str(),
-                "sts:assumerole" | "sts:*" | "*"
-            )
-        }) {
-            continue;
-        }
-        let aws = match &statement["Principal"] {
-            Value::String(s) if s == "*" => vec!["*".to_string()],
-            Value::Object(map) => map.get("AWS").map(strings).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        if aws
-            .iter()
-            .any(|p| p == "*" || principals.contains(&p.as_str()))
-        {
-            let conditional = statement
-                .get("Condition")
-                .is_some_and(|c| c.as_object().is_some_and(|o| !o.is_empty()));
-            // Conditional only when every statement that allows it is.
-            found = Some(found.unwrap_or(true) && conditional);
+    let mut allowed: Option<Answer> = None;
+    let mut denied = BTreeSet::new();
+    for statement in &statements {
+        let answer = applies(statement, requester);
+        match (statement["Effect"].as_str(), answer) {
+            (_, Answer::No) => {}
+            (Some("Deny"), Answer::Yes) => return Ok(None),
+            (Some("Deny"), Answer::Unknown(notes)) => {
+                denied.extend(
+                    notes
+                        .into_iter()
+                        .map(|n| format!("a Deny statement may apply ({n})")),
+                );
+            }
+            (Some("Allow"), answer) => {
+                // Any statement that allows it is enough.
+                allowed = Some(match (allowed, answer) {
+                    (Some(Answer::Yes), _) | (_, Answer::Yes) => Answer::Yes,
+                    (Some(Answer::Unknown(mut a)), Answer::Unknown(b)) => {
+                        a.extend(b);
+                        Answer::Unknown(a)
+                    }
+                    (_, answer) => answer,
+                });
+            }
+            _ => {}
         }
     }
-    Ok(found)
+    Ok(match allowed {
+        None | Some(Answer::No) => None,
+        Some(Answer::Yes) => Some(denied.into_iter().collect()),
+        Some(Answer::Unknown(mut notes)) => {
+            notes.extend(denied);
+            Some(notes.into_iter().collect())
+        }
+    })
+}
+
+/// Whether a statement concerns the requester's `sts:AssumeRole`, its
+/// effect aside.
+fn applies(statement: &Value, requester: &Requester) -> Answer {
+    let assume = |patterns: &Value| {
+        strings(patterns)
+            .iter()
+            .any(|a| wildcard(&a.to_ascii_lowercase(), "sts:assumerole"))
+    };
+    let action = match (statement.get("Action"), statement.get("NotAction")) {
+        (Some(action), _) => assume(action),
+        (None, Some(not)) => !assume(not),
+        (None, None) => false,
+    };
+    // `NotPrincipal` is rare in trust policies and not read.
+    let principal = match &statement["Principal"] {
+        Value::String(s) => s == "*",
+        Value::Object(map) => map
+            .get("AWS")
+            .map(strings)
+            .unwrap_or_default()
+            .iter()
+            .any(|p| requester.is(p)),
+        _ => false,
+    };
+    if !action || !principal {
+        return Answer::No;
+    }
+    let Some(Value::Object(conditions)) = statement.get("Condition") else {
+        return Answer::Yes;
+    };
+    let mut answer = Answer::Yes;
+    for (operator, keys) in conditions {
+        let Value::Object(keys) = keys else {
+            continue;
+        };
+        for (key, values) in keys {
+            answer = answer.and(condition(operator, key, &strings(values), requester));
+        }
+    }
+    answer
+}
+
+/// One condition: an operator, a key and the values it is compared with.
+fn condition(operator: &str, key: &str, values: &[String], requester: &Requester) -> Answer {
+    let unknown = || Answer::Unknown(BTreeSet::from([needs(key, values)]));
+    let key = key.to_ascii_lowercase();
+    // A single-valued key answers a set operator as it would the plain one.
+    let operator = operator
+        .strip_prefix("ForAnyValue:")
+        .or_else(|| operator.strip_prefix("ForAllValues:"))
+        .unwrap_or(operator);
+    let (operator, if_exists) = match operator.strip_suffix("IfExists") {
+        Some(operator) => (operator, true),
+        None => (operator, false),
+    };
+    // A role found is written without `external_id`, so its request has no
+    // `sts:ExternalId`: a condition that it be absent holds, as in the CDK
+    // bootstrap roles' trust policies, and an `IfExists` one is skipped.
+    if key == "sts:externalid" {
+        return match operator {
+            "Null" if values.iter().any(|v| v.eq_ignore_ascii_case("true")) => Answer::Yes,
+            _ if if_exists => Answer::Yes,
+            _ => unknown(),
+        };
+    }
+    // The keys fob answers are always present, so `IfExists` changes nothing.
+    let Some(value) = requester.value(&key) else {
+        return unknown();
+    };
+    // A policy variable is a value fob would have to resolve.
+    if values.iter().any(|v| v.contains("${")) {
+        return unknown();
+    }
+    let matches = |f: &dyn Fn(&str) -> bool| values.iter().any(|v| f(v));
+    let result = match operator {
+        "StringEquals" | "ArnEquals" => matches(&|v| v == value),
+        "StringNotEquals" | "ArnNotEquals" => !matches(&|v| v == value),
+        "StringEqualsIgnoreCase" => matches(&|v| v.eq_ignore_ascii_case(value)),
+        "StringNotEqualsIgnoreCase" => !matches(&|v| v.eq_ignore_ascii_case(value)),
+        "StringLike" | "ArnLike" => matches(&|v| wildcard(v, value)),
+        "StringNotLike" | "ArnNotLike" => !matches(&|v| wildcard(v, value)),
+        "Bool" => matches(&|v| v.eq_ignore_ascii_case(value)),
+        "Null" => matches(&|v| v.eq_ignore_ascii_case("false")),
+        _ => return unknown(),
+    };
+    if result { Answer::Yes } else { Answer::No }
+}
+
+/// What a condition fob cannot check asks of the requester, in words.
+fn needs(key: &str, values: &[String]) -> String {
+    let lower = key.to_ascii_lowercase();
+    if lower == "sts:externalid" {
+        "requires an external ID (set external_id)".into()
+    } else if lower == "aws:multifactorauthpresent" || lower == "aws:multifactorauthage" {
+        "requires MFA (set mfa_serial)".into()
+    } else if let Some(tag) = key.get("aws:PrincipalTag/".len()..)
+        && lower.starts_with("aws:principaltag/")
+    {
+        format!("requires the principal tag {tag}")
+    } else if lower == "aws:principalorgid" && !values.is_empty() {
+        format!("requires the organization {}", values.join(" or "))
+    } else {
+        format!("checks {key}")
+    }
+}
+
+/// Whether `text` matches `pattern`, where `*` matches any run of
+/// characters and `?` any one, as IAM's `Like` operators read them.
+fn wildcard(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// A string or a list of strings in a policy, as a list.
@@ -941,66 +1137,233 @@ mod tests {
             .collect()
     }
 
+    const ROOT: &str = "arn:aws:iam::111111111111:root";
+    const SOURCE: &str =
+        "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_pe_1";
+    const REQUESTER: Requester = Requester {
+        account_id: "111111111111",
+        root: ROOT,
+        arn: SOURCE,
+    };
+
+    /// A trust policy of one statement, `fields` added to it.
+    fn statement(effect: &str, principal: &str, fields: &str) -> String {
+        format!(
+            r#"{{"Effect":"{effect}","Principal":{{"AWS":{principal}}},"Action":"sts:AssumeRole"{fields}}}"#
+        )
+    }
+
+    fn policy(statements: &[String]) -> Option<Vec<String>> {
+        let doc = encoded(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+            statements.join(",")
+        ));
+        trusts(&doc, &REQUESTER).unwrap()
+    }
+
+    fn allow(principal: &str, fields: &str) -> Option<Vec<String>> {
+        policy(&[statement("Allow", principal, fields)])
+    }
+
+    fn quoted(s: &str) -> String {
+        format!("\"{s}\"")
+    }
+
     #[test]
     fn trust_policies_are_read_for_the_account_or_the_role() {
-        let root = "arn:aws:iam::111111111111:root";
-        let source =
-            "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_pe_1";
-        let principals = [root, "111111111111", source];
-        let doc = |principal: &str, extra: &str| {
-            encoded(&format!(
-                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":{principal}}},"Action":"sts:AssumeRole"{extra}}}]}}"#
-            ))
-        };
+        let unconditional = Some(Vec::new());
+        assert_eq!(allow(&quoted(ROOT), ""), unconditional);
         assert_eq!(
-            trusts(&doc(&format!("\"{root}\""), ""), &principals).unwrap(),
-            Some(false)
+            allow(
+                &format!("[\"arn:aws:iam::999999999999:root\",\"{SOURCE}\"]"),
+                ""
+            ),
+            unconditional
         );
-        assert_eq!(
-            trusts(
-                &doc(
-                    &format!("[\"arn:aws:iam::999999999999:root\",\"{source}\"]"),
-                    ""
-                ),
-                &principals
-            )
-            .unwrap(),
-            Some(false)
-        );
-        assert_eq!(
-            trusts(&doc("\"111111111111\"", ""), &principals).unwrap(),
-            Some(false)
-        );
-        // Conditions are reported, not evaluated.
-        assert_eq!(
-            trusts(
-                &doc(
-                    &format!("\"{root}\""),
-                    r#","Condition":{"Bool":{"aws:MultiFactorAuthPresent":"true"}}"#
-                ),
-                &principals
-            )
-            .unwrap(),
-            Some(true)
-        );
+        assert_eq!(allow("\"111111111111\"", ""), unconditional);
+        assert_eq!(allow("\"*\"", ""), unconditional);
         // Another account, a service, or another action: not this source.
-        assert_eq!(
-            trusts(&doc("\"arn:aws:iam::999999999999:root\"", ""), &principals).unwrap(),
-            None
-        );
+        assert_eq!(allow("\"arn:aws:iam::999999999999:root\"", ""), None);
         let service = encoded(
             r#"{"Statement":{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}}"#,
         );
-        assert_eq!(trusts(&service, &principals).unwrap(), None);
+        assert_eq!(trusts(&service, &REQUESTER).unwrap(), None);
         let tagging = encoded(&format!(
-            r#"{{"Statement":{{"Effect":"Allow","Principal":{{"AWS":"{root}"}},"Action":"sts:TagSession"}}}}"#
+            r#"{{"Statement":{{"Effect":"Allow","Principal":{{"AWS":"{ROOT}"}},"Action":"sts:TagSession"}}}}"#
         ));
-        assert_eq!(trusts(&tagging, &principals).unwrap(), None);
+        assert_eq!(trusts(&tagging, &REQUESTER).unwrap(), None);
+        // Action patterns and NotAction.
+        let actions = |field: &str| {
+            policy(&[format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{ROOT}"}},{field}}}"#
+            )])
+        };
+        assert_eq!(actions(r#""Action":"sts:Assume*""#), unconditional);
+        assert_eq!(actions(r#""Action":["STS:*"]"#), unconditional);
+        assert_eq!(actions(r#""NotAction":"sts:TagSession""#), unconditional);
+        assert_eq!(actions(r#""NotAction":"sts:*""#), None);
+        assert!(trusts("%zz", &REQUESTER).is_err());
+    }
+
+    #[test]
+    fn a_deny_statement_rejects_the_role_or_is_noted() {
+        let allowed = statement("Allow", &quoted(ROOT), "");
+        assert_eq!(
+            policy(&[allowed.clone(), statement("Deny", &quoted(SOURCE), "")]),
+            None
+        );
+        assert_eq!(
+            policy(&[allowed.clone(), statement("Deny", "\"*\"", "")]),
+            None
+        );
+        // A Deny for someone else does not concern this source.
+        assert_eq!(
+            policy(&[
+                allowed.clone(),
+                statement("Deny", "\"arn:aws:iam::999999999999:root\"", "")
+            ]),
+            Some(Vec::new())
+        );
+        // One whose condition fob cannot check is noted.
+        assert_eq!(
+            policy(&[
+                allowed.clone(),
+                statement(
+                    "Deny",
+                    "\"*\"",
+                    r#","Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}"#
+                )
+            ]),
+            Some(vec![
+                "a Deny statement may apply (checks aws:SourceIp)".to_string()
+            ])
+        );
+        // One whose condition rules this source out does not apply.
+        assert_eq!(
+            policy(&[
+                allowed,
+                statement(
+                    "Deny",
+                    "\"*\"",
+                    r#","Condition":{"StringNotLike":{"aws:PrincipalArn":"*AWSReservedSSO_pe_*"}}"#
+                )
+            ]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn conditions_on_the_principal_are_evaluated() {
+        let condition = |c: &str| allow("\"*\"", &format!(r#","Condition":{c}"#));
+        let unconditional = Some(Vec::new());
+        assert_eq!(
+            condition(
+                r#"{"ArnLike":{"aws:PrincipalArn":"arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_pe_*"}}"#
+            ),
+            unconditional
+        );
+        assert_eq!(
+            condition(
+                r#"{"ArnLike":{"aws:PrincipalArn":["arn:aws:iam::*:role/*AWSReservedSSO_Admin_*","arn:aws:iam::*:role/*_pe_*"]}}"#
+            ),
+            unconditional
+        );
+        assert_eq!(
+            condition(r#"{"ArnLike":{"aws:PrincipalArn":"*AWSReservedSSO_Admin_*"}}"#),
+            None
+        );
+        assert_eq!(
+            condition(
+                r#"{"StringEquals":{"aws:PrincipalAccount":"111111111111","aws:PrincipalType":"AssumedRole"}}"#
+            ),
+            unconditional
+        );
+        assert_eq!(
+            condition(r#"{"StringNotEqualsIfExists":{"aws:PrincipalAccount":"111111111111"}}"#),
+            None
+        );
+        assert_eq!(
+            condition(r#"{"ForAnyValue:StringLike":{"aws:PrincipalArn":"*_pe_*"}}"#),
+            unconditional
+        );
+        assert_eq!(
+            condition(r#"{"Bool":{"aws:PrincipalIsAWSService":"false"}}"#),
+            unconditional
+        );
+        assert_eq!(condition(r#"{"Null":{"aws:PrincipalArn":"true"}}"#), None);
+        // A policy variable is not resolved.
+        assert_eq!(
+            condition(r#"{"StringEquals":{"aws:PrincipalArn":"${aws:PrincipalTag/role}"}}"#),
+            Some(vec!["checks aws:PrincipalArn".to_string()])
+        );
+    }
+
+    #[test]
+    fn other_conditions_say_what_they_need() {
+        let condition = |c: &str| allow(&quoted(ROOT), &format!(r#","Condition":{c}"#));
+        assert_eq!(
+            condition(
+                r#"{"StringEquals":{"sts:ExternalId":"x"},"Bool":{"aws:MultiFactorAuthPresent":"true"}}"#
+            ),
+            Some(vec![
+                "requires MFA (set mfa_serial)".to_string(),
+                "requires an external ID (set external_id)".to_string()
+            ])
+        );
+        assert_eq!(
+            condition(
+                r#"{"StringEquals":{"aws:PrincipalTag/team":"ops","aws:PrincipalOrgID":"o-abc"}}"#
+            ),
+            Some(vec![
+                "requires the organization o-abc".to_string(),
+                "requires the principal tag team".to_string()
+            ])
+        );
+        // No external ID is sent, so one that must be absent is no
+        // condition, and one compared only if present is skipped.
+        assert_eq!(
+            condition(r#"{"Null":{"sts:ExternalId":"true"}}"#),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            condition(r#"{"StringEqualsIfExists":{"sts:ExternalId":"x"}}"#),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            condition(r#"{"Null":{"sts:ExternalId":"false"}}"#),
+            Some(vec![
+                "requires an external ID (set external_id)".to_string()
+            ])
+        );
+        // A known condition that fails rules the statement out, whatever
+        // the others.
+        assert_eq!(
+            condition(
+                r#"{"StringEquals":{"sts:ExternalId":"x","aws:PrincipalAccount":"999999999999"}}"#
+            ),
+            None
+        );
         // Unconditional once any statement that allows it is.
-        let both = encoded(&format!(
-            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{root}"}},"Action":"sts:AssumeRole"}},{{"Effect":"Allow","Principal":{{"AWS":"{root}"}},"Action":"sts:AssumeRole","Condition":{{"Bool":{{"aws:MultiFactorAuthPresent":"true"}}}}}}]}}"#
-        ));
-        assert_eq!(trusts(&both, &principals).unwrap(), Some(false));
-        assert!(trusts("%zz", &principals).is_err());
+        assert_eq!(
+            policy(&[
+                statement("Allow", &quoted(ROOT), ""),
+                statement(
+                    "Allow",
+                    &quoted(ROOT),
+                    r#","Condition":{"Bool":{"aws:MultiFactorAuthPresent":"true"}}"#
+                )
+            ]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn wildcards_match_as_iam_reads_them() {
+        assert!(wildcard("a*c", "abbbc"));
+        assert!(wildcard("a?c", "abc"));
+        assert!(wildcard("*", ""));
+        assert!(wildcard("*_pe_*", "AWSReservedSSO_pe_1"));
+        assert!(!wildcard("a*c", "abcd"));
+        assert!(!wildcard("abc", "ab"));
     }
 }

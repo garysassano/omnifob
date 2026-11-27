@@ -387,10 +387,12 @@ pub(crate) async fn discover_aws(
         {
             continue;
         }
-        if found.conditional {
+        if !found.conditions.is_empty() {
             eprintln!(
-                "fob: {} ({}): its trust policy has conditions fob did not check",
-                found.label, found.role.role_arn
+                "fob: {} ({}): trust-policy conditions fob did not check: {}",
+                found.label,
+                found.role.role_arn,
+                found.conditions.join("; ")
             );
         }
         if !found.also_via.is_empty() {
