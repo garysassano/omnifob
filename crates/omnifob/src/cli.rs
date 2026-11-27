@@ -342,8 +342,9 @@ pub(crate) enum ImportCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum DiscoverCommand {
-    /// IAM roles an Identity Center role may assume in its own account, found
-    /// with iam:ListRoles and the policy simulator (needs both; assumes nothing)
+    /// IAM roles an Identity Center role may assume, in its account or another
+    /// one of the integration, found with iam:ListRoles and the policy
+    /// simulator (needs both; assumes nothing)
     Aws {
         /// The aws-sso integration to search
         #[arg(add = ArgValueCandidates::new(integration_candidates))]
