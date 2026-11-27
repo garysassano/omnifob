@@ -39,7 +39,11 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 
 When fob fails, the last line of its stderr is `fob-error: ` followed by JSON: a `code`, the `message`, and the values that go with the code. Act on the code, not the wording:
 
-- `login_required` (`integration`, `run`): the sign-in lapsed. Either ask the user to run `fob login <integration>`, or run it yourself with a 15-minute timeout (a browser sign-in waits up to ten minutes, an Entra ID device code up to fifteen) and tell the user to approve the sign-in in the browser window that opens on their screen. If it is still valid, it returns at once without opening anything.
+- `login_required` (`integration`, `run`): the sign-in lapsed. Either ask the user to run `fob login <integration>`, or sign in yourself:
+  - Identity Center (`aws-sso`) and Azure: run `fob login <integration> --start`. It opens the approval page on the user's screen, prints the URL and code, and returns at once. Tell the user both, then run `fob login <integration> --wait` with a 15-minute timeout; it returns once they approve.
+  - Other integrations: run `fob login <integration>` with a 15-minute timeout and tell the user to approve the sign-in in the browser window that opens on their screen.
+
+  Either returns at once, without opening anything, while the sign-in still works.
 - `profile_ambiguous` (`candidates`, `matches`, `query`): name the profile by one of the full ids in `candidates`. With a single candidate from "this directory's default", the user mapped the working directory to that profile; name it in full.
 - `profile_not_found` (`query`): no profile matches; look in `fob list`. When the query came from `[directories]`, the user's entry is stale; tell them.
 - `not_open_to_agents` (`profile`): the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
@@ -51,7 +55,7 @@ When fob fails, the last line of its stderr is `fob-error: ` followed by JSON: a
 - `other`: read the message. Some it may be:
   - "would both be the profile" or "two profiles of '...' would both be": two accounts or configured roles would share a profile id. Report it; the user renames one.
   - "could not check the token ... try again later" or "could not reach": the provider is down or unreachable, and the token may be fine; retry later. "the token was rejected" means the token itself is refused and the user must replace it.
-- `fob login` printing a URL and a code instead of opening a browser: this session looks remote, in a container or (on Linux) without a display. Pass both to the user to approve on any device, and keep the command running until it returns.
+- `fob login` printing a URL and a code instead of opening a browser: this session looks remote, in a container or (on Linux) without a display. Pass both to the user to approve on any device; with `--start`, then run `--wait`.
 - AWS `AccessDenied` right after the user was given access: Identity Center takes a minute to propagate; retry once, then report.
 - `fob check` (exit status 1 if a sign-in fails; `--integration <name>` for one, `--json` for structured output), `fob check <profile>` (what the credentials act as) and `fob status --check` diagnose without printing secrets. Plain `fob status` shows only what is stored: a sign-in whose token "renews on next use if the portal session is still open" (`"needs_check": true` in `--json`) may have ended, so check before telling the user it works.
 - "the omnifob skill in ... describes fob ...": this skill is out of date or ahead of fob. Tell the user, who updates it (`npx skills update`) or fob; meanwhile prefer what `fob <command> --help` says over this file.

@@ -54,6 +54,22 @@ pub(crate) enum Command {
         /// Center, AWS console sign-in, Google, Azure, Cloudflare OAuth) still works
         #[arg(long)]
         force: bool,
+        /// Start a device sign-in and return at once, after printing where to
+        /// approve it and the code; `--wait` then finishes it. For agents and
+        /// scripts, which see a command's output only when it ends (AWS IAM
+        /// Identity Center and Azure)
+        #[arg(
+            long,
+            conflicts_with_all = ["wait", "token_stdin", "from_clipboard", "device_code"]
+        )]
+        start: bool,
+        /// Wait until the sign-in `--start` began is approved, then keep it and
+        /// discover profiles
+        #[arg(
+            long,
+            conflicts_with_all = ["token_stdin", "from_clipboard", "device_code", "force", "no_browser"]
+        )]
+        wait: bool,
     },
     /// Forget an integration's sign-in and cached credentials
     Logout {

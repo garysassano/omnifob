@@ -63,9 +63,25 @@ fn token_key(integration: &str) -> String {
     format!("azure/{integration}/oauth")
 }
 
+fn pending_key(integration: &str) -> String {
+    format!("azure/{integration}/pending")
+}
+
 /// Every keychain key an integration uses, for renaming it.
 pub fn keys(integration: &str) -> Vec<String> {
-    vec![token_key(integration)]
+    vec![token_key(integration), pending_key(integration)]
+}
+
+/// A device sign-in waiting for approval, kept between `fob login --start`
+/// and `fob login --wait`. Not `Debug`: whoever polls with the device code
+/// gets the tokens once the person approves.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingDevice {
+    /// The authority's tenant the sign-in started with.
+    tenant: String,
+    device_code: String,
+    interval_secs: u64,
+    expires_at: jiff::Timestamp,
 }
 
 /// What the keychain keeps for a signed-in integration. Not `Debug`: it holds
@@ -177,8 +193,82 @@ pub async fn login(
     let response = if browser_here {
         browser_sign_in(tenant, show).await?
     } else {
-        device_sign_in(tenant, show).await?
+        let (pending, user_code, url) = start_device(tenant).await?;
+        show(SignInPrompt {
+            url: &url,
+            user_code: Some(&user_code),
+        });
+        poll_device(&pending).await?
     };
+    keep_sign_in(integration, config, response).await
+}
+
+/// What `fob login --start` shows: where to approve, the code, and until when.
+#[derive(Debug, Clone)]
+pub struct DeviceStart {
+    pub url: String,
+    pub user_code: String,
+    pub expires_at: jiff::Timestamp,
+}
+
+/// Starts a device sign-in and keeps it for [`finish_device_login`], so the
+/// code can be shown and the process end while the person approves it.
+pub async fn start_device_login(
+    integration: &str,
+    config: &AzureConfig,
+) -> anyhow::Result<DeviceStart> {
+    let tenant = config.tenant.as_deref().unwrap_or("organizations");
+    let (pending, user_code, url) = start_device(tenant).await?;
+    store::set(&pending_key(integration), &pending)?;
+    Ok(DeviceStart {
+        url,
+        user_code,
+        expires_at: pending.expires_at,
+    })
+}
+
+/// Whether a device sign-in [`start_device_login`] started is waiting.
+pub fn has_pending_login(integration: &str) -> anyhow::Result<bool> {
+    Ok(store::get::<PendingDevice>(&pending_key(integration))?.is_some())
+}
+
+/// Waits for the sign-in [`start_device_login`] started to be approved,
+/// then keeps it as `login` does; returns the account's user name. The
+/// started sign-in is forgotten once it ends either way.
+pub async fn finish_device_login(
+    integration: &str,
+    config: &AzureConfig,
+) -> anyhow::Result<String> {
+    let key = pending_key(integration);
+    let Some(pending) = store::get::<PendingDevice>(&key)? else {
+        bail!(
+            "no device sign-in was started for '{integration}'; run `fob login {integration} --start` first"
+        );
+    };
+    if pending.tenant != config.tenant.as_deref().unwrap_or("organizations") {
+        store::delete(&key)?;
+        bail!(
+            "the sign-in started for '{integration}' was for another tenant; run `fob login {integration} --start` again"
+        );
+    }
+    if pending.expires_at <= jiff::Timestamp::now() {
+        store::delete(&key)?;
+        bail!(
+            "the code of the sign-in started for '{integration}' expired; run `fob login {integration} --start` again"
+        );
+    }
+    let polled = poll_device(&pending).await;
+    // Approved, refused or expired, the device code is spent.
+    store::delete(&key)?;
+    keep_sign_in(integration, config, polled?).await
+}
+
+/// Stores the sign-in a token response holds; returns the user name.
+async fn keep_sign_in(
+    integration: &str,
+    config: &AzureConfig,
+    response: TokenResponse,
+) -> anyhow::Result<String> {
     let claims = response
         .id_token
         .as_deref()
@@ -249,10 +339,8 @@ async fn browser_sign_in(
     }
 }
 
-async fn device_sign_in(
-    tenant: &str,
-    show: impl FnOnce(SignInPrompt),
-) -> anyhow::Result<TokenResponse> {
+/// Starts the device flow: what polling needs, the code and where to enter it.
+async fn start_device(tenant: &str) -> anyhow::Result<(PendingDevice, String, String)> {
     #[derive(Deserialize)]
     struct DeviceCode {
         device_code: String,
@@ -275,20 +363,29 @@ async fn device_sign_in(
         );
     }
     let device: DeviceCode = response.json().await?;
-    show(SignInPrompt {
-        url: &device.verification_uri,
-        user_code: Some(&device.user_code),
-    });
-    let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
-    let mut interval = Duration::from_secs(device.interval.unwrap_or(5));
+    let expires_at = jiff::Timestamp::now()
+        .saturating_add(jiff::SignedDuration::from_secs(device.expires_in as i64))
+        .unwrap_or(jiff::Timestamp::MAX);
+    let pending = PendingDevice {
+        tenant: tenant.to_string(),
+        device_code: device.device_code,
+        interval_secs: device.interval.unwrap_or(5),
+        expires_at,
+    };
+    Ok((pending, device.user_code, device.verification_uri))
+}
+
+/// Polls until the person approves the device sign-in, or its code expires.
+async fn poll_device(pending: &PendingDevice) -> anyhow::Result<TokenResponse> {
+    let mut interval = Duration::from_secs(pending.interval_secs);
     loop {
         tokio::time::sleep(interval).await;
         let polled = exchange(
-            tenant,
+            &pending.tenant,
             &[
                 ("client_id", CLIENT_ID),
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", &device.device_code),
+                ("device_code", &pending.device_code),
             ],
             None,
         )
@@ -299,7 +396,7 @@ async fn device_sign_in(
             Exchange::Refused(e) if e.error == "slow_down" => interval += Duration::from_secs(5),
             Exchange::Refused(e) => bail!("Entra ID refused the sign-in: {}", e.detail()),
         }
-        if std::time::Instant::now() >= deadline {
+        if jiff::Timestamp::now() >= pending.expires_at {
             bail!("the sign-in was not approved in time");
         }
     }
@@ -435,6 +532,7 @@ pub fn account(integration: &str) -> anyhow::Result<Option<String>> {
 /// Forgets the sign-in. Entra ID offers public clients no revocation, so,
 /// as with `az logout`, the refresh token is only deleted here.
 pub fn logout(integration: &str) -> anyhow::Result<bool> {
+    store::delete(&pending_key(integration))?;
     store::delete(&token_key(integration))
 }
 
