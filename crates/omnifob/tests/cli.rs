@@ -873,6 +873,20 @@ async fn failures_carry_a_code_for_agents_and_scripts() {
     let error = error_line(&fob.run_as_agent(&["login", "nope"]));
     assert_eq!(error["code"], "integration_not_found", "{error}");
     assert_eq!(error["configured"], json!(["acme"]), "{error}");
+    let missing = fob.root.join("missing.toml");
+    let error = error_line(&fob.run_as_agent(&["--config", missing.to_str().unwrap(), "list"]));
+    assert_eq!(error["code"], "config_invalid", "{error}");
+    let error = error_line(&fob.run_as_agent(&["console", "acme/prod/Admin", "--print"]));
+    assert_eq!(error["code"], "use_exec", "{error}");
+    assert_eq!(error["run"], "fob console acme/prod/Admin", "{error}");
+    // A marker turned off is no agent: no line for programs.
+    let output = fob
+        .command(&["exec", "nothing-like-it", "--", "true"])
+        .env("CLAUDECODE", "0")
+        .output()
+        .unwrap();
+    let (_, stderr) = texts(&output);
+    assert!(!stderr.contains("fob-error"), "{stderr}");
 
     // People see the message alone, unless they ask for the line.
     let stderr = fob.fails(&["exec", "nothing-like-it", "--", "true"]);

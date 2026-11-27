@@ -85,9 +85,13 @@ impl App {
         );
         // The integrations that synced are saved; the others keep their old
         // profiles and are reported last, so none of them scrolls away.
+        if failures.len() == 1 {
+            // As context, so a needed login or a locked vault keeps its code.
+            let (name, e) = failures.remove(0);
+            return Err(e.context(format!("syncing '{name}'")));
+        }
         match failures.as_slice() {
             [] => Ok(()),
-            [(name, e)] => Err(anyhow::anyhow!("syncing '{name}': {e:#}")),
             _ => {
                 for (name, e) in &failures {
                     eprintln!("fob: syncing '{name}': {e:#}");
@@ -362,16 +366,8 @@ impl App {
         if query.is_none() && !pick.by_account() && pick.directory_default {
             from_directory = self.directory_default()?;
             if let Some((dir, id)) = &from_directory {
-                if agent::active() {
-                    return Err(Coded::new(
-                        Code::ProfileAmbiguous,
-                        format!(
-                            "name a profile by its full id; this directory's default ({dir}) is {id}"
-                        ),
-                    )
-                    .with("candidates", vec![id.clone()])
-                    .into());
-                }
+                // A default that is gone, or kept from agents, says so before
+                // an agent is asked to name it.
                 if !self.cache.all().any(|p| p.id == *id) {
                     return Err(Coded::new(
                         Code::ProfileNotFound,
@@ -380,6 +376,27 @@ impl App {
                         ),
                     )
                     .with("query", id.as_str())
+                    .into());
+                }
+                if agent::active() && !self.config.agent.allows(id) {
+                    return Err(Coded::new(
+                        Code::NotOpenToAgents,
+                        format!(
+                            "{id}, this directory's default ({dir}), is not open to agents; ask the user to run the command or to give agents access"
+                        ),
+                    )
+                    .with("profile", id.as_str())
+                    .into());
+                }
+                if agent::active() {
+                    return Err(Coded::new(
+                        Code::ProfileAmbiguous,
+                        format!(
+                            "name a profile by its full id; this directory's default ({dir}) is {id}"
+                        ),
+                    )
+                    .with("matches", 1)
+                    .with("candidates", vec![id.clone()])
                     .into());
                 }
             }

@@ -491,18 +491,18 @@ fob: getting credentials for acme/dev/ReadOnly: not signed in to 'acme'; run `fo
 fob-error: {"code":"login_required","integration":"acme","message":"getting credentials for acme/dev/ReadOnly: not signed in to 'acme'; run `fob login acme`","run":"fob login acme"}
 ```
 
-| Code                    | Values                           | Meaning                                                                  |
-| ----------------------- | -------------------------------- | ------------------------------------------------------------------------ |
-| `login_required`        | `integration`, `run`             | The integration needs `fob login`.                                       |
-| `profile_ambiguous`     | `candidates`, `matches`, `query` | Several profiles match, or under an agent the words were not a full id.  |
-| `profile_not_found`     | `query`                          | No profile matches.                                                      |
-| `not_open_to_agents`    | `profile`                        | `[agent] profiles` keeps the profile from agents.                        |
-| `mfa_required`          | `profile`, `run`                 | A code from the MFA device is needed; `run` in a terminal asks for it.   |
-| `vault_locked`          | `vault`                          | The encrypted vault has not been unlocked since boot.                    |
-| `use_exec`              | `run`, `profile`                 | The command would print credentials or change the shell; use `fob exec`. |
-| `config_invalid`        | `path`                           | The config file does not load.                                           |
-| `integration_not_found` | `integration`, `configured`      | No integration of that name.                                             |
-| `other`                 |                                  | Anything else; the message says what.                                    |
+| Code                    | Values                           | Meaning                                                                                                                        |
+| ----------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `login_required`        | `integration`, `run`             | The integration needs `fob login`.                                                                                             |
+| `profile_ambiguous`     | `candidates`, `matches`, `query` | Several profiles match, or under an agent the words were not a full id.                                                        |
+| `profile_not_found`     | `query`                          | No profile matches.                                                                                                            |
+| `not_open_to_agents`    | `profile`, `integration`         | `[agent] profiles` keeps the profile (or every role `fob discover aws` would search) from agents.                              |
+| `mfa_required`          | `profile`, `run`                 | A code from the MFA device is needed; `run` in a terminal asks for it.                                                         |
+| `vault_locked`          | `vault`                          | The encrypted vault has not been unlocked since boot.                                                                          |
+| `use_exec`              | `run`, `profile`                 | The command would print credentials or change the shell; run what `run` says (`fob exec`, or `fob console` without `--print`). |
+| `config_invalid`        | `path`                           | The config file does not load, cannot be read, or the file `--config` names does not exist.                                    |
+| `integration_not_found` | `integration`, `configured`      | No integration of that name.                                                                                                   |
+| `other`                 |                                  | Anything else; the message says what.                                                                                          |
 
 `fob check --json` and `fob status --check --json` give a failed check's `code` too. Codes keep their meaning across releases; new ones may be added.
 
