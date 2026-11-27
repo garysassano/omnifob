@@ -159,7 +159,10 @@ impl TryFrom<RawIntegration> for Integration {
                 c.validate()?;
                 Integration::Gcp(c)
             }
-            RawIntegration::Azure(c) => Integration::Azure(c),
+            RawIntegration::Azure(c) => {
+                c.validate()?;
+                Integration::Azure(c)
+            }
             RawIntegration::Token(c) => {
                 c.validate()?;
                 Integration::Token(c)
@@ -423,6 +426,10 @@ pub fn check_name(what: &str, name: &str) -> anyhow::Result<()> {
     }
     if name.starts_with('-') {
         bail!("{what} '{name}' must not start with '-'");
+    }
+    // Names become path segments (lock files, the vault's files).
+    if name == "." || name == ".." {
+        bail!("{what} must not be '{name}'");
     }
     if !name
         .chars()

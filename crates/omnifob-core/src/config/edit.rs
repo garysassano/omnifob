@@ -100,14 +100,14 @@ mod tests {
 
     #[test]
     fn renames_keep_comments_order_and_subtables() {
-        let text = "# mine\n[integrations.gary] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.gary.chained.lab]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
-        let renamed = rename_integration(text, "gary", "aws").unwrap();
+        let text = "# mine\n[integrations.mine] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.mine.chained.lab]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
+        let renamed = rename_integration(text, "mine", "aws").unwrap();
         assert_eq!(
             renamed,
-            text.replace("integrations.gary", "integrations.aws")
+            text.replace("integrations.mine", "integrations.aws")
         );
         assert!(
-            rename_integration(text, "gary", "cf")
+            rename_integration(text, "mine", "cf")
                 .unwrap_err()
                 .to_string()
                 .contains("already exists")
@@ -120,7 +120,7 @@ mod tests {
         );
         for bad in ["a/b", "a b", "", "a\"b"] {
             assert!(
-                rename_integration(text, "gary", bad).is_err(),
+                rename_integration(text, "mine", bad).is_err(),
                 "{bad:?} is refused"
             );
         }
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn adds_cloudflare_templates() {
-        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare-token\"\n\n[integrations.gary]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
+        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare-token\"\n\n[integrations.mine]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
         let template = CloudflareTemplate {
             permissions: vec!["Pages Write".into(), "Zone Read".into()],
             optional: vec![],
@@ -154,7 +154,7 @@ mod tests {
         );
         assert!(add_cloudflare_template(&added, "cf", "pages", &template, true).is_ok());
         assert!(
-            err(add_cloudflare_template(text, "gary", "x", &template, false))
+            err(add_cloudflare_template(text, "mine", "x", &template, false))
                 .contains("not a cloudflare")
         );
         assert!(

@@ -11,9 +11,17 @@ filter="${1:-}"
 
 printf '%-32s %-10s %7s  %-10s %s\n' TOOL STATUS STARS PUSHED ARCHIVED
 # Table rows look like: | [name](https://github.com/owner/repo) | covers | why | status | look at |
-sed -nE 's/^\| \[([^]]+)\]\(https:\/\/github\.com\/([^)]+)\) \|[^|]*\|.*\| ([^|]+) \|[^|]*\|$/\1\t\2\t\3/p' "$dir/README.md" |
+# Biome pads the columns, so cells are split on `|` and trimmed.
+awk -F'|' '
+  function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+  $2 ~ /^[[:space:]]*\[[^]]+\]\(https:\/\/github\.com\/[^)]+\)/ {
+    link = trim($2)
+    name = link; sub(/^\[/, "", name); sub(/\].*$/, "", name)
+    repo = link; sub(/^.*\(https:\/\/github\.com\//, "", repo); sub(/\).*$/, "", repo)
+    printf "%s\t%s\t%s\n", name, repo, trim($5)
+  }' "$dir/README.md" |
   while IFS=$'\t' read -r name repo status; do
-    status="$(tr -d '*' <<<"$status" | tr ' ' '-')"
+    status="$(tr -d '*_' <<<"$status" | tr ' ' '-')"
     [[ -z "$filter" || "$status" == "$filter" ]] || continue
     if info="$("$gh" api "repos/$repo" --jq '[.stargazers_count, .pushed_at[:10], .archived] | @tsv' 2>/dev/null)"; then
       IFS=$'\t' read -r stars pushed archived <<<"$info"

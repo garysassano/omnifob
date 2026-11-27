@@ -62,7 +62,8 @@ impl AwsSsoConfig {
         }
         if self.scopes.is_empty() || self.scopes.iter().any(|s| s.trim().is_empty()) {
             return Err(
-                "scopes must name at least one scope, and none may be empty; leave it out for                  the default, [\"sso:account:access\"]"
+                "scopes must name at least one scope, and none may be empty; leave it out for \
+                 the default, [\"sso:account:access\"]"
                     .to_string(),
             );
         }
