@@ -248,7 +248,15 @@ impl Config {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            Err(e) => {
+                return Err(crate::Coded::wrap(
+                    crate::Code::ConfigInvalid,
+                    format!("reading {}", path.display()),
+                    e.into(),
+                )
+                .with("path", path.display().to_string())
+                .into());
+            }
         };
         parse(&text).map_err(|e| {
             crate::Coded::wrap(

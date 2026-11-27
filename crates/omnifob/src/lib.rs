@@ -61,6 +61,15 @@ pub fn main() -> ExitCode {
     )
     .init();
 
+    // Styled names and notes in fob's own output follow the same rule as
+    // the log, so a coding agent in a terminal gets plain text.
+    if !logging::colors_on_stderr() {
+        dialoguer::console::set_colors_enabled_stderr(false);
+    }
+    if agent::active() {
+        dialoguer::console::set_colors_enabled(false);
+    }
+
     let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
     if let Some(path) = &cli.config {
         // Through the variable, so every reader of the config (and `fob
@@ -97,7 +106,9 @@ pub fn main() -> ExitCode {
 /// the code, such as the command to `run`.
 fn report(e: &anyhow::Error) {
     eprintln!("fob: {e:#}");
-    if agent::active() || std::env::var("OMNIFOB_ERROR_FORMAT").is_ok_and(|v| v == "json") {
+    if agent::active()
+        || std::env::var("OMNIFOB_ERROR_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"))
+    {
         eprintln!("fob-error: {}", error_json(e));
     }
 }
@@ -210,7 +221,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         && !matches!(cli.command, Command::Import(_))
         && matches!(std::fs::metadata(&config_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
     {
-        bail!("the config file {} does not exist", config_file.display());
+        return Err(omnifob_core::Coded::new(
+            omnifob_core::Code::ConfigInvalid,
+            format!("the config file {} does not exist", config_file.display()),
+        )
+        .with("path", config_file.display().to_string())
+        .into());
     }
     // `fob rename` has to open a config with a name the rule refuses, to fix it.
     let config = if matches!(cli.command, Command::Rename { .. }) {

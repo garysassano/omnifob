@@ -49,7 +49,7 @@ When fob fails, the last line of its stderr is `fob-error: ` followed by JSON: a
 - `not_open_to_agents` (`profile`): the user limited agents to some profiles. Use an allowed one, or ask the user to run the command.
 - `mfa_required` (`profile`, `run`): ask the user to run the `run` command (`fob exec <profile> -- true`) in their terminal, then retry.
 - `vault_locked`: the user keeps secrets in an encrypted vault that has not been unlocked since boot. Ask them to run any `fob` command (`fob status`) in their terminal to enter the passphrase, then retry; never ask for the passphrase or set `OMNIFOB_VAULT_PASSPHRASE` yourself.
-- `use_exec` (`run`): the command would print credentials or change a shell you do not keep; run what you need as `fob exec <profile> -- <command>`.
+- `use_exec` (`run`): the command would print credentials or change a shell you do not keep; run what you need as `fob exec <profile> -- <command>`, or, for a console URL, what `run` says (`fob console <profile>`, which opens the user's browser).
 - `config_invalid` (`path`): the message names the key and why (`chained.prod: duration must be...`). Tell the user; do not edit the config yourself.
 - `integration_not_found` (`configured`): use one of the configured names.
 - `other`: read the message. Some it may be:

@@ -1,6 +1,6 @@
 //! `fob console`: open the provider's web console as a profile.
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use omnifob_core::providers;
 
 use crate::{App, clipboard, record_use};
@@ -26,10 +26,16 @@ impl App {
         if crate::agent::active()
             && (action == Action::Print || (action == Action::Copy && clipboard::over_ssh()))
         {
-            bail!(
-                "not printing the console sign-in URL into an agent's output; `fob console {}` opens it in the user's browser",
-                profile.id
-            );
+            return Err(omnifob_core::Coded::new(
+                omnifob_core::Code::UseExec,
+                format!(
+                    "not printing the console sign-in URL into an agent's output; `fob console {}` opens it in the user's browser",
+                    profile.id
+                ),
+            )
+            .with("profile", profile.id.as_str())
+            .with("run", format!("fob console {}", profile.id))
+            .into());
         }
         providers::check_console_options(&self.config, &profile, options)?;
         // New credentials, not cached ones: without a session length the

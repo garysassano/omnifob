@@ -263,14 +263,17 @@ impl App {
 struct Failure {
     message: String,
     code: omnifob_core::Code,
+    details: serde_json::Map<String, serde_json::Value>,
 }
 
 impl From<omnifob_core::Error> for Failure {
     fn from(e: omnifob_core::Error) -> Self {
         let e = anyhow::Error::from(e);
+        let (code, details) = omnifob_core::classify(&e);
         Self {
             message: format!("{e:#}"),
-            code: omnifob_core::classify(&e).0,
+            code,
+            details,
         }
     }
 }
@@ -279,11 +282,15 @@ impl From<omnifob_core::Error> for Failure {
 fn check_json(result: &Result<String, Failure>) -> serde_json::Value {
     match result {
         Ok(detail) => json!({ "ok": true, "detail": detail }),
-        Err(failure) => json!({
-            "ok": false,
-            "detail": failure.message,
-            "code": failure.code.as_str(),
-        }),
+        Err(failure) => {
+            // The code's values too (`run`, `integration`), as `fob-error`
+            // gives them; the fixed keys win over a value of the same name.
+            let mut object = failure.details.clone();
+            object.insert("ok".into(), false.into());
+            object.insert("detail".into(), failure.message.clone().into());
+            object.insert("code".into(), failure.code.as_str().into());
+            object.into()
+        }
     }
 }
 

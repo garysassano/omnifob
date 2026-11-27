@@ -82,10 +82,13 @@ fn detect(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
         Some("0" | "false" | "no") => return None,
         _ => {}
     }
-    MARKERS
-        .iter()
-        .copied()
-        .find(|marker| var(marker).is_some_and(|v| !v.is_empty()))
+    // `CLAUDECODE=0` or `CLINE_ACTIVE=false` says no agent.
+    MARKERS.iter().copied().find(|marker| {
+        var(marker).is_some_and(|v| {
+            let v = v.to_string_lossy().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        })
+    })
 }
 
 /// The error for a command that would print credentials into the agent's
@@ -121,6 +124,9 @@ mod tests {
         assert!(detect_with(&[("CLAUDECODE", "1")]));
         assert!(detect_with(&[("CODEX_SANDBOX", "seatbelt")]));
         assert!(!detect_with(&[("CLAUDECODE", "")]));
+        // A marker turned off is no marker.
+        assert!(!detect_with(&[("CLAUDECODE", "0")]));
+        assert!(!detect_with(&[("CLINE_ACTIVE", "false")]));
         assert!(detect_with(&[("OMNIFOB_AGENT", "1")]));
         assert!(detect_with(&[("OMNIFOB_AGENT", "TRUE")]));
         assert!(!detect_with(&[("OMNIFOB_AGENT", "0"), ("CLAUDECODE", "1")]));

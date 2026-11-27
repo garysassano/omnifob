@@ -16,12 +16,22 @@ where
     use tracing_subscriber::layer::SubscriberExt;
     tracing_subscriber::fmt()
         .with_writer(writer)
+        .with_ansi(colors_on_stderr())
         .with_env_filter(filter)
         .without_time()
         .finish()
         .with(tracing_subscriber::filter::filter_fn(|meta| {
             !logs_http_bodies(meta)
         }))
+}
+
+/// Whether stderr takes colour: a terminal, without `NO_COLOR`, and not a
+/// coding agent's, whose transcript would keep the escape codes.
+pub(crate) fn colors_on_stderr() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+        && !crate::agent::active()
 }
 
 /// Whether a log event may hold whole HTTP requests or responses: the AWS
