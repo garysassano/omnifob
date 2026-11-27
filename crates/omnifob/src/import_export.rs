@@ -183,12 +183,13 @@ fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Leaves out of an imported portal what a configured one already has:
-/// chained roles one of its rules gives, including the accounts of an
-/// imported rule for the same permission set, role name and path (the rest
-/// of that rule's accounts come in as tables, since the configured rule is
-/// not rewritten). Imported rules get labels of their own where theirs is
-/// taken by a configured table or rule.
-fn keep_new_rules(
+/// chained roles with a configured table's label or role, chained roles one
+/// of its rules gives, including the accounts of an imported rule for the
+/// same permission set, role name and path (the rest of that rule's
+/// accounts come in as tables, since the configured rule is not rewritten).
+/// What remains gets labels of its own where theirs is taken by a
+/// configured table or rule, so the config still parses once it is added.
+fn keep_new(
     existing: &omnifob_core::config::AwsSsoConfig,
     portal: &mut omnifob_core::import::AwsPortal,
 ) {
@@ -212,29 +213,58 @@ fn keep_new_rules(
             );
         }
     }
-    portal.chained.retain(|_, role| {
-        !existing.chained_rules.values().any(|rule| {
+    // Labels become lowercase in ids, so `Prod` there is `prod` here.
+    let tables: Vec<String> = existing.chained.keys().map(|l| slug(l)).collect();
+    portal.chained.retain(|label, role| {
+        let given_by_rule = existing.chained_rules.values().any(|rule| {
             rule.via_role == role.via_role
                 && rule.applies_to(&role.via_account_id)
                 && rule.role_for(&role.via_account_id, partition).role_arn == role.role_arn
-        })
+        });
+        let configured = existing.chained.values().any(|c| {
+            c.via_account_id == role.via_account_id
+                && c.via_role == role.via_role
+                && c.role_arn == role.role_arn
+        });
+        !given_by_rule && !configured && !tables.contains(&slug(label))
     });
-    let rules = std::mem::take(&mut portal.chained_rules);
-    for (label, rule) in rules {
+    let configured: Vec<String> = existing
+        .chained
+        .keys()
+        .chain(existing.chained_rules.keys())
+        .map(|l| slug(l))
+        .collect();
+    let chained = std::mem::take(&mut portal.chained);
+    for (label, role) in chained {
         let taken = |l: &str| {
-            existing.chained.contains_key(l)
-                || existing.chained_rules.contains_key(l)
+            configured.contains(&slug(l))
                 || portal.chained.contains_key(l)
                 || portal.chained_rules.contains_key(l)
         };
-        let mut unique = label.clone();
-        let mut n = 1;
-        while taken(&unique) {
-            n += 1;
-            unique = format!("{label}-{n}");
-        }
-        portal.chained_rules.insert(unique, rule);
+        portal.chained.insert(unique_label(&label, taken), role);
     }
+    let rules = std::mem::take(&mut portal.chained_rules);
+    for (label, rule) in rules {
+        let taken = |l: &str| {
+            configured.contains(&slug(l))
+                || portal.chained.contains_key(l)
+                || portal.chained_rules.contains_key(l)
+        };
+        portal
+            .chained_rules
+            .insert(unique_label(&label, taken), rule);
+    }
+}
+
+/// `label`, or `label-2`, `label-3`, ... until `taken` refuses none.
+fn unique_label(label: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut unique = label.to_string();
+    let mut n = 1;
+    while taken(&unique) {
+        n += 1;
+        unique = format!("{label}-{n}");
+    }
+    unique
 }
 
 pub(crate) fn import_aws(
@@ -284,10 +314,7 @@ pub(crate) fn import_aws(
     }
     for mut portal in import.portals {
         if let Some((name, existing)) = configured.get(&portal.start_url) {
-            // Labels become lowercase in ids, so `Prod` there is `prod` here.
-            let labels: Vec<String> = existing.chained.keys().map(|l| slug(l)).collect();
-            portal.chained.retain(|label, _| !labels.contains(label));
-            keep_new_rules(existing, &mut portal);
+            keep_new(existing, &mut portal);
             if portal.chained.is_empty() && portal.chained_rules.is_empty() {
                 eprintln!(
                     "fob: {} is already configured as '{name}'",

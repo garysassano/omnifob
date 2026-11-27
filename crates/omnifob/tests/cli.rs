@@ -2232,6 +2232,30 @@ fn import_folds_a_role_every_account_has_into_a_rule_once() {
             && stdout.contains("arn:aws:iam::333333333333:role/root"),
         "{stdout}"
     );
+
+    // Importing again adds nothing: the table written for the third account
+    // is not expanded from the rule a second time.
+    fob.ok(&["import", "aws", "--write"]);
+    let (_, stderr) = fob.ok(&["import", "aws"]);
+    assert!(stderr.contains("nothing new to import"), "{stderr}");
+
+    // A table labelled like a configured rule gets a label of its own, so
+    // the config still loads.
+    text.push_str(
+        "[profile root]\nsource_profile = ops-pe\nrole_arn = arn:aws:iam::333333333333:role/admin\n",
+    );
+    std::fs::write(fob.aws_config(), &text).unwrap();
+    let (stdout, _) = fob.ok(&["import", "aws"]);
+    assert!(stdout.contains("chained.\"root-2\"]"), "{stdout}");
+    fob.ok(&["import", "aws", "--write"]);
+    let config = omnifob_core::Config::load(&fob.config_file()).unwrap();
+    let omnifob_core::Integration::AwsSso(portal) = &config.integrations["acme"] else {
+        panic!("{:?}", config.integrations.keys());
+    };
+    assert_eq!(
+        portal.chained["root-2"].role_arn,
+        "arn:aws:iam::333333333333:role/admin"
+    );
 }
 
 // Providers other than IAM Identity Center, each against a mock of its
