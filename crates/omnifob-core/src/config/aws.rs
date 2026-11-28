@@ -14,11 +14,11 @@ use crate::providers::aws::partition::Partition;
 pub struct AwsSsoConfig {
     /// The AWS access portal URL, e.g. `https://acme.awsapps.com/start`.
     pub start_url: String,
-    /// The region IAM Identity Center runs in.
-    pub region: String,
+    /// The Region IAM Identity Center runs in.
+    pub sso_region: String,
     /// Region exported as `AWS_REGION` for every profile of this integration.
     #[serde(default)]
-    pub default_region: Option<String>,
+    pub region: Option<String>,
     /// OIDC scopes. `sso:account:access` makes Identity Center issue a refresh
     /// token, so sessions renew without a browser until the portal session ends.
     #[serde(default = "default_sso_scopes")]
@@ -56,9 +56,9 @@ pub struct AwsSsoConfig {
 impl AwsSsoConfig {
     pub(super) fn validate(&self) -> Result<(), String> {
         check_https_url("start_url", &self.start_url)?;
-        check_region("region", &self.region)?;
-        if let Some(region) = &self.default_region {
-            check_region("default_region", region)?;
+        check_region("sso_region", &self.sso_region)?;
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
         }
         if self.scopes.is_empty() || self.scopes.iter().any(|s| s.trim().is_empty()) {
             return Err(
@@ -71,7 +71,7 @@ impl AwsSsoConfig {
             if let Some(region) = &role.region {
                 check_region(&format!("chained.{label}.region"), region)?;
             }
-            role.validate(&self.region)
+            role.validate(&self.sso_region)
                 .map_err(|e| format!("chained.{label}: {e}"))?;
         }
         for (label, rule) in &self.chained_rules {
@@ -80,7 +80,7 @@ impl AwsSsoConfig {
                     "chained.{label} and chained_rules.{label} share a label; rename one of them"
                 ));
             }
-            rule.validate(&self.region)
+            rule.validate(&self.sso_region)
                 .map_err(|e| format!("chained_rules.{label}: {e}"))?;
         }
         for (label, role) in &self.cross_partition {
@@ -108,14 +108,14 @@ impl AwsSsoConfig {
     }
 
     /// The Region a cross-partition role's token is requested in, when the
-    /// role sets none: `default_region`, else the portal's.
+    /// role sets none: `region`, else `sso_region`.
     pub fn default_source_region(&self) -> &str {
-        self.default_region.as_deref().unwrap_or(&self.region)
+        self.region.as_deref().unwrap_or(&self.sso_region)
     }
 
     /// The partition of the portal, which its roles' credentials belong to.
     pub fn partition(&self) -> anyhow::Result<Partition> {
-        Partition::of_region(&self.region)
+        Partition::of_region(&self.sso_region)
     }
 
     /// The chained role a profile labelled `label` assumes: its `chained`
@@ -364,7 +364,7 @@ impl ChainedRule {
     pub(crate) fn validate(&self, portal_region: &str) -> Result<(), String> {
         let partition = Partition::of_region(portal_region).map_err(|_| {
             format!(
-                "the portal's region {portal_region} is in a partition omnifob does not model, \
+                "the portal's sso_region {portal_region} is in a partition omnifob does not model, \
                  so it cannot write the roles' ARNs; use `chained` tables instead"
             )
         })?;
@@ -449,7 +449,7 @@ pub struct CrossPartitionRole {
     /// The destination partition's STS Region, exported as `AWS_REGION`.
     pub region: String,
     /// Where the token is requested; defaults to the integration's
-    /// `default_region`, then the portal's Region.
+    /// `region`, then its `sso_region`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_region: Option<String>,
     /// How the token is signed; ES384 unless set.
@@ -520,7 +520,7 @@ impl CrossPartitionRole {
     }
 
     /// The Region the token is requested in: `source_region`, else the
-    /// portal's `default_region`, else the portal's Region.
+    /// portal's `region`, else its `sso_region`.
     pub fn source_region<'a>(&'a self, portal: &'a AwsSsoConfig) -> &'a str {
         self.source_region
             .as_deref()
@@ -558,16 +558,16 @@ impl CrossPartitionRole {
             check_region("source_region", region)?;
         }
         let source_region = self.source_region(portal);
-        let source_key = match (&self.source_region, &portal.default_region) {
+        let source_key = match (&self.source_region, &portal.region) {
             (Some(_), _) => "source_region",
-            (None, Some(_)) => "default_region (the default source_region)",
-            (None, None) => "the portal's region (the default source_region)",
+            (None, Some(_)) => "region (the default source_region)",
+            (None, None) => "sso_region (the default source_region)",
         };
         let source =
             Partition::of_region(source_region).map_err(|e| format!("{source_key}: {e:#}"))?;
         let portal_partition = portal
             .partition()
-            .map_err(|e| format!("the portal's region: {e:#}"))?;
+            .map_err(|e| format!("sso_region: {e:#}"))?;
         if source != portal_partition {
             return Err(format!(
                 "{source_key} {source_region} is in the {source} partition, but the Identity \
@@ -772,11 +772,12 @@ impl AwsIamConfig {
 #[serde(deny_unknown_fields)]
 pub struct AwsLoginConfig {
     /// The Region signed in through; the refresh token works only there. It
-    /// is also exported as `AWS_REGION` unless `default_region` is set.
-    pub region: String,
-    /// Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` instead of `region`.
+    /// is also exported as `AWS_REGION` unless `region` is set.
+    pub login_region: String,
+    /// Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` instead of
+    /// `login_region`.
     #[serde(default)]
-    pub default_region: Option<String>,
+    pub region: Option<String>,
     /// Middle segment of the profile's id; defaults to the account ID.
     #[serde(default)]
     pub account: Option<String>,
@@ -794,12 +795,12 @@ pub struct AwsLoginConfig {
 impl AwsLoginConfig {
     pub(super) fn validate(&self) -> Result<(), String> {
         check_not_blank("account", self.account.as_deref())?;
-        check_region("region", &self.region)?;
-        if let Some(region) = &self.default_region {
-            check_region("default_region", region)?;
+        check_region("login_region", &self.login_region)?;
+        if let Some(region) = &self.region {
+            check_region("region", region)?;
         }
         for (label, role) in &self.roles {
-            role.validate(&self.region)
+            role.validate(&self.login_region)
                 .map_err(|e| format!("roles.{label}: {e}"))?;
         }
         check_unique_ids(
@@ -997,7 +998,7 @@ mod tests {
     fn console_durations_are_checked_and_have_no_default() {
         let sso = |extra: &str| {
             Config::parse(&format!(
-                "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n{extra}"
+                "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n{extra}"
             ))
         };
         let Integration::AwsSso(c) = &sso("").unwrap().integrations["a"] else {
@@ -1049,7 +1050,7 @@ mod tests {
     ) -> anyhow::Result<CrossPartitionRole> {
         let text = format!(
             "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-             region = \"{portal_region}\"\n{extra}\n\
+             sso_region = \"{portal_region}\"\n{extra}\n\
              [integrations.acme.cross_partition.gov-audit]\n{role}\n"
         );
         match Config::parse(&text)?.integrations.remove("acme").unwrap() {
@@ -1085,7 +1086,7 @@ mod tests {
         let portal = |extra: &str| {
             let text = format!(
                 "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-                 region = \"us-east-1\"\n{extra}\n[integrations.acme.cross_partition.gov-audit]\n{GOV_ROLE}\n"
+                 sso_region = \"us-east-1\"\n{extra}\n[integrations.acme.cross_partition.gov-audit]\n{GOV_ROLE}\n"
             );
             match Config::parse(&text)
                 .unwrap()
@@ -1102,13 +1103,13 @@ mod tests {
             c.cross_partition["gov-audit"].source_region(&c),
             "us-east-1"
         );
-        let c = portal("default_region = \"eu-west-1\"");
+        let c = portal("region = \"eu-west-1\"");
         assert_eq!(
             c.cross_partition["gov-audit"].source_region(&c),
             "eu-west-1"
         );
         let text = format!("{GOV_ROLE}\nsource_region = \"us-west-2\"");
-        let role = cross_partition("us-east-1", "default_region = \"eu-west-1\"", &text).unwrap();
+        let role = cross_partition("us-east-1", "region = \"eu-west-1\"", &text).unwrap();
         assert_eq!(role.source_region(&c), "us-west-2");
 
         let all = format!(
@@ -1170,11 +1171,10 @@ mod tests {
             error.contains("source_region cn-north-1 is in the aws-cn partition"),
             "{error}"
         );
-        // ...also when it comes from default_region.
-        let error =
-            cross_partition_error("us-east-1", "default_region = \"us-gov-west-1\"", GOV_ROLE);
+        // ...also when it comes from region.
+        let error = cross_partition_error("us-east-1", "region = \"us-gov-west-1\"", GOV_ROLE);
         assert!(
-            error.contains("default_region (the default source_region)"),
+            error.contains("region (the default source_region)"),
             "{error}"
         );
 
@@ -1185,7 +1185,7 @@ mod tests {
         ] {
             let error = cross_partition_error("us-isob-east-1", "", &role);
             assert!(
-                error.contains("cross_partition.gov-audit: the portal's region")
+                error.contains("cross_partition.gov-audit: sso_region")
                     && error.contains("isolated"),
                 "{error}"
             );
@@ -1290,7 +1290,7 @@ mod tests {
         let parse = |label: &str, chained_label: &str| {
             Config::parse(&format!(
                 "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-                 region = \"us-east-1\"\n\
+                 sso_region = \"us-east-1\"\n\
                  [integrations.acme.chained.\"{chained_label}\"]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
                  role_arn = \"arn:aws:iam::333333333333:role/Audit\"\n\
                  [integrations.acme.cross_partition.\"{label}\"]\n{GOV_ROLE}\n"
@@ -1321,7 +1321,7 @@ mod tests {
             "{:#}",
             Config::parse(&format!(
                 "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-                 region = \"us-east-1\"\n\
+                 sso_region = \"us-east-1\"\n\
                  [integrations.acme.cross_partition.Gov]\n{GOV_ROLE}\n\
                  [integrations.acme.cross_partition.gov]\n{GOV_ROLE}\n"
             ))
@@ -1341,7 +1341,7 @@ mod tests {
         let parse = |region: &str, rule: &str| {
             Config::parse(&format!(
                 "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-                 region = \"{region}\"\n[integrations.acme.chained_rules.root]\n{rule}\n"
+                 sso_region = \"{region}\"\n[integrations.acme.chained_rules.root]\n{rule}\n"
             ))
             .map(|_| ())
             .map_err(|e| format!("{e:#}"))
@@ -1403,7 +1403,7 @@ mod tests {
         // A label in both tables would make a profile's role ambiguous.
         let error = Config::parse(
             "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-             region = \"eu-west-1\"\n[integrations.acme.chained.root]\nvia_account_id = \"111111111111\"\n\
+             sso_region = \"eu-west-1\"\n[integrations.acme.chained.root]\nvia_account_id = \"111111111111\"\n\
              via_role = \"pe\"\nrole_arn = \"arn:aws:iam::111111111111:role/root\"\n\
              [integrations.acme.chained_rules.root]\nvia_role = \"pe\"\nrole_name = \"root\"\n",
         )
@@ -1420,7 +1420,7 @@ mod tests {
     fn a_chained_rule_gives_each_account_its_role() {
         let Integration::AwsSso(config) = Config::parse(
             "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://ac.awsapps.com/start\"\n\
-             region = \"us-gov-west-1\"\n[integrations.acme.chained_rules.root]\nvia_role = \"pe\"\n\
+             sso_region = \"us-gov-west-1\"\n[integrations.acme.chained_rules.root]\nvia_role = \"pe\"\n\
              role_name = \"root\"\npath = \"/ops/\"\nexclude_accounts = [\"333333333333\"]\n",
         )
         .unwrap()
@@ -1450,7 +1450,7 @@ mod tests {
         let parse = |portal_region: &str, role_arn: &str| {
             Config::parse(&format!(
                 "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-                 region = \"{portal_region}\"\n\
+                 sso_region = \"{portal_region}\"\n\
                  [integrations.acme.chained.audit]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
                  role_arn = \"{role_arn}\"\n"
             ))
@@ -1512,36 +1512,34 @@ mod tests {
             Config::parse(&format!("[integrations.u]\ntype = \"aws-iam\"\n{extra}")).map(|_| ())
         };
         let error = |result: anyhow::Result<()>| format!("{:#}", result.unwrap_err());
-        assert!(sso("region = \"eu-west-1\"\ndefault_region = \"us-gov-west-1\"").is_ok());
+        assert!(sso("sso_region = \"eu-west-1\"\nregion = \"us-gov-west-1\"").is_ok());
         // Isolated Regions pass the shape check; the console refuses them later.
-        assert!(sso("region = \"us-isob-east-1\"").is_ok());
+        assert!(sso("sso_region = \"us-isob-east-1\"").is_ok());
         let bad = "attacker.example#";
         for (key, result) in [
-            ("region", sso(&format!("region = \"{bad}\""))),
+            ("sso_region", sso(&format!("sso_region = \"{bad}\""))),
             (
-                "default_region",
-                sso(&format!(
-                    "region = \"eu-west-1\"\ndefault_region = \"{bad}\""
-                )),
+                "region",
+                sso(&format!("sso_region = \"eu-west-1\"\nregion = \"{bad}\"")),
             ),
             (
                 "chained.c.region",
                 sso(&format!(
-                    "region = \"eu-west-1\"\n[integrations.a.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
+                    "sso_region = \"eu-west-1\"\n[integrations.a.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\n\
                      role_arn = \"arn:aws:iam::222222222222:role/R\"\nregion = \"{bad}\""
                 )),
             ),
             (
                 "cross_partition.gov-audit: region",
                 sso(&format!(
-                    "region = \"us-east-1\"\n[integrations.a.cross_partition.gov-audit]\n{}",
+                    "sso_region = \"us-east-1\"\n[integrations.a.cross_partition.gov-audit]\n{}",
                     GOV_ROLE.replace("us-gov-west-1", bad)
                 )),
             ),
             (
                 "cross_partition.gov-audit: source_region",
                 sso(&format!(
-                    "region = \"us-east-1\"\n[integrations.a.cross_partition.gov-audit]\n{GOV_ROLE}\nsource_region = \"{bad}\""
+                    "sso_region = \"us-east-1\"\n[integrations.a.cross_partition.gov-audit]\n{GOV_ROLE}\nsource_region = \"{bad}\""
                 )),
             ),
             ("region", iam(&format!("region = \"{bad}\""))),
@@ -1558,10 +1556,10 @@ mod tests {
                 "{key}: {error}"
             );
         }
-        assert!(error(sso("region = \"EU-WEST-1\"")).contains("not an AWS Region name"));
+        assert!(error(sso("sso_region = \"EU-WEST-1\"")).contains("not an AWS Region name"));
     }
 
-    const SSO: &str = "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
+    const SSO: &str = "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n";
     const CHAINED: &str = "via_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n";
 
     #[test]

@@ -52,7 +52,7 @@ Otherwise, create `~/.config/omnifob/config.toml` with one entry per sign-in you
 [integrations.acme]                 # AWS IAM Identity Center
 type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
-region = "eu-central-1"             # the Region Identity Center runs in
+sso_region = "eu-central-1"         # the Region Identity Center runs in
 
 [integrations.google]               # Google Cloud
 type = "gcp"

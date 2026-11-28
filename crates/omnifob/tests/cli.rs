@@ -267,8 +267,8 @@ fn portal_config(name: &str) -> String {
         r#"[integrations.{name}]
 type = "aws-sso"
 start_url = "{START_URL}"
-region = "eu-west-1"
-default_region = "eu-central-1"
+sso_region = "eu-west-1"
+region = "eu-central-1"
 "#
     )
 }
@@ -1711,7 +1711,7 @@ async fn export_checks_its_prefix_and_the_existing_block() {
 fn export_gives_console_sign_in_profiles_their_region() {
     let fob = Fob::new("export-login");
     fob.write_config(
-        "[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\ndefault_region = \"eu-central-1\"\n",
+        "[integrations.console]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\nregion = \"eu-central-1\"\n",
     );
     std::fs::create_dir_all(fob.keyring()).unwrap();
     let session = json!({
@@ -2219,7 +2219,9 @@ async fn revoke_and_logout_all() {
 #[test]
 fn import_brings_in_console_sign_ins_and_skips_what_the_config_would_refuse() {
     let fob = Fob::new("import-aws");
-    fob.write_config("[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n");
+    fob.write_config(
+        "[integrations.console]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\n",
+    );
     std::fs::write(
         fob.aws_config(),
         "[profile p]\r\nsso_start_url = https://acme.awsapps.com/start\r\nsso_region = us-east-1\r\n\
@@ -2246,7 +2248,9 @@ fn import_brings_in_console_sign_ins_and_skips_what_the_config_would_refuse() {
         "{stderr}"
     );
     assert!(
-        stdout.contains("[integrations.laptop]\ntype = \"aws-login\"\nregion = \"us-west-2\"\n"),
+        stdout.contains(
+            "[integrations.laptop]\ntype = \"aws-login\"\nlogin_region = \"us-west-2\"\n"
+        ),
         "{stdout}"
     );
     assert!(
@@ -2787,7 +2791,9 @@ async fn a_console_sign_in_signs_in_in_the_browser_and_renews() {
     mount_aws_sign_in(&server).await;
     mount_sts(&server).await;
     let fob = Fob::new("aws-login").with_server(&server);
-    fob.write_config("[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n");
+    fob.write_config(
+        "[integrations.console]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\n",
+    );
     let stderr = fob.fails(&["login", "console", "--token-stdin"]);
     assert!(stderr.contains("it takes no token"), "{stderr}");
 

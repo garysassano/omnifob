@@ -144,7 +144,9 @@ impl<'a> Origin<'a> {
                 let region = super::iam::sts_region(c);
                 (Partition::of_region(region)?, region.to_string())
             }
-            crate::Integration::AwsLogin(c) => (super::login::partition(c)?, c.region.clone()),
+            crate::Integration::AwsLogin(c) => {
+                (super::login::partition(c)?, c.login_region.clone())
+            }
             other => anyhow::bail!(
                 "'{}' is a {} integration; only aws-sso, aws-iam and aws-login are searched",
                 profile.integration,

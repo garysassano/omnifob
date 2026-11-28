@@ -18,7 +18,7 @@ The config is a set of _integrations_, one per sign-in, each with a `type`:
 [integrations.acme]   # the integration's name, the first part of its profile ids
 type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
-region = "eu-central-1"
+sso_region = "eu-central-1"
 ```
 
 Integration names may contain only letters, digits, `.`, `_` and `-`, and may not start with `-`. A config with another name is refused with a pointer to `fob rename "<old name>" <new-name>`, which still works on it.
@@ -41,13 +41,15 @@ Two commands write integrations for you: `fob import aws --write` (see [Migratin
 [integrations.acme]
 type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
-region = "eu-central-1"          # where IAM Identity Center runs
-default_region = "eu-central-1"  # optional: exported as AWS_REGION
+sso_region = "eu-central-1"      # where IAM Identity Center runs
+region = "eu-central-1"          # optional: exported as AWS_REGION
 console_duration = "4h"          # optional: `fob console` session length, 15m to 12h; must fit the
                                  # permission set's session duration, 1h unless an administrator raised it
 ```
 
 `fob login acme` discovers every account and role the portal gives you. Profile ids are `acme/<account>/<permission set>`.
+
+The keys match `~/.aws/config`: `sso_region` is the Region IAM Identity Center runs in, and `region` is what tools get as `AWS_REGION`. Every AWS integration type uses `region` that way.
 
 ### Chained roles
 
@@ -117,7 +119,7 @@ An additional Region of a multi-Region Identity Center instance is a second inte
 [integrations.acme-eu]
 type = "aws-sso"
 start_url = "https://ssoins-1111111111111111.eu-west-1.portal.amazonaws.com"
-region = "eu-west-1"
+sso_region = "eu-west-1"
 ```
 
 ## AWS IAM user (`aws-iam`)
@@ -149,8 +151,8 @@ Console credentials, as `aws login` gets them: the browser picks a console sessi
 ```toml
 [integrations.console]
 type = "aws-login"
-region = "eu-central-1"        # the Region signed in through; also AWS_REGION
-default_region = "eu-west-1"   # optional: AWS_REGION instead of region
+login_region = "eu-central-1"  # the Region signed in through; also AWS_REGION
+region = "eu-west-1"           # optional: AWS_REGION instead of login_region
 
 [integrations.console.roles.audit]  # profile id: console/audit/Audit, assumed with the
 role_arn = "arn:aws:iam::333333333333:role/Audit"   # console credentials: role chaining,

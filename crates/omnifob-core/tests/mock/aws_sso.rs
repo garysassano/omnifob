@@ -35,7 +35,7 @@ fn config() -> AwsSsoConfig {
         [integrations.acme]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         "#
     );
     match Config::parse(&text)
@@ -762,7 +762,7 @@ async fn chained_roles_send_the_mfa_code_and_duration() {
         [integrations.chain]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         [integrations.chain.chained.prod]
         via_account_id = "111111111111"
         via_role = "Admin"
@@ -837,7 +837,7 @@ async fn an_agent_s_role_sessions_are_named_for_it_unless_configured() {
         [integrations.chain]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         [integrations.chain.chained.prod]
         via_account_id = "111111111111"
         via_role = "Admin"
@@ -899,7 +899,7 @@ async fn a_chained_rule_assumes_the_role_in_its_profile_account() {
         [integrations.rule]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         [integrations.rule.chained_rules.root]
         via_role = "pe"
         role_name = "root"
@@ -946,7 +946,7 @@ async fn credentials_carry_the_account_id() {
         [integrations.acct]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         [integrations.acct.chained.prod]
         via_account_id = "111111111111"
         via_role = "Admin"
@@ -1147,7 +1147,7 @@ async fn the_console_gets_new_credentials_and_caches_them() {
         .await;
 
     let text = format!(
-        "[integrations.fresh]\ntype = \"aws-sso\"\nstart_url = \"{START_URL}\"\nregion = \"eu-west-1\"\n"
+        "[integrations.fresh]\ntype = \"aws-sso\"\nstart_url = \"{START_URL}\"\nsso_region = \"eu-west-1\"\n"
     );
     let config = Config::parse(&text).unwrap();
     let profile = omnifob_core::Profile::new(
@@ -1224,7 +1224,7 @@ fn cross_partition_config(integration: &str) -> Config {
         [integrations.{integration}]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         [integrations.{integration}.cross_partition.gov]
         via_account_id = "111111111111"
         via_role = "Admin"
@@ -2565,7 +2565,7 @@ async fn agents_get_a_shorter_copy_of_a_long_session() {
         [integrations.scope]
         type = "aws-sso"
         start_url = "{START_URL}"
-        region = "eu-west-1"
+        sso_region = "eu-west-1"
         "#
     ))
     .unwrap();

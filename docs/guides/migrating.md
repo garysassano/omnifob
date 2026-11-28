@@ -78,7 +78,7 @@ Their configs are not imported. Copy each portal's start URL and Region into an 
 [integrations.acme]
 type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
-region = "eu-central-1"
+sso_region = "eu-central-1"
 ```
 
 IAM user keys from Leapp go into an [`aws-iam`](configuration.md#aws-iam-user-aws-iam) integration.

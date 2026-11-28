@@ -575,7 +575,7 @@
           "description": "How the token is signed; ES384 unless set."
         },
         "source_region": {
-          "description": "Where the token is requested; defaults to the integration's\n`default_region`, then the portal's Region.",
+          "description": "Where the token is requested; defaults to the integration's\n`region`, then its `sso_region`.",
           "type": "string"
         },
         "via_account_id": {
@@ -726,12 +726,8 @@
               "description": "Roles in another AWS partition, reached with a web identity token\nthat one of this portal's roles requests, keyed by a label that\nbecomes the middle of the profile id.",
               "type": "object"
             },
-            "default_region": {
-              "description": "Region exported as `AWS_REGION` for every profile of this integration.",
-              "type": "string"
-            },
             "region": {
-              "description": "The region IAM Identity Center runs in.",
+              "description": "Region exported as `AWS_REGION` for every profile of this integration.",
               "type": "string"
             },
             "scopes": {
@@ -743,6 +739,10 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "sso_region": {
+              "description": "The Region IAM Identity Center runs in.",
+              "type": "string"
             },
             "start_url": {
               "description": "The AWS access portal URL, e.g. `https://acme.awsapps.com/start`.",
@@ -756,7 +756,7 @@
           "required": [
             "type",
             "start_url",
-            "region"
+            "sso_region"
           ],
           "type": "object"
         },
@@ -814,12 +814,12 @@
               "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
               "type": "string"
             },
-            "default_region": {
-              "description": "Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` instead of `region`.",
+            "login_region": {
+              "description": "The Region signed in through; the refresh token works only there. It\nis also exported as `AWS_REGION` unless `region` is set.",
               "type": "string"
             },
             "region": {
-              "description": "The Region signed in through; the refresh token works only there. It\nis also exported as `AWS_REGION` unless `default_region` is set.",
+              "description": "Exported as `AWS_REGION` and `AWS_DEFAULT_REGION` instead of\n`login_region`.",
               "type": "string"
             },
             "roles": {
@@ -837,7 +837,7 @@
           },
           "required": [
             "type",
-            "region"
+            "login_region"
           ],
           "type": "object"
         },
