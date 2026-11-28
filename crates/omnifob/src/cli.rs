@@ -354,6 +354,14 @@ pub(crate) enum DiscoverCommand {
         /// Append what was found to the config instead of printing it
         #[arg(long)]
         write: bool,
+        /// Include CDK bootstrap and other roles tooling assumes for itself,
+        /// left out by default
+        #[arg(long)]
+        all: bool,
+        /// Print what was found, skipped and left out as JSON, for scripts
+        /// and agents, instead of config
+        #[arg(long, conflicts_with = "write")]
+        json: bool,
     },
 }
 

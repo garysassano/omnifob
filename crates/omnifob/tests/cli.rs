@@ -2323,8 +2323,9 @@ fn signing_account(request: &Request) -> String {
 }
 
 /// Mocks IAM for `fob discover aws`: in each account, the permission set's
-/// role, an `admin-root` role trusting the account, which the simulator
-/// allows, and a `lambda` role trusting a service.
+/// role, an `admin-root` role and a CDK bootstrap role trusting the
+/// account, which the simulator allows, and a `lambda` role trusting a
+/// service.
 async fn mount_iam(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/"))
@@ -2355,6 +2356,7 @@ async fn mount_iam(server: &MockServer) {
             let members = [
                 role("/aws-reserved/sso.amazonaws.com/", "AWSReservedSSO_Admin_0123456789abcdef", &root),
                 role("/", "admin-root", &root),
+                role("/", &format!("cdk-hnb659fds-deploy-role-{account}-eu-west-1"), &root),
                 role("/", "lambda", &trust(r#"{"Service":"lambda.amazonaws.com"}"#)),
             ]
             .concat();
@@ -2374,7 +2376,7 @@ async fn mount_iam(server: &MockServer) {
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/xml")
                 .set_body_string(format!(
-                    r#"<SimulatePrincipalPolicyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::{account}:role/admin-root</EvalResourceName><EvalDecision>allowed</EvalDecision></member></EvaluationResults></SimulatePrincipalPolicyResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SimulatePrincipalPolicyResponse>"#
+                    r#"<SimulatePrincipalPolicyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::${{Account}}:${{RelativeId}}</EvalResourceName><EvalDecision>allowed</EvalDecision><ResourceSpecificResults><member><EvalResourceName>arn:aws:iam::{account}:role/admin-root</EvalResourceName><EvalResourceDecision>allowed</EvalResourceDecision></member><member><EvalResourceName>arn:aws:iam::{account}:role/cdk-hnb659fds-deploy-role-{account}-eu-west-1</EvalResourceName><EvalResourceDecision>allowed</EvalResourceDecision></member></ResourceSpecificResults></member></EvaluationResults></SimulatePrincipalPolicyResult><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></SimulatePrincipalPolicyResponse>"#
                 ))
         })
         .mount(server)
@@ -2399,10 +2401,36 @@ async fn discovery_writes_a_rule_for_a_role_every_account_has() {
         "{stdout}"
     );
     assert!(!stdout.contains("lambda"), "{stdout}");
+    assert!(!stdout.contains("cdk-"), "{stdout}");
+    assert!(
+        stderr.contains("left out 2 CDK bootstrap or other tooling role(s); pass --all"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("chained_rules.admin-root lists every account where Admin was searched"),
         "{stderr}"
     );
+    // CDK bootstrap roles differ by account, so they stay tables.
+    let (stdout, _) = fob.ok(&["discover", "aws", "acme", "--via", "Admin", "--all"]);
+    assert!(stdout.contains("cdk-hnb659fds-deploy-role-"), "{stdout}");
+
+    let (stdout, _) = fob.ok(&["discover", "aws", "acme", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hidden_tooling_roles"], 2, "{json}");
+    assert_eq!(json["found"].as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(json["found"][0]["via_role"], "Admin", "{json}");
+    assert_eq!(json["found"][0]["configured"], false, "{json}");
+    assert_eq!(json["found"][0]["conditions"], json!([]), "{json}");
+    assert!(
+        json["found"][0]["role_arn"]
+            .as_str()
+            .unwrap()
+            .ends_with(":role/admin-root"),
+        "{json}"
+    );
+    assert_eq!(json["skipped"], serde_json::json!([]), "{json}");
+    let stderr = fob.fails(&["discover", "aws", "acme", "--json", "--write"]);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
 
     fob.ok(&["discover", "aws", "acme", "--write"]);
     fob.ok(&["sync"]);
@@ -2414,6 +2442,9 @@ async fn discovery_writes_a_rule_for_a_role_every_account_has() {
     // Found again, it is configured already.
     let (_, stderr) = fob.ok(&["discover", "aws", "acme"]);
     assert!(stderr.contains("nothing new found"), "{stderr}");
+    let (stdout, _) = fob.ok(&["discover", "aws", "acme", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["found"][0]["configured"], true, "{json}");
 
     let stderr = fob.fails(&["discover", "aws", "acme", "--via", "Nobody"]);
     assert!(

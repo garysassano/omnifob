@@ -292,14 +292,26 @@ fn append_to_config(toml: &str) -> anyhow::Result<std::path::PathBuf> {
 /// their own account, and prints what is not configured yet as chained
 /// tables, folding a role found in several accounts into a rule, as
 /// `fob import aws` does. Under an agent, only profiles open to it search.
+/// What `fob discover aws` does with what it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoverOutput {
+    /// Print it as config, for review.
+    Print,
+    /// Append it to the config.
+    Write,
+    /// Print it as JSON.
+    Json,
+}
+
 pub(crate) async fn discover_aws(
     app: &App,
     integration: &str,
     via: &[String],
-    write: bool,
+    all: bool,
+    output: DiscoverOutput,
 ) -> anyhow::Result<()> {
     use omnifob_core::import::{chained_rules_toml, chained_toml, fold_chained};
-    use omnifob_core::providers::aws::discover::{Source, discover};
+    use omnifob_core::providers::aws::discover::{Source, discover, is_tooling};
     let Integration::AwsSso(config) = app.config.integration(integration)? else {
         bail!(
             "'{integration}' is not an aws-sso integration; discovery searches Identity Center roles"
@@ -365,9 +377,29 @@ pub(crate) async fn discover_aws(
         "fob: searching {} role(s) of '{integration}' with iam:ListRoles and the policy simulator",
         sources.len()
     );
-    let discovery = app
+    let mut discovery = app
         .with_login(|| discover(integration, config, sources.clone()))
         .await?;
+    let found_count = discovery.found.len();
+    if !all {
+        discovery
+            .found
+            .retain(|f| !is_tooling(f.role.role_arn.rsplit('/').next().unwrap_or_default()));
+    }
+    let hidden = found_count - discovery.found.len();
+    if output == DiscoverOutput::Json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&discovery_json(integration, config, &discovery, hidden))?
+        );
+        return Ok(());
+    }
+    if hidden > 0 {
+        eprintln!(
+            "fob: left out {hidden} CDK bootstrap or other tooling role(s); pass --all to include \
+             them"
+        );
+    }
     for skipped in &discovery.skipped {
         eprintln!(
             "fob: skipped {}/{}/{}: {}",
@@ -451,7 +483,7 @@ pub(crate) async fn discover_aws(
         chained.len(),
         rules.len()
     );
-    if !write {
+    if output == DiscoverOutput::Print {
         print!("{toml}");
         eprintln!(
             "fob: review them, then run again with --write to append them to {}",
@@ -465,6 +497,67 @@ pub(crate) async fn discover_aws(
         path.display()
     );
     Ok(())
+}
+
+/// Whether the config already gives `role`, as a chained table or through
+/// a rule.
+fn configured(
+    config: &omnifob_core::config::AwsSsoConfig,
+    role: &omnifob_core::config::ChainedRole,
+) -> bool {
+    let by_rule = config.partition().is_ok_and(|partition| {
+        config.chained_rules.values().any(|rule| {
+            rule.via_role == role.via_role
+                && rule.applies_to(&role.via_account_id)
+                && rule.role_for(&role.via_account_id, partition).role_arn == role.role_arn
+        })
+    });
+    by_rule || config.chained.values().any(|c| c.role_arn == role.role_arn)
+}
+
+/// What `fob discover aws --json` prints: each role found with what it
+/// needs and whether the config has it already, the sources skipped and
+/// why, the roles whose trust policy could not be read, and how many
+/// tooling roles were left out.
+fn discovery_json(
+    integration: &str,
+    config: &omnifob_core::config::AwsSsoConfig,
+    discovery: &omnifob_core::providers::aws::discover::Discovery,
+    hidden: usize,
+) -> serde_json::Value {
+    let found: Vec<_> = discovery
+        .found
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "label": f.label,
+                "role_arn": f.role.role_arn,
+                "via_account_id": f.role.via_account_id,
+                "via_role": f.role.via_role,
+                "also_via": f.also_via,
+                "conditions": f.conditions,
+                "configured": configured(config, &f.role),
+            })
+        })
+        .collect();
+    let skipped: Vec<_> = discovery
+        .skipped
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "profile": format!("{integration}/{}/{}", s.source.segment, s.source.via_role),
+                "account_id": s.source.account_id,
+                "via_role": s.source.via_role,
+                "reason": s.reason,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "found": found,
+        "skipped": skipped,
+        "unreadable": discovery.unreadable,
+        "hidden_tooling_roles": hidden,
+    })
 }
 
 pub(crate) fn import_aws(
