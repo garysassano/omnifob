@@ -222,8 +222,8 @@ profiles = ["mine/dev/*", # dev
   "other/*/*"]
 
 [directories]
-"/code/a" = "mine/dev/Admin" # a
-"/code/b" = "other/x/Y"
+"~/code/a" = "mine/dev/Admin" # a
+"~/code/b" = "other/x/Y"
 
 [[labels]]
 profiles = ["mine/*-prd/*"]
