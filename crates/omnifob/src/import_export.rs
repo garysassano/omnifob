@@ -58,14 +58,47 @@ pub(crate) fn export_gcp_adc(
 
 /// How generated configuration runs fob: `fob`, or this binary's full path.
 fn fob_program(absolute: bool) -> anyhow::Result<String> {
-    if !absolute {
-        return Ok("fob".to_string());
+    let program = if absolute {
+        let exe = std::env::current_exe().context("finding the path of this fob binary")?;
+        let exe = exe
+            .to_str()
+            .with_context(|| format!("the path {} is not valid Unicode", exe.display()))?;
+        omnifob_core::import::credential_process_program(exe, cfg!(windows))?
+    } else {
+        "fob".to_string()
+    };
+    // A config named with --config goes into the line, so the tool that
+    // runs it reads the same config.
+    match crate::CONFIG_FLAG.get() {
+        Some(config) => {
+            let config = config.to_str().with_context(|| {
+                format!("the config path {} is not valid Unicode", config.display())
+            })?;
+            let config = omnifob_core::import::credential_process_program(config, cfg!(windows))
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "the config path {config:?} cannot be written in the generated command; \
+                         move the config to a plainer path"
+                    )
+                })?;
+            Ok(format!("{program} --config {config}"))
+        }
+        None => Ok(program),
     }
-    let exe = std::env::current_exe().context("finding the path of this fob binary")?;
-    let exe = exe
-        .to_str()
-        .with_context(|| format!("the path {} is not valid Unicode", exe.display()))?;
-    omnifob_core::import::credential_process_program(exe, cfg!(windows))
+}
+
+/// Fails unless `prefix` keeps AWS profile names to characters the AWS
+/// config file reads back: letters, digits and `-_.+@`.
+fn check_prefix(prefix: &str) -> anyhow::Result<()> {
+    if let Some(c) = prefix
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@')))
+    {
+        bail!(
+            "--prefix {prefix:?} has {c:?}; AWS profile names may hold letters, digits and -_.+@"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn export_aws_config(
@@ -75,7 +108,10 @@ pub(crate) fn export_aws_config(
     write: bool,
     file: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    use omnifob_core::import::{aws_config_block, replace_aws_block};
+    use omnifob_core::import::{
+        AWS_BLOCK_BEGIN, AWS_BLOCK_END, aws_config_block, replace_aws_block,
+    };
+    check_prefix(prefix)?;
     let program = fob_program(absolute)?;
     let profiles: Vec<&Profile> = app.cache.all().filter(|p| p.target.is_aws()).collect();
     let regions: std::collections::BTreeMap<String, String> = profiles
@@ -134,7 +170,11 @@ pub(crate) fn export_aws_config(
     }
     let written = profiles.len() - clashes.len();
     if !write {
-        print!("{block}");
+        if written == 0 {
+            eprintln!("fob: no AWS profiles to export; run `fob sync`");
+        } else {
+            print!("{block}");
+        }
         return Ok(());
     }
     let path = aws_config_file(file)?;
@@ -143,6 +183,23 @@ pub(crate) fn export_aws_config(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
+    // A block whose end marker went missing cannot be told from what the
+    // user wrote after it, so nothing is replaced.
+    if let Some(start) = existing.find(AWS_BLOCK_BEGIN)
+        && !existing[start..].contains(AWS_BLOCK_END)
+    {
+        bail!(
+            "{} has omnifob's begin marker but not `{AWS_BLOCK_END}`; restore or delete the block \
+             by hand, then run this again",
+            path.display()
+        );
+    }
+    // No profiles: an empty block is not added, and an old one goes.
+    if written == 0 && !existing.contains(AWS_BLOCK_BEGIN) {
+        eprintln!("fob: no AWS profiles to export; run `fob sync`");
+        return Ok(());
+    }
+    let block = if written == 0 { String::new() } else { block };
     let updated = replace_aws_block(&existing, &block);
     if updated == existing {
         eprintln!("fob: {} is up to date", path.display());
@@ -308,15 +365,131 @@ pub(crate) async fn discover_aws(
     integration: &str,
     via: &[String],
     all: bool,
+    trust_only: bool,
+    output: DiscoverOutput,
+) -> anyhow::Result<()> {
+    let options = omnifob_core::providers::aws::discover::Options { trust_only };
+    match app.config.integration(integration)? {
+        Integration::AwsSso(config) => {
+            discover_sso(app, integration, config, via, all, options, output).await
+        }
+        Integration::AwsIam(_) | Integration::AwsLogin(_) => {
+            if !via.is_empty() {
+                bail!("--via names permission sets, which only aws-sso integrations have");
+            }
+            discover_identity(app, integration, all, options, output).await
+        }
+        other => bail!(
+            "'{integration}' is a {} integration; discovery searches aws-sso, aws-iam and \
+             aws-login integrations",
+            other.kind()
+        ),
+    }
+}
+
+/// Drops the tooling roles unless `all`, and says how many went.
+fn without_tooling(
+    discovery: &mut omnifob_core::providers::aws::discover::Discovery,
+    all: bool,
+) -> usize {
+    use omnifob_core::providers::aws::discover::is_tooling;
+    let before = discovery.found.len();
+    if !all {
+        discovery
+            .found
+            .retain(|f| !is_tooling(f.role.role_arn.rsplit('/').next().unwrap_or_default()));
+    }
+    before - discovery.found.len()
+}
+
+/// Reports what was left out, skipped or found only by trust, and returns
+/// the roles that may be written: those the simulator allowed or the
+/// policies were estimated to allow. Trust-only roles are listed, never
+/// written.
+fn report_discovery<'a>(
+    integration: &str,
+    discovery: &'a omnifob_core::providers::aws::discover::Discovery,
+    hidden: usize,
+) -> Vec<&'a omnifob_core::providers::aws::discover::Found> {
+    use omnifob_core::providers::aws::discover::Basis;
+    if hidden > 0 {
+        eprintln!(
+            "fob: left out {hidden} CDK bootstrap or other tooling role(s); pass --all to include \
+             them"
+        );
+    }
+    for skipped in &discovery.skipped {
+        eprintln!(
+            "fob: skipped {}/{}/{}: {}",
+            integration, skipped.source.segment, skipped.source.via_role, skipped.reason
+        );
+    }
+    for role in &discovery.unreadable {
+        eprintln!("fob: left out {role}: its trust policy could not be read");
+    }
+    let (trusted, writable): (Vec<_>, Vec<_>) = discovery
+        .found
+        .iter()
+        .partition(|f| f.basis == Basis::TrustOnly);
+    for found in &trusted {
+        eprintln!(
+            "fob: {} ({}) trusts {}, unchecked: neither the simulator nor its policies could be \
+             read; try it, or ask an administrator (not written)",
+            found.label, found.role.role_arn, found.role.via_role
+        );
+    }
+    writable
+}
+
+/// Prints a role's conditions and the other sources that may assume it.
+fn note_found(found: &omnifob_core::providers::aws::discover::Found) {
+    if !found.conditions.is_empty() {
+        eprintln!(
+            "fob: {} ({}): conditions fob did not check: {}",
+            found.label,
+            found.role.role_arn,
+            found.conditions.join("; ")
+        );
+    }
+    if !found.also_via.is_empty() {
+        eprintln!(
+            "fob: {} ({}): also assumable from {}; written from {}",
+            found.label,
+            found.role.role_arn,
+            found.also_via.join(", "),
+            found.role.via_role
+        );
+    }
+}
+
+/// The comment above what discovery writes.
+fn found_header(found: &[&omnifob_core::providers::aws::discover::Found]) -> String {
+    use omnifob_core::providers::aws::discover::Basis;
+    let mut header = String::from(
+        "# Found by `fob discover aws`: the policy simulator lets the source assume these\n\
+         # roles. Trust-policy conditions and resource control policies are not checked,\n\
+         # so a role can still refuse.\n",
+    );
+    if found.iter().any(|f| f.basis == Basis::Estimated) {
+        header.push_str(
+            "# Where the simulator was refused, the source's own policies were read instead,\n\
+             # without SCPs or the permissions boundary.\n",
+        );
+    }
+    header
+}
+
+async fn discover_sso(
+    app: &App,
+    integration: &str,
+    config: &omnifob_core::config::AwsSsoConfig,
+    via: &[String],
+    all: bool,
+    options: omnifob_core::providers::aws::discover::Options,
     output: DiscoverOutput,
 ) -> anyhow::Result<()> {
     use omnifob_core::import::{chained_rules_toml, chained_toml, fold_chained};
-    use omnifob_core::providers::aws::discover::{Source, discover, is_tooling};
-    let Integration::AwsSso(config) = app.config.integration(integration)? else {
-        bail!(
-            "'{integration}' is not an aws-sso integration; discovery searches Identity Center roles"
-        );
-    };
+    use omnifob_core::providers::aws::discover::{Origin, Source, discover_from};
     let agent_limits = crate::agent::active() && app.config.agent.profiles.is_some();
     let all_sources = app
         .cache
@@ -342,26 +515,12 @@ pub(crate) async fn discover_aws(
         all_sources.partition(|(p, _)| !agent_limits || app.config.agent.allows(&p.id));
     let sources: Vec<Source> = open.into_iter().map(|(_, s)| s).collect();
     if sources.is_empty() && !closed.is_empty() {
-        return Err(omnifob_core::Coded::new(
-            omnifob_core::Code::NotOpenToAgents,
-            format!(
-                "none of the {} Identity Center role(s) of '{integration}' to search is open to \
-                 agents; ask the user to run `fob discover aws {integration}` or to give agents \
-                 access",
-                closed.len()
-            ),
-        )
-        .with("integration", integration)
-        .into());
+        return Err(not_open_to_agents(integration, closed.len()));
     }
     // Never synced because it is not signed in: say so, with the code an
     // agent acts on, rather than that it has no roles.
     if sources.is_empty() && !app.cache.integrations.contains_key(integration) {
-        return Err(omnifob_core::Error::needs_login(
-            integration,
-            format!("'{integration}' is not signed in, so its roles are not known"),
-        )
-        .into());
+        return Err(not_signed_in(integration));
     }
     if sources.is_empty() {
         bail!(
@@ -377,40 +536,21 @@ pub(crate) async fn discover_aws(
         "fob: searching {} role(s) of '{integration}' with iam:ListRoles and the policy simulator",
         sources.len()
     );
+    let origin = Origin::Sso(config);
     let mut discovery = app
-        .with_login(|| discover(integration, config, sources.clone()))
+        .with_login(|| discover_from(integration, &origin, sources.clone(), options))
         .await?;
-    let found_count = discovery.found.len();
-    if !all {
-        discovery
-            .found
-            .retain(|f| !is_tooling(f.role.role_arn.rsplit('/').next().unwrap_or_default()));
-    }
-    let hidden = found_count - discovery.found.len();
+    let hidden = without_tooling(&mut discovery, all);
     if output == DiscoverOutput::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&discovery_json(integration, config, &discovery, hidden))?
-        );
+        let json = discovery_json(integration, &discovery, hidden, |f| {
+            configured(config, &f.role)
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
-    if hidden > 0 {
-        eprintln!(
-            "fob: left out {hidden} CDK bootstrap or other tooling role(s); pass --all to include \
-             them"
-        );
-    }
-    for skipped in &discovery.skipped {
-        eprintln!(
-            "fob: skipped {}/{}/{}: {}",
-            integration, skipped.source.segment, skipped.source.via_role, skipped.reason
-        );
-    }
-    for role in &discovery.unreadable {
-        eprintln!("fob: left out {role}: its trust policy could not be read");
-    }
+    let writable = report_discovery(integration, &discovery, hidden);
     let mut chained = std::collections::BTreeMap::new();
-    for found in &discovery.found {
+    for found in &writable {
         // Already a table, under any label.
         if config
             .chained
@@ -419,23 +559,7 @@ pub(crate) async fn discover_aws(
         {
             continue;
         }
-        if !found.conditions.is_empty() {
-            eprintln!(
-                "fob: {} ({}): conditions fob did not check: {}",
-                found.label,
-                found.role.role_arn,
-                found.conditions.join("; ")
-            );
-        }
-        if !found.also_via.is_empty() {
-            eprintln!(
-                "fob: {} ({}): also assumable from {}; written from {}",
-                found.label,
-                found.role.role_arn,
-                found.also_via.join(", "),
-                found.role.via_role
-            );
-        }
+        note_found(found);
         chained.insert(found.label.clone(), found.role.clone());
     }
     let (mut chained, mut rules) = fold_chained(chained);
@@ -470,11 +594,7 @@ pub(crate) async fn discover_aws(
         eprintln!("fob: nothing new found");
         return Ok(());
     }
-    let mut toml = String::from(
-        "# Found by `fob discover aws`: the policy simulator lets the permission set assume\n\
-         # these roles. Trust-policy conditions and resource control policies are not checked,\n\
-         # so a role can still refuse.\n",
-    );
+    let mut toml = found_header(&writable);
     let mut found = chained_toml(integration, &chained);
     found.push_str(&chained_rules_toml(integration, &rules));
     toml.push_str(found.trim_start());
@@ -483,6 +603,107 @@ pub(crate) async fn discover_aws(
         chained.len(),
         rules.len()
     );
+    print_or_write(integration, &toml, output)
+}
+
+/// `fob discover aws` on an `aws-iam` or `aws-login` integration: roles in
+/// the identity's account that it may assume, as `roles` tables.
+async fn discover_identity(
+    app: &App,
+    integration: &str,
+    all: bool,
+    options: omnifob_core::providers::aws::discover::Options,
+    output: DiscoverOutput,
+) -> anyhow::Result<()> {
+    use omnifob_core::providers::aws::discover::{Origin, Source, discover_from};
+    let session = app.cache.all().find(|p| {
+        p.integration == integration
+            && matches!(
+                p.target,
+                omnifob_core::Target::AwsIamSession { .. } | omnifob_core::Target::AwsLogin { .. }
+            )
+    });
+    let Some(session) = session else {
+        if !app.cache.integrations.contains_key(integration) {
+            return Err(not_signed_in(integration));
+        }
+        bail!(
+            "'{integration}' has no session profile to search with; see `fob list {integration}`"
+        );
+    };
+    if crate::agent::active()
+        && app.config.agent.profiles.is_some()
+        && !app.config.agent.allows(&session.id)
+    {
+        return Err(not_open_to_agents(integration, 1));
+    }
+    let account_id = session.target.account_id().unwrap_or_default().to_string();
+    let source = Source {
+        account_id,
+        segment: session.id.split('/').nth(1).unwrap_or_default().to_string(),
+        via_role: session
+            .id
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string(),
+        profile_id: session.id.clone(),
+    };
+    eprintln!(
+        "fob: searching the roles of {} with iam:ListRoles and the policy simulator",
+        session.id
+    );
+    let origin = Origin::identity(&app.config, session)?;
+    let mut discovery = app
+        .with_login(|| discover_from(integration, &origin, vec![source.clone()], options))
+        .await?;
+    let hidden = without_tooling(&mut discovery, all);
+    let configured_arns: Vec<&str> = match app.config.integration(integration)? {
+        Integration::AwsIam(c) => c.roles.values().map(|r| r.role_arn.as_str()).collect(),
+        Integration::AwsLogin(c) => c.roles.values().map(|r| r.role_arn.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    let labels: Vec<String> = match app.config.integration(integration)? {
+        Integration::AwsIam(c) => c.roles.keys().map(|k| k.to_lowercase()).collect(),
+        Integration::AwsLogin(c) => c.roles.keys().map(|k| k.to_lowercase()).collect(),
+        _ => Vec::new(),
+    };
+    if output == DiscoverOutput::Json {
+        let json = discovery_json(integration, &discovery, hidden, |f| {
+            configured_arns.contains(&f.role.role_arn.as_str())
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(());
+    }
+    let writable = report_discovery(integration, &discovery, hidden);
+    let mut roles = std::collections::BTreeMap::new();
+    let mut taken = labels;
+    for found in &writable {
+        if configured_arns.contains(&found.role.role_arn.as_str()) {
+            continue;
+        }
+        note_found(found);
+        let mut label = found.label.clone();
+        let mut n = 1;
+        while taken.contains(&label) {
+            n += 1;
+            label = format!("{}-{n}", found.label);
+        }
+        taken.push(label.clone());
+        roles.insert(label, found.role.role_arn.clone());
+    }
+    if roles.is_empty() {
+        eprintln!("fob: nothing new found");
+        return Ok(());
+    }
+    let mut toml = found_header(&writable);
+    toml.push_str(omnifob_core::import::role_arns_toml(integration, &roles).trim_start());
+    eprintln!("fob: found {} role(s)", roles.len());
+    print_or_write(integration, &toml, output)
+}
+
+/// Prints what discovery found for review, or appends it to the config.
+fn print_or_write(integration: &str, toml: &str, output: DiscoverOutput) -> anyhow::Result<()> {
     if output == DiscoverOutput::Print {
         print!("{toml}");
         eprintln!(
@@ -491,12 +712,32 @@ pub(crate) async fn discover_aws(
         );
         return Ok(());
     }
-    let path = append_to_config(&toml)?;
+    let path = append_to_config(toml)?;
     eprintln!(
         "fob: added them to {}; run `fob sync {integration}`",
         path.display()
     );
     Ok(())
+}
+
+fn not_open_to_agents(integration: &str, closed: usize) -> anyhow::Error {
+    omnifob_core::Coded::new(
+        omnifob_core::Code::NotOpenToAgents,
+        format!(
+            "none of the {closed} role(s) of '{integration}' to search is open to agents; ask the \
+             user to run `fob discover aws {integration}` or to give agents access"
+        ),
+    )
+    .with("integration", integration)
+    .into()
+}
+
+fn not_signed_in(integration: &str) -> anyhow::Error {
+    omnifob_core::Error::needs_login(
+        integration,
+        format!("'{integration}' is not signed in, so its roles are not known"),
+    )
+    .into()
 }
 
 /// Whether the config already gives `role`, as a chained table or through
@@ -521,9 +762,9 @@ fn configured(
 /// tooling roles were left out.
 fn discovery_json(
     integration: &str,
-    config: &omnifob_core::config::AwsSsoConfig,
     discovery: &omnifob_core::providers::aws::discover::Discovery,
     hidden: usize,
+    configured: impl Fn(&omnifob_core::providers::aws::discover::Found) -> bool,
 ) -> serde_json::Value {
     let found: Vec<_> = discovery
         .found
@@ -536,7 +777,8 @@ fn discovery_json(
                 "via_role": f.role.via_role,
                 "also_via": f.also_via,
                 "conditions": f.conditions,
-                "configured": configured(config, &f.role),
+                "basis": f.basis.as_str(),
+                "configured": configured(f),
             })
         })
         .collect();

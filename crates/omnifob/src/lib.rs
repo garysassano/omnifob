@@ -78,6 +78,7 @@ pub fn main() -> ExitCode {
         // Through the variable, so every reader of the config (and `fob
         // renew`, which fob starts) uses the same file.
         let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        let _ = CONFIG_FLAG.set(path.clone());
         // SAFETY: no other thread exists yet; the runtime starts below.
         unsafe { std::env::set_var("OMNIFOB_CONFIG", path) };
     }
@@ -140,6 +141,10 @@ fn command() -> clap::Command {
         _ => Cli::command(),
     }
 }
+
+/// The config named with `--config`, as an absolute path, for the commands
+/// fob writes into other tools' files.
+pub(crate) static CONFIG_FLAG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 /// The name fob was run as: `omnifob`, or else `fob`.
 pub(crate) fn bin_name() -> &'static str {
@@ -501,6 +506,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             if agent::active() && matches!(format, CredsFormat::Json) {
                 return Err(agent::refuse_to_print(&profile.id));
             }
+            // Options a format would ignore are refused, so a script that
+            // passes them learns they did nothing.
+            let eks = matches!(format, CredsFormat::K8sExec) && profile.target.is_aws();
+            if (cluster.is_some() || region.is_some()) && !eks {
+                bail!(
+                    "--cluster and --region apply only to --format k8s-exec for AWS (EKS) profiles"
+                );
+            }
+            let never_cached = matches!(format, CredsFormat::GcpExecutable)
+                || (matches!(format, CredsFormat::K8sExec)
+                    && matches!(profile.target, omnifob_core::Target::Azure { .. }));
+            if no_cache && never_cached {
+                bail!("--no-cache does not apply here: these tokens are fetched new every time");
+            }
             if matches!(format, CredsFormat::GcpExecutable | CredsFormat::K8sExec) {
                 if ttl.is_some() {
                     bail!("--ttl does not apply to --format gcp-executable or k8s-exec");
@@ -564,6 +583,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             write,
             all,
             json,
+            trust_only,
         }) => {
             // An unknown name fails before any other integration syncs.
             app.config.integration(&integration)?;
@@ -575,7 +595,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 DiscoverOutput::Print
             };
-            discover_aws(&app, &integration, &via, all, output).await?;
+            discover_aws(&app, &integration, &via, all, trust_only, output).await?;
         }
         Command::Export(ExportCommand::AwsConfig {
             prefix,

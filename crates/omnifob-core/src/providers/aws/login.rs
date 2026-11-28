@@ -160,12 +160,10 @@ impl DpopKey {
 }
 
 fn client(region: &str) -> aws_sdk_signin::Client {
-    let mut config = aws_sdk_signin::Config::builder()
+    let config = aws_sdk_signin::Config::builder()
         .region(aws_sdk_signin::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_signin::config::BehaviorVersion::latest());
-    if let Some(url) = service_endpoint(ENDPOINT_VARIABLE) {
-        config = config.endpoint_url(url);
-    }
+    let config = super::aws_endpoint!(config, ENDPOINT_VARIABLE);
     aws_sdk_signin::Client::from_conf(config.build())
 }
 

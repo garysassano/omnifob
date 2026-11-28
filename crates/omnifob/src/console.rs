@@ -46,13 +46,11 @@ impl App {
             .await
             .with_context(|| format!("getting credentials for {}", profile.id))?;
         let url = providers::console_url(&self.config, &profile, &creds, options).await?;
-        record_use(&profile.id);
         let via = match action {
             Action::Open => "console",
             Action::Print => "console-url",
             Action::Copy => "console-url-copied",
         };
-        self.audit(&profile, via, creds.expires_at, None);
         match action {
             Action::Print => println!("{url}"),
             Action::Copy => {
@@ -68,6 +66,10 @@ impl App {
                 eprintln!("fob: opened the console for {}", profile.id);
             }
         }
+        // Only once the URL reached the user: a browser that did not start
+        // or a clipboard that refused handed nothing out.
+        record_use(&profile.id);
+        self.audit(&profile, via, creds.expires_at, None);
         Ok(())
     }
 }

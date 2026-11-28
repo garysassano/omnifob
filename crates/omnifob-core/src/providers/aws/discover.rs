@@ -73,6 +73,8 @@ pub struct Found {
     pub conditions: Vec<String>,
     /// Other permission sets of the account that may assume it too.
     pub also_via: Vec<String>,
+    /// How fob decided the source may assume it.
+    pub basis: Basis,
 }
 
 /// A source fob could not search, and why.
@@ -90,14 +92,122 @@ pub struct Discovery {
     pub unreadable: Vec<String>,
 }
 
-/// Searches every source, a few accounts at a time. A sign-in that has
-/// ended or a locked vault fails the whole search, since no source can
-/// succeed and the caller can sign in or unlock; anything else skips the
-/// sources it concerns, with the reason.
+/// How fob decided that a source may assume a role it found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Basis {
+    /// The policy simulator allowed it.
+    #[default]
+    Simulated,
+    /// The simulator was refused, so fob read the source's own policies:
+    /// SCPs, the permissions boundary and session policies are not checked.
+    Estimated,
+    /// Neither the simulator nor the source's policies could be read; only
+    /// the role's trust policy lets the source in (`--trust-only`).
+    TrustOnly,
+}
+
+impl Basis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Basis::Simulated => "simulated",
+            Basis::Estimated => "estimated",
+            Basis::TrustOnly => "trust-only",
+        }
+    }
+}
+
+/// Where the sources' credentials come from.
+pub enum Origin<'a> {
+    /// An `aws-sso` integration: each source is a permission set.
+    Sso(&'a AwsSsoConfig),
+    /// An `aws-iam` or `aws-login` integration: the one source is its own
+    /// identity (an IAM user, or the console sign-in's user or role), with
+    /// the credentials of `profile`, its session profile.
+    Identity {
+        config: &'a crate::Config,
+        profile: &'a crate::Profile,
+        partition: Partition,
+        /// Where STS is asked whom the credentials act as.
+        sts_region: String,
+    },
+}
+
+impl<'a> Origin<'a> {
+    /// The origin of an `aws-iam` or `aws-login` integration's session
+    /// profile `profile`.
+    pub fn identity(
+        config: &'a crate::Config,
+        profile: &'a crate::Profile,
+    ) -> anyhow::Result<Self> {
+        let (partition, sts_region) = match config.integration(&profile.integration)? {
+            crate::Integration::AwsIam(c) => {
+                let region = super::iam::sts_region(c);
+                (Partition::of_region(region)?, region.to_string())
+            }
+            crate::Integration::AwsLogin(c) => (super::login::partition(c)?, c.region.clone()),
+            other => anyhow::bail!(
+                "'{}' is a {} integration; only aws-sso, aws-iam and aws-login are searched",
+                profile.integration,
+                other.kind()
+            ),
+        };
+        Ok(Origin::Identity {
+            config,
+            profile,
+            partition,
+            sts_region,
+        })
+    }
+
+    fn partition(&self) -> anyhow::Result<Partition> {
+        match self {
+            Origin::Sso(config) => config.partition(),
+            Origin::Identity { partition, .. } => Ok(*partition),
+        }
+    }
+
+    /// What a source is called in messages.
+    fn who(&self) -> &'static str {
+        match self {
+            Origin::Sso(_) => "the permission set",
+            Origin::Identity { .. } => "the identity",
+        }
+    }
+}
+
+/// How to search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// When neither the simulator nor the source's policies can be read,
+    /// keep the roles whose trust policy lets the source in, as
+    /// [`Basis::TrustOnly`], instead of skipping the source.
+    pub trust_only: bool,
+}
+
+/// Searches every source of an `aws-sso` integration; see [`discover_from`].
 pub async fn discover(
     integration: &str,
     config: &AwsSsoConfig,
     sources: Vec<Source>,
+) -> Result<Discovery> {
+    discover_from(
+        integration,
+        &Origin::Sso(config),
+        sources,
+        Options::default(),
+    )
+    .await
+}
+
+/// Searches every source, a few accounts at a time. A sign-in that has
+/// ended or a locked vault fails the whole search, since no source can
+/// succeed and the caller can sign in or unlock; anything else skips the
+/// sources it concerns, with the reason.
+pub async fn discover_from(
+    integration: &str,
+    origin: &Origin<'_>,
+    sources: Vec<Source>,
+    options: Options,
 ) -> Result<Discovery> {
     let mut accounts: BTreeMap<String, Vec<Source>> = BTreeMap::new();
     for source in sources {
@@ -106,13 +216,13 @@ pub async fn discover(
             .or_default()
             .push(source);
     }
-    let partition = config.partition()?;
+    let partition = origin.partition()?;
     // Every account's roles first, so each source can be matched against the
     // roles of the integration's other accounts as well as its own.
     let listed: Vec<Result<(Lister, Option<AccountRoles>)>> = futures_util::stream::iter(
         accounts
             .into_values()
-            .map(|sources| list_account(integration, config, partition, sources)),
+            .map(|sources| list_account(integration, origin, partition, sources)),
     )
     .buffer_unordered(CONCURRENCY)
     .collect()
@@ -128,7 +238,7 @@ pub async fn discover(
     let results: Vec<Result<Discovery>> = futures_util::stream::iter(
         listers
             .into_iter()
-            .map(|lister| search_account(lister, listings, partition)),
+            .map(|lister| search_account(lister, listings, partition, options)),
     )
     .buffer_unordered(CONCURRENCY)
     .collect()
@@ -211,14 +321,14 @@ struct Lister<'a> {
 /// whose credentials may.
 async fn list_account<'a>(
     integration: &'a str,
-    config: &'a AwsSsoConfig,
+    origin: &'a Origin<'a>,
     partition: Partition,
     mut sources: Vec<Source>,
 ) -> Result<(Lister<'a>, Option<AccountRoles>)> {
     sources.sort_by(|a, b| a.via_role.cmp(&b.via_role));
     let mut clients = Clients {
         integration,
-        config,
+        origin,
         partition,
         made: BTreeMap::new(),
     };
@@ -272,6 +382,7 @@ async fn search_account(
     lister: Lister<'_>,
     listings: &[AccountRoles],
     partition: Partition,
+    options: Options,
 ) -> Result<Discovery> {
     let Lister {
         sources,
@@ -293,7 +404,7 @@ async fn search_account(
         }
     };
     for source in &sources {
-        match search(&mut clients, &lister, listings, partition, source).await {
+        match search(&mut clients, &lister, listings, partition, source, options).await {
             Ok((found, unreadable)) => {
                 discovery.found.extend(found);
                 discovery.unreadable.extend(unreadable);
@@ -307,23 +418,29 @@ async fn search_account(
     Ok(discovery)
 }
 
-/// An IAM client per permission set of an account, made the first time it
-/// is needed, or why it could not be.
+/// An IAM client per source of an account, made the first time it is
+/// needed, or why it could not be.
 struct Clients<'a> {
     integration: &'a str,
-    config: &'a AwsSsoConfig,
+    origin: &'a Origin<'a>,
     partition: Partition,
     made: BTreeMap<String, std::result::Result<Iam, String>>,
 }
 
 impl Clients<'_> {
-    /// The client of `source`'s permission set; `Err` only for an error that
-    /// stops every search.
+    /// The client of `source`; `Err` only for an error that stops every
+    /// search.
     async fn get(&mut self, source: &Source) -> Result<std::result::Result<&Iam, String>> {
         if !self.made.contains_key(&source.via_role) {
             let made = async {
-                let creds = source_credentials(self.integration, self.config, source).await?;
-                Ok::<_, crate::Error>(Iam::new(&creds, self.partition)?)
+                let creds = source_credentials(self.integration, self.origin, source).await?;
+                let mut iam = Iam::new(&creds, self.partition, self.origin.who())?;
+                // An identity's ARN is not in its account's roles, as a
+                // permission set's role is: STS says whom it acts as.
+                if let Origin::Identity { sts_region, .. } = self.origin {
+                    iam.caller = Some(super::sts::caller_identity(&creds, sts_region).await?.arn);
+                }
+                Ok::<_, crate::Error>(iam)
             }
             .await;
             let made = match made {
@@ -335,7 +452,7 @@ impl Clients<'_> {
         Ok(self.made[&source.via_role].as_ref().map_err(Clone::clone))
     }
 
-    /// The client of a permission set already made.
+    /// The client of a source already made.
     fn made(&self, via_role: &str) -> Option<&Iam> {
         self.made.get(via_role).and_then(|m| m.as_ref().ok())
     }
@@ -345,9 +462,15 @@ impl Clients<'_> {
 /// fresh, as `fob exec` would use them, or new ones, which are cached.
 async fn source_credentials(
     integration: &str,
-    config: &AwsSsoConfig,
+    origin: &Origin<'_>,
     source: &Source,
 ) -> Result<Credentials> {
+    let config = match origin {
+        Origin::Sso(config) => config,
+        Origin::Identity {
+            config, profile, ..
+        } => return crate::providers::credentials(config, profile, true, None).await,
+    };
     let key = crate::store::credentials_key(&source.profile_id);
     let now = jiff::Timestamp::now();
     match crate::store::get::<Credentials>(&key) {
@@ -367,27 +490,25 @@ async fn source_credentials(
     Ok(fresh)
 }
 
-/// The roles of the listed accounts that one source may assume, and those
-/// whose trust policy could not be read. The simulator is called with the
-/// credentials of `lister`, the permission set that listed the source's
-/// account, or with the source's own when `lister`'s may not call it.
-async fn search(
-    clients: &mut Clients<'_>,
-    lister: &str,
-    listings: &[AccountRoles],
-    partition: Partition,
+/// The principal a source signs requests as: its ARN (a role's, path
+/// included, for a role session) and whether it is an IAM user.
+fn principal(
+    clients: &Clients<'_>,
+    roles: &[Role],
     source: &Source,
-) -> Result<(Vec<Found>, Vec<String>)> {
-    let roles = &listings
-        .iter()
-        .find(|a| a.account_id == source.account_id)
-        .context("the source's account was not listed")?
-        .roles;
+) -> anyhow::Result<(String, bool)> {
+    if let Origin::Identity { .. } = clients.origin {
+        let caller = clients
+            .made(&source.via_role)
+            .and_then(|iam| iam.caller.clone())
+            .context("no caller identity for the source")?;
+        return identity_principal(&caller, roles);
+    }
     // The role Identity Center made for the permission set in this account:
     // `AWSReservedSSO_<permission set>_<16 hex digits>`, so a permission set
     // named `Admin` does not take `AWSReservedSSO_Admin_ReadOnly_...`.
     let prefix = format!("AWSReservedSSO_{}_", source.via_role);
-    let source_arn = roles
+    let arn = roles
         .iter()
         .find(|r| {
             r.path.starts_with("/aws-reserved/")
@@ -402,6 +523,50 @@ async fn search(
                  unknown"
             )
         })?;
+    Ok((arn, false))
+}
+
+/// The principal behind a caller ARN from `GetCallerIdentity`: an IAM user
+/// as it is, and a role session (`arn:aws:sts::<account>:assumed-role/<name>/<session>`)
+/// as its role, whose path only the account's roles tell. The simulator
+/// takes no session ARNs.
+fn identity_principal(caller: &str, roles: &[Role]) -> anyhow::Result<(String, bool)> {
+    if caller.contains(":user/") {
+        return Ok((caller.to_string(), true));
+    }
+    if let Some((_, rest)) = caller.split_once(":assumed-role/") {
+        let name = rest.split('/').next().unwrap_or_default();
+        return roles
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| (r.arn.clone(), false))
+            .with_context(|| {
+                format!("the role {name} of {caller} is not among the account's roles")
+            });
+    }
+    anyhow::bail!(
+        "{caller} is neither an IAM user nor a role session, which discovery searches for"
+    )
+}
+
+/// The roles of the listed accounts that one source may assume, and those
+/// whose trust policy could not be read. The simulator is called with the
+/// credentials of `lister`, the source that listed the source's account,
+/// or with the source's own when `lister`'s may not call it.
+async fn search(
+    clients: &mut Clients<'_>,
+    lister: &str,
+    listings: &[AccountRoles],
+    partition: Partition,
+    source: &Source,
+    options: Options,
+) -> Result<(Vec<Found>, Vec<String>)> {
+    let roles = &listings
+        .iter()
+        .find(|a| a.account_id == source.account_id)
+        .context("the source's account was not listed")?
+        .roles;
+    let (source_arn, user) = principal(clients, roles, source)?;
     let root = format!(
         "arn:{}:iam::{}:root",
         partition.arn_name(),
@@ -411,6 +576,7 @@ async fn search(
         account_id: &source.account_id,
         root: &root,
         arn: &source_arn,
+        user,
     };
     let mut candidates = Vec::new();
     let mut unreadable = Vec::new();
@@ -434,126 +600,291 @@ async fn search(
         }
     }
     let arns: Vec<&str> = candidates.iter().map(|(_, r, _)| r.arn.as_str()).collect();
-    let (simulator, decisions) = simulate(clients, lister, source, &requester, &arns).await?;
     let mut kept = Vec::new();
-    for (account, role, trust) in candidates {
-        let Some(decision) = decisions.get(&role.arn) else {
-            continue;
-        };
-        let same_account = account.account_id == source.account_id;
-        let mut conditions = trust.conditions;
-        let assumable = match decision.decision.as_str() {
-            "allowed" => true,
-            // In its own account, a role whose trust policy names the
-            // source's role ARN needs nothing from the source's policies,
-            // unless the organization's SCPs or the permissions boundary
-            // refuse, which the simulator reports for one role at a time.
-            // Another account's role always needs the source's policies too.
-            "implicitDeny" if same_account && trust.by_arn && decision.boundary != Some(false) => {
-                let iam = clients
-                    .made(&simulator)
-                    .context("the simulating permission set has no client")?;
-                let alone = iam
-                    .simulate_assume_role(&requester, &[role.arn.as_str()])
-                    .await?;
-                alone.iter().any(|(_, d)| d.trust_alone_allows())
+    match simulate(clients, lister, source, &requester, &arns).await? {
+        Simulation::Decided(simulator, decisions) => {
+            for (account, role, trust) in candidates {
+                let Some(decision) = decisions.get(&role.arn) else {
+                    continue;
+                };
+                let same_account = account.account_id == source.account_id;
+                let mut conditions = trust.conditions;
+                let assumable = match decision.decision.as_str() {
+                    "allowed" => true,
+                    // In its own account, a role whose trust policy names the
+                    // source's ARN needs nothing from the source's policies,
+                    // unless the organization's SCPs or the permissions
+                    // boundary refuse, which the simulator reports for one
+                    // role at a time. A boundary does not limit what a
+                    // resource policy grants to a user's ARN. Another
+                    // account's role always needs the source's policies too.
+                    "implicitDeny"
+                        if same_account
+                            && trust.by_arn
+                            && (user || decision.boundary != Some(false)) =>
+                    {
+                        let iam = clients
+                            .made(&simulator)
+                            .context("the simulating source has no client")?;
+                        let alone = iam
+                            .simulate_assume_role(&requester, &[role.arn.as_str()])
+                            .await?;
+                        alone.iter().any(|(_, d)| d.trust_alone_allows(user))
+                    }
+                    // Denied only for want of context the source's policies check.
+                    "implicitDeny" if !decision.missing.is_empty() => {
+                        conditions.push(format!(
+                            "{}'s policies check {}, which the simulator was not given",
+                            clients.origin.who(),
+                            decision.missing.join(", ")
+                        ));
+                        true
+                    }
+                    _ => false,
+                };
+                if assumable {
+                    kept.push((account, role, conditions, Basis::Simulated));
+                }
             }
-            // Denied only for want of context the source's policies check.
-            "implicitDeny" if !decision.missing.is_empty() => {
-                conditions.push(format!(
-                    "the permission set's policies check {}, which the simulator was not given",
-                    decision.missing.join(", ")
-                ));
-                true
+        }
+        Simulation::Refused(reason) => {
+            match estimate(clients, lister, source, &requester).await {
+                Ok(statements) => {
+                    let note = format!(
+                        "estimated from {}'s own policies, since the simulator was refused: SCPs, \
+                         the permissions boundary and session policies are not checked",
+                        clients.origin.who()
+                    );
+                    for (account, role, trust) in candidates {
+                        let same_account = account.account_id == source.account_id;
+                        let mut conditions = trust.conditions;
+                        let assumable = match allows(&statements, &role.arn) {
+                            Answer::No => false,
+                            // Its own trust naming the source is enough in
+                            // its account, unless the source's policies deny.
+                            _ if same_account && trust.by_arn => {
+                                denies(&statements, &role.arn, &mut conditions)
+                            }
+                            Answer::Yes => denies(&statements, &role.arn, &mut conditions),
+                            Answer::Unknown(notes) => {
+                                conditions.extend(notes);
+                                denies(&statements, &role.arn, &mut conditions)
+                            }
+                        };
+                        if assumable {
+                            conditions.push(note.clone());
+                            kept.push((account, role, conditions, Basis::Estimated));
+                        }
+                    }
+                }
+                Err(e) if is_denied(&e) && options.trust_only => {
+                    for (account, role, trust) in candidates {
+                        let mut conditions = trust.conditions;
+                        conditions.push(format!(
+                            "not checked against {}'s policies: neither the simulator nor the \
+                             policies could be read",
+                            clients.origin.who()
+                        ));
+                        kept.push((account, role, conditions, Basis::TrustOnly));
+                    }
+                }
+                Err(e) if is_denied(&e) => {
+                    return Err(anyhow!(
+                        "{reason}, nor read its policies; {} role(s) trust it (pass --trust-only \
+                         to list them)",
+                        arns.len()
+                    )
+                    .into());
+                }
+                Err(e) => return Err(e),
             }
-            _ => false,
-        };
-        if assumable {
-            // Another account's role is labelled after both accounts.
-            let label = if same_account {
-                format!("{}-{}", source.segment, crate::profile::slug(&role.name))
-            } else {
-                format!(
+        }
+    }
+    let identity = matches!(clients.origin, Origin::Identity { .. });
+    let found = kept
+        .into_iter()
+        .map(|(account, role, conditions, basis)| {
+            let same_account = account.account_id == source.account_id;
+            // An identity's roles are labelled after the role alone; a
+            // permission set's after its account, and another account's role
+            // after both accounts.
+            let label = match (identity, same_account) {
+                (true, true) => crate::profile::slug(&role.name),
+                (true, false) => {
+                    format!("{}-{}", account.segment, crate::profile::slug(&role.name))
+                }
+                (false, true) => format!("{}-{}", source.segment, crate::profile::slug(&role.name)),
+                (false, false) => format!(
                     "{}-{}-{}",
                     source.segment,
                     account.segment,
                     crate::profile::slug(&role.name)
-                )
+                ),
             };
-            kept.push((label, role, conditions));
-        }
-    }
-    let found = kept
-        .into_iter()
-        .map(|(label, role, conditions)| Found {
-            label,
-            role: ChainedRole {
-                via_account_id: source.account_id.clone(),
-                via_role: source.via_role.clone(),
-                role_arn: role.arn.clone(),
-                session_name: None,
-                external_id: None,
-                region: None,
-                mfa_serial: None,
-                duration: None,
-            },
-            conditions,
-            also_via: Vec::new(),
+            Found {
+                label,
+                role: ChainedRole {
+                    via_account_id: source.account_id.clone(),
+                    via_role: source.via_role.clone(),
+                    role_arn: role.arn.clone(),
+                    session_name: None,
+                    external_id: None,
+                    region: None,
+                    mfa_serial: None,
+                    duration: None,
+                },
+                conditions,
+                also_via: Vec::new(),
+                basis,
+            }
         })
         .collect();
     Ok((found, unreadable))
 }
 
+/// What the simulator answered, or why nobody could ask it.
+enum Simulation {
+    /// Each role's answer, and the source whose credentials asked.
+    Decided(String, BTreeMap<String, Decision>),
+    Refused(String),
+}
+
 /// The simulator's answer for each of `arns`, asked with `lister`'s
 /// credentials, or with the source's own when `lister`'s may not call the
-/// simulator, and the permission set whose credentials answered.
+/// simulator.
 async fn simulate(
     clients: &mut Clients<'_>,
     lister: &str,
     source: &Source,
     requester: &Requester<'_>,
     arns: &[&str],
-) -> Result<(String, BTreeMap<String, Decision>)> {
+) -> Result<Simulation> {
     if arns.is_empty() {
-        return Ok((lister.to_string(), BTreeMap::new()));
+        return Ok(Simulation::Decided(lister.to_string(), BTreeMap::new()));
     }
     let iam = clients
         .made(lister)
-        .context("the permission set that listed the roles has no client")?;
+        .context("the source that listed the roles has no client")?;
     match simulate_with(iam, requester, arns).await {
         Err(e) if is_denied(&e) && source.via_role != lister => {}
-        Err(e) if is_denied(&e) => return Err(untested(e, arns.len())),
-        other => return other.map(|d| (lister.to_string(), d)),
+        Err(e) if is_denied(&e) => return Ok(Simulation::Refused(format!("{e:#}"))),
+        other => return other.map(|d| Simulation::Decided(lister.to_string(), d)),
     }
     let own = match clients.get(source).await? {
         Ok(iam) => iam,
         Err(reason) => {
-            return Err(anyhow!(
-                "{lister} may not call iam:SimulatePrincipalPolicy, and {reason}; {} role(s) in \
-                 the account trust it",
-                arns.len()
-            )
-            .into());
+            return Ok(Simulation::Refused(format!(
+                "{lister} may not call iam:SimulatePrincipalPolicy, and {reason}"
+            )));
         }
     };
-    let decisions = simulate_with(own, requester, arns).await.map_err(|e| {
-        if is_denied(&e) {
-            anyhow!(
-                "neither it nor {lister} may call iam:SimulatePrincipalPolicy; {} role(s) in the \
-                 account trust it",
-                arns.len()
-            )
-            .into()
-        } else {
-            e
-        }
-    })?;
-    Ok((source.via_role.clone(), decisions))
+    match simulate_with(own, requester, arns).await {
+        Ok(decisions) => Ok(Simulation::Decided(source.via_role.clone(), decisions)),
+        Err(e) if is_denied(&e) => Ok(Simulation::Refused(format!(
+            "neither it nor {lister} may call iam:SimulatePrincipalPolicy"
+        ))),
+        Err(e) => Err(e),
+    }
 }
 
-/// `e`, a refused simulation, with how many roles it left untested.
-fn untested(e: crate::Error, roles: usize) -> crate::Error {
-    anyhow!("{e:#}; {roles} role(s) in the account trust it").into()
+/// The statements of the source principal's own policies (attached and
+/// inline, and its groups' for an IAM user), read with `lister`'s
+/// credentials or the source's own.
+async fn estimate(
+    clients: &mut Clients<'_>,
+    lister: &str,
+    source: &Source,
+    requester: &Requester<'_>,
+) -> Result<Vec<Value>> {
+    if let Some(iam) = clients.made(lister) {
+        match iam.principal_statements(requester).await {
+            Err(e) if is_denied(&e) && source.via_role != lister => {}
+            other => return other,
+        }
+    }
+    match clients.get(source).await? {
+        Ok(iam) => iam.principal_statements(requester).await,
+        Err(reason) => {
+            Err(anyhow::Error::new(Denied(format!("its policies ({reason})"), "the source")).into())
+        }
+    }
+}
+
+/// Whether the statements of an identity policy allow `sts:AssumeRole` on
+/// `arn`; conditions are described, not evaluated.
+fn allows(statements: &[Value], arn: &str) -> Answer {
+    let mut answer = Answer::No;
+    for statement in statements {
+        if statement["Effect"] != "Allow" || !grants(statement, arn) {
+            continue;
+        }
+        let here = match statement.get("Condition") {
+            Some(Value::Object(c)) if !c.is_empty() => Answer::Unknown(BTreeSet::from([format!(
+                "the policy that allows it has conditions ({})",
+                condition_keys(c)
+            )])),
+            _ => Answer::Yes,
+        };
+        answer = match (answer, here) {
+            (Answer::Yes, _) | (_, Answer::Yes) => Answer::Yes,
+            (Answer::Unknown(mut a), Answer::Unknown(b)) => {
+                a.extend(b);
+                Answer::Unknown(a)
+            }
+            (_, here) => here,
+        };
+    }
+    answer
+}
+
+/// Whether nothing denies `sts:AssumeRole` on `arn` outright; a `Deny` with
+/// conditions is described in `conditions`.
+fn denies(statements: &[Value], arn: &str, conditions: &mut Vec<String>) -> bool {
+    for statement in statements {
+        if statement["Effect"] != "Deny" || !grants(statement, arn) {
+            continue;
+        }
+        match statement.get("Condition") {
+            Some(Value::Object(c)) if !c.is_empty() => conditions.push(format!(
+                "a Deny statement may apply ({})",
+                condition_keys(c)
+            )),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether a statement covers `sts:AssumeRole` on `arn`, its effect and
+/// conditions aside.
+fn grants(statement: &Value, arn: &str) -> bool {
+    let assume = |patterns: &Value| {
+        strings(patterns)
+            .iter()
+            .any(|a| wildcard(&a.to_ascii_lowercase(), "sts:assumerole"))
+    };
+    let action = match (statement.get("Action"), statement.get("NotAction")) {
+        (Some(action), _) => assume(action),
+        (None, Some(not)) => !assume(not),
+        (None, None) => false,
+    };
+    let on = |patterns: &Value| strings(patterns).iter().any(|r| wildcard(r, arn));
+    let resource = match (statement.get("Resource"), statement.get("NotResource")) {
+        (Some(resource), _) => on(resource),
+        (None, Some(not)) => !on(not),
+        (None, None) => false,
+    };
+    action && resource
+}
+
+/// The condition keys of a statement, for a note.
+fn condition_keys(conditions: &serde_json::Map<String, Value>) -> String {
+    let keys: BTreeSet<&str> = conditions
+        .values()
+        .filter_map(Value::as_object)
+        .flat_map(|keys| keys.keys().map(String::as_str))
+        .collect();
+    keys.into_iter().collect::<Vec<_>>().join(", ")
 }
 
 async fn simulate_with(
@@ -588,20 +919,23 @@ impl Decision {
     /// source's identity policies may lack an allow, but nothing denies it,
     /// and neither the SCPs nor the permissions boundary withhold it (a
     /// boundary limits what a policy grants to a role ARN, though not to a
-    /// session ARN).
-    fn trust_alone_allows(&self) -> bool {
+    /// session ARN or, for `user`, to an IAM user's ARN).
+    fn trust_alone_allows(&self, user: bool) -> bool {
         match self.decision.as_str() {
             "allowed" => true,
-            "implicitDeny" => self.organizations != Some(false) && self.boundary != Some(false),
+            "implicitDeny" => {
+                self.organizations != Some(false) && (user || self.boundary != Some(false))
+            }
             _ => false,
         }
     }
 }
 
-/// IAM refused the call: the permission set may not make it.
+/// IAM refused the call: the source (the second field, "the permission
+/// set" or "the identity") may not make it.
 #[derive(Debug, thiserror::Error)]
-#[error("the permission set may not call {0}")]
-struct Denied(&'static str);
+#[error("{1} may not call {0}")]
+struct Denied(String, &'static str);
 
 fn is_denied(e: &crate::Error) -> bool {
     matches!(e, crate::Error::Other(e) if e.downcast_ref::<Denied>().is_some())
@@ -624,10 +958,14 @@ struct Iam {
     url: String,
     region: &'static str,
     creds: aws_sdk_sts::config::Credentials,
+    /// Whose credentials these are, in messages.
+    who: &'static str,
+    /// The ARN STS gives for the credentials, for an identity source.
+    caller: Option<String>,
 }
 
 impl Iam {
-    fn new(creds: &Credentials, partition: Partition) -> anyhow::Result<Self> {
+    fn new(creds: &Credentials, partition: Partition, who: &'static str) -> anyhow::Result<Self> {
         let get = |k: &str| {
             creds
                 .env
@@ -649,7 +987,132 @@ impl Iam {
             url,
             region: partition.default_region(),
             creds,
+            who,
+            caller: None,
         })
+    }
+
+    /// The statements of the requester's own policies: a role's attached
+    /// and inline policies, and an IAM user's and its groups'.
+    async fn principal_statements(&self, requester: &Requester<'_>) -> Result<Vec<Value>> {
+        let name = requester
+            .arn
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let mut entities = vec![(if requester.user { "User" } else { "Role" }, name.clone())];
+        if requester.user {
+            for group in self
+                .list_all(
+                    "ListGroupsForUser",
+                    &[("UserName", name.clone())],
+                    "GroupName",
+                )
+                .await?
+            {
+                entities.push(("Group", group));
+            }
+        }
+        let mut documents = Vec::new();
+        for (kind, name) in entities {
+            let key = format!("{kind}Name");
+            for arn in self
+                .list_all(
+                    &format!("ListAttached{kind}Policies"),
+                    &[(key.as_str(), name.clone())],
+                    "PolicyArn",
+                )
+                .await?
+            {
+                let policy = self
+                    .call("GetPolicy", &[("PolicyArn", arn.clone())])
+                    .await?;
+                let version = leaves(&policy, &["DefaultVersionId"])
+                    .context("reading iam:GetPolicy")?
+                    .into_iter()
+                    .next()
+                    .map(|(_, v)| v)
+                    .with_context(|| format!("no default version of {arn}"))?;
+                let body = self
+                    .call(
+                        "GetPolicyVersion",
+                        &[("PolicyArn", arn), ("VersionId", version)],
+                    )
+                    .await?;
+                documents.extend(
+                    leaves(&body, &["Document"])
+                        .context("reading iam:GetPolicyVersion")?
+                        .into_iter()
+                        .map(|(_, d)| d),
+                );
+            }
+            for policy in self
+                .list_all(
+                    &format!("List{kind}Policies"),
+                    &[(key.as_str(), name.clone())],
+                    "member",
+                )
+                .await?
+            {
+                let body = self
+                    .call(
+                        &format!("Get{kind}Policy"),
+                        &[(key.as_str(), name.clone()), ("PolicyName", policy)],
+                    )
+                    .await?;
+                documents.extend(
+                    leaves(&body, &["PolicyDocument"])
+                        .with_context(|| format!("reading iam:Get{kind}Policy"))?
+                        .into_iter()
+                        .map(|(_, d)| d),
+                );
+            }
+        }
+        let mut statements = Vec::new();
+        for document in documents {
+            let json = percent_decode(&document)?;
+            let policy: Value = serde_json::from_str(&json).context("a policy that is not JSON")?;
+            match &policy["Statement"] {
+                Value::Array(list) => statements.extend(list.iter().cloned()),
+                statement @ Value::Object(_) => statements.push(statement.clone()),
+                _ => {}
+            }
+        }
+        Ok(statements)
+    }
+
+    /// Every `field` of a paginated listing (`operation`, all pages).
+    async fn list_all(
+        &self,
+        operation: &str,
+        params: &[(&str, String)],
+        field: &str,
+    ) -> Result<Vec<String>> {
+        let mut values = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut all: Vec<(&str, String)> = params.to_vec();
+            all.push(("MaxItems", MAX_ITEMS.to_string()));
+            if let Some(m) = &marker {
+                all.push(("Marker", m.clone()));
+            }
+            let body = self.call(operation, &all).await?;
+            let mut truncated = false;
+            marker = None;
+            for (name, value) in leaves(&body, &[field, "IsTruncated", "Marker"])
+                .with_context(|| format!("reading iam:{operation}"))?
+            {
+                match name.as_str() {
+                    "IsTruncated" => truncated = value == "true",
+                    "Marker" => marker = Some(value),
+                    _ => values.push(value),
+                }
+            }
+            if !truncated || marker.is_none() {
+                return Ok(values);
+            }
+        }
     }
 
     /// Every role in the account (`iam:ListRoles`, all pages).
@@ -665,7 +1128,7 @@ impl Iam {
             if let Some(m) = &marker {
                 params.push(("Marker", m.clone()));
             }
-            let body = self.call(action, &params).await?;
+            let body = self.call("ListRoles", &params).await?;
             let page = parse_list_roles(&body).with_context(|| format!("reading {action}"))?;
             roles.extend(page.roles);
             match page.marker {
@@ -691,7 +1154,7 @@ impl Iam {
         let context = [
             ("aws:PrincipalArn", requester.arn),
             ("aws:PrincipalAccount", requester.account_id),
-            ("aws:PrincipalType", "AssumedRole"),
+            ("aws:PrincipalType", requester.principal_type()),
         ];
         let context_params: Vec<(String, String)> = context
             .iter()
@@ -726,7 +1189,7 @@ impl Iam {
             if let Some(m) = &marker {
                 params.push(("Marker", m.clone()));
             }
-            let body = self.call(action, &params).await?;
+            let body = self.call("SimulatePrincipalPolicy", &params).await?;
             let page = parse_simulation(&body).with_context(|| format!("reading {action}"))?;
             decisions.extend(page.decisions);
             match page.marker {
@@ -736,10 +1199,17 @@ impl Iam {
         }
     }
 
-    /// One signed Query call, tried again with backoff while IAM throttles
-    /// it or fails on its side.
-    async fn call(&self, action: &'static str, params: &[(&str, String)]) -> Result<String> {
-        let body = form_urlencoded::Serializer::new(String::new())
+    /// One signed Query call of `operation`, tried again with backoff while
+    /// IAM throttles it or fails on its side. `Action` is added unless
+    /// `params` has it.
+    async fn call(&self, operation: &str, params: &[(&str, String)]) -> Result<String> {
+        let action = format!("iam:{operation}");
+        let action = action.as_str();
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        if !params.iter().any(|(k, _)| *k == "Action") {
+            serializer.append_pair("Action", operation);
+        }
+        let body = serializer
             .extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())))
             .append_pair("Version", "2010-05-08")
             .finish();
@@ -768,7 +1238,7 @@ impl Iam {
             }
             return Err(match iam_failure(&text) {
                 Some((code, _)) if code == "AccessDenied" || code == "AccessDeniedException" => {
-                    anyhow::Error::new(Denied(action)).into()
+                    anyhow::Error::new(Denied(action.to_string(), self.who)).into()
                 }
                 Some((code, message)) => anyhow!("{action} failed: {code}: {message}").into(),
                 None => anyhow!("{action} failed with HTTP {status}").into(),
@@ -901,6 +1371,29 @@ fn result_children(
         }
     }
     anyhow::bail!("no {name} in the response")
+}
+
+/// The text of every element of `body` named one of `names`, in document
+/// order, with its name; other elements are searched within.
+fn leaves(body: &str, names: &[&str]) -> anyhow::Result<Vec<(String, String)>> {
+    fn walk(
+        tag: &mut Decoder,
+        names: &[&str],
+        out: &mut Vec<(String, String)>,
+    ) -> anyhow::Result<()> {
+        while let Some(mut child) = tag.next_tag() {
+            match names.iter().find(|n| child.start_el().matches(n)) {
+                Some(name) => out.push((name.to_string(), text(&mut child)?)),
+                None => walk(&mut child, names, out)?,
+            }
+        }
+        Ok(())
+    }
+    let mut document = aws_smithy_xml::decode::Document::new(body);
+    let mut root = document.root_element()?;
+    let mut out = Vec::new();
+    walk(&mut root, names, &mut out)?;
+    Ok(out)
 }
 
 fn parse_list_roles(body: &str) -> anyhow::Result<RolesPage> {
@@ -1076,9 +1569,16 @@ struct Requester<'a> {
     account_id: &'a str,
     root: &'a str,
     arn: &'a str,
+    /// An IAM user, rather than a role session.
+    user: bool,
 }
 
 impl Requester<'_> {
+    /// `aws:PrincipalType`.
+    fn principal_type(&self) -> &'static str {
+        if self.user { "User" } else { "AssumedRole" }
+    }
+
     fn is(&self, principal: &str) -> bool {
         principal == "*" || [self.root, self.account_id, self.arn].contains(&principal)
     }
@@ -1090,7 +1590,7 @@ impl Requester<'_> {
             // The role's ARN, path included, not the session's.
             "aws:principalarn" => Some(self.arn),
             "aws:principalaccount" => Some(self.account_id),
-            "aws:principaltype" => Some("AssumedRole"),
+            "aws:principaltype" => Some(self.principal_type()),
             "aws:principalisawsservice" => Some("false"),
             _ => None,
         }
@@ -1445,17 +1945,95 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(page.decisions[0].1.organizations, Some(false));
-        assert!(!page.decisions[0].1.trust_alone_allows());
+        assert!(!page.decisions[0].1.trust_alone_allows(false));
         let alone = |decision: &str, organizations, boundary| Decision {
             decision: decision.into(),
             missing: Vec::new(),
             boundary,
             organizations,
         };
-        assert!(alone("implicitDeny", Some(true), None).trust_alone_allows());
-        assert!(alone("implicitDeny", None, Some(true)).trust_alone_allows());
-        assert!(!alone("implicitDeny", Some(true), Some(false)).trust_alone_allows());
-        assert!(!alone("explicitDeny", Some(true), Some(true)).trust_alone_allows());
+        assert!(alone("implicitDeny", Some(true), None).trust_alone_allows(false));
+        assert!(alone("implicitDeny", None, Some(true)).trust_alone_allows(false));
+        assert!(!alone("implicitDeny", Some(true), Some(false)).trust_alone_allows(false));
+        assert!(!alone("explicitDeny", Some(true), Some(true)).trust_alone_allows(false));
+    }
+
+    #[test]
+    fn a_users_boundary_does_not_limit_what_its_arn_is_granted() {
+        let limited = Decision {
+            decision: "implicitDeny".into(),
+            boundary: Some(false),
+            ..Default::default()
+        };
+        assert!(!limited.trust_alone_allows(false));
+        assert!(limited.trust_alone_allows(true));
+    }
+
+    #[test]
+    fn identities_are_users_or_the_roles_of_their_sessions() {
+        let roles = [Role {
+            path: "/team/".into(),
+            name: "Dev".into(),
+            arn: "arn:aws:iam::111111111111:role/team/Dev".into(),
+            trust: None,
+        }];
+        assert_eq!(
+            identity_principal("arn:aws:iam::111111111111:user/ops/alice", &roles).unwrap(),
+            ("arn:aws:iam::111111111111:user/ops/alice".to_string(), true)
+        );
+        assert_eq!(
+            identity_principal("arn:aws:sts::111111111111:assumed-role/Dev/alice", &roles).unwrap(),
+            ("arn:aws:iam::111111111111:role/team/Dev".to_string(), false)
+        );
+        assert!(
+            identity_principal("arn:aws:sts::111111111111:assumed-role/Gone/x", &roles).is_err()
+        );
+        assert!(identity_principal("arn:aws:iam::111111111111:root", &roles).is_err());
+    }
+
+    #[test]
+    fn identity_policies_are_read_for_assume_role_on_the_role() {
+        let role = "arn:aws:iam::111111111111:role/ops/deployer";
+        let statements = |json: &str| -> Vec<Value> { serde_json::from_str(json).unwrap() };
+        let allow_all = statements(r#"[{"Effect":"Allow","Action":"*","Resource":"*"}]"#);
+        assert_eq!(allows(&allow_all, role), Answer::Yes);
+        let read_only =
+            statements(r#"[{"Effect":"Allow","Action":["s3:Get*","iam:List*"],"Resource":"*"}]"#);
+        assert_eq!(allows(&read_only, role), Answer::No);
+        let others = statements(
+            r#"[{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::*:role/ci-*"}]"#,
+        );
+        assert_eq!(allows(&others, role), Answer::No);
+        let not_action = statements(r#"[{"Effect":"Allow","NotAction":"iam:*","Resource":"*"}]"#);
+        assert_eq!(allows(&not_action, role), Answer::Yes);
+        let conditional = statements(
+            r#"[{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"*","Condition":{"Bool":{"aws:MultiFactorAuthPresent":"true"}}}]"#,
+        );
+        assert!(matches!(allows(&conditional, role), Answer::Unknown(_)));
+
+        let mut notes = Vec::new();
+        let deny = statements(
+            r#"[{"Effect":"Allow","Action":"*","Resource":"*"},{"Effect":"Deny","Action":"sts:*","Resource":"arn:aws:iam::*:role/ops/*"}]"#,
+        );
+        assert!(!denies(&deny, role, &mut notes));
+        let deny_if = statements(
+            r#"[{"Effect":"Deny","Action":"sts:AssumeRole","Resource":"*","Condition":{"StringNotEquals":{"aws:RequestedRegion":"eu-west-1"}}}]"#,
+        );
+        assert!(denies(&deny_if, role, &mut notes));
+        assert_eq!(notes, ["a Deny statement may apply (aws:RequestedRegion)"]);
+    }
+
+    #[test]
+    fn leaves_are_found_at_any_depth() {
+        let body = "<R><X><IsTruncated>true</IsTruncated><Marker>m</Marker><PolicyNames><member>a</member><member>b</member></PolicyNames></X></R>";
+        assert_eq!(
+            leaves(body, &["member", "Marker"]).unwrap(),
+            [
+                ("Marker".to_string(), "m".to_string()),
+                ("member".to_string(), "a".to_string()),
+                ("member".to_string(), "b".to_string())
+            ]
+        );
     }
 
     fn encoded(json: &str) -> String {
@@ -1476,6 +2054,7 @@ mod tests {
         account_id: "111111111111",
         root: ROOT,
         arn: SOURCE,
+        user: false,
     };
 
     /// A trust policy of one statement, `fields` added to it.

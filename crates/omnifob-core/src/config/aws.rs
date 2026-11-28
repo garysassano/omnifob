@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
-use super::{check_https_url, check_name, check_unique_ids, opt_duration};
+use super::{check_https_url, check_name, check_not_blank, check_unique_ids, opt_duration};
 use crate::providers::aws::partition::Partition;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,6 +260,8 @@ impl ChainedRole {
         if self.via_role.trim().is_empty() {
             return Err("via_role must name the Identity Center role (permission set)".into());
         }
+        check_not_blank("external_id", self.external_id.as_deref())?;
+        check_not_blank("mfa_serial", self.mfa_serial.as_deref())?;
         check_chained_role_arn(&self.role_arn, portal_region)?;
         if let Some(region) = &self.region {
             check_region("region", region)?;
@@ -541,7 +543,7 @@ impl CrossPartitionRole {
     fn validate(&self, label: &str, portal: &AwsSsoConfig) -> Result<(), String> {
         check_name("the label", label).map_err(|e| e.to_string())?;
         check_account_id("via_account_id", &self.via_account_id)?;
-        if self.via_role.is_empty() {
+        if self.via_role.trim().is_empty() {
             return Err("via_role must name the Identity Center role (permission set)".into());
         }
         check_role_arn(&self.role_arn)?;
@@ -701,6 +703,8 @@ pub struct AwsIamConfig {
 
 impl AwsIamConfig {
     pub(super) fn validate(&self) -> Result<(), String> {
+        check_not_blank("account", self.account.as_deref())?;
+        check_not_blank("mfa_serial", self.mfa_serial.as_deref())?;
         if let Some(region) = &self.region {
             check_region("region", region)?;
         }
@@ -789,6 +793,7 @@ pub struct AwsLoginConfig {
 
 impl AwsLoginConfig {
     pub(super) fn validate(&self) -> Result<(), String> {
+        check_not_blank("account", self.account.as_deref())?;
         check_region("region", &self.region)?;
         if let Some(region) = &self.default_region {
             check_region("default_region", region)?;
@@ -856,6 +861,8 @@ impl LoginRole {
     /// `login_region`.
     fn validate(&self, login_region: &str) -> Result<(), String> {
         check_role_arn(&self.role_arn)?;
+        check_not_blank("external_id", self.external_id.as_deref())?;
+        check_not_blank("mfa_serial", self.mfa_serial.as_deref())?;
         if let Ok(login) = Partition::of_region(login_region) {
             let role = Partition::of_arn(&self.role_arn).map_err(|e| format!("role_arn: {e:#}"))?;
             if login != role {
@@ -950,6 +957,7 @@ impl IamRole {
     /// the whole key.
     pub(crate) fn validate(&self, user_region: Option<&str>) -> Result<(), String> {
         check_role_arn(&self.role_arn)?;
+        check_not_blank("external_id", self.external_id.as_deref())?;
         // The role is assumed with the user's session, in the user's
         // partition; AssumeRole cannot leave it. A user in an isolated
         // partition, which `Partition` does not model, gets the shape check

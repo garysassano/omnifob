@@ -204,12 +204,10 @@ where
 }
 
 fn oidc_client(region: &str) -> aws_sdk_ssooidc::Client {
-    let mut config = aws_sdk_ssooidc::Config::builder()
+    let config = aws_sdk_ssooidc::Config::builder()
         .region(aws_sdk_ssooidc::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_ssooidc::config::BehaviorVersion::latest());
-    if let Some(url) = service_endpoint(OIDC_ENDPOINT_VARIABLE) {
-        config = config.endpoint_url(url);
-    }
+    let config = super::aws_endpoint!(config, OIDC_ENDPOINT_VARIABLE);
     aws_sdk_ssooidc::Client::from_conf(config.build())
 }
 
@@ -222,16 +220,14 @@ const PORTAL_MAX_ATTEMPTS: u32 = 8;
 /// client slows down once Identity Center throttles it, as the AWS CLI's
 /// `retry_mode = adaptive` does.
 fn portal_client(region: &str) -> aws_sdk_sso::Client {
-    let mut config = aws_sdk_sso::Config::builder()
+    let config = aws_sdk_sso::Config::builder()
         .region(aws_sdk_sso::config::Region::new(region.to_string()))
         .retry_config(
             aws_sdk_sso::config::retry::RetryConfig::adaptive()
                 .with_max_attempts(PORTAL_MAX_ATTEMPTS),
         )
         .behavior_version(aws_sdk_sso::config::BehaviorVersion::latest());
-    if let Some(url) = service_endpoint(PORTAL_ENDPOINT_VARIABLE) {
-        config = config.endpoint_url(url);
-    }
+    let config = super::aws_endpoint!(config, PORTAL_ENDPOINT_VARIABLE);
     aws_sdk_sso::Client::from_conf(config.build())
 }
 

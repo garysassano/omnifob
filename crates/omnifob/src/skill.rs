@@ -64,32 +64,39 @@ pub(crate) fn installed() -> Vec<Copy> {
     copies
 }
 
-/// The global skill folders of the agents that document one: the shared
+/// The skill folders of the agents that document one: the shared
 /// `~/.agents/skills` (Codex, OpenCode and `npx skills`), Claude Code's,
-/// Codex's own and OpenCode's.
+/// Codex's own, OpenCode's, Gemini CLI's, Cursor's and GitHub Copilot's, and
+/// the repository's own `.agents/skills` and `.claude/skills` in the working
+/// directory. Without a home directory, the folders a variable names are
+/// still looked in.
 fn skill_dirs() -> Vec<PathBuf> {
     let var = |name: &str| {
         std::env::var_os(name)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
     };
-    let Some(home) = std::env::home_dir() else {
-        return Vec::new();
-    };
-    let config = var("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
-    let mut dirs = vec![home.join(".agents").join("skills")];
-    dirs.push(
+    let home = std::env::home_dir().filter(|h| h.is_absolute());
+    let under_home = |path: &str| home.as_ref().map(|h| h.join(path));
+    let config = var("XDG_CONFIG_HOME").or_else(|| under_home(".config"));
+    let mut dirs: Vec<Option<PathBuf>> = vec![
+        under_home(".agents/skills"),
         var("CLAUDE_CONFIG_DIR")
-            .unwrap_or_else(|| home.join(".claude"))
-            .join("skills"),
-    );
-    dirs.push(
+            .or_else(|| under_home(".claude"))
+            .map(|d| d.join("skills")),
         var("CODEX_HOME")
-            .unwrap_or_else(|| home.join(".codex"))
-            .join("skills"),
-    );
-    dirs.push(config.join("opencode").join("skills"));
-    dirs
+            .or_else(|| under_home(".codex"))
+            .map(|d| d.join("skills")),
+        config.map(|c| c.join("opencode").join("skills")),
+        under_home(".gemini/skills"),
+        under_home(".cursor/skills"),
+        under_home(".copilot/skills"),
+    ];
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(Some(cwd.join(".agents").join("skills")));
+        dirs.push(Some(cwd.join(".claude").join("skills")));
+    }
+    dirs.into_iter().flatten().collect()
 }
 
 /// `metadata.fob-version` in a skill's front matter.

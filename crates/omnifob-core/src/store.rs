@@ -621,17 +621,75 @@ pub mod test_files {
 /// An exclusive lock shared by every omnifob process on this machine,
 /// released when dropped. It guards read-modify-write of a stored value, such
 /// as renewing a session with a refresh token that only works once.
-pub struct Lock(#[allow(dead_code)] std::fs::File);
+pub struct Lock(#[allow(dead_code)] Held);
+
+enum Held {
+    /// Held while the file is open.
+    File(#[allow(dead_code)] std::fs::File),
+    /// A lock within this process, for an in-memory keychain, which no
+    /// other process shares; it needs no state directory.
+    Local(String),
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Held::Local(name) = self {
+            local_locks().remove(name.as_str());
+        }
+    }
+}
+
+fn local_locks() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    static LOCKS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    LOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The lock called `name`, being taken.
+enum Attempt {
+    File(std::fs::File, std::path::PathBuf),
+    Local(String),
+}
+
+impl Attempt {
+    fn open(name: &str) -> anyhow::Result<Self> {
+        if Context::current().in_memory() {
+            return Ok(Attempt::Local(name.to_string()));
+        }
+        let (file, path) = open_lock(name)?;
+        Ok(Attempt::File(file, path))
+    }
+
+    /// `Ok` with the lock when taken, or `None` when given up on; `Err` with
+    /// the attempt to try again.
+    fn take(self, deadline: std::time::Instant) -> anyhow::Result<Result<Option<Lock>, Attempt>> {
+        match self {
+            Attempt::File(file, path) => Ok(match try_lock(&file, &path, deadline)? {
+                Some(true) => Ok(Some(Lock(Held::File(file)))),
+                Some(false) => Ok(None),
+                None => Err(Attempt::File(file, path)),
+            }),
+            Attempt::Local(name) => Ok(if local_locks().insert(name.clone()) {
+                Ok(Some(Lock(Held::Local(name))))
+            } else if std::time::Instant::now() < deadline {
+                Err(Attempt::Local(name))
+            } else {
+                Ok(None)
+            }),
+        }
+    }
+}
 
 /// Takes the lock called `name`, waiting up to `timeout`. Returns `None` when
 /// another process holds it that long, so the caller can go ahead unguarded
 /// rather than hang.
 pub async fn lock(name: &str, timeout: std::time::Duration) -> anyhow::Result<Option<Lock>> {
-    let (file, path) = open_lock(name)?;
+    let mut attempt = Attempt::open(name)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(taken) = try_lock(&file, &path, deadline)? {
-            return Ok(taken.then_some(Lock(file)));
+        match attempt.take(deadline)? {
+            Ok(taken) => return Ok(taken),
+            Err(again) => attempt = again,
         }
         tokio::time::sleep(LOCK_POLL).await;
     }
@@ -640,11 +698,12 @@ pub async fn lock(name: &str, timeout: std::time::Duration) -> anyhow::Result<Op
 /// [`lock`] for synchronous callers, which waits on this thread. Meant for
 /// locks held only as long as a file is read and written back.
 pub fn lock_blocking(name: &str, timeout: std::time::Duration) -> anyhow::Result<Option<Lock>> {
-    let (file, path) = open_lock(name)?;
+    let mut attempt = Attempt::open(name)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Some(taken) = try_lock(&file, &path, deadline)? {
-            return Ok(taken.then_some(Lock(file)));
+        match attempt.take(deadline)? {
+            Ok(taken) => return Ok(taken),
+            Err(again) => attempt = again,
         }
         std::thread::sleep(LOCK_POLL);
     }
@@ -721,6 +780,23 @@ mod tests {
         std::fs::write(dir.join("bus"), "").unwrap();
         assert!(super::session_bus_may_exist(None, runtime));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An in-memory keychain locks within the process, with no state
+    /// directory to keep lock files in.
+    #[test]
+    fn in_memory_keychains_lock_without_a_state_directory() {
+        let cx = crate::Context::builder()
+            .keychain(super::Keychain::Memory)
+            .build();
+        let _entered = cx.enter();
+        let short = std::time::Duration::from_millis(100);
+        let held = super::lock_blocking("renew-x", short).unwrap();
+        assert!(held.is_some());
+        assert!(super::lock_blocking("renew-x", short).unwrap().is_none());
+        assert!(super::lock_blocking("renew-y", short).unwrap().is_some());
+        drop(held);
+        assert!(super::lock_blocking("renew-x", short).unwrap().is_some());
     }
 
     #[test]

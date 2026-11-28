@@ -2073,6 +2073,12 @@ async fn discovery_simulates_with_its_own_credentials_when_the_lister_may_not() 
         .expect(2)
         .mount(&server)
         .await;
+    // Nor may it read its policies, for an estimate.
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListAttachedRolePolicies"))
+        .respond_with(iam_denied())
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(body_string_contains("Action=SimulatePrincipalPolicy"))
         .and(body_string_contains("AWSReservedSSO_PowerUser_"))
@@ -2091,8 +2097,8 @@ async fn discovery_simulates_with_its_own_credentials_when_the_lister_may_not() 
     assert_eq!(discovery.skipped[0].source.via_role, "Audit");
     assert_eq!(
         discovery.skipped[0].reason,
-        "the permission set may not call iam:SimulatePrincipalPolicy; 1 role(s) in the account \
-         trust it"
+        "the permission set may not call iam:SimulatePrincipalPolicy, nor read its policies; 1 \
+         role(s) trust it (pass --trust-only to list them)"
     );
 }
 
@@ -2412,4 +2418,219 @@ async fn discovery_without_a_sign_in_asks_for_one() {
     .await
     .unwrap_err();
     assert!(matches!(error, Error::NeedsLogin { .. }), "{error:?}");
+}
+
+/// When nobody may call the simulator, the permission set's own policies
+/// are read instead, and what they allow is an estimate; when those cannot
+/// be read either, the roles that trust it are skipped, or listed with
+/// `trust_only`.
+#[tokio::test]
+async fn discovery_estimates_from_policies_when_the_simulator_is_refused() {
+    use omnifob_core::providers::aws::discover::{Basis, Options, Origin, Source, discover_from};
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "guess", 3600).await;
+    Mock::given(method("GET"))
+        .and(path("/federation/credentials"))
+        .respond_with(role_credentials())
+        .mount(&server)
+        .await;
+    let sso = "/aws-reserved/sso.amazonaws.com/";
+    let root = r#"{"AWS":"arn:aws:iam::111111111111:root"}"#;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListRoles"))
+        .respond_with(iam_roles(&[
+            (sso, "AWSReservedSSO_ro_0123456789abcdef", root),
+            ("/", "admin-root", root),
+            ("/", "billing", root),
+        ]))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .respond_with(iam_denied())
+        .mount(&server)
+        .await;
+    let source = Source {
+        account_id: "111111111111".into(),
+        segment: "dev".into(),
+        via_role: "ro".into(),
+        profile_id: "guess/dev/ro".into(),
+    };
+    let config = config();
+    let origin = Origin::Sso(&config);
+    let run = |trust_only| {
+        discover_from(
+            "guess",
+            &origin,
+            vec![source.clone()],
+            Options { trust_only },
+        )
+    };
+
+    // The policies cannot be read: skipped, with the way out.
+    let policies = Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListAttachedRolePolicies"))
+        .respond_with(iam_denied())
+        .mount_as_scoped(&server)
+        .await;
+    let discovery = run(false).await.unwrap();
+    assert!(discovery.found.is_empty());
+    assert!(
+        discovery.skipped[0].reason.contains("--trust-only"),
+        "{:?}",
+        discovery.skipped
+    );
+    let discovery = run(true).await.unwrap();
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    assert_eq!(discovery.found.len(), 2);
+    assert!(discovery.found.iter().all(|f| f.basis == Basis::TrustOnly));
+    drop(policies);
+
+    // One attached policy allows assuming `admin-*`; an inline one denies
+    // nothing.
+    let attached = "arn:aws:iam::111111111111:policy/assume-admin";
+    let xml = |body: String| {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/xml")
+            .set_body_string(body)
+    };
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListAttachedRolePolicies"))
+        .and(body_string_contains("RoleName=AWSReservedSSO_ro_0123456789abcdef"))
+        .respond_with(xml(format!(
+            "<ListAttachedRolePoliciesResponse><ListAttachedRolePoliciesResult><IsTruncated>false</IsTruncated><AttachedPolicies><member><PolicyName>assume-admin</PolicyName><PolicyArn>{attached}</PolicyArn></member></AttachedPolicies></ListAttachedRolePoliciesResult></ListAttachedRolePoliciesResponse>"
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetPolicy&"))
+        .respond_with(xml(
+            "<GetPolicyResponse><GetPolicyResult><Policy><DefaultVersionId>v2</DefaultVersionId></Policy></GetPolicyResult></GetPolicyResponse>".into(),
+        ))
+        .mount(&server)
+        .await;
+    let document = iam_encoded(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::111111111111:role/admin-*"}]}"#,
+    );
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetPolicyVersion"))
+        .and(body_string_contains("VersionId=v2"))
+        .respond_with(xml(format!(
+            "<GetPolicyVersionResponse><GetPolicyVersionResult><PolicyVersion><Document>{document}</Document></PolicyVersion></GetPolicyVersionResult></GetPolicyVersionResponse>"
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListRolePolicies"))
+        .respond_with(xml(
+            "<ListRolePoliciesResponse><ListRolePoliciesResult><IsTruncated>false</IsTruncated><PolicyNames/></ListRolePoliciesResult></ListRolePoliciesResponse>".into(),
+        ))
+        .mount(&server)
+        .await;
+    let discovery = run(false).await.unwrap();
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    let found: Vec<_> = discovery
+        .found
+        .iter()
+        .map(|f| (f.label.as_str(), f.basis))
+        .collect();
+    assert_eq!(found, [("dev-admin-root", Basis::Estimated)]);
+    assert!(
+        discovery.found[0]
+            .conditions
+            .iter()
+            .any(|c| c.contains("SCPs")),
+        "{:?}",
+        discovery.found[0].conditions
+    );
+}
+
+/// Under `[agent] max_ttl`, an Identity Center role's credentials, whose
+/// length the permission set sets, are shortened with
+/// `GetScopedCredentials`; a refusal names the permission it needs.
+#[tokio::test]
+async fn agents_get_a_shorter_copy_of_a_long_session() {
+    let (_guard, server) = setup().await;
+    device_login(&server, "scope", 3600).await;
+    let config = Config::parse(&format!(
+        r#"
+        [integrations.scope]
+        type = "aws-sso"
+        start_url = "{START_URL}"
+        region = "eu-west-1"
+        "#
+    ))
+    .unwrap();
+    let profile = Profile::new(
+        "scope",
+        "dev",
+        "Admin",
+        Target::Aws {
+            account_id: "111111111111".into(),
+            account_name: "Dev".into(),
+            role_name: "Admin".into(),
+        },
+    );
+    // Valid until 2100: far longer than the cap.
+    let long = Credentials {
+        env: [
+            ("AWS_ACCESS_KEY_ID", "ASIALONG"),
+            ("AWS_SECRET_ACCESS_KEY", "s"),
+            ("AWS_SESSION_TOKEN", "t"),
+            ("AWS_REGION", "eu-west-1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+        expires_at: Some("2100-01-01T00:00:00Z".parse().unwrap()),
+        ..Default::default()
+    };
+    let max = jiff::SignedDuration::from_mins(30);
+    let refused = Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetScopedCredentials"))
+        .respond_with(sts_error(403, "AccessDenied"))
+        .mount_as_scoped(&server)
+        .await;
+    use omnifob_core::{Credentials, Profile, Target, providers};
+    use wiremock::matchers::header_regex;
+    let err = providers::scoped_for_agent(&config, &profile, long.clone(), max, "fob exec (agent)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("sts:GetScopedCredentials"), "{err}");
+    drop(refused);
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetScopedCredentials"))
+        .and(body_string_contains("DurationSeconds=1800"))
+        .and(body_string_contains("ScopedSessionDescription=fob"))
+        .and(header_regex("authorization", "Credential=ASIALONG/"))
+        .respond_with(sts_credentials("GetScopedCredentials", "ASIASCOPED"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let scoped =
+        providers::scoped_for_agent(&config, &profile, long.clone(), max, "fob exec (agent)")
+            .await
+            .unwrap();
+    assert_eq!(scoped.env["AWS_ACCESS_KEY_ID"], "ASIASCOPED");
+    assert_eq!(scoped.env["AWS_REGION"], "eu-west-1");
+    // Credentials that end within the cap are left alone.
+    let short = Credentials {
+        expires_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10)),
+        ..long
+    };
+    let same = providers::scoped_for_agent(&config, &profile, short.clone(), max, "x")
+        .await
+        .unwrap();
+    assert_eq!(same.env["AWS_ACCESS_KEY_ID"], "ASIALONG");
 }

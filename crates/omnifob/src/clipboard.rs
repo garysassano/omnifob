@@ -10,9 +10,16 @@ use anyhow::{Context, bail};
 /// Commands that print the clipboard, in order of preference for this
 /// platform.
 fn readers() -> Vec<(&'static str, Vec<&'static str>)> {
+    // Windows PowerShell writes to a pipe in the console's code page unless
+    // told otherwise, which mangles anything outside ASCII.
     let powershell = (
         "powershell.exe",
-        vec!["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard"],
+        vec![
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Clipboard",
+        ],
     );
     if cfg!(target_os = "macos") {
         vec![("pbpaste", vec![])]

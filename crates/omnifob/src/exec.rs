@@ -76,6 +76,11 @@ impl ExecOptions {
 }
 
 impl App {
+    /// `[agent] max_ttl`, when an agent runs fob.
+    pub(crate) fn agent_max_ttl(&self) -> Option<jiff::SignedDuration> {
+        self.config.agent.max_ttl.filter(|_| crate::agent::active())
+    }
+
     /// The lifetime to ask for: `ttl`, capped at `[agent] max_ttl` for an
     /// agent where the profile's lifetime is omnifob's to choose.
     pub(crate) fn agent_ttl(
@@ -118,6 +123,21 @@ impl App {
             .with_login(|| providers::credentials(&self.config, profile, use_cache, ttl))
             .await
             .with_context(|| format!("getting credentials for {}", profile.id))?;
+        // An AWS session the provider sets the length of (an Identity Center
+        // role's, a console sign-in's) is shortened for an agent instead.
+        // `fob console` signs in with them, which needs the session itself.
+        let creds = match self.agent_max_ttl() {
+            Some(max) if self.command != "console" => providers::scoped_for_agent(
+                &self.config,
+                profile,
+                creds,
+                max,
+                &format!("fob {} (agent)", self.command),
+            )
+            .await
+            .with_context(|| format!("getting credentials for {}", profile.id))?,
+            _ => creds,
+        };
         if use_cache && ttl.is_none() && creds.wants_renewal(Timestamp::now()) {
             spawn_renewal(&self.config, profile);
         }
@@ -171,8 +191,13 @@ impl App {
         let ttl = self.agent_ttl(profile, ttl);
         if options.server {
             provision.merge(
-                provision::aws_container_endpoint(self.config.clone(), profile.clone(), ttl)
-                    .await?,
+                provision::aws_container_endpoint(
+                    self.config.clone(),
+                    profile.clone(),
+                    ttl,
+                    self.agent_max_ttl(),
+                )
+                .await?,
             );
             via.push("aws-container");
         }
@@ -460,19 +485,7 @@ pub(crate) fn child_env(
     // The vault's passphrase opens every stored secret; the command never
     // needs it.
     remove.push(omnifob_core::context::VAULT_PASSPHRASE_VAR.to_string());
-    if sets("AWS_ACCESS_KEY_ID") {
-        let mut stale: Vec<&str> = AWS_CREDENTIAL_VARS.to_vec();
-        stale.extend(AWS_COMPANION_VARS);
-        if sets("AWS_REGION") || sets("AWS_DEFAULT_REGION") {
-            stale.extend(["AWS_REGION", "AWS_DEFAULT_REGION"]);
-        }
-        remove.extend(
-            stale
-                .into_iter()
-                .filter(|name| !sets(name))
-                .map(str::to_string),
-        );
-    }
+    remove.extend(stale_vars(creds));
     let mut set: Vec<(String, String)> = creds
         .env
         .iter()
@@ -486,6 +499,28 @@ pub(crate) fn child_env(
     remove.sort();
     remove.dedup();
     (remove, set)
+}
+
+/// Variables from another source of AWS credentials (a profile, a session
+/// token, an endpoint) that would mix with `creds`' own, when they are AWS
+/// credentials; also the Region variables when they set one. `fob exec`
+/// removes them from the command's environment and `fob use` from the
+/// shell's.
+pub(crate) fn stale_vars(creds: &Credentials) -> Vec<String> {
+    let sets = |name: &str| creds.env.contains_key(name);
+    if !sets("AWS_ACCESS_KEY_ID") {
+        return Vec::new();
+    }
+    let mut stale: Vec<&str> = AWS_CREDENTIAL_VARS.to_vec();
+    stale.extend(AWS_COMPANION_VARS);
+    if sets("AWS_REGION") || sets("AWS_DEFAULT_REGION") {
+        stale.extend(["AWS_REGION", "AWS_DEFAULT_REGION"]);
+    }
+    stale
+        .into_iter()
+        .filter(|name| !sets(name))
+        .map(str::to_string)
+        .collect()
 }
 
 /// [`child_env`] for this process's `OMNIFOB_VARS`.

@@ -102,10 +102,16 @@ pub fn export(
     if let Some(bad) = creds.env.keys().find(|name| !is_var_name(name)) {
         bail!("`{bad}` is not a valid environment variable name ([A-Za-z_][A-Za-z0-9_]*)");
     }
-    let mut out: String = previous_names(previous)
+    let mut stale: Vec<String> = previous_names(previous)
         .filter(|name| !creds.env.contains_key(*name))
-        .map(|name| remove(shell, name))
+        .map(str::to_string)
         .collect();
+    // As `fob exec` does: another source of AWS credentials in the shell
+    // (`AWS_PROFILE`, a session token) would mix with these.
+    stale.extend(crate::exec::stale_vars(creds));
+    stale.sort();
+    stale.dedup();
+    let mut out: String = stale.iter().map(|name| remove(shell, name)).collect();
     for (name, value) in &creds.env {
         out.push_str(&set(shell, name, value));
     }
@@ -329,6 +335,14 @@ mod tests {
             out.ends_with("set -gx OMNIFOB_EXPIRES_AT '2100-01-01T00:00:00Z'\n"),
             "{out}"
         );
+        // AWS credentials clear another source in the shell, as `fob exec`
+        // does, but keep the Region unless they set one.
+        let aws = creds(&[("AWS_ACCESS_KEY_ID", "A"), ("AWS_SECRET_ACCESS_KEY", "s")]);
+        let out = export(Shell::Posix, "p", &aws, &[]).unwrap();
+        for stale in ["AWS_PROFILE", "AWS_SESSION_TOKEN"] {
+            assert!(out.contains(&format!("unset {stale}\n")), "{out}");
+        }
+        assert!(!out.contains("unset AWS_REGION"), "{out}");
     }
 
     #[test]

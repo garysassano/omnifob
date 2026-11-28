@@ -214,6 +214,13 @@ impl CloudflareTemplate {
         if self.permissions.is_empty() {
             return Err("permissions must name at least one permission".to_string());
         }
+        self.check_options()
+    }
+
+    /// The checks of everything but `permissions` being empty, which `fob
+    /// cf add-template` runs before signing in, since it may still ask for
+    /// the permissions.
+    pub fn check_options(&self) -> Result<(), String> {
         for (key, list) in [
             ("permissions", &self.permissions),
             ("optional", &self.optional),

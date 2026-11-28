@@ -161,12 +161,28 @@ impl Served {
         config: &Config,
         profile: &Profile,
         ttl: Option<SignedDuration>,
+        agent_max: Option<SignedDuration>,
     ) -> crate::Result<Credentials> {
         let mut held = self.0.lock().await;
         if let Some(creds) = held.as_ref().filter(|c| still_served(c, Timestamp::now())) {
             return Ok(creds.clone());
         }
         let creds = served_credentials(config, profile, ttl).await?;
+        // Under `[agent] max_ttl`, the SDKs' refreshes stay as short as the
+        // variables' credentials.
+        let creds = match agent_max {
+            Some(max) => {
+                providers::scoped_for_agent(
+                    config,
+                    profile,
+                    creds,
+                    max,
+                    "fob exec endpoint (agent)",
+                )
+                .await?
+            }
+            None => creds,
+        };
         *held = Some(creds.clone());
         Ok(creds)
     }
@@ -238,6 +254,7 @@ pub async fn aws_container_endpoint(
     config: Config,
     profile: Profile,
     ttl: Option<SignedDuration>,
+    agent_max: Option<SignedDuration>,
 ) -> anyhow::Result<Provision> {
     let listener = serve::bind().await?;
     let port = listener.local_addr()?.port();
@@ -253,7 +270,7 @@ pub async fn aws_container_endpoint(
             if request.method != "GET" || request.path != "/" {
                 return Response::error(404, "message", "GET / only");
             }
-            let creds = match served.get(config, profile, ttl).await {
+            let creds = match served.get(config, profile, ttl, agent_max).await {
                 Ok(creds) => creds,
                 Err(e) => return Response::error(500, "message", failure(&e)),
             };
@@ -304,6 +321,16 @@ const AZURE_SHADOWING: &[&str] = &[
     "IMDS_ENDPOINT",
     "MSI_ENDPOINT",
     "MSI_SECRET",
+    // Terraform's azurerm provider prefers a service principal or OIDC
+    // token from these over every other way in.
+    "ARM_CLIENT_ID",
+    "ARM_CLIENT_SECRET",
+    "ARM_CLIENT_CERTIFICATE_PATH",
+    "ARM_CLIENT_CERTIFICATE_PASSWORD",
+    "ARM_OIDC_TOKEN",
+    "ARM_OIDC_TOKEN_FILE_PATH",
+    "ARM_OIDC_REQUEST_TOKEN",
+    "ARM_OIDC_REQUEST_URL",
 ];
 
 /// The body App Service's token endpoint answers with: `expires_on` in
@@ -482,7 +509,7 @@ pub async fn gcp_adc_endpoint(
             {
                 return error(400, "invalid_grant", "wrong grant or refresh token".into());
             }
-            let creds = match served.get(config, profile, ttl).await {
+            let creds = match served.get(config, profile, ttl, None).await {
                 Ok(creds) => creds,
                 Err(e) => return error(400, "invalid_grant", failure(&e)),
             };
@@ -504,7 +531,9 @@ pub async fn gcp_adc_endpoint(
             "GOOGLE_APPLICATION_CREDENTIALS".into(),
             file.path().display().to_string(),
         )],
-        remove: Vec::new(),
+        // Terraform's google provider takes a static access token here over
+        // the ADC file, and stops working when it expires.
+        remove: vec!["GOOGLE_OAUTH_ACCESS_TOKEN".into()],
         files: vec![file],
         tasks: vec![task(serve::serve(listener, handler))],
     })

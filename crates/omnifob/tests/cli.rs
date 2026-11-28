@@ -1679,6 +1679,34 @@ async fn export_writes_the_aws_config_atomically_and_rename_warns_about_it() {
     assert_eq!(lines(&stdout), ["corp/dev/Admin", "corp/prod/Admin"]);
 }
 
+/// `fob export aws-config` refuses a prefix the AWS config cannot hold and
+/// a block whose end marker is gone, writes no empty block, and names the
+/// config given with `--config` in each line.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_checks_its_prefix_and_the_existing_block() {
+    let (fob, _server) = synced_portal("export-checks").await;
+    let stderr = fob.fails(&["export", "aws-config", "--prefix", "my fob "]);
+    assert!(stderr.contains("--prefix"), "{stderr}");
+    std::fs::create_dir_all(fob.root.join("aws")).unwrap();
+    let orphaned = format!("{}\n[profile x]\n", omnifob_core::import::AWS_BLOCK_BEGIN);
+    std::fs::write(fob.aws_config(), &orphaned).unwrap();
+    let stderr = fob.fails(&["export", "aws-config", "--write"]);
+    assert!(stderr.contains("# END omnifob"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(fob.aws_config()).unwrap(), orphaned);
+    #[cfg(unix)]
+    {
+        let config = fob.config_file();
+        let (stdout, _) = fob.ok(&["--config", config.to_str().unwrap(), "export", "aws-config"]);
+        assert!(
+            stdout.contains(&format!(
+                "credential_process = fob --config {} creds acme/dev/Admin",
+                config.display()
+            )),
+            "{stdout}"
+        );
+    }
+}
+
 #[test]
 fn export_gives_console_sign_in_profiles_their_region() {
     let fob = Fob::new("export-login");

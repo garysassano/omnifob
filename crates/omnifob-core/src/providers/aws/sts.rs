@@ -7,7 +7,6 @@ use anyhow::{Context, anyhow};
 use aws_sdk_sts::error::ProvideErrorMetadata;
 use jiff::{SignedDuration, Timestamp};
 
-use super::service_endpoint;
 use crate::Credentials;
 
 /// The variable the AWS CLI and SDKs read for STS's endpoint, a VPC
@@ -67,13 +66,11 @@ pub(crate) fn sts_client(creds: &Credentials, region: &str) -> anyhow::Result<aw
         None,
         "omnifob",
     );
-    let mut config = aws_sdk_sts::Config::builder()
+    let config = aws_sdk_sts::Config::builder()
         .region(aws_sdk_sts::config::Region::new(region.to_string()))
         .credentials_provider(provider)
         .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest());
-    if let Some(url) = service_endpoint(STS_ENDPOINT_VARIABLE) {
-        config = config.endpoint_url(url);
-    }
+    let config = super::aws_endpoint!(config, STS_ENDPOINT_VARIABLE);
     Ok(aws_sdk_sts::Client::from_conf(config.build()))
 }
 
@@ -81,12 +78,10 @@ pub(crate) fn sts_client(creds: &Credentials, region: &str) -> anyhow::Result<aw
 /// own proof of identity (`AssumeRoleWithWebIdentity`), so the request is
 /// not signed and no AWS credentials leave this machine with it.
 pub(crate) fn unsigned_sts_client(region: &str) -> aws_sdk_sts::Client {
-    let mut config = aws_sdk_sts::Config::builder()
+    let config = aws_sdk_sts::Config::builder()
         .region(aws_sdk_sts::config::Region::new(region.to_string()))
         .behavior_version(aws_sdk_sts::config::BehaviorVersion::latest());
-    if let Some(url) = service_endpoint(STS_ENDPOINT_VARIABLE) {
-        config = config.endpoint_url(url);
-    }
+    let config = super::aws_endpoint!(config, STS_ENDPOINT_VARIABLE);
     aws_sdk_sts::Client::from_conf(config.build())
 }
 
@@ -163,6 +158,45 @@ pub(crate) async fn assume_role(
         assumed.credentials().context("no credentials returned")?,
         export_region,
     )
+}
+
+/// A copy of temporary credentials that ends after `duration` (STS
+/// `GetScopedCredentials`): the same principal and session, so CloudTrail
+/// and policies see the caller they always did, with `description` logged.
+/// Fails rather than handing out the unscoped credentials, naming the
+/// permission the call needs when STS refuses it.
+pub(crate) async fn scoped_credentials(
+    creds: &Credentials,
+    sts_region: &str,
+    duration: SignedDuration,
+    description: &str,
+) -> anyhow::Result<Credentials> {
+    let scoped = sts_client(creds, sts_region)?
+        .get_scoped_credentials()
+        .duration_seconds(whole_seconds(duration)?)
+        .scoped_session_description(description)
+        .send()
+        .await
+        .map_err(|e| {
+            let detail = aws_sdk_sts::error::DisplayErrorContext(&e).to_string();
+            match sts_code(e.code()) {
+                Some("AccessDenied") => anyhow!(
+                    "shortening the credentials to `[agent] max_ttl` needs                      sts:GetScopedCredentials, which the role may not call; allow it, or unset                      max_ttl ({detail})"
+                ),
+                _ => anyhow!("shortening the credentials with GetScopedCredentials: {detail}"),
+            }
+        })?;
+    let region = creds.env.get("AWS_REGION").map(String::as_str);
+    let mut out = from_sts(
+        scoped.credentials().context("no credentials returned")?,
+        region,
+    )?;
+    // Everything else the profile exports (its account, Region) stays.
+    for (name, value) in &creds.env {
+        out.env.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    out.issued_at = Some(Timestamp::now());
+    Ok(out)
 }
 
 /// Temporary credentials from STS as the variables AWS tools read.

@@ -468,9 +468,37 @@ impl App {
                 }));
             }
             _ => {
+                let mut sign_ins: HashMap<&str, SignInState> = HashMap::new();
+                for profile in &candidates {
+                    sign_ins
+                        .entry(profile.integration.as_str())
+                        .or_insert_with(|| sign_in_state(&self.config, &profile.integration));
+                }
+                let details = |p: &Profile| {
+                    let found = labels::of(&self.config, p);
+                    let mut cells = Vec::new();
+                    if let Some((env, _)) = &found.env {
+                        cells.push(env.clone());
+                    }
+                    if let Some((access, _)) = found.access {
+                        cells.push(access.as_str().to_string());
+                    }
+                    let mut notes = Vec::new();
+                    match sign_ins[p.integration.as_str()] {
+                        SignInState::SignedIn => {}
+                        state => notes.push(state.describe().to_string()),
+                    }
+                    if let Some(via) = self.via_profile(p) {
+                        notes.push(format!("via {via}"));
+                    }
+                    if !notes.is_empty() {
+                        cells.push(format!("({})", notes.join(", ")));
+                    }
+                    cells.join("  ")
+                };
                 let picked = dialoguer::FuzzySelect::new()
                     .with_prompt("Profile")
-                    .items(picker_rows(&candidates))
+                    .items(picker_rows(&candidates, details))
                     .default(0)
                     .interact_on_opt(&Term::stderr())?
                     .context("no profile selected")?;
@@ -617,6 +645,11 @@ fn sign_in_state(config: &omnifob_core::Config, integration: &str) -> SignInStat
     }
 }
 
+/// An integration's sign-in in words, for the integration picker.
+pub(crate) fn describe_sign_in(config: &omnifob_core::Config, integration: &str) -> &'static str {
+    sign_in_state(config, integration).describe()
+}
+
 /// Whether an environment label is production's, which `fob list` marks.
 fn is_production(env: &str) -> bool {
     let env = env.trim().trim_end_matches('?');
@@ -638,10 +671,16 @@ impl Skipped {
 }
 
 /// The picker's rows: the parts of each id (integration, account, role) in
-/// aligned columns, then the account ID, so a long list is easy to scan.
+/// aligned columns, then the account ID and `details` (the environment,
+/// access and notes `fob list` shows), so a long list is easy to scan.
 /// Typing still filters, and words separated by spaces now match across parts.
-fn picker_rows(profiles: &[&Profile]) -> Vec<String> {
+fn picker_rows(profiles: &[&Profile], details: impl Fn(&Profile) -> String) -> Vec<String> {
     let parts: Vec<Vec<&str>> = profiles.iter().map(|p| p.id.split('/').collect()).collect();
+    let account_width = profiles
+        .iter()
+        .map(|p| p.target.account_id().unwrap_or_default().chars().count())
+        .max()
+        .unwrap_or(0);
     let columns = parts.iter().map(Vec::len).max().unwrap_or(0);
     let widths: Vec<usize> = (0..columns)
         .map(|i| {
@@ -662,7 +701,9 @@ fn picker_rows(profiles: &[&Profile]) -> Vec<String> {
                 let part = parts.get(i).copied().unwrap_or_default();
                 row.push_str(&format!("{part:width$}  "));
             }
-            row.push_str(profile.target.account_id().unwrap_or_default());
+            let account = profile.target.account_id().unwrap_or_default();
+            row.push_str(&format!("{account:account_width$}  "));
+            row.push_str(&details(profile));
             row.trim_end().to_string()
         })
         .collect()
@@ -722,11 +763,25 @@ mod tests {
             target: Target::Token {},
         };
         assert_eq!(
-            picker_rows(&[&a, &b, &token]),
+            picker_rows(&[&a, &b, &token], |_| String::new()),
             [
                 "mine        management  AdministratorAccess  111111111111",
                 "acme-media  am-dev      acme-media-pe        222222222222",
                 "tok         prod",
+            ]
+        );
+        let details = |p: &Profile| {
+            if p.id.starts_with("tok") {
+                "(signed out)".to_string()
+            } else {
+                "prod  admin".to_string()
+            }
+        };
+        assert_eq!(
+            picker_rows(&[&a, &token], details),
+            [
+                "mine  management  AdministratorAccess  111111111111  prod  admin",
+                "tok   prod                                           (signed out)",
             ]
         );
     }

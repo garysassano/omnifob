@@ -214,6 +214,15 @@ fn check_unique_ids<'a>(
 }
 
 /// Fails unless `value` is an `https://` URL with a host, naming the key.
+/// Fails when an optional key is set but blank, which reads as set and
+/// means nothing.
+pub(crate) fn check_not_blank(key: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(v) if v.trim().is_empty() => Err(format!("{key} must not be empty")),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn check_https_url(key: &str, value: &str) -> Result<(), String> {
     let url = parse_url(key, value)?;
     if url.scheme() != "https" {
@@ -369,9 +378,11 @@ impl Config {
                     None => std::path::PathBuf::from(dir),
                 };
                 let real = std::fs::canonicalize(&path).ok();
+                let cwd = comparable(cwd);
                 let depth = [Some(path), real]
                     .into_iter()
                     .flatten()
+                    .map(|p| comparable(&p))
                     .filter(|p| cwd.starts_with(p))
                     .map(|p| p.components().count())
                     .max()?;
@@ -395,6 +406,22 @@ impl Config {
             .with("configured", known)
             .into()
         })
+    }
+}
+
+/// A path as directories compare: on Windows, without the `\\?\` prefix
+/// `canonicalize` adds and in lower case, as the file system ignores case;
+/// elsewhere as it is.
+fn comparable(path: &Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let text = path.to_string_lossy();
+        let text = match text.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
+        };
+        std::path::PathBuf::from(text.to_lowercase())
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -557,6 +584,39 @@ mod tests {
         assert!(Config::parse(&renamed).is_err(), "'b c' is still to fix");
         let renamed = rename_integration(&renamed, "b c", "b-c").unwrap().text;
         assert!(Config::parse(&renamed).is_ok());
+    }
+
+    /// Windows paths ignore case, and the working directory may carry the
+    /// `\\?\` prefix a canonical path has.
+    #[cfg(windows)]
+    #[test]
+    fn windows_directories_ignore_case_and_verbatim_prefixes() {
+        let config =
+            Config::parse("[directories]\n'C:\\Code\\Acme' = \"acme/dev/Admin\"\n").unwrap();
+        for cwd in [r"c:\code\acme\app", r"\\?\C:\CODE\Acme"] {
+            assert_eq!(
+                config.directory_profile(Path::new(cwd), None),
+                Some((r"C:\Code\Acme", "acme/dev/Admin")),
+                "{cwd}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_optional_values_are_refused() {
+        let base =
+            |extra: &str| parse_error(&format!("[integrations.u]\ntype = \"aws-iam\"\n{extra}\n"));
+        assert!(base("mfa_serial = \" \"").contains("mfa_serial must not be empty"));
+        assert!(base("account = \"\"").contains("account must not be empty"));
+        let gcp = parse_error("[integrations.g]\ntype = \"gcp\"\nprojects = []\n");
+        assert!(gcp.contains("projects must name"), "{gcp}");
+        let chained = parse_error(
+            "[integrations.p]\ntype = \"aws-sso\"\nstart_url = \"https://x.awsapps.com/start\"\nregion = \"eu-west-1\"\n[integrations.p.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nexternal_id = \"\"\n",
+        );
+        assert!(
+            chained.contains("external_id must not be empty"),
+            "{chained}"
+        );
     }
 
     #[test]

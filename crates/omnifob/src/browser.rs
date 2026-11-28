@@ -18,6 +18,9 @@ pub(crate) fn open(config: &Config, name: &str, url: &str) -> anyhow::Result<()>
 /// isolated from other profiles' consoles as that browser's `isolate` says,
 /// or in the system's default browser.
 pub(crate) fn open_console(config: &Config, profile: &Profile, url: &str) -> anyhow::Result<()> {
+    if !omnifob_core::providers::console_signs_in(config, profile) {
+        return open(config, &profile.integration, url);
+    }
     match config.browser_for(&profile.integration)? {
         Some(browser) => run(browser.console_command_for(url, profile)?),
         None => open_default(url),
