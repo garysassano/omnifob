@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "omnifob"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "omnifob-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",

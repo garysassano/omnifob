@@ -21,7 +21,7 @@ clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 dialoguer = { version = "0.12.0", default-features = false, features = ["fuzzy-select", "password"] }
 futures-util.workspace = true
 jiff.workspace = true
-omnifob-core = { version = "0.13.0", path = "../omnifob-core" }
+omnifob-core = { version = "0.14.0", path = "../omnifob-core" }
 open = "5.4.5"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "signal"] }
