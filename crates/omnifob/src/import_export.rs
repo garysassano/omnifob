@@ -136,8 +136,8 @@ pub(crate) fn export_aws_config(
                     }
                     _ => None,
                 }
-                .or_else(|| c.default_region.clone())
-                .unwrap_or_else(|| c.region.clone());
+                .or_else(|| c.region.clone())
+                .unwrap_or_else(|| c.login_region.clone());
                 return Some((p.id.clone(), region));
             }
             if let Integration::Command(c) = integration {
@@ -150,13 +150,13 @@ pub(crate) fn export_aws_config(
                 omnifob_core::Target::AwsChained { label, account_id } => c
                     .chained_role(label, account_id.as_deref())
                     .and_then(|r| r.region.clone())
-                    .or_else(|| c.default_region.clone()),
+                    .or_else(|| c.region.clone()),
                 // Always set: the destination partition's Region, which the
-                // portal's default_region cannot be.
+                // portal's region cannot be.
                 omnifob_core::Target::AwsCrossPartition { label, .. } => {
                     c.cross_partition.get(label).map(|r| r.region.clone())
                 }
-                _ => c.default_region.clone(),
+                _ => c.region.clone(),
             }?;
             Some((p.id.clone(), region))
         })
@@ -934,7 +934,7 @@ pub(crate) fn import_aws(
         unique(&mut login.name);
         eprintln!(
             "fob: profile '{}' (an `aws login` sign-in) as aws-login '{}' in {}",
-            login.profile, login.name, login.region
+            login.profile, login.name, login.login_region
         );
         sections.push(aws_login_toml(&login));
         new_logins.push(login.name);

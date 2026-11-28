@@ -22,8 +22,9 @@ pub struct AwsPortal {
     /// from the portal's URL.
     pub name: String,
     pub start_url: String,
-    pub region: String,
-    /// The region most of the portal's profiles use.
+    /// The Region IAM Identity Center runs in.
+    pub sso_region: String,
+    /// The Region most of the portal's profiles use, written as `region`.
     pub default_region: Option<String>,
     /// `sso_registration_scopes` of the portal's `sso-session` section.
     pub scopes: Option<Vec<String>>,
@@ -66,7 +67,7 @@ pub struct AwsLogin {
     pub name: String,
     pub profile: String,
     /// The profile's `region`, the one signed in through.
-    pub region: String,
+    pub login_region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,7 +407,7 @@ pub fn aws_import(text: &str) -> AwsImport {
                 logins.push(AwsLogin {
                     name: crate::profile::slug(name),
                     profile: name.clone(),
-                    region: region.clone(),
+                    login_region: region.clone(),
                 });
             }
             continue;
@@ -545,7 +546,7 @@ pub fn aws_import(text: &str) -> AwsImport {
             AwsPortal {
                 name,
                 start_url,
-                region: f.region,
+                sso_region: f.region,
                 default_region,
                 scopes: f.scopes,
                 profiles: f.profiles,
@@ -619,9 +620,9 @@ pub fn aws_import(text: &str) -> AwsImport {
 /// file. `fob login` signs it in: the AWS CLI's cached tokens are not read.
 pub fn aws_login_toml(login: &AwsLogin) -> String {
     format!(
-        "[integrations.{}]\ntype = \"aws-login\"\nregion = {}\n",
+        "[integrations.{}]\ntype = \"aws-login\"\nlogin_region = {}\n",
         toml_key(&login.name),
-        toml_str(&login.region)
+        toml_str(&login.login_region)
     )
 }
 
@@ -758,13 +759,13 @@ fn same_account_role(role: &crate::config::ChainedRole) -> Option<(String, Strin
 /// to the config file.
 pub fn aws_portal_toml(portal: &AwsPortal) -> String {
     let mut out = format!(
-        "[integrations.{}]\ntype = \"aws-sso\"\nstart_url = {}\nregion = {}\n",
+        "[integrations.{}]\ntype = \"aws-sso\"\nstart_url = {}\nsso_region = {}\n",
         toml_key(&portal.name),
         toml_str(&portal.start_url),
-        toml_str(&portal.region)
+        toml_str(&portal.sso_region)
     );
     if let Some(region) = &portal.default_region {
-        out.push_str(&format!("default_region = {}\n", toml_str(region)));
+        out.push_str(&format!("region = {}\n", toml_str(region)));
     }
     if let Some(scopes) = &portal.scopes
         && scopes != &["sso:account:access"]
@@ -1127,7 +1128,7 @@ credential_process = /usr/bin/creds
         let client = portal(&import, "client");
         assert_eq!(client.name, "client");
         assert_eq!(client.start_url, "https://client.awsapps.com/start");
-        assert_eq!(client.region, "eu-west-1");
+        assert_eq!(client.sso_region, "eu-west-1");
         assert_eq!(client.profiles, 4);
         assert_eq!(client.default_region.as_deref(), Some("eu-west-2"));
 
@@ -1417,7 +1418,7 @@ credential_process = /usr/bin/creds
         assert_eq!(sso.chained["p.deploy"].via_role, "Admin");
 
         // Appending roles to an integration whose name is quoted in the config.
-        let existing = "[integrations.\"acme.prod\"]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.\"john.doe\"]\ntype = \"aws-iam\"\n";
+        let existing = "[integrations.\"acme.prod\"]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n\n[integrations.\"john.doe\"]\ntype = \"aws-iam\"\n";
         let appended = format!(
             "{existing}{}{}",
             chained_toml("acme.prod", &import.portals[0].chained),
@@ -1478,7 +1479,7 @@ credential_process = /usr/bin/creds
         let found: Vec<(&str, &str, &str)> = import
             .portals
             .iter()
-            .map(|p| (p.name.as_str(), p.start_url.as_str(), p.region.as_str()))
+            .map(|p| (p.name.as_str(), p.start_url.as_str(), p.sso_region.as_str()))
             .collect();
         assert_eq!(
             found,
@@ -1656,7 +1657,7 @@ credential_process = /usr/bin/creds
         let logins: Vec<(&str, &str, &str)> = import
             .logins
             .iter()
-            .map(|l| (l.name.as_str(), l.profile.as_str(), l.region.as_str()))
+            .map(|l| (l.name.as_str(), l.profile.as_str(), l.login_region.as_str()))
             .collect();
         assert_eq!(
             logins,
@@ -1687,7 +1688,7 @@ credential_process = /usr/bin/creds
         let toml = aws_login_toml(&import.logins[0]);
         assert_eq!(
             toml,
-            "[integrations.console]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n"
+            "[integrations.console]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\n"
         );
         let all: String = import
             .logins

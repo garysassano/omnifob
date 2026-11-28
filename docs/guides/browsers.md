@@ -16,7 +16,7 @@ profile = "personal"       # optional: the Firefox profile name
 [integrations.acme]
 type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
-region = "eu-central-1"
+sso_region = "eu-central-1"
 browser = "work"
 ```
 

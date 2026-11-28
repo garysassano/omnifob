@@ -92,7 +92,7 @@ mod tests {
 [integrations.acme]
 type = "aws-sso"
 start_url = "https://acme.awsapps.com/start"
-region = "eu-west-1"
+sso_region = "eu-west-1"
 
 [integrations.acme.chained.deploy]
 via_account_id = "111111111111"
@@ -136,7 +136,7 @@ no_session = true
 
 [integrations.console]
 type = "aws-login"
-region = "eu-west-1"
+login_region = "eu-west-1"
 
 [integrations.console.roles.plain]
 role_arn = "arn:aws:iam::222222222222:role/P"

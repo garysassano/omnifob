@@ -240,7 +240,7 @@ pub async fn login(
     show: impl FnOnce(&str),
     paste: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let base = base_url(&config.region).await?;
+    let base = base_url(&config.login_region).await?;
     let oauth::Pkce {
         verifier,
         challenge,
@@ -281,7 +281,7 @@ pub async fn login(
         .redirect_uri(redirect_uri)
         .build()?;
     let now = Timestamp::now();
-    let token = create_token(&config.region, key, body)
+    let token = create_token(&config.login_region, key, body)
         .await
         .map_err(|e| match refusal(&e) {
             Some(OAuth2ErrorCode::AuthcodeExpired) => {
@@ -304,7 +304,7 @@ pub async fn login(
         login_session: login_session.clone(),
         account_id,
         client_id: client_id.to_string(),
-        region: config.region.clone(),
+        region: config.login_region.clone(),
         dpop_key: stored_key,
         ..from_token(&token, now, None)?
     };
@@ -544,7 +544,7 @@ pub async fn credentials(
     put("AWS_SECRET_ACCESS_KEY", &session.secret_access_key);
     put("AWS_SESSION_TOKEN", &session.session_token);
     put("AWS_CREDENTIAL_EXPIRATION", &session.expires_at.to_string());
-    let region = config.default_region.as_deref().unwrap_or(&config.region);
+    let region = config.region.as_deref().unwrap_or(&config.login_region);
     put("AWS_REGION", region);
     put("AWS_DEFAULT_REGION", region);
     Ok(Credentials {
@@ -624,15 +624,15 @@ pub async fn role_credentials(
     let region = role
         .region
         .as_deref()
-        .or(config.default_region.as_deref())
-        .unwrap_or(&config.region);
+        .or(config.region.as_deref())
+        .unwrap_or(&config.login_region);
     let source = credentials(integration, config, false).await?;
-    match sts::assume_role(&source, &request, &config.region, Some(region)).await {
+    match sts::assume_role(&source, &request, &config.login_region, Some(region)).await {
         // Kept credentials STS no longer takes: renew them once.
         Err(e) if e.downcast_ref::<sts::CredentialsRejected>().is_some() => {
             tracing::debug!("renewing the console sign-in's credentials: {e:#}");
             let source = credentials(integration, config, true).await?;
-            Ok(sts::assume_role(&source, &request, &config.region, Some(region)).await?)
+            Ok(sts::assume_role(&source, &request, &config.login_region, Some(region)).await?)
         }
         result => Ok(result?),
     }
@@ -653,10 +653,8 @@ fn identity_name(arn: &str) -> &str {
 /// Whether the stored session was signed in through the configured Region:
 /// its refresh token renews only there. `false` when none is stored.
 pub fn session_matches(integration: &str, config: &AwsLoginConfig) -> anyhow::Result<bool> {
-    Ok(
-        store::get::<Session>(&session_key(integration))?
-            .is_some_and(|s| s.region == config.region),
-    )
+    Ok(store::get::<Session>(&session_key(integration))?
+        .is_some_and(|s| s.region == config.login_region))
 }
 
 /// Whether a session is stored, and until when its credentials last.
@@ -671,13 +669,13 @@ pub fn logout(integration: &str) -> anyhow::Result<bool> {
 /// Checks that the sign-in works; says whom it belongs to.
 pub async fn check(integration: &str, config: &AwsLoginConfig) -> Result<String> {
     let creds = credentials(integration, config, false).await?;
-    let identity = sts::caller_identity(&creds, &config.region).await?;
+    let identity = sts::caller_identity(&creds, &config.login_region).await?;
     Ok(format!("signed in as {}", identity.arn))
 }
 
 /// The partition of the signed-in Region.
 pub fn partition(config: &AwsLoginConfig) -> anyhow::Result<Partition> {
-    Partition::of_region(&config.region)
+    Partition::of_region(&config.login_region)
 }
 
 #[cfg(test)]

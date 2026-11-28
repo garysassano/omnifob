@@ -244,7 +244,7 @@ pub async fn login(
     flow: Flow,
     prompt: impl FnOnce(&SignInPrompt),
 ) -> anyhow::Result<()> {
-    let oidc = oidc_client(&config.region);
+    let oidc = oidc_client(&config.sso_region);
     let (registration, token) = match flow {
         Flow::Browser => browser_sign_in(integration, config, &oidc, prompt).await?,
         Flow::DeviceCode => {
@@ -270,7 +270,7 @@ pub async fn start_device_login(
     integration: &str,
     config: &AwsSsoConfig,
 ) -> anyhow::Result<DeviceStart> {
-    let oidc = oidc_client(&config.region);
+    let oidc = oidc_client(&config.sso_region);
     let (pending, prompt) = start_device(integration, config, &oidc).await?;
     store::set(&pending_key(integration), &pending)?;
     Ok(DeviceStart {
@@ -295,7 +295,7 @@ pub async fn finish_device_login(integration: &str, config: &AwsSsoConfig) -> an
         );
     };
     if pending.registration.start_url != config.start_url
-        || pending.registration.region != config.region
+        || pending.registration.region != config.sso_region
     {
         store::delete(&key)?;
         bail!(
@@ -308,7 +308,7 @@ pub async fn finish_device_login(integration: &str, config: &AwsSsoConfig) -> an
             "the code of the sign-in started for '{integration}' expired; run `fob login {integration} --start` again"
         );
     }
-    let oidc = oidc_client(&config.region);
+    let oidc = oidc_client(&config.sso_region);
     let polled = poll_device(&oidc, &pending).await;
     // Approved, refused or expired, the device code is spent.
     store::delete(&key)?;
@@ -330,7 +330,7 @@ async fn keep_token(
         &token_key(integration),
         &SsoToken {
             start_url: config.start_url.clone(),
-            region: config.region.clone(),
+            region: config.sso_region.clone(),
             access_token: token
                 .access_token()
                 .context("no access token returned")?
@@ -359,7 +359,7 @@ async fn registration(
         Ok(Some(r))
             if r.expires_at > usable_until
                 && r.start_url == config.start_url
-                && r.region == config.region
+                && r.region == config.sso_region
                 && r.scopes == config.scopes =>
         {
             return Ok(r);
@@ -395,7 +395,7 @@ async fn registration(
             .to_string(),
         expires_at: Timestamp::from_second(client.client_secret_expires_at())?,
         start_url: config.start_url.clone(),
-        region: config.region.clone(),
+        region: config.sso_region.clone(),
         scopes: config.scopes.clone(),
         authorization_endpoint: client
             .authorization_endpoint()
@@ -422,7 +422,7 @@ async fn browser_sign_in(
     // the AWS CLI, which builds the consent URL from the client's endpoint.
     let endpoint = match &registration.authorization_endpoint {
         Some(endpoint) if service_endpoint(OIDC_ENDPOINT_VARIABLE).is_none() => endpoint.clone(),
-        _ => authorization_endpoint(&config.region).await?,
+        _ => authorization_endpoint(&config.sso_region).await?,
     };
     let pkce = oauth::Pkce::new()?;
     prompt(&SignInPrompt {
@@ -582,7 +582,7 @@ pub async fn end_session(integration: &str, config: &AwsSsoConfig) -> anyhow::Re
             ));
         }
     };
-    portal_client(&config.region)
+    portal_client(&config.sso_region)
         .logout()
         .access_token(&token.access_token)
         .send()
@@ -634,7 +634,7 @@ fn load(integration: &str, config: &AwsSsoConfig) -> Result<SsoToken> {
     let Some(token) = store::get::<SsoToken>(&token_key(integration))? else {
         return Err(Error::not_signed_in(integration));
     };
-    if token.start_url != config.start_url || token.region != config.region {
+    if token.start_url != config.start_url || token.region != config.sso_region {
         return Err(Error::needs_login(
             integration,
             format!("the stored sign-in for '{integration}' is for another portal or region"),
@@ -920,7 +920,7 @@ fn drop_if_current(integration: &str, access_token: &str) {
 
 /// Lists every account and role reachable through this integration.
 pub async fn discover(integration: &str, config: &AwsSsoConfig) -> Result<Vec<Profile>> {
-    let portal = portal_client(&config.region);
+    let portal = portal_client(&config.sso_region);
     let found = with_portal(integration, config, |token| {
         let portal = portal.clone();
         async move { list_roles(&portal, &token).await }
@@ -1027,7 +1027,7 @@ pub async fn credentials(
     account_id: &str,
     role_name: &str,
 ) -> Result<Credentials> {
-    let portal = portal_client(&config.region);
+    let portal = portal_client(&config.sso_region);
     let response = with_portal(integration, config, |token| {
         let portal = portal.clone();
         async move {
@@ -1100,7 +1100,7 @@ pub async fn credentials(
             .with_context(|| missing("a session token"))?,
     );
     put("AWS_CREDENTIAL_EXPIRATION", &expires_at.to_string());
-    if let Some(region) = &config.default_region {
+    if let Some(region) = &config.region {
         put("AWS_REGION", region);
         put("AWS_DEFAULT_REGION", region);
     }
@@ -1285,7 +1285,7 @@ pub async fn chained_credentials(
     let source = credentials(integration, config, &role.via_account_id, &role.via_role).await?;
     // Only a configured region is exported; STS itself is called in the
     // portal's region when none is.
-    let region = role.region.as_deref().or(config.default_region.as_deref());
+    let region = role.region.as_deref().or(config.region.as_deref());
     let request = RoleRequest {
         role_arn: &role.role_arn,
         session_name: role.session_name.as_deref(),
@@ -1294,13 +1294,19 @@ pub async fn chained_credentials(
         duration,
         profile_id,
     };
-    Ok(assume_role(&source, &request, region.unwrap_or(&config.region), region).await?)
+    Ok(assume_role(
+        &source,
+        &request,
+        region.unwrap_or(&config.sso_region),
+        region,
+    )
+    .await?)
 }
 
 /// Checks that the stored session works: it is refreshed when needed, and
 /// the portal must answer with it.
 pub async fn check(integration: &str, config: &AwsSsoConfig) -> Result<String> {
-    let portal = portal_client(&config.region);
+    let portal = portal_client(&config.sso_region);
     with_portal(integration, config, |token| {
         let portal = portal.clone();
         async move {
@@ -1338,7 +1344,7 @@ mod tests {
     fn sso_config(text: &str) -> AwsSsoConfig {
         match crate::Config::parse(&format!(
             "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"https://acme.awsapps.com/start\"\n\
-             region = \"eu-west-1\"\n{text}"
+             sso_region = \"eu-west-1\"\n{text}"
         ))
         .unwrap()
         .integrations
@@ -1430,7 +1436,7 @@ mod tests {
             [integrations.acme]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "eu-west-1"
+            sso_region = "eu-west-1"
             [integrations.acme.chained.prod]
             via_account_id = "111111111111"
             via_role = "Admin"
@@ -1480,7 +1486,7 @@ mod tests {
             [integrations.acme]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "us-east-1"
+            sso_region = "us-east-1"
             [integrations.acme.chained.ops]
             via_account_id = "111111111111"
             via_role = "Admin"

@@ -682,7 +682,7 @@ fn aws_console_partition(
         (Integration::Command(c), Target::Command { aws: true }) => {
             Partition::of_region(c.region.as_deref().unwrap_or("us-east-1"))
         }
-        (Integration::AwsSso(c), _) => Partition::of_region(&c.region),
+        (Integration::AwsSso(c), _) => Partition::of_region(&c.sso_region),
         (Integration::AwsIam(c), _) => Partition::of_region(aws::iam::sts_region(c)),
         (Integration::AwsLogin(c), _) => aws::login::partition(c),
         _ => anyhow::bail!("not an AWS profile"),
@@ -846,9 +846,9 @@ pub async fn console_url(
         (Integration::AwsSso(c), target @ (Target::Aws { .. } | Target::AwsChained { .. })) => {
             let request = aws::console::ConsoleRequest {
                 partition: aws_console_partition(&profile.integration, integration, target)?,
-                home_region: Some(&c.region),
+                home_region: Some(&c.sso_region),
                 region: region.or(match target {
-                    Target::Aws { .. } => c.default_region.as_deref(),
+                    Target::Aws { .. } => c.region.as_deref(),
                     _ => creds.env.get("AWS_REGION").map(String::as_str),
                 }),
                 service,
@@ -890,7 +890,7 @@ pub async fn console_url(
         ) => {
             let request = aws::console::ConsoleRequest {
                 partition: aws_console_partition(&profile.integration, integration, target)?,
-                home_region: Some(&c.region),
+                home_region: Some(&c.login_region),
                 region: region.or(creds.env.get("AWS_REGION").map(String::as_str)),
                 service,
                 session_duration,
@@ -1061,7 +1061,7 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
                 .env
                 .get("AWS_REGION")
                 .cloned()
-                .unwrap_or_else(|| c.region.clone());
+                .unwrap_or_else(|| c.sso_region.clone());
             Ok(format!(
                 "acts as {}",
                 aws::sts::caller_identity(&creds, &region).await?.arn
@@ -1109,7 +1109,9 @@ pub async fn check_profile(config: &Config, profile: &Profile) -> Result<String>
         (Integration::AwsLogin(c), Target::AwsLogin { .. } | Target::AwsLoginRole { .. }) => {
             Ok(format!(
                 "acts as {}",
-                aws::sts::caller_identity(&creds, &c.region).await?.arn
+                aws::sts::caller_identity(&creds, &c.login_region)
+                    .await?
+                    .arn
             ))
         }
         (Integration::Gcp(_), Target::Gcp { .. } | Target::GcpServiceAccount { .. }) => {
@@ -1258,7 +1260,7 @@ mod tests {
     #[test]
     fn roles_that_need_mfa_keep_their_lifetime_under_a_cap() {
         let config = Config::parse(
-            "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\
+            "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n\
              [integrations.a.chained.plain]\nvia_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nduration = \"1h\"\n\
              [integrations.a.chained.mfa]\nvia_account_id = \"111111111111\"\nvia_role = \"Admin\"\nrole_arn = \"arn:aws:iam::222222222222:role/M\"\nmfa_serial = \"arn:aws:iam::111111111111:mfa/me\"\n",
         )
@@ -1289,7 +1291,7 @@ mod tests {
             "[integrations.u]\ntype = \"aws-iam\"\nmfa_serial = \"arn:aws:iam::111111111111:mfa/me\"\n\
              [integrations.u.roles.session]\nrole_arn = \"arn:aws:iam::222222222222:role/S\"\n\
              [integrations.u.roles.key]\nrole_arn = \"arn:aws:iam::222222222222:role/K\"\nno_session = true\n\
-             [integrations.c]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n\
+             [integrations.c]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\n\
              [integrations.c.roles.plain]\nrole_arn = \"arn:aws:iam::222222222222:role/P\"\n\
              [integrations.c.roles.mfa]\nrole_arn = \"arn:aws:iam::222222222222:role/M\"\nmfa_serial = \"arn:aws:iam::111111111111:mfa/me\"\n",
         )
@@ -1388,7 +1390,7 @@ mod tests {
             toml::from_str(
                 r#"
                 start_url = "https://acme.awsapps.com/start"
-                region = "eu-west-1"
+                sso_region = "eu-west-1"
                 [chained.gov]
                 via_account_id = "111111111111"
                 via_role = "Admin"
@@ -1460,7 +1462,7 @@ mod tests {
             [integrations.portal]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "us-east-1"
+            sso_region = "us-east-1"
             console_duration = "4h"
             [integrations.portal.cross_partition.gov-audit]
             via_account_id = "111111111111"
@@ -1520,7 +1522,7 @@ mod tests {
             [integrations.portal]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "us-east-1"
+            sso_region = "us-east-1"
             [integrations.portal.cross_partition.gov]
             via_account_id = "111111111111"
             via_role = "Admin"
@@ -1618,7 +1620,7 @@ mod tests {
             [integrations.portal]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "eu-west-1"
+            sso_region = "eu-west-1"
             console_duration = "4h"
             [integrations.portal.chained.ops]
             via_account_id = "111111111111"

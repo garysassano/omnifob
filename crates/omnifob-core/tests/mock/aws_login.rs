@@ -29,8 +29,8 @@ fn config() -> AwsLoginConfig {
     let text = r#"
         [integrations.console]
         type = "aws-login"
-        region = "eu-west-1"
-        default_region = "eu-central-1"
+        login_region = "eu-west-1"
+        region = "eu-central-1"
     "#;
     match Config::parse(text)
         .unwrap()
@@ -318,7 +318,7 @@ async fn a_sign_in_is_kept_only_for_its_region_and_ttl_is_refused() {
     browser_login(&server, "kept", 900).await;
     assert!(aws::login::session_matches("kept", &config()).unwrap());
     let moved = AwsLoginConfig {
-        region: "us-east-1".into(),
+        login_region: "us-east-1".into(),
         ..config()
     };
     assert!(!aws::login::session_matches("kept", &moved).unwrap());
@@ -441,8 +441,8 @@ async fn roles_are_assumed_with_the_console_credentials_for_at_most_an_hour() {
     let text = r#"
         [integrations.chain]
         type = "aws-login"
-        region = "eu-west-1"
-        default_region = "eu-central-1"
+        login_region = "eu-west-1"
+        region = "eu-central-1"
 
         [integrations.chain.roles.prod]
         role_arn = "arn:aws:iam::222222222222:role/Deploy"
@@ -512,7 +512,7 @@ async fn roles_are_assumed_with_the_console_credentials_for_at_most_an_hour() {
         ),
     ] {
         let text = format!(
-            "[integrations.x]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n[integrations.x.roles.prod]\n{role}\n"
+            "[integrations.x]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\n[integrations.x.roles.prod]\n{role}\n"
         );
         let error = format!("{:#}", Config::parse(&text).unwrap_err());
         assert!(error.contains(message), "{role}: {error}");

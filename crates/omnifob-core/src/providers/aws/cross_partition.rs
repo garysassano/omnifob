@@ -345,7 +345,7 @@ mod tests {
             [integrations.portal]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "us-east-1"
+            sso_region = "us-east-1"
             [integrations.portal.cross_partition.gov]
             via_account_id = "111111111111"
             via_role = "Admin"

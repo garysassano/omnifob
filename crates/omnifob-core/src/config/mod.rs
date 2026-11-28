@@ -293,14 +293,14 @@ impl Config {
     ///     [integrations.acme]
     ///     type = "aws-sso"
     ///     start_url = "https://acme.awsapps.com/start"
-    ///     region = "eu-west-1"
+    ///     sso_region = "eu-west-1"
     ///     "#,
     /// )?;
     /// assert!(matches!(config.integration("acme")?, Integration::AwsSso(_)));
     ///
     /// // Every key is checked as the config loads, and the error names it.
     /// let err = Config::parse(
-    ///     "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"http://acme\"\nregion = \"eu-west-1\"",
+    ///     "[integrations.acme]\ntype = \"aws-sso\"\nstart_url = \"http://acme\"\nsso_region = \"eu-west-1\"",
     /// )
     /// .unwrap_err();
     /// assert!(format!("{err:#}").contains("start_url"));
@@ -318,7 +318,27 @@ impl Config {
 
     /// Parses a config without checking integration names.
     pub fn parse_allowing_any_names(text: &str) -> anyhow::Result<Self> {
-        let config: Self = toml::from_str(text)?;
+        let config: Self = toml::from_str(text).map_err(|e| {
+            let message = e.message();
+            // 0.15 renamed the Region keys of aws-sso and aws-login; a config
+            // written before then fails here, so say what the keys became.
+            if [
+                "missing field `sso_region`",
+                "missing field `login_region`",
+                "unknown field `default_region`",
+            ]
+            .iter()
+            .any(|key| message.contains(key))
+            {
+                anyhow::anyhow!(
+                    "{e}\nThe Region keys of aws-sso and aws-login integrations were renamed in \
+                     omnifob 0.15: aws-sso `region` is now `sso_region`, aws-login `region` is \
+                     now `login_region`, and `default_region` is now `region`"
+                )
+            } else {
+                e.into()
+            }
+        })?;
         if let Err(e) = config.agent.validate() {
             bail!("[agent] {e}");
         }
@@ -526,7 +546,7 @@ mod tests {
             [integrations.acme]
             type = "aws-sso"
             start_url = "https://acme.awsapps.com/start"
-            region = "eu-central-1"
+            sso_region = "eu-central-1"
 
             [integrations.cf]
             type = "cloudflare-token"
@@ -553,6 +573,52 @@ mod tests {
         assert_eq!(
             cf.templates["pages"].ttl,
             Some(SignedDuration::from_mins(30))
+        );
+    }
+
+    #[test]
+    fn region_keys_from_before_0_15_get_a_hint() {
+        let sso =
+            "[integrations.a]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\n";
+        for old in [
+            format!("{sso}region = \"eu-west-1\"\n"),
+            format!("{sso}sso_region = \"eu-west-1\"\ndefault_region = \"eu-west-2\"\n"),
+            "[integrations.c]\ntype = \"aws-login\"\nregion = \"eu-west-1\"\n".to_string(),
+            "[integrations.c]\ntype = \"aws-login\"\nlogin_region = \"eu-west-1\"\n\
+             default_region = \"eu-west-2\"\n"
+                .to_string(),
+        ] {
+            let err = format!("{:#}", Config::parse(&old).unwrap_err());
+            assert!(err.contains("renamed in omnifob 0.15"), "{old}: {err}");
+        }
+        // The new keys load, and other errors get no hint.
+        let config = Config::parse(&format!(
+            "{sso}sso_region = \"eu-west-1\"\nregion = \"eu-west-2\"\n"
+        ))
+        .unwrap();
+        let Integration::AwsSso(c) = &config.integrations["a"] else {
+            panic!()
+        };
+        assert_eq!(
+            (c.sso_region.as_str(), c.region.as_deref()),
+            ("eu-west-1", Some("eu-west-2"))
+        );
+        let err = format!(
+            "{:#}",
+            Config::parse(&format!("{sso}sso_region = 1\n")).unwrap_err()
+        );
+        assert!(!err.contains("0.15"), "{err}");
+        // A typo lists `sso_region` among the expected keys; that is no hint.
+        let err = format!(
+            "{:#}",
+            Config::parse(&format!(
+                "{sso}sso_region = \"eu-west-1\"\nregoin = \"x\"\n"
+            ))
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("`sso_region`") && !err.contains("0.15"),
+            "{err}"
         );
     }
 
@@ -611,7 +677,7 @@ mod tests {
         let gcp = parse_error("[integrations.g]\ntype = \"gcp\"\nprojects = []\n");
         assert!(gcp.contains("projects must name"), "{gcp}");
         let chained = parse_error(
-            "[integrations.p]\ntype = \"aws-sso\"\nstart_url = \"https://x.awsapps.com/start\"\nregion = \"eu-west-1\"\n[integrations.p.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nexternal_id = \"\"\n",
+            "[integrations.p]\ntype = \"aws-sso\"\nstart_url = \"https://x.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n[integrations.p.chained.c]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\nexternal_id = \"\"\n",
         );
         assert!(
             chained.contains("external_id must not be empty"),

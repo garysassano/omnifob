@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn renames_keep_comments_order_and_subtables() {
-        let text = "# mine\n[integrations.mine] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.mine.chained.lab]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
+        let text = "# mine\n[integrations.mine] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n\n[integrations.mine.chained.lab]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
         let renamed = rename_integration(text, "mine", "aws").unwrap();
         assert_eq!(
             renamed.text,
@@ -215,7 +215,7 @@ mod tests {
         let text = r#"[integrations.mine]
 type = "aws-sso"
 start_url = "https://a.awsapps.com/start"
-region = "eu-west-1"
+sso_region = "eu-west-1"
 
 [agent]
 profiles = ["mine/dev/*", # dev
@@ -259,7 +259,7 @@ color = "red"
 
     #[test]
     fn adds_cloudflare_templates() {
-        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare-token\"\n\n[integrations.mine]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n";
+        let text = "# mine\n[integrations.cf] # work\ntype = \"cloudflare-token\"\n\n[integrations.mine]\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n";
         let template = CloudflareTemplate {
             permissions: vec!["Pages Write".into(), "Zone Read".into()],
             optional: vec![],
