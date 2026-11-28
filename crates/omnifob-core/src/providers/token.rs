@@ -18,6 +18,8 @@ use crate::{Credentials, Error, Profile, Result, Target, store};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preset {
     pub name: &'static str,
+    /// The provider's name as it writes it, for pickers.
+    pub title: &'static str,
     /// Secret name → environment variables that receive it.
     pub secrets: &'static [(&'static str, &'static [&'static str])],
     /// Fixed variables the provider's tools need alongside the secrets;
@@ -83,6 +85,7 @@ const fn bearer_scoped(url: &'static str, secret: &'static str) -> Option<Verify
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "hetzner",
+        title: "Hetzner Cloud",
         secrets: &[("token", &["HCLOUD_TOKEN"])],
         vars: &[],
         verify: bearer("https://api.hetzner.cloud/v1/locations", "token"),
@@ -90,6 +93,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "digitalocean",
+        title: "DigitalOcean",
         // doctl reads the first, Terraform's provider the second.
         secrets: &[(
             "token",
@@ -101,6 +105,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "vultr",
+        title: "Vultr",
         secrets: &[("api_key", &["VULTR_API_KEY"])],
         vars: &[],
         verify: bearer("https://api.vultr.com/v2/account", "api_key"),
@@ -108,6 +113,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "linode",
+        title: "Akamai Cloud (Linode)",
         // Akamai Cloud. linode-cli reads the second, Terraform the first.
         secrets: &[("token", &["LINODE_TOKEN", "LINODE_CLI_TOKEN"])],
         vars: &[],
@@ -116,6 +122,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "upstash",
+        title: "Upstash",
         // Set UPSTASH_EMAIL under `vars`; the API key is the secret. The
         // Developer API takes both as HTTP Basic credentials, as the
         // Upstash CLI sends them.
@@ -133,6 +140,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "akamai-edgegrid",
+        title: "Akamai CDN and security (EdgeGrid)",
         secrets: &[
             ("client_token", &["AKAMAI_CLIENT_TOKEN"]),
             ("client_secret", &["AKAMAI_CLIENT_SECRET"]),
@@ -144,6 +152,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "scaleway",
+        title: "Scaleway",
         secrets: &[
             ("access_key", &["SCW_ACCESS_KEY"]),
             ("secret_key", &["SCW_SECRET_KEY"]),
@@ -162,6 +171,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "modal",
+        title: "Modal",
         // The Modal client reads both, overriding `~/.modal.toml`. Its API is
         // gRPC only, so there is no plain URL to check the token against.
         secrets: &[
@@ -174,6 +184,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "unikraft",
+        title: "Unikraft Cloud",
         // Unikraft Cloud: `kraft` reads UKC_TOKEN and UKC_METRO; the newer
         // `unikraft` CLI reads them only when UNIKRAFT_PROFILE_ENV is true.
         // Set UKC_METRO under `vars`.
@@ -184,6 +195,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "vercel",
+        title: "Vercel",
         secrets: &[("token", &["VERCEL_TOKEN"])],
         vars: &[],
         verify: bearer("https://api.vercel.com/v2/user", "token"),
@@ -191,6 +203,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "netlify",
+        title: "Netlify",
         secrets: &[("token", &["NETLIFY_AUTH_TOKEN"])],
         vars: &[],
         verify: bearer("https://api.netlify.com/api/v1/user", "token"),
@@ -198,6 +211,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "fly",
+        title: "Fly.io",
         // No check: Fly.io has no call that every token may make. Deploy
         // tokens are limited to one app, listing apps needs an organization
         // slug, and flyctl's `fly auth whoami` asks GraphQL for the user,
@@ -209,6 +223,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "neon",
+        title: "Neon",
         secrets: &[("api_key", &["NEON_API_KEY"])],
         vars: &[],
         verify: bearer_scoped("https://console.neon.tech/api/v2/users/me", "api_key"),
@@ -216,6 +231,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "supabase",
+        title: "Supabase",
         secrets: &[("token", &["SUPABASE_ACCESS_TOKEN"])],
         vars: &[],
         verify: bearer("https://api.supabase.com/v1/projects", "token"),
@@ -223,6 +239,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "github",
+        title: "GitHub",
         // gh prefers GH_TOKEN; most other tools read GITHUB_TOKEN.
         secrets: &[("token", &["GH_TOKEN", "GITHUB_TOKEN"])],
         vars: &[],

@@ -10,6 +10,8 @@
 ## Commands
 
 ```sh
+fob add                   # add an integration: pick its type and answer a few questions
+fob add gcp --login       # or name the type (or a token preset) and sign in straight away
 fob login acme            # browser sign-in (kept while it still works), then discovers profiles
 fob login                 # pick the integration from a fuzzy list (fob logout too)
 fob login acme --force    # sign in again even though the stored sign-in works

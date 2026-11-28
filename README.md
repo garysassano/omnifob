@@ -44,9 +44,18 @@ cargo install --locked omnifob           # from source
 
 ### 1. Add your sign-ins
 
-**Coming from granted, aws-vault or the AWS CLI?** Skip writing anything: `fob import aws --write` turns your `~/.aws/config` into integrations. Coming from another tool, see [Migrating](#migrating).
+Run `fob add` for each sign-in you use. It asks for the type and the few values it needs, writes `~/.config/omnifob/config.toml`, and offers to sign in straight away:
 
-Otherwise, create `~/.config/omnifob/config.toml` with one entry per sign-in you use. The name after `integrations.` is yours to choose:
+```sh
+fob add                    # pick from a list and answer its questions
+fob add gcp                # or name the type
+fob add hetzner            # or a token preset
+fob add aws-sso acme --start-url https://acme.awsapps.com/start --sso-region eu-central-1
+```
+
+**Coming from granted, aws-vault or the AWS CLI?** `fob import aws --write` turns your `~/.aws/config` into integrations in one go. Coming from another tool, see [Migrating](#migrating).
+
+The config is plain TOML, one entry per sign-in, and you can write it by hand just as well. The name after `integrations.` is yours to choose:
 
 ```toml
 [integrations.acme]                 # AWS IAM Identity Center
@@ -104,16 +113,16 @@ fob unuse             # and remove them
 
 ## Migrating
 
-| Coming from                              | Do this                                                                                            |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| granted, aws-vault, AWS CLI SSO profiles | `fob import aws --write`, then `fob login <name>`                                                  |
-| `aws login`                              | `fob import aws --write` (it becomes an `aws-login` integration)                                   |
-| Leapp, aws-sso-cli                       | An `aws-sso` entry with the portal's start URL and Region                                          |
-| saml2aws, gimme-aws-creds, okta-aws-cli  | A `command` integration that runs the tool                                                         |
-| `gcloud auth login`                      | `type = "gcp"`; gcloud and the client libraries pick up the token under `fob exec`                 |
-| `az login`                               | `type = "azure"`; `DefaultAzureCredential` works under `fob exec`                                  |
-| `wrangler login`                         | `type = "cloudflare-token"`, then `fob exec cf workers -- wrangler ...`                            |
-| hcloud, doctl, vercel, fly, ...          | `type = "token"` with the preset; the token moves from the CLI's plain-text file into the keychain |
+| Coming from                              | Do this                                                                                           |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| granted, aws-vault, AWS CLI SSO profiles | `fob import aws --write`, then `fob login <name>`                                                 |
+| `aws login`                              | `fob import aws --write` (it becomes an `aws-login` integration)                                  |
+| Leapp, aws-sso-cli                       | `fob add aws-sso`, with the portal's start URL and Region                                         |
+| saml2aws, gimme-aws-creds, okta-aws-cli  | A `command` integration that runs the tool                                                        |
+| `gcloud auth login`                      | `fob add gcp`; gcloud and the client libraries pick up the token under `fob exec`                 |
+| `az login`                               | `fob add azure`; `DefaultAzureCredential` works under `fob exec`                                  |
+| `wrangler login`                         | `fob add cloudflare-token`, then `fob exec cloudflare workers -- wrangler ...`                    |
+| hcloud, doctl, vercel, fly, ...          | `fob add hetzner` (or the CLI's preset); the token moves from a plain-text file into the keychain |
 
 [Migrating from other tools](docs/guides/migrating.md) walks through each, with the matching commands (`assume` → `fob use`, `aws-vault exec` → `fob exec`, `assume -c` → `fob console`, ...).
 

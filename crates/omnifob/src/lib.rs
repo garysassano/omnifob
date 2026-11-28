@@ -4,6 +4,7 @@
 //! `App`, which holds the config and the discovered profiles. The commands
 //! live in modules named after them.
 
+mod add;
 mod agent;
 mod browser;
 mod cli;
@@ -278,10 +279,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         _ => {}
     }
     // A config named with `--config` has to exist, so a mistyped path is not
-    // taken for an empty config. `fob import --write` may create it.
+    // taken for an empty config. `fob import --write` and `fob add` may
+    // create it.
     let config_file = paths::config_file()?;
     if cli.config.is_some()
-        && !matches!(cli.command, Command::Import(_))
+        && !matches!(cli.command, Command::Import(_) | Command::Add { .. })
         && matches!(std::fs::metadata(&config_file), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
     {
         return Err(omnifob_core::Coded::new(
@@ -365,6 +367,42 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return app
                 .check(query(&profile).as_deref(), &integration, output)
                 .await;
+        }
+        Command::Add {
+            kind,
+            name,
+            start_url,
+            sso_region,
+            login_region,
+            region,
+            mfa_serial,
+            tenant,
+            projects,
+            client_id,
+            token_type,
+            account_id,
+            vars,
+            login,
+            print,
+        } => {
+            app.add(add::AddArgs {
+                kind,
+                name,
+                start_url,
+                sso_region,
+                login_region,
+                region,
+                mfa_serial,
+                tenant,
+                projects,
+                client_id,
+                token_type,
+                account_id,
+                vars,
+                login,
+                print,
+            })
+            .await?
         }
         Command::Rename { old, new } => app.rename(&old, &new)?,
         Command::Sync { integrations } => app.sync(&integrations).await?,
@@ -635,6 +673,7 @@ fn load_profiles(command: &Command) -> anyhow::Result<ProfileCache> {
             return Ok(ProfileCache::default());
         }
         Command::Login { .. }
+        | Command::Add { .. }
         | Command::Sync { .. }
         | Command::Status { .. }
         | Command::Logout { .. }

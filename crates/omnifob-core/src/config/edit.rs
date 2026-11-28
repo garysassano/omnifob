@@ -176,6 +176,98 @@ pub fn add_cloudflare_template(
     Ok(text)
 }
 
+/// The first line of a config file `fob add` creates: editors and taplo
+/// then complete and check its keys.
+pub const SCHEMA_LINE: &str =
+    "#:schema https://raw.githubusercontent.com/garysassano/omnifob/main/schema/config.schema.json";
+
+/// A value `fob add` writes for a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewValue {
+    String(String),
+    /// An array of strings, as `projects`.
+    Strings(Vec<String>),
+    /// An inline table of strings, as a token integration's `vars`.
+    Map(Vec<(String, String)>),
+}
+
+impl From<&str> for NewValue {
+    fn from(s: &str) -> Self {
+        NewValue::String(s.to_string())
+    }
+}
+
+impl From<String> for NewValue {
+    fn from(s: String) -> Self {
+        NewValue::String(s)
+    }
+}
+
+impl NewValue {
+    fn to_toml(&self) -> toml_edit::Value {
+        match self {
+            NewValue::String(s) => s.as_str().into(),
+            NewValue::Strings(items) => items.iter().collect::<toml_edit::Array>().into(),
+            NewValue::Map(entries) => {
+                let mut table = toml_edit::InlineTable::new();
+                for (key, value) in entries {
+                    table.insert(key, value.as_str().into());
+                }
+                table.into()
+            }
+        }
+    }
+}
+
+/// An integration's table as `fob add` writes it: `[integrations.<name>]`
+/// with `type` and then `keys` in order. Values are quoted as TOML needs.
+pub fn integration_toml(name: &str, kind: &str, keys: &[(&str, NewValue)]) -> String {
+    let mut table = toml_edit::Table::new();
+    table["type"] = toml_edit::value(kind);
+    for (key, value) in keys {
+        table[*key] = toml_edit::Item::Value(value.to_toml());
+    }
+    let mut integrations = toml_edit::Table::new();
+    integrations.set_implicit(true);
+    integrations.insert(name, toml_edit::Item::Table(table));
+    let mut doc = toml_edit::DocumentMut::new();
+    doc.insert("integrations", toml_edit::Item::Table(integrations));
+    doc.to_string()
+}
+
+/// Appends a new integration to the text of a config file, leaving the rest
+/// of the file as it is; an empty text becomes a new file headed by
+/// [`SCHEMA_LINE`]. Fails when the name is taken or the result would not
+/// load, so a bad value is reported before anything is written.
+pub fn add_integration(
+    text: &str,
+    name: &str,
+    kind: &str,
+    keys: &[(&str, NewValue)],
+) -> anyhow::Result<String> {
+    check_name("integration name", name)?;
+    let existing = Config::parse_allowing_any_names(text).context("parsing the config")?;
+    if existing.integrations.contains_key(name) {
+        bail!("an integration named '{name}' already exists");
+    }
+    let table = integration_toml(name, kind, keys);
+    let text = if text.trim().is_empty() {
+        format!("{SCHEMA_LINE}\n\n{table}")
+    } else {
+        let separator = if text.ends_with("\n\n") {
+            ""
+        } else if text.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        format!("{text}{separator}{table}")
+    };
+    Config::parse_allowing_any_names(&text)
+        .context("the new integration does not make a valid config; nothing was written")?;
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +390,57 @@ color = "red"
                 "{bad:?} is refused"
             );
         }
+    }
+
+    #[test]
+    fn added_integrations_go_at_the_end_and_must_load() {
+        let keys = [
+            ("start_url", "https://acme.awsapps.com/start".into()),
+            ("sso_region", "eu-west-1".into()),
+        ];
+        // A new file starts with the schema line.
+        let text = add_integration("", "acme", "aws-sso", &keys).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{SCHEMA_LINE}\n\n[integrations.acme]\ntype = \"aws-sso\"\n\
+                 start_url = \"https://acme.awsapps.com/start\"\nsso_region = \"eu-west-1\"\n"
+            )
+        );
+        // An existing file keeps its text, comments included.
+        let existing = "# mine\n[integrations.cf] # work\ntype = \"cloudflare-token\"\n";
+        let text = add_integration(existing, "john.doe", "gcp", &[]).unwrap();
+        assert_eq!(
+            text,
+            format!("{existing}\n[integrations.\"john.doe\"]\ntype = \"gcp\"\n")
+        );
+        assert!(
+            Config::parse(&text)
+                .unwrap()
+                .integrations
+                .contains_key("john.doe")
+        );
+        let projects = NewValue::Strings(vec!["a".into(), "b".into()]);
+        let text = add_integration(existing, "g", "gcp", &[("projects", projects)]).unwrap();
+        assert!(text.ends_with("[integrations.g]\ntype = \"gcp\"\nprojects = [\"a\", \"b\"]\n"));
+
+        // A taken name, a bad name and a value the config refuses fail
+        // without a result to write.
+        let err = add_integration(existing, "cf", "gcp", &[]).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let err = add_integration(existing, "a b", "gcp", &[]).unwrap_err();
+        assert!(err.to_string().contains("integration name"), "{err}");
+        let bad = [
+            ("start_url", "https://acme.awsapps.com/start".into()),
+            ("sso_region", "attacker.example#".into()),
+        ];
+        let err = format!(
+            "{:#}",
+            add_integration("", "acme", "aws-sso", &bad).unwrap_err()
+        );
+        assert!(
+            err.contains("nothing was written") && err.contains("not an AWS Region name"),
+            "{err}"
+        );
     }
 }

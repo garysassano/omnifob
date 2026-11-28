@@ -3654,3 +3654,123 @@ async fn renewals_of_one_profile_do_not_overlap() {
     // A profile that is gone is nothing to renew.
     fob.ok(&["renew", "acme/gone/Admin"]);
 }
+
+#[test]
+fn add_writes_integrations_from_options() {
+    let fob = Fob::new("add");
+    let config = || std::fs::read_to_string(fob.config_file()).unwrap();
+
+    // No config yet: `fob add` creates one, headed by the schema line.
+    let (_, stderr) = fob.ok(&["add", "gcp"]);
+    assert!(stderr.contains("added 'google' (gcp)"), "{stderr}");
+    assert!(stderr.contains("run `fob login google`"), "{stderr}");
+    assert_eq!(
+        config(),
+        format!(
+            "{}\n\n[integrations.google]\ntype = \"gcp\"\n",
+            omnifob_core::config::SCHEMA_LINE
+        )
+    );
+
+    // The suggested name is taken now.
+    let stderr = fob.fails(&["add", "gcp"]);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("fob add <type> <name>"),
+        "{stderr}"
+    );
+
+    // A regional portal URL names its instance's Region and the integration.
+    fob.ok(&[
+        "add",
+        "aws-sso",
+        "--start-url",
+        "https://ssoins-1111aaaa2222bbbb.portal.eu-west-1.app.aws",
+        "--region",
+        "eu-central-1",
+    ]);
+    assert!(
+        config().ends_with(
+            "[integrations.ssoins-1111aaaa2222bbbb-eu-west-1]\ntype = \"aws-sso\"\n\
+             start_url = \"https://ssoins-1111aaaa2222bbbb.portal.eu-west-1.app.aws\"\n\
+             sso_region = \"eu-west-1\"\nregion = \"eu-central-1\"\n"
+        ),
+        "{}",
+        config()
+    );
+
+    // What is missing, wrong or for another type fails before anything is
+    // written.
+    let before = config();
+    for (args, expected) in [
+        (
+            &[
+                "add",
+                "aws-sso",
+                "acme",
+                "--start-url",
+                "https://acme.awsapps.com/start",
+            ][..],
+            "aws-sso needs --sso-region",
+        ),
+        (
+            &["add", "aws-login", "--login-region", "attacker.example#"],
+            "not an AWS Region name",
+        ),
+        (
+            &["add", "gcp", "work", "--tenant", "contoso"],
+            "--tenant applies only to azure",
+        ),
+        (&["add", "token"], "name the provider's preset"),
+        (&["add", "command"], "by hand"),
+        (&["add"], "name the type or token preset to add"),
+        (&["add", "gcp", "a b"], "integration name"),
+    ] {
+        let stderr = fob.fails(args);
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+    }
+    assert_eq!(config(), before);
+
+    // --print shows the TOML and writes nothing.
+    let (stdout, _) = fob.ok(&[
+        "add",
+        "upstash",
+        "--var",
+        "UPSTASH_EMAIL=me@example.com",
+        "--print",
+    ]);
+    assert_eq!(
+        stdout,
+        "[integrations.upstash]\ntype = \"token\"\npreset = \"upstash\"\n\
+         vars = { UPSTASH_EMAIL = \"me@example.com\" }\n"
+    );
+    assert_eq!(config(), before);
+
+    // An agent adds with options alone, and the integration is usable.
+    let output = fob.run_as_agent(&[
+        "add",
+        "azure",
+        "work",
+        "--tenant",
+        "contoso.onmicrosoft.com",
+    ]);
+    assert!(output.status.success(), "{}", texts(&output).1);
+    fob.ok(&["add", "hetzner", "prod"]);
+    let (stdout, _) = fob.ok(&["status"]);
+    for name in [
+        "google",
+        "ssoins-1111aaaa2222bbbb-eu-west-1",
+        "work",
+        "prod",
+    ] {
+        assert!(stdout.contains(name), "{name}: {stdout}");
+    }
+
+    // --config may name a file that does not exist yet.
+    let other = fob.root.join("other.toml");
+    fob.ok(&["--config", other.to_str().unwrap(), "add", "fly"]);
+    assert!(
+        std::fs::read_to_string(&other)
+            .unwrap()
+            .contains("[integrations.fly]")
+    );
+}

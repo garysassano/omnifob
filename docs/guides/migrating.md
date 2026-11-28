@@ -72,16 +72,13 @@ browser = "firefox"
 
 ## Leapp and aws-sso-cli
 
-Their configs are not imported. Copy each portal's start URL and Region into an `aws-sso` integration, then `fob login`; every account and role is discovered, so nothing per account needs copying:
+Their configs are not imported. Add each portal with its start URL and Region, then sign in; every account and role is discovered, so nothing per account needs copying:
 
-```toml
-[integrations.acme]
-type = "aws-sso"
-start_url = "https://acme.awsapps.com/start"
-sso_region = "eu-central-1"
+```sh
+fob add aws-sso acme --start-url https://acme.awsapps.com/start --sso-region eu-central-1 --login
 ```
 
-IAM user keys from Leapp go into an [`aws-iam`](configuration.md#aws-iam-user-aws-iam) integration.
+IAM user keys from Leapp go into an [`aws-iam`](configuration.md#aws-iam-user-aws-iam) integration: `fob add aws-iam`, then `fob login` asks for the key.
 
 ## saml2aws, gimme-aws-creds, okta-aws-cli
 
@@ -96,12 +93,11 @@ format = "credential-process"
 
 ## gcloud
 
-```toml
-[integrations.google]
-type = "gcp"
+```sh
+fob add gcp --login
 ```
 
-`fob login google` signs in as `gcloud auth login` does, with gcloud's own OAuth client, and finds every active project. Then:
+This adds an integration named `google` and signs in as `gcloud auth login` does, with gcloud's own OAuth client, and finds every active project. Then:
 
 | Before                                     | With fob                                                                            |
 | ------------------------------------------ | ----------------------------------------------------------------------------------- |
@@ -115,12 +111,11 @@ gcloud reads `CLOUDSDK_AUTH_ACCESS_TOKEN` and `CLOUDSDK_CORE_PROJECT` from the e
 
 ## az
 
-```toml
-[integrations.work]
-type = "azure"
+```sh
+fob add azure work --login     # --tenant <ID or domain> for one tenant only
 ```
 
-`fob login work` signs in as `az login` does, with az's own client, and finds every subscription in every tenant. A profile per subscription (`work/<subscription>/user`) exports `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID`, `ARM_SUBSCRIPTION_ID`, `ARM_TENANT_ID` and a Resource Manager token, and under `fob exec` the Azure Identity libraries' `DefaultAzureCredential` gets tokens for any resource from a local managed identity endpoint. The `az` CLI itself keeps its own sign-in: it has no variable for a token. Azure support has not yet been tried on a live tenant.
+This signs in as `az login` does, with az's own client, and finds every subscription in every tenant. A profile per subscription (`work/<subscription>/user`) exports `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID`, `ARM_SUBSCRIPTION_ID`, `ARM_TENANT_ID` and a Resource Manager token, and under `fob exec` the Azure Identity libraries' `DefaultAzureCredential` gets tokens for any resource from a local managed identity endpoint. The `az` CLI itself keeps its own sign-in: it has no variable for a token. Azure support has not yet been tried on a live tenant.
 
 ## wrangler
 
@@ -128,19 +123,15 @@ type = "azure"
 
 The quickest start is a bootstrap token, created once in the dashboard (`fob login` opens the page):
 
-```toml
-[integrations.cf]
-type = "cloudflare-token"
-```
-
 ```sh
+fob add cloudflare-token cf
 fob login cf                              # opens the dashboard; paste the bootstrap token
 fob exec cf workers -- wrangler deploy    # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID for this command
 fob exec cf workers --revoke -- wrangler deploy   # a token deleted as soon as the command ends
 wrangler logout                           # once fob works, drop wrangler's own long-lived sign-in
 ```
 
-A browser sign-in like `wrangler login` (`type = "cloudflare-oauth"`) needs an OAuth client registered in your account once. The [Cloudflare guide](cloudflare.md) covers both, account-owned bootstrap tokens, sessions and your own templates (`fob cf add-template`).
+A browser sign-in like `wrangler login` (`fob add cloudflare-oauth`) needs an OAuth client registered in your account once. The [Cloudflare guide](cloudflare.md) covers both, account-owned bootstrap tokens, sessions and your own templates (`fob cf add-template`).
 
 Long-lived API tokens kept in `.env` files or CI-like shell profiles can go the same way: a template with the same permissions, and `fob exec` in front of the command.
 
@@ -148,13 +139,8 @@ Long-lived API tokens kept in `.env` files or CI-like shell profiles can go the 
 
 These CLIs keep their tokens in plain-text files. fob keeps them in the OS keychain and hands them out under the variables the CLI reads, which win over its own config:
 
-```toml
-[integrations.hetzner]
-type = "token"
-preset = "hetzner"
-```
-
 ```sh
+fob add hetzner
 fob login hetzner                 # paste the token (or --from-clipboard); checked with the provider
 fob exec hetzner -- hcloud server list
 ```

@@ -33,7 +33,12 @@ The config has a JSON Schema, [schema/config.schema.json](../../schema/config.sc
 
 Then `taplo check ~/.config/omnifob/config.toml` checks the file, and editors with the Even Better TOML extension (which uses taplo) complete keys and show their descriptions. The schema knows the keys and their types; the checks above that need more than that (partitions, clashing ids) still run when omnifob loads the config.
 
-Two commands write integrations for you: `fob import aws --write` (see [Migrating](migrating.md#granted-aws-vault-and-the-aws-cli)) and `fob discover aws --write` (below). `fob cf add-template` writes Cloudflare templates.
+Commands write most of it for you, keeping the rest of the file as it is:
+
+- `fob add` adds an integration: it asks for the type and the values it needs, or takes them as options (`fob add aws-sso acme --start-url ... --sso-region ...`; `fob add --help` lists them). A new config starts with the schema line above. `--print` shows the TOML instead of writing it, and `--login` signs in straight away. Chained roles, templates and the other keys below are edited by hand.
+- `fob import aws --write` adds what `~/.aws/config` describes (see [Migrating](migrating.md#granted-aws-vault-and-the-aws-cli)).
+- `fob discover aws --write` adds roles your sign-ins may assume ([below](#finding-roles-to-chain)).
+- `fob cf add-template` adds Cloudflare templates.
 
 ## AWS IAM Identity Center (`aws-sso`)
 

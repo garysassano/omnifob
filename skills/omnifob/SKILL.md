@@ -33,7 +33,7 @@ For AWS, profiles exported with `fob export aws-config` work without fob in the 
 ## Never
 
 - Print credentials: no `fob creds` (except `--format credential-process`, `fnox`, `k8s-exec` or `gcp-executable` inside the config of a tool that reads it), `fob env`, `fob use` or `fob console --print`, and no `env`, `printenv` or `echo $AWS_SECRET_ACCESS_KEY` inside `fob exec`. Under an agent, fob refuses the first ones; that refusal is not something to work around.
-- Change the user's setup unprompted: `fob login --force`, `fob logout`, `fob revoke`, `fob rename`, `fob import ... --write`, `fob discover ... --write`, `fob export ... --write`, `fob cf add-template`, or edits to `~/.config/omnifob/config.toml` (including its `[agent]` section).
+- Change the user's setup unprompted: `fob login --force`, `fob logout`, `fob revoke`, `fob rename`, `fob add`, `fob import ... --write`, `fob discover ... --write`, `fob export ... --write`, `fob cf add-template`, or edits to `~/.config/omnifob/config.toml` (including its `[agent]` section).
 
 ## When fob says no
 
