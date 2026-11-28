@@ -1596,10 +1596,11 @@ mod tests {
 
     #[test]
     fn every_browser_fob_knows_has_a_name_and_a_place_to_be_found() {
-        // The README's table of browsers names every one, by type and name.
-        let readme =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"))
-                .unwrap();
+        // The browsers guide's table names every one, by type and name.
+        let guide = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/guides/browsers.md"),
+        )
+        .unwrap();
         for kind in ALL.into_iter().filter(|k| *k != BrowserType::Command) {
             let install = kind.install();
             assert!(
@@ -1611,10 +1612,10 @@ mod tests {
             assert!(kind.engine().is_some(), "{kind:?}");
             let id = format!("{kind:?}").to_lowercase();
             let row = format!("| `{id}` ");
-            let line = readme.lines().find(|l| l.starts_with(&row));
+            let line = guide.lines().find(|l| l.starts_with(&row));
             assert!(
                 line.is_some_and(|l| l.contains(kind.name())),
-                "README's browser table lacks `{id}` ({})",
+                "the browsers guide's table lacks `{id}` ({})",
                 kind.name()
             );
         }

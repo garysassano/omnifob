@@ -15,7 +15,7 @@ Before pushing, run `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 
 ## Documentation
 
-- `README.md` covers status, installation, configuration and use. Longer guides go in `docs/guides/`, design and research in `docs/`.
+- `README.md` stays short: what omnifob is, installation, a quick start with the smallest config per provider, migration pointers and the agent story. Reference material (every config key, every command, formats for other tools) goes in `docs/guides/`, design and research in `docs/`.
 - When a provider is added or its handling changes, update the table in `docs/providers/README.md` and the provider's notes.
 - Record design decisions with their reasons in `docs/decisions.md`.
 
