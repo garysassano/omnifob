@@ -550,10 +550,12 @@ mod tests {
         // `fob rename` reads such a config to fix it.
         let text = "[integrations.\"my portal\"]\ntype = \"cloudflare-token\"\n\n[integrations.\"b c\"]\ntype = \"cloudflare-token\"\n";
         assert!(Config::parse_allowing_any_names(text).is_ok());
-        let renamed = rename_integration(text, "my portal", "portal").unwrap();
+        let renamed = rename_integration(text, "my portal", "portal")
+            .unwrap()
+            .text;
         assert!(renamed.contains("[integrations.portal]"), "{renamed}");
         assert!(Config::parse(&renamed).is_err(), "'b c' is still to fix");
-        let renamed = rename_integration(&renamed, "b c", "b-c").unwrap();
+        let renamed = rename_integration(&renamed, "b c", "b-c").unwrap().text;
         assert!(Config::parse(&renamed).is_ok());
     }
 
@@ -635,6 +637,8 @@ mod tests {
             .into_root_schema_for::<Config>();
         let mut value = serde_json::to_value(&schema).unwrap();
         without_null(&mut value);
+        exact_variants(&mut value);
+        refs_alone(&mut value);
         let object = value.as_object_mut().unwrap();
         object.insert(
             "$id".into(),
@@ -672,6 +676,101 @@ mod tests {
                 object.values_mut().for_each(without_null);
             }
             Value::Array(items) => items.iter_mut().for_each(without_null),
+            _ => {}
+        }
+    }
+
+    /// Narrows the parts of the schema that the config types share between
+    /// types the loader tells apart: the two Cloudflare integration types,
+    /// `command` and the other browsers, and the token presets.
+    fn exact_variants(schema: &mut serde_json::Value) {
+        use serde_json::{Value, json};
+        let definitions = schema["definitions"].as_object_mut().unwrap();
+        for variant in definitions["Integration"]["oneOf"].as_array_mut().unwrap() {
+            let kind = variant["properties"]["type"]["const"].clone();
+            let properties = variant["properties"].as_object_mut().unwrap();
+            match kind.as_str() {
+                Some("cloudflare-token") => {
+                    properties.remove("client_id");
+                    properties.remove("scopes");
+                }
+                Some("cloudflare-oauth") => {
+                    properties.remove("token_type");
+                    variant["required"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push("client_id".into());
+                }
+                Some("token") => {
+                    let names: Vec<&str> = crate::providers::token::PRESETS
+                        .iter()
+                        .map(|p| p.name)
+                        .collect();
+                    properties["preset"]["enum"] = json!(names);
+                }
+                _ => {}
+            }
+        }
+        // `type = "command"` takes its program in `command`, which the
+        // browsers fob knows refuse, as they refuse `engine`; `path` and
+        // `profile` are theirs alone.
+        let browser = definitions["Browser"].clone();
+        let known_types: Vec<Value> = definitions["BrowserType"]["oneOf"]
+            .as_array()
+            .map(|e| {
+                e.iter()
+                    .filter(|t| t["const"] != "command")
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(!known_types.is_empty(), "BrowserType is a oneOf of names");
+        let mut command = browser.clone();
+        let mut known = browser.clone();
+        {
+            let properties = command["properties"].as_object_mut().unwrap();
+            properties.remove("path");
+            properties.remove("profile");
+            properties["type"] = json!({ "const": "command", "type": "string" });
+            properties["command"]["minItems"] = json!(1);
+            properties["command"]
+                .as_object_mut()
+                .unwrap()
+                .remove("default");
+            command["required"] = json!(["type", "command"]);
+            command.as_object_mut().unwrap().remove("description");
+        }
+        {
+            let properties = known["properties"].as_object_mut().unwrap();
+            properties.remove("command");
+            properties.remove("engine");
+            let description = properties["type"]["description"].clone();
+            properties["type"] = json!({ "oneOf": known_types, "description": description });
+            known.as_object_mut().unwrap().remove("description");
+        }
+        definitions.insert(
+            "Browser".into(),
+            json!({
+                "description": browser["description"],
+                "oneOf": [known, command],
+            }),
+        );
+    }
+
+    /// Draft 07 ignores every keyword next to `$ref`, descriptions too, so a
+    /// `$ref` with company goes into an `allOf` of its own.
+    fn refs_alone(value: &mut serde_json::Value) {
+        use serde_json::{Value, json};
+        match value {
+            Value::Object(object) => {
+                if object.len() > 1
+                    && let Some(reference) = object.remove("$ref")
+                {
+                    object.insert("allOf".into(), json!([{ "$ref": reference }]));
+                }
+                object.values_mut().for_each(refs_alone);
+            }
+            Value::Array(items) => items.iter_mut().for_each(refs_alone),
             _ => {}
         }
     }

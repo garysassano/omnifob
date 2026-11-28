@@ -61,7 +61,7 @@ impl App {
             };
             match result {
                 Ok(profiles) => {
-                    eprintln!("fob: {name}: {} profiles", profiles.len());
+                    eprintln!("fob: {name}: {}", crate::profiles_count(profiles.len()));
                     self.cache.integrations.insert(
                         name.clone(),
                         SyncedProfiles {
@@ -135,7 +135,7 @@ impl App {
         for (name, result) in missing.iter().zip(discovered) {
             match result {
                 Ok(profiles) => {
-                    eprintln!("fob: {name}: {} profiles", profiles.len());
+                    eprintln!("fob: {name}: {}", crate::profiles_count(profiles.len()));
                     self.cache.integrations.insert(
                         name.clone(),
                         SyncedProfiles {

@@ -18,8 +18,9 @@ pub struct AgentConfig {
     /// The longest lifetime of credentials an agent gets, e.g. "15m", for
     /// profiles whose lifetime omnifob chooses (Cloudflare tokens, chained
     /// and IAM users' roles, cross-partition roles, Google service
-    /// accounts). Longer ones are asked for with this lifetime and not
-    /// cached. At least 15 minutes, the shortest AWS session.
+    /// accounts, and `command` integrations that set `ttl`). Longer ones
+    /// are asked for with this lifetime and not cached. At least 15
+    /// minutes, the shortest AWS session.
     #[serde(default, with = "opt_duration")]
     #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub max_ttl: Option<SignedDuration>,

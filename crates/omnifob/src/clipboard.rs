@@ -88,7 +88,15 @@ pub fn write(text: &str) -> anyhow::Result<&'static str> {
         if !terminal.is_terminal() {
             bail!("no terminal to copy through over SSH; use --print");
         }
-        terminal.write_all(osc52(text, std::env::var_os("TMUX").is_some()).as_bytes())?;
+        let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        let multiplexer = if set("TMUX") {
+            Some(Multiplexer::Tmux)
+        } else if set("STY") {
+            Some(Multiplexer::Screen)
+        } else {
+            None
+        };
+        terminal.write_all(osc52(text, multiplexer).as_bytes())?;
         terminal.flush()?;
         return Ok("to your terminal's clipboard (OSC 52)");
     }
@@ -125,14 +133,25 @@ pub fn write(text: &str) -> anyhow::Result<&'static str> {
 
 /// The OSC 52 sequence that sets the terminal's clipboard to `text`, wrapped
 /// for tmux to pass on when `tmux` is set.
-fn osc52(text: &str, tmux: bool) -> String {
+/// A terminal multiplexer that passes OSC 52 on only inside its own
+/// escape (DCS passthrough).
+#[derive(Clone, Copy)]
+enum Multiplexer {
+    Tmux,
+    Screen,
+}
+
+fn osc52(text: &str, multiplexer: Option<Multiplexer>) -> String {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let sequence = format!("\x1b]52;c;{encoded}\x07");
-    if tmux {
-        format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
-    } else {
-        sequence
+    match multiplexer {
+        Some(Multiplexer::Tmux) => {
+            format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b"))
+        }
+        // screen passes a DCS string on as it is.
+        Some(Multiplexer::Screen) => format!("\x1bP{sequence}\x1b\\"),
+        None => sequence,
     }
 }
 
@@ -221,8 +240,15 @@ mod tests {
 
     #[test]
     fn osc52_carries_the_text_in_base64() {
-        assert_eq!(osc52("hi", false), "\x1b]52;c;aGk=\x07");
-        assert_eq!(osc52("hi", true), "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\");
+        assert_eq!(osc52("hi", None), "\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            osc52("hi", Some(Multiplexer::Tmux)),
+            "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"
+        );
+        assert_eq!(
+            osc52("hi", Some(Multiplexer::Screen)),
+            "\x1bP\x1b]52;c;aGk=\x07\x1b\\"
+        );
     }
 
     #[test]

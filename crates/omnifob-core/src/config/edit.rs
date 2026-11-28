@@ -6,7 +6,7 @@ use super::{CloudflareTemplate, Config, check_name};
 
 /// Renames an integration in the text of a config file, keeping comments,
 /// layout and its sub-tables (chained roles, templates).
-pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<String> {
+pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<Renamed> {
     check_name("integration name", new)?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("parsing the config")?;
     let integrations = doc
@@ -23,10 +23,93 @@ pub fn rename_integration(text: &str, old: &str, new: &str) -> anyhow::Result<St
         .with_leaf_decor(key.leaf_decor().clone())
         .with_dotted_decor(key.dotted_decor().clone());
     integrations.insert_formatted(&renamed, item);
+    let references = rename_references(&mut doc, old, new);
     let text = doc.to_string();
     // Other integrations may still have names to fix, one rename at a time.
     Config::parse_allowing_any_names(&text).context("the renamed config is not valid")?;
-    Ok(text)
+    Ok(Renamed { text, references })
+}
+
+/// A config renamed by [`rename_integration`].
+#[derive(Debug)]
+pub struct Renamed {
+    /// The config's new text.
+    pub text: String,
+    /// Where profile ids or patterns under the old name were rewritten, as
+    /// `[agent] profiles`, `[directories]`, `labels[0].profiles` or
+    /// `browsers.<name>.containers[0].profiles`.
+    pub references: Vec<String>,
+}
+
+/// Rewrites profile ids and patterns that start with `<old>/` to start with
+/// `<new>/`, in `[agent] profiles`, `[directories]`, `[[labels]]` and
+/// `[[browsers.*.containers]]`, keeping comments; returns where.
+fn rename_references(doc: &mut toml_edit::DocumentMut, old: &str, new: &str) -> Vec<String> {
+    let prefix = format!("{old}/");
+    let rewrite = |value: &mut toml_edit::Value| -> bool {
+        let Some(rest) = value.as_str().and_then(|s| s.strip_prefix(&prefix)) else {
+            return false;
+        };
+        let decor = value.decor().clone();
+        let mut renamed = toml_edit::Value::from(format!("{new}/{rest}"));
+        *renamed.decor_mut() = decor;
+        *value = renamed;
+        true
+    };
+    let rewrite_array = |item: Option<&mut toml_edit::Item>| -> bool {
+        let Some(array) = item.and_then(|i| i.as_array_mut()) else {
+            return false;
+        };
+        let mut changed = false;
+        for value in array.iter_mut() {
+            changed |= rewrite(value);
+        }
+        changed
+    };
+    let mut references = Vec::new();
+    if rewrite_array(doc.get_mut("agent").and_then(|a| a.get_mut("profiles"))) {
+        references.push("[agent] profiles".to_string());
+    }
+    if let Some(dirs) = doc
+        .get_mut("directories")
+        .and_then(|d| d.as_table_like_mut())
+    {
+        let mut changed = false;
+        for (_, item) in dirs.iter_mut() {
+            if let Some(value) = item.as_value_mut() {
+                changed |= rewrite(value);
+            }
+        }
+        if changed {
+            references.push("[directories]".to_string());
+        }
+    }
+    if let Some(labels) = doc
+        .get_mut("labels")
+        .and_then(|l| l.as_array_of_tables_mut())
+    {
+        for (i, label) in labels.iter_mut().enumerate() {
+            if rewrite_array(label.get_mut("profiles")) {
+                references.push(format!("labels[{i}].profiles"));
+            }
+        }
+    }
+    if let Some(browsers) = doc.get_mut("browsers").and_then(|b| b.as_table_like_mut()) {
+        for (name, browser) in browsers.iter_mut() {
+            let Some(styles) = browser
+                .get_mut("containers")
+                .and_then(|c| c.as_array_of_tables_mut())
+            else {
+                continue;
+            };
+            for (i, style) in styles.iter_mut().enumerate() {
+                if rewrite_array(style.get_mut("profiles")) {
+                    references.push(format!("browsers.{name}.containers[{i}].profiles"));
+                }
+            }
+        }
+    }
+    references
 }
 
 /// Adds a template to a Cloudflare integration in the config text, keeping
@@ -103,9 +186,10 @@ mod tests {
         let text = "# mine\n[integrations.mine] # personal\ntype = \"aws-sso\"\nstart_url = \"https://a.awsapps.com/start\"\nregion = \"eu-west-1\"\n\n[integrations.mine.chained.lab]\nvia_account_id = \"111111111111\"\nvia_role = \"A\"\nrole_arn = \"arn:aws:iam::222222222222:role/R\"\n\n[integrations.cf]\ntype = \"cloudflare-token\"\n";
         let renamed = rename_integration(text, "mine", "aws").unwrap();
         assert_eq!(
-            renamed,
+            renamed.text,
             text.replace("integrations.mine", "integrations.aws")
         );
+        assert!(renamed.references.is_empty());
         assert!(
             rename_integration(text, "mine", "cf")
                 .unwrap_err()
@@ -124,6 +208,53 @@ mod tests {
                 "{bad:?} is refused"
             );
         }
+    }
+
+    #[test]
+    fn renames_rewrite_profile_references_and_keep_their_comments() {
+        let text = r#"[integrations.mine]
+type = "aws-sso"
+start_url = "https://a.awsapps.com/start"
+region = "eu-west-1"
+
+[agent]
+profiles = ["mine/dev/*", # dev
+  "other/*/*"]
+
+[directories]
+"~/code/a" = "mine/dev/Admin" # a
+"~/code/b" = "other/x/Y"
+
+[[labels]]
+profiles = ["mine/*-prd/*"]
+env = "prod"
+
+[[labels]]
+profiles = ["*/dev/*"]
+env = "dev"
+
+[browsers.ff]
+type = "firefox"
+
+[[browsers.ff.containers]]
+profiles = ["mine/prod/*"]
+color = "red"
+"#;
+        let renamed = rename_integration(text, "mine", "aws").unwrap();
+        assert_eq!(
+            renamed.references,
+            [
+                "[agent] profiles",
+                "[directories]",
+                "labels[0].profiles",
+                "browsers.ff.containers[0].profiles"
+            ]
+        );
+        assert_eq!(
+            renamed.text,
+            text.replace("integrations.mine", "integrations.aws")
+                .replace("\"mine/", "\"aws/")
+        );
     }
 
     #[test]

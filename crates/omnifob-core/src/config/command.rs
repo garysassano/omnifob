@@ -48,7 +48,9 @@ pub struct CommandConfig {
     /// `credential-process` output.
     #[serde(default)]
     pub region: Option<String>,
-    /// URL `fob console` opens; there is none by default.
+    /// URL `fob console` opens. Unset, an `aws` command's profiles open the
+    /// AWS console signed in with their credentials, and other commands
+    /// have no console.
     #[serde(default)]
     pub console: Option<String>,
     /// The browser in `[browsers]` that this integration's consoles open in;

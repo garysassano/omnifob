@@ -513,7 +513,8 @@ fn code_byte(code: i32) -> u8 {
 }
 
 /// Runs a command to its end and returns its exit status. Ctrl-C reaches the
-/// command, not omnifob, so omnifob can clean up after it.
+/// command, not omnifob, so omnifob can clean up after it; `SIGINT`,
+/// `SIGHUP` and `SIGTERM` sent to omnifob alone are passed on to it.
 pub(crate) async fn run_to_end(
     profile: &Profile,
     creds: &Credentials,
@@ -534,7 +535,7 @@ pub(crate) async fn run_to_end(
     // The terminal sends Ctrl-C, and a hangup when it closes, to the command
     // too; omnifob waits for the command to end instead of ending first.
     // Listening for them, from before the command starts, keeps them from
-    // ending omnifob.
+    // ending omnifob; those sent to omnifob alone are passed on.
     #[cfg(unix)]
     let (mut interrupt, mut hangup, mut terminate) = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -558,15 +559,18 @@ pub(crate) async fn run_to_end(
         tokio::select! {
             status = child.wait() => break status?,
             () = &mut serving => {}
-            _ = interrupt.recv() => {}
-            _ = hangup.recv() => {}
-            _ = terminate.recv() => {
-                // Unlike Ctrl-C, nobody else told the command to stop.
-                if let Some(pid) = child.id() {
-                    // SAFETY: sends a signal to the child, which has not been reaped.
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            _ = interrupt.recv() => {
+                if !terminal_signals_group() {
+                    forward(&child, libc::SIGINT);
                 }
             }
+            _ = hangup.recv() => {
+                if !terminal_signals_group() {
+                    forward(&child, libc::SIGHUP);
+                }
+            }
+            // Unlike Ctrl-C, nobody else told the command to stop.
+            _ = terminate.recv() => forward(&child, libc::SIGTERM),
         }
         #[cfg(windows)]
         tokio::select! {
@@ -582,7 +586,43 @@ pub(crate) async fn run_to_end(
         }
     };
     drop(files);
+    // Windows exit codes are 32-bit; `main` exits with the whole code once
+    // the cleanup after the command (revoking a token) is done.
+    #[cfg(windows)]
+    if let Some(code) = status.code() {
+        let _ = WHOLE_EXIT_CODE.set(code);
+    }
     Ok(exit_code(status))
+}
+
+/// The command's whole exit code, kept by [`run_to_end`] on Windows, where
+/// [`ExitCode`] holds only a byte.
+#[cfg(windows)]
+pub(crate) static WHOLE_EXIT_CODE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+/// Sends `signal` to the command, unless it has ended.
+#[cfg(unix)]
+fn forward(child: &tokio::process::Child, signal: libc::c_int) {
+    if let Some(pid) = child.id() {
+        // SAFETY: sends a signal to the child, which has not been reaped.
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+}
+
+/// Whether a `SIGINT` or `SIGHUP` fob got most likely came from its
+/// terminal, which sends it to the whole foreground process group, the
+/// command included: fob is in that group. Otherwise (no terminal, as in
+/// CI and agents, or fob in the background) someone sent it to fob alone,
+/// and fob passes it on.
+#[cfg(unix)]
+fn terminal_signals_group() -> bool {
+    // SAFETY: plain queries of this process and its terminal.
+    unsafe {
+        let group = libc::getpgrp();
+        [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+            .into_iter()
+            .any(|fd| libc::isatty(fd) == 1 && libc::tcgetpgrp(fd) == group)
+    }
 }
 
 /// The command's environment with a provisioner's changes: the variables

@@ -22,12 +22,11 @@
 //! answered with an error. Files are written private, in the state
 //! directory's `run` directory, and deleted when dropped.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine;
@@ -38,10 +37,10 @@ use crate::serve::{self, Request, Response};
 use crate::{Config, Credentials, Profile, Target, providers};
 
 /// A future that serves an endpoint, or keeps a file fresh, until dropped.
-pub type Task = Pin<Box<dyn Future<Output = ()>>>;
+pub type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// `future` as a [`Task`]: in the context current now, and unattended.
-fn task(future: impl Future<Output = ()> + 'static) -> Task {
+fn task(future: impl Future<Output = ()> + Send + 'static) -> Task {
     Box::pin(crate::Context::current().scope(crate::prompt::unattended(future)))
 }
 
@@ -134,31 +133,22 @@ fn run_dir() -> anyhow::Result<PathBuf> {
 /// long left.
 const SERVE_MIN: SignedDuration = SignedDuration::from_mins(15);
 
-/// A profile's credentials for an endpoint: the cached ones while they last
-/// at least [`SERVE_MIN`], else new ones. Credentials issued in the last
-/// minute are kept anyway, so ones that never last that long (console
-/// sign-in's 15 minutes) are not fetched again on every request.
+/// A profile's credentials for an endpoint: the cached ones while
+/// [`still_served`] keeps them, else new ones.
 async fn served_credentials(
     config: &Config,
     profile: &Profile,
     ttl: Option<SignedDuration>,
 ) -> crate::Result<Credentials> {
     let creds = providers::credentials(config, profile, true, ttl).await?;
-    let now = Timestamp::now();
-    let short = creds
-        .expires_at
-        .is_some_and(|at| at.duration_since(now) < SERVE_MIN);
-    let recent = creds
-        .issued_at
-        .is_some_and(|at| now.duration_since(at) < SignedDuration::from_mins(1));
-    if short && !recent && ttl.is_none() {
+    if !still_served(&creds, Timestamp::now()) && ttl.is_none() {
         return providers::credentials(config, profile, false, None).await;
     }
     Ok(creds)
 }
 
 /// The credentials an endpoint last handed out, for the next requests while
-/// they last at least [`SERVE_MIN`] or are less than a minute old. With a
+/// [`still_served`] keeps them. With a
 /// `ttl` (the agent's cap), [`providers::credentials`] skips its cache, so
 /// without this every request would get new credentials. Requests that
 /// arrive while new ones are fetched wait for them.
@@ -182,15 +172,21 @@ impl Served {
     }
 }
 
-/// Whether credentials an endpoint handed out can be handed out again.
+/// Whether credentials an endpoint handed out can be handed out again:
+/// while they last at least [`SERVE_MIN`], or, for credentials that never
+/// last that long (console sign-in's 15 minutes), until they are due for
+/// renewal, never once expired.
 fn still_served(creds: &Credentials, now: Timestamp) -> bool {
-    let long = creds
-        .expires_at
-        .is_none_or(|at| at.duration_since(now) >= SERVE_MIN);
-    let recent = creds
+    let Some(expires) = creds.expires_at else {
+        return true;
+    };
+    if expires.duration_since(now) >= SERVE_MIN {
+        return true;
+    }
+    let short_lived = creds
         .issued_at
-        .is_some_and(|at| now.duration_since(at) < SignedDuration::from_mins(1));
-    long || recent
+        .is_some_and(|at| expires.duration_since(at) <= SERVE_MIN);
+    short_lived && !creds.wants_renewal(now)
 }
 
 /// How a failure reads in an endpoint's answer: the error, without the
@@ -246,7 +242,7 @@ pub async fn aws_container_endpoint(
     let listener = serve::bind().await?;
     let port = listener.local_addr()?.port();
     let secret = serve::secret()?;
-    let state = Rc::new((config, profile, secret.clone(), Served::default()));
+    let state = Arc::new((config, profile, secret.clone(), Served::default()));
     let handler = move |request: Request| {
         let state = state.clone();
         async move {
@@ -342,9 +338,12 @@ pub async fn azure_identity_endpoint(
     let listener = serve::bind().await?;
     let port = listener.local_addr()?.port();
     let secret = serve::secret()?;
-    type Cache = RefCell<HashMap<String, (String, Timestamp)>>;
-    let state: Rc<(String, String, String, Cache)> =
-        Rc::new((integration, tenant, secret.clone(), RefCell::default()));
+    // One lock over the cache, held while a token is fetched, so requests
+    // that miss together start one refresh at Entra ID, not one each
+    // (`resource_token` takes the integration's lock anyway).
+    type Cache = tokio::sync::Mutex<HashMap<String, (String, Timestamp)>>;
+    let state: Arc<(String, String, String, Cache)> =
+        Arc::new((integration, tenant, secret.clone(), Cache::default()));
     let handler = move |request: Request| {
         let state = state.clone();
         async move {
@@ -371,20 +370,32 @@ pub async fn azure_identity_endpoint(
                     "fob serves the signed-in account, not a user-assigned identity; unset AZURE_CLIENT_ID",
                 );
             }
-            let Some(resource) = request.query("resource").map(str::to_string) else {
+            let Some(resource) = request
+                .query("resource")
+                .filter(|r| !r.trim().is_empty())
+                .map(str::to_string)
+            else {
                 return azure_error(400, "invalid_request", "no resource");
             };
-            let cached = cache.borrow().get(&resource).cloned();
+            let mut cache = cache.lock().await;
+            let now = Timestamp::now();
+            cache.retain(|_, (_, at)| *at > now);
+            let cached = cache.get(&resource).cloned();
             let (token, expires_at) = match cached {
-                Some((token, at)) if at.duration_since(Timestamp::now()) > SERVE_MIN => (token, at),
+                Some((token, at)) if at.duration_since(now) > SERVE_MIN => (token, at),
                 _ => match providers::azure::resource_token(integration, tenant, &resource).await {
                     Ok(found) => {
-                        cache.borrow_mut().insert(resource.clone(), found.clone());
+                        cache.insert(resource.clone(), found.clone());
                         found
+                    }
+                    // Passed on as unavailable, so the SDKs try again.
+                    Err(e) if transient(&e) => {
+                        return azure_error(503, "temporarily_unavailable", failure(&e));
                     }
                     Err(e) => return azure_error(400, "invalid_resource", failure(&e)),
                 },
             };
+            drop(cache);
             Response::ok(azure_identity_body(&token, expires_at, &resource))
         }
     };
@@ -400,6 +411,17 @@ pub async fn azure_identity_endpoint(
         files: Vec::new(),
         tasks: vec![task(serve::serve(listener, handler))],
     })
+}
+
+/// Whether a failure may pass if tried again: the network, or a 5xx from
+/// the provider.
+fn transient(e: &crate::Error) -> bool {
+    match e {
+        crate::Error::NeedsLogin { .. } => false,
+        crate::Error::Other(e) => e
+            .chain()
+            .any(|c| c.is::<reqwest::Error>() || c.is::<providers::azure::Unavailable>()),
+    }
 }
 
 // --- Google ----------------------------------------------------------------
@@ -443,7 +465,7 @@ pub async fn gcp_adc_endpoint(
     let secret = serve::secret()?;
     let body = gcp_adc_file_body(&format!("http://127.0.0.1:{port}/token"), &secret);
     let file = TempFile::create(".json", &serde_json::to_vec_pretty(&body)?)?;
-    let state = Rc::new((config, profile, secret, Served::default()));
+    let state = Arc::new((config, profile, secret, Served::default()));
     let handler = move |request: Request| {
         let state = state.clone();
         async move {
@@ -763,6 +785,34 @@ mod tests {
             creds.env.insert(k.into(), v.into());
         }
         creds
+    }
+
+    #[test]
+    fn served_credentials_last_until_they_are_due_for_renewal() {
+        let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        let creds = |issued_mins_ago: i64, lasts_mins: i64| Credentials {
+            issued_at: Some(now - SignedDuration::from_mins(issued_mins_ago)),
+            expires_at: Some(
+                now - SignedDuration::from_mins(issued_mins_ago)
+                    + SignedDuration::from_mins(lasts_mins),
+            ),
+            ..Default::default()
+        };
+        // An hour's credentials, while 15 minutes are left.
+        assert!(still_served(&creds(30, 60), now));
+        assert!(!still_served(&creds(50, 60), now));
+        // 15-minute credentials are not fetched again every minute...
+        assert!(still_served(&creds(3, 15), now));
+        // ...but are near their end, and never served expired.
+        assert!(!still_served(&creds(10, 15), now));
+        assert!(!still_served(&creds(0, -1), now));
+    }
+
+    /// Embedders can run the tasks on a multi-threaded runtime.
+    #[test]
+    fn provisions_are_send() {
+        fn send<T: Send>() {}
+        send::<Provision>();
     }
 
     #[test]

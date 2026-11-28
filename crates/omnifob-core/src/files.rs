@@ -9,10 +9,45 @@ use std::time::Duration;
 use anyhow::Context;
 
 /// A file name for a key (a keychain key, a lock name, a profile id): every
-/// byte outside `[A-Za-z0-9._-]` is written as `%XX`, and so is a leading
-/// `.`, so `aws-sso/acme/token` is `aws-sso%2Facme%2Ftoken`. Distinct keys
-/// always get distinct names, and a name is never `.`, `..` or hidden.
+/// byte outside `[a-z0-9._-]` is written as `%XX`, uppercase letters
+/// included, and so are a leading or trailing `.`, so `aws-sso/Acme/token`
+/// is `aws-sso%2F%41cme%2Ftoken`. Distinct keys always get distinct names,
+/// also on file systems that ignore case (APFS, NTFS), and a name is never
+/// empty, `.`, `..`, hidden or a Windows device name (`con`, `nul.x`, ...).
 pub fn encode_key_filename(key: &str) -> String {
+    if key.is_empty() {
+        // `%` is otherwise always followed by two hex digits.
+        return "%".to_string();
+    }
+    let stem = key.split('.').next().unwrap_or_default();
+    let device = is_windows_device_name(stem);
+    let last = key.len() - 1;
+    let mut name = String::with_capacity(key.len());
+    for (i, b) in key.bytes().enumerate() {
+        let plain = b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.');
+        let edge_dot = b == b'.' && (i == 0 || i == last);
+        if plain && !edge_dot && !(device && i == 0) {
+            name.push(b as char);
+        } else {
+            name.push_str(&format!("%{b:02X}"));
+        }
+    }
+    name
+}
+
+/// Whether Windows reserves `stem` (a name up to its first `.`, ignoring
+/// case) for a device, also with an extension after it.
+fn is_windows_device_name(stem: &str) -> bool {
+    let stem = stem.to_ascii_lowercase();
+    matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+        || ((stem.starts_with("com") || stem.starts_with("lpt"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// The name [`encode_key_filename`] gave a key before omnifob 0.14, which
+/// kept uppercase letters and trailing dots as they were.
+fn legacy_key_filename(key: &str) -> String {
     let mut name = String::with_capacity(key.len());
     for (i, b) in key.bytes().enumerate() {
         let leading_dot = i == 0 && b == b'.';
@@ -23,6 +58,27 @@ pub fn encode_key_filename(key: &str) -> String {
         }
     }
     name
+}
+
+/// The path of `key`'s file in `dir`: its [`encode_key_filename`] name with
+/// `suffix` added. A file an older omnifob wrote under the name that kept
+/// case is renamed to it first, so nobody has to sign in again. It moves
+/// only when a directory entry has exactly the old name, so on a file
+/// system that ignores case, `Acme` never takes over `acme`'s file.
+pub fn key_file(dir: &Path, key: &str, suffix: &str) -> PathBuf {
+    let path = dir.join(format!("{}{suffix}", encode_key_filename(key)));
+    let legacy = format!("{}{suffix}", legacy_key_filename(key));
+    if path.file_name().is_some_and(|name| name != legacy.as_str())
+        && !path.exists()
+        && std::fs::read_dir(dir)
+            .is_ok_and(|mut entries| entries.any(|e| e.is_ok_and(|e| e.file_name() == legacy.as_str())))
+        && let Err(e) = std::fs::rename(dir.join(&legacy), &path)
+        // Another process moved it first.
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("could not rename {legacy} to {}: {e}", path.display());
+    }
+    path
 }
 
 /// Creates `dir` and any missing parents readable by their owner only on
@@ -239,9 +295,42 @@ mod tests {
         assert_eq!(encode_key_filename("a b%"), "a%20b%25");
         assert_eq!(encode_key_filename("é"), "%C3%A9");
         assert_eq!(encode_key_filename("."), "%2E");
-        assert_eq!(encode_key_filename(".."), "%2E.");
+        assert_eq!(encode_key_filename(".."), "%2E%2E");
         assert_eq!(encode_key_filename(".hidden"), "%2Ehidden");
-        assert_eq!(encode_key_filename("x.y."), "x.y.");
+        assert_eq!(encode_key_filename("x.y."), "x.y%2E");
+        assert_eq!(encode_key_filename(""), "%");
+        // Case-insensitive file systems would give these one file.
+        assert_eq!(encode_key_filename("Acme"), "%41cme");
+        assert_ne!(
+            encode_key_filename("Acme").to_lowercase(),
+            encode_key_filename("acme").to_lowercase()
+        );
+        // Windows device names, with or without an extension.
+        assert_eq!(encode_key_filename("con"), "%63on");
+        assert_eq!(encode_key_filename("nul.sealed"), "%6Eul.sealed");
+        assert_eq!(encode_key_filename("com1"), "%63om1");
+        assert_eq!(encode_key_filename("console"), "console");
+        assert_eq!(encode_key_filename("com"), "com");
+    }
+
+    #[test]
+    fn key_files_under_the_old_name_move_to_the_new_one() {
+        let dir = scratch("legacy-key");
+        std::fs::write(dir.join("aws-sso%2FAcme%2Ftoken.sealed"), "old").unwrap();
+        let path = key_file(&dir, "aws-sso/Acme/token", ".sealed");
+        assert_eq!(path, dir.join("aws-sso%2F%41cme%2Ftoken.sealed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(entries(&dir), ["aws-sso%2F%41cme%2Ftoken.sealed"]);
+        // A lowercase name was never different, and a key without a file
+        // gets the new name without anything moving.
+        assert_eq!(key_file(&dir, "acme", ".sealed"), dir.join("acme.sealed"));
+        assert_eq!(key_file(&dir, "Other", ""), dir.join("%4Fther"));
+        assert_eq!(entries(&dir), ["aws-sso%2F%41cme%2Ftoken.sealed"]);
+        // A file under the new name wins over one left under the old name.
+        std::fs::write(dir.join("aws-sso%2FAcme%2Ftoken.sealed"), "stale").unwrap();
+        let path = key_file(&dir, "aws-sso/Acme/token", ".sealed");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -155,6 +155,11 @@ enum Exchange {
     Refused(OauthError),
 }
 
+/// Entra ID answered with a server error, which may pass if tried again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Unavailable(String);
+
 async fn exchange(
     tenant: &str,
     form: &[(&str, &str)],
@@ -171,6 +176,13 @@ async fn exchange(
         return Ok(Exchange::Ok(
             serde_json::from_str(&text).context("unexpected token response")?,
         ));
+    }
+    if status.is_server_error() {
+        return Err(Unavailable(format!(
+            "Entra ID answered {status}: {}",
+            text.chars().take(200).collect::<String>()
+        ))
+        .into());
     }
     match serde_json::from_str::<OauthError>(&text) {
         Ok(e) => Ok(Exchange::Refused(e)),

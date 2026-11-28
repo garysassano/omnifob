@@ -53,6 +53,7 @@ pub fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     // Answers the shell's completion requests (COMPLETE=<shell>) and exits.
+    config_for_completion();
     clap_complete::CompleteEnv::with_factory(command).complete();
 
     use tracing_subscriber::util::SubscriberInitExt;
@@ -94,7 +95,13 @@ pub fn main() -> ExitCode {
         ExitCode::FAILURE
     };
     match runtime.block_on(run(cli)) {
-        Ok(code) => code,
+        Ok(code) => {
+            #[cfg(windows)]
+            if let Some(code) = exec::WHOLE_EXIT_CODE.get() {
+                std::process::exit(*code);
+            }
+            code
+        }
         Err(e) => {
             report(&e);
             failed
@@ -128,13 +135,62 @@ fn error_json(e: &anyhow::Error) -> serde_json::Value {
 /// The command line, named after the binary that was run (`fob` or `omnifob`),
 /// so help, errors and `--version` say what the user typed.
 fn command() -> clap::Command {
+    match bin_name() {
+        "omnifob" => Cli::command().name("omnifob").bin_name("omnifob"),
+        _ => Cli::command(),
+    }
+}
+
+/// The name fob was run as: `omnifob`, or else `fob`.
+pub(crate) fn bin_name() -> &'static str {
     let invoked = std::env::args_os()
         .next()
         .map(std::path::PathBuf::from)
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
     match invoked.as_deref() {
-        Some("omnifob") => Cli::command().name("omnifob").bin_name("omnifob"),
-        _ => Cli::command(),
+        Some("omnifob") => "omnifob",
+        _ => "fob",
+    }
+}
+
+/// "1 profile", "2 profiles".
+pub(crate) fn profiles_count(n: usize) -> String {
+    if n == 1 {
+        "1 profile".to_string()
+    } else {
+        format!("{n} profiles")
+    }
+}
+
+/// Points `OMNIFOB_CONFIG` at the `--config` of the command line a shell
+/// asks completions for (`COMPLETE=<shell> fob -- fob --config x exec <TAB>`),
+/// so candidates come from that config.
+fn config_for_completion() {
+    if std::env::var_os("COMPLETE").is_none_or(|v| v.is_empty() || v == "0") {
+        return;
+    }
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let Some(start) = args.iter().position(|a| a == "--") else {
+        return;
+    };
+    // The words of the line: the program, global options, then the command.
+    let mut words = args[start + 1..].iter().skip(1);
+    let mut config = None;
+    while let Some(word) = words.next() {
+        let text = word.to_string_lossy();
+        if text == "--config" {
+            config = words.next().cloned();
+        } else if let Some(path) = text.strip_prefix("--config=") {
+            config = Some(path.into());
+        } else if !text.starts_with('-') {
+            break;
+        }
+    }
+    if let Some(path) = config.filter(|p| !p.is_empty()) {
+        let path = std::path::PathBuf::from(path);
+        let path = std::path::absolute(&path).unwrap_or(path);
+        // SAFETY: called from main before any thread exists.
+        unsafe { std::env::set_var("OMNIFOB_CONFIG", path) };
     }
 }
 
@@ -188,7 +244,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // `fob activate`, or `fob unuse`.
     match &cli.command {
         Command::Activate { shell } => {
-            print!("{}", shell::activate(*shell));
+            print!("{}", shell::activate(*shell, bin_name()));
             return Ok(ExitCode::SUCCESS);
         }
         Command::Env {
@@ -562,6 +618,9 @@ fn load_profiles(command: &Command) -> anyhow::Result<ProfileCache> {
         | Command::Sync { .. }
         | Command::Status { .. }
         | Command::Logout { .. }
+        // Renaming rewrites the cache; a damaged one is only discovered
+        // profiles, which the next sync finds again.
+        | Command::Rename { .. }
         | Command::Revoke { all: true, .. } => true,
         _ => false,
     };

@@ -468,8 +468,15 @@ async fn the_managed_identity_endpoint_mints_for_any_resource_with_its_secret() 
             "scope=https%3A%2F%2Fvault.azure.net%2F.default+offline_access",
         ))
         .respond_with(tokens("vault-1", "refresh-2"))
-        // Kept per resource while it lasts: one exchange for two requests.
+        // Kept per resource while it lasts: one exchange for two requests,
+        // also when they arrive together.
         .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/{HOME}/oauth2/v2.0/token")))
+        .and(body_string_contains("storage.azure.com"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
         .mount(&server)
         .await;
     let mut provision =
@@ -494,7 +501,7 @@ async fn the_managed_identity_endpoint_mints_for_any_resource_with_its_secret() 
         ("resource", "https://vault.azure.net"),
         ("api-version", "2019-08-01"),
     ];
-    let (wrong, missing, user_assigned, first, second) = while_serving(task, async {
+    let (wrong, missing, user_assigned, empty, busy, first, second) = while_serving(task, async {
         let wrong = get(Some("guess"), &resource).await.unwrap().status();
         let missing = get(None, &resource).await.unwrap().status();
         let user_assigned = get(
@@ -504,21 +511,29 @@ async fn the_managed_identity_endpoint_mints_for_any_resource_with_its_secret() 
         .await
         .unwrap()
         .status();
-        let first: serde_json::Value = get(Some(&secret), &resource)
+        let empty = get(Some(&secret), &[("resource", "")])
             .await
             .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let second: serde_json::Value = get(Some(&secret), &resource)
+            .status();
+        let busy = get(Some(&secret), &[("resource", "https://storage.azure.com")])
             .await
             .unwrap()
-            .json()
-            .await
-            .unwrap();
-        (wrong, missing, user_assigned, first, second)
+            .status();
+        let json = || async {
+            get(Some(&secret), &resource)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        let (first, second) = tokio::join!(json(), json());
+        (wrong, missing, user_assigned, empty, busy, first, second)
     })
     .await;
+    assert_eq!(empty, 400);
+    // Entra ID's 5xx stays retryable for the SDKs.
+    assert_eq!(busy, 503);
     assert_eq!(wrong, 401);
     assert_eq!(missing, 401);
     assert_eq!(user_assigned, 400);

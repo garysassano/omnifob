@@ -22,7 +22,7 @@
           "type": "boolean"
         },
         "max_ttl": {
-          "description": "The longest lifetime of credentials an agent gets, e.g. \"15m\", for\nprofiles whose lifetime omnifob chooses (Cloudflare tokens, chained\nand IAM users' roles, cross-partition roles, Google service\naccounts). Longer ones are asked for with this lifetime and not\ncached. At least 15 minutes, the shortest AWS session.",
+          "description": "The longest lifetime of credentials an agent gets, e.g. \"15m\", for\nprofiles whose lifetime omnifob chooses (Cloudflare tokens, chained\nand IAM users' roles, cross-partition roles, Google service\naccounts, and `command` integrations that set `ttl`). Longer ones\nare asked for with this lifetime and not cached. At least 15\nminutes, the shortest AWS session.",
           "type": "string"
         },
         "profiles": {
@@ -48,53 +48,171 @@
       "type": "object"
     },
     "Browser": {
-      "additionalProperties": false,
       "description": "A browser, or one profile of a browser, that integrations open their\nsign-ins and consoles in, so that each integration's sessions stay where\nthey belong.",
-      "properties": {
-        "command": {
-          "default": [],
-          "description": "With `type = \"command\"`: the program and its arguments, run without a\nshell; `{url}` in an argument is replaced by the URL, e.g.\n`[\"flatpak\", \"run\", \"org.mozilla.firefox\", \"{url}\"]`.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "containers": {
-          "description": "The colour and icon of the Firefox containers of the profiles each\nentry matches, the first match winning (`isolate = \"container\"`).\nUnmatched containers get the add-on's own.",
-          "items": {
-            "$ref": "#/definitions/ContainerStyle"
-          },
-          "type": "array"
-        },
-        "engine": {
-          "$ref": "#/definitions/Engine",
-          "description": "With `type = \"command\"`: the engine the program's browser is built\non, which decides how its consoles can be kept apart. Without it,\nthey are not."
-        },
-        "isolate": {
-          "$ref": "#/definitions/Isolation",
-          "description": "How each AWS profile's console is kept apart from the others, so that\nsigning in as one does not sign the console out of another. Defaults\nto what the browser supports: `profile` for Chromium-based browsers,\n`container` for Firefox-based ones, `none` for the rest."
-        },
-        "path": {
-          "description": "Where the browser is, when fob does not find it on its own: an\nabsolute path (a macOS `.app` bundle or the program inside it), one\nunder `~/`, or a program name on `PATH`. Not for `command`.",
-          "type": "string"
-        },
-        "profile": {
-          "description": "The browser's own profile that sign-ins and other providers' consoles\nopen in: a Chromium profile folder, as `chrome://version` shows it\n(`Default`, `Profile 1`), or a Firefox profile name. Not for\n`command`.",
-          "type": "string"
-        },
-        "type": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/BrowserType"
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "containers": {
+              "description": "The colour and icon of the Firefox containers of the profiles each\nentry matches, the first match winning (`isolate = \"container\"`).\nUnmatched containers get the add-on's own.",
+              "items": {
+                "$ref": "#/definitions/ContainerStyle"
+              },
+              "type": "array"
+            },
+            "isolate": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Isolation"
+                }
+              ],
+              "description": "How each AWS profile's console is kept apart from the others, so that\nsigning in as one does not sign the console out of another. Defaults\nto what the browser supports: `profile` for Chromium-based browsers,\n`container` for Firefox-based ones, `none` for the rest."
+            },
+            "path": {
+              "description": "Where the browser is, when fob does not find it on its own: an\nabsolute path (a macOS `.app` bundle or the program inside it), one\nunder `~/`, or a program name on `PATH`. Not for `command`.",
+              "type": "string"
+            },
+            "profile": {
+              "description": "The browser's own profile that sign-ins and other providers' consoles\nopen in: a Chromium profile folder, as `chrome://version` shows it\n(`Default`, `Profile 1`), or a Firefox profile name. Not for\n`command`.",
+              "type": "string"
+            },
+            "type": {
+              "description": "Which browser this is. fob finds the browsers it knows where they are\ninstalled and knows how to open them; `command` runs any other\nprogram.",
+              "oneOf": [
+                {
+                  "const": "chrome",
+                  "description": "Google Chrome (Chromium).",
+                  "type": "string"
+                },
+                {
+                  "const": "edge",
+                  "description": "Microsoft Edge (Chromium).",
+                  "type": "string"
+                },
+                {
+                  "const": "brave",
+                  "description": "Brave (Chromium).",
+                  "type": "string"
+                },
+                {
+                  "const": "vivaldi",
+                  "description": "Vivaldi (Chromium).",
+                  "type": "string"
+                },
+                {
+                  "const": "chromium",
+                  "description": "Chromium, and ungoogled-chromium.",
+                  "type": "string"
+                },
+                {
+                  "const": "helium",
+                  "description": "Helium (Chromium).",
+                  "type": "string"
+                },
+                {
+                  "const": "thorium",
+                  "description": "Thorium (Chromium).",
+                  "type": "string"
+                },
+                {
+                  "const": "opera",
+                  "description": "Opera (Chromium); its consoles are not kept apart.",
+                  "type": "string"
+                },
+                {
+                  "const": "arc",
+                  "description": "Arc (Chromium); its consoles are not kept apart.",
+                  "type": "string"
+                },
+                {
+                  "const": "firefox",
+                  "description": "Firefox, with its Developer Edition, Nightly and ESR (Gecko).",
+                  "type": "string"
+                },
+                {
+                  "const": "zen",
+                  "description": "Zen (Gecko).",
+                  "type": "string"
+                },
+                {
+                  "const": "librewolf",
+                  "description": "LibreWolf (Gecko).",
+                  "type": "string"
+                },
+                {
+                  "const": "waterfox",
+                  "description": "Waterfox (Gecko).",
+                  "type": "string"
+                },
+                {
+                  "const": "floorp",
+                  "description": "Floorp (Gecko).",
+                  "type": "string"
+                },
+                {
+                  "const": "safari",
+                  "description": "Safari (WebKit, macOS); its consoles are not kept apart.",
+                  "type": "string"
+                },
+                {
+                  "const": "orion",
+                  "description": "Orion (WebKit, macOS); its consoles are not kept apart.",
+                  "type": "string"
+                }
+              ]
             }
+          },
+          "required": [
+            "type"
           ],
-          "description": "Which browser this is. fob finds the browsers it knows where they are\ninstalled and knows how to open them; `command` runs any other\nprogram."
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "description": "With `type = \"command\"`: the program and its arguments, run without a\nshell; `{url}` in an argument is replaced by the URL, e.g.\n`[\"flatpak\", \"run\", \"org.mozilla.firefox\", \"{url}\"]`.",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "containers": {
+              "description": "The colour and icon of the Firefox containers of the profiles each\nentry matches, the first match winning (`isolate = \"container\"`).\nUnmatched containers get the add-on's own.",
+              "items": {
+                "$ref": "#/definitions/ContainerStyle"
+              },
+              "type": "array"
+            },
+            "engine": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Engine"
+                }
+              ],
+              "description": "With `type = \"command\"`: the engine the program's browser is built\non, which decides how its consoles can be kept apart. Without it,\nthey are not."
+            },
+            "isolate": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Isolation"
+                }
+              ],
+              "description": "How each AWS profile's console is kept apart from the others, so that\nsigning in as one does not sign the console out of another. Defaults\nto what the browser supports: `profile` for Chromium-based browsers,\n`container` for Firefox-based ones, `none` for the rest."
+            },
+            "type": {
+              "const": "command",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "command"
+          ],
+          "type": "object"
         }
-      },
-      "required": [
-        "type"
-      ],
-      "type": "object"
+      ]
     },
     "BrowserType": {
       "description": "The browsers fob knows, and `command` for any other.",
@@ -432,7 +550,7 @@
           "type": "string"
         },
         "duration": {
-          "description": "Session length, 15 minutes to the destination role's maximum (at most\n12 hours); defaults to one hour\n([`CrossPartitionRole::DEFAULT_DURATION`]).",
+          "description": "Session length, 15 minutes to the destination role's maximum (at most\n12 hours); defaults to one hour.",
           "type": "string"
         },
         "region": {
@@ -457,7 +575,7 @@
           "description": "How the token is signed; ES384 unless set."
         },
         "source_region": {
-          "description": "Where the token is requested; defaults to the integration's\n`default_region`, then the portal's Region\n([`CrossPartitionRole::source_region`]).",
+          "description": "Where the token is requested; defaults to the integration's\n`default_region`, then the portal's Region.",
           "type": "string"
         },
         "via_account_id": {
@@ -806,20 +924,9 @@
               "description": "The browser in `[browsers]` that this integration's sign-ins and\nconsoles open in; by default the system's.",
               "type": "string"
             },
-            "client_id": {
-              "description": "`cloudflare-oauth`: the OAuth client to sign in with.",
-              "type": "string"
-            },
             "ips": {
               "default": [],
               "description": "Addresses minted tokens may be used from, unless a template sets its\nown: IPs or CIDR ranges, or \"current\" for this machine's public\naddresses at minting time. Empty means anywhere.",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "scopes": {
-              "description": "`cloudflare-oauth`: scopes requested at sign-in; defaults to the ones\nminting needs.",
               "items": {
                 "type": "string"
               },
@@ -842,7 +949,7 @@
                   "$ref": "#/definitions/CloudflareTokenType"
                 }
               ],
-              "description": "The configured owner of minted tokens (`cloudflare-token` only). OAuth\nleaves it at the default yet mints account-owned tokens, so code that\nacts on the owner reads [`CloudflareConfig::minting`] instead."
+              "description": "`cloudflare-token`: who owns minted tokens, the user or the account."
             },
             "ttl": {
               "default": "1h",
@@ -904,14 +1011,6 @@
               "description": "Extra templates, added to (or replacing) the built-in ones.",
               "type": "object"
             },
-            "token_type": {
-              "allOf": [
-                {
-                  "$ref": "#/definitions/CloudflareTokenType"
-                }
-              ],
-              "description": "The configured owner of minted tokens (`cloudflare-token` only). OAuth\nleaves it at the default yet mints account-owned tokens, so code that\nacts on the owner reads [`CloudflareConfig::minting`] instead."
-            },
             "ttl": {
               "default": "1h",
               "description": "Lifetime of minted tokens unless a template overrides it.",
@@ -923,7 +1022,8 @@
             }
           },
           "required": [
-            "type"
+            "type",
+            "client_id"
           ],
           "type": "object"
         },
@@ -944,6 +1044,23 @@
             },
             "preset": {
               "description": "A known provider: its variable names, token check and console URL.",
+              "enum": [
+                "hetzner",
+                "digitalocean",
+                "vultr",
+                "linode",
+                "upstash",
+                "akamai-edgegrid",
+                "scaleway",
+                "modal",
+                "unikraft",
+                "vercel",
+                "netlify",
+                "fly",
+                "neon",
+                "supabase",
+                "github"
+              ],
               "type": "string"
             },
             "secrets": {
@@ -999,7 +1116,7 @@
               "type": "array"
             },
             "console": {
-              "description": "URL `fob console` opens; there is none by default.",
+              "description": "URL `fob console` opens. Unset, an `aws` command's profiles open the\nAWS console signed in with their credentials, and other commands\nhave no console.",
               "type": "string"
             },
             "format": {
@@ -1064,7 +1181,11 @@
       "description": "Labels for the profiles matching `profiles`. For each label, the first\nentry that matches a profile and sets it wins; profiles no entry labels\nget what fob can tell or guess from their id.",
       "properties": {
         "access": {
-          "$ref": "#/definitions/Access",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Access"
+            }
+          ],
           "description": "What the profiles may do: \"read\", \"write\" or \"admin\"."
         },
         "env": {

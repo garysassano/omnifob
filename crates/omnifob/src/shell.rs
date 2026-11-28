@@ -16,14 +16,18 @@ pub enum Shell {
 }
 
 impl Shell {
-    /// Guesses the shell from `$SHELL`; POSIX unless it is clearly fish or PowerShell.
+    /// Guesses the shell from `$SHELL`; POSIX unless it is clearly fish or
+    /// PowerShell. PowerShell on Unix leaves `$SHELL` as the login shell's,
+    /// but sets `$PSModulePath`, which no Unix shell does.
     pub fn detect() -> Self {
         let shell = std::env::var("SHELL").unwrap_or_default();
         let name = shell.rsplit(['/', '\\']).next().unwrap_or_default();
+        let ps_module_path = std::env::var_os("PSModulePath").is_some_and(|p| !p.is_empty());
         match name {
             "fish" => Shell::Fish,
             "pwsh" | "pwsh.exe" | "powershell.exe" => Shell::Powershell,
             _ if cfg!(windows) && shell.is_empty() => Shell::Powershell,
+            _ if cfg!(unix) && ps_module_path => Shell::Powershell,
             _ => Shell::Posix,
         }
     }
@@ -131,8 +135,21 @@ pub fn activation_line(shell: Shell) -> &'static str {
 /// command (`fob --config x use p`) are passed on. `--help` and `--version`
 /// go to the binary as they are, since their output is not shell code, and
 /// the shell evaluates nothing when fob fails. Also registers completions,
-/// which ask the binary for profile ids as you type.
-pub fn activate(shell: Shell) -> &'static str {
+/// which ask the binary for profile ids as you type. `bin` names the
+/// function and the program, `fob` or `omnifob`.
+pub fn activate(shell: Shell, bin: &str) -> String {
+    let script = script(shell);
+    if bin == "fob" {
+        return script.to_string();
+    }
+    script
+        .replace("fob() {", &format!("{bin}() {{"))
+        .replace("function fob", &format!("function {bin}"))
+        .replace("command fob", &format!("command {bin}"))
+        .replace("Get-Command fob ", &format!("Get-Command {bin} "))
+}
+
+fn script(shell: Shell) -> &'static str {
     match shell {
         Shell::Posix => {
             r#"fob() {
@@ -174,9 +191,9 @@ pub fn activate(shell: Shell) -> &'static str {
   esac
 }
 if [ -n "${ZSH_VERSION:-}" ]; then
-  source <(COMPLETE=zsh command fob)
+  eval "$(COMPLETE=zsh command fob)"
 elif [ -n "${BASH_VERSION:-}" ]; then
-  source <(COMPLETE=bash command fob)
+  eval "$(COMPLETE=bash command fob)"
 fi
 "#
         }
@@ -316,9 +333,27 @@ mod tests {
 
     #[test]
     fn powershell_finds_fob_on_any_platform() {
-        let script = activate(Shell::Powershell);
+        let script = activate(Shell::Powershell, "fob");
         assert!(!script.contains("fob.exe"), "{script}");
         assert!(script.contains("-and $code"), "{script}");
+    }
+
+    #[test]
+    fn the_wrapper_is_named_as_fob_was_run() {
+        for shell in [Shell::Posix, Shell::Fish, Shell::Powershell] {
+            let script = activate(shell, "omnifob");
+            assert!(
+                !script.contains("command fob")
+                    && !script.contains("function fob")
+                    && !script.contains("\nfob() {")
+                    && !script.contains("Get-Command fob "),
+                "{script}"
+            );
+            assert!(script.contains("omnifob"), "{script}");
+            // Its variables keep their names.
+            assert!(script.contains("__fob_"), "{script}");
+        }
+        assert!(activate(Shell::Posix, "omnifob").starts_with("omnifob() {"));
     }
 
     #[test]
@@ -326,7 +361,7 @@ mod tests {
     fn the_posix_wrapper_works_under_set_u() {
         // Bare `fob` under `set -u` must reach the binary, not fail on "$1".
         // The function only: completion needs bash or zsh.
-        let script = activate(Shell::Posix)
+        let script = activate(Shell::Posix, "fob")
             .split("if [ -n")
             .next()
             .unwrap()
