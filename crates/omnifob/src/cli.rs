@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
 use omnifob_core::history::{self, History};
 use omnifob_core::profile::ProfileCache;
-use omnifob_core::{Config, paths};
+use omnifob_core::{Config, Profile, paths};
 
 use crate::profiles_file;
 use crate::shell::Shell;
@@ -136,7 +136,11 @@ pub(crate) enum Command {
         json: bool,
         /// Only the profiles in one account (an account ID, or a profile in it),
         /// from least to most access: where to look when a role is denied
-        #[arg(long, value_name = "ACCOUNT_OR_PROFILE")]
+        #[arg(
+            long,
+            value_name = "ACCOUNT_OR_PROFILE",
+            add = ArgValueCandidates::new(account_candidates)
+        )]
         account: Option<String>,
     },
     /// Print shell code exporting a profile's credentials (pick one when omitted)
@@ -347,7 +351,7 @@ pub(crate) enum DiscoverCommand {
     /// simulator (needs both; assumes nothing)
     Aws {
         /// The aws-sso integration to search
-        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        #[arg(add = ArgValueCandidates::new(aws_sso_candidates))]
         integration: String,
         /// Search with this permission set only (repeatable); every one when left out
         #[arg(long = "via", value_name = "PERMISSION_SET")]
@@ -390,7 +394,7 @@ pub(crate) enum ExportCommand {
     /// workload identity pool; holds no token
     GcpAdc {
         /// The Google profile whose account the file signs in as
-        #[arg(required = true, add = ArgValueCandidates::new(profile_candidates))]
+        #[arg(required = true, add = ArgValueCandidates::new(gcp_profile_candidates))]
         profile: Vec<String>,
         /// The workload identity pool provider that trusts
         /// https://accounts.google.com, as
@@ -411,7 +415,7 @@ pub(crate) enum CloudflareCommand {
     /// List the permission names templates can use
     Permissions {
         /// The Cloudflare integration
-        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        #[arg(add = ArgValueCandidates::new(cloudflare_candidates))]
         integration: String,
         /// Only show permissions whose name contains this
         filter: Option<String>,
@@ -419,14 +423,14 @@ pub(crate) enum CloudflareCommand {
     /// List templates and their permissions
     Templates {
         /// The Cloudflare integration
-        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        #[arg(add = ArgValueCandidates::new(cloudflare_candidates))]
         integration: String,
     },
     /// Create a template: pick services and their access level from the
     /// account's permissions, or name the permissions with --permission
     AddTemplate {
         /// The Cloudflare integration
-        #[arg(add = ArgValueCandidates::new(integration_candidates))]
+        #[arg(add = ArgValueCandidates::new(cloudflare_candidates))]
         integration: String,
         /// Template name; profiles become <integration>/<account>/<name>
         name: String,
@@ -485,10 +489,45 @@ pub(crate) fn parse_ttl(s: &str) -> anyhow::Result<jiff::SignedDuration> {
 /// Profile ids for shell completion, recently used ones first, with the
 /// provider kind as a hint.
 pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
+    profiles_where(|_| true)
+}
+
+/// Google profiles for shell completion.
+fn gcp_profile_candidates() -> Vec<CompletionCandidate> {
+    profiles_where(|p| matches!(p.target, omnifob_core::Target::Gcp { .. }))
+}
+
+/// Account IDs for shell completion, with the profiles' integration and
+/// account name as a hint.
+fn account_candidates() -> Vec<CompletionCandidate> {
     let Ok(cache) = profiles_file().and_then(|file| ProfileCache::load(&file)) else {
         return Vec::new();
     };
-    let mut profiles: Vec<_> = cache.all().collect();
+    let mut accounts = std::collections::BTreeMap::new();
+    for profile in cache.all() {
+        if let Some(account) = profile.target.account_id() {
+            let hint = profile
+                .id
+                .rsplit_once('/')
+                .map_or(profile.id.as_str(), |(head, _)| head);
+            accounts
+                .entry(account.to_string())
+                .or_insert_with(|| hint.to_string());
+        }
+    }
+    accounts
+        .into_iter()
+        .map(|(account, hint)| CompletionCandidate::new(account).help(Some(hint.into())))
+        .collect()
+}
+
+/// Profile ids matching `keep` for shell completion, recently used ones
+/// first, with the provider kind as a hint.
+fn profiles_where(keep: impl Fn(&Profile) -> bool) -> Vec<CompletionCandidate> {
+    let Ok(cache) = profiles_file().and_then(|file| ProfileCache::load(&file)) else {
+        return Vec::new();
+    };
+    let mut profiles: Vec<_> = cache.all().filter(|p| keep(p)).collect();
     if let Ok(file) = history::file() {
         History::load(&file).sort_recent_first(&mut profiles, |p| p.id.as_str());
     }
@@ -518,6 +557,22 @@ pub(crate) fn profile_candidates() -> Vec<CompletionCandidate> {
 
 /// Integration names for shell completion.
 pub(crate) fn integration_candidates() -> Vec<CompletionCandidate> {
+    integrations_where(|_| true)
+}
+
+/// `aws-sso` integration names for shell completion.
+fn aws_sso_candidates() -> Vec<CompletionCandidate> {
+    integrations_where(|i| matches!(i, omnifob_core::Integration::AwsSso(_)))
+}
+
+/// Cloudflare integration names for shell completion.
+fn cloudflare_candidates() -> Vec<CompletionCandidate> {
+    integrations_where(|i| matches!(i, omnifob_core::Integration::Cloudflare(_)))
+}
+
+fn integrations_where(
+    keep: impl Fn(&omnifob_core::Integration) -> bool,
+) -> Vec<CompletionCandidate> {
     let Ok(config) = paths::config_file().and_then(|file| Config::load_allowing_any_names(&file))
     else {
         return Vec::new();
@@ -525,6 +580,7 @@ pub(crate) fn integration_candidates() -> Vec<CompletionCandidate> {
     config
         .integrations
         .iter()
+        .filter(|(_, i)| keep(i))
         .map(|(name, i)| CompletionCandidate::new(name).help(Some(i.kind().into())))
         .collect()
 }

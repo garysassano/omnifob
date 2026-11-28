@@ -3,7 +3,7 @@
 //! `OMNIFOB_KEYRING=encrypted-file`, or `encrypted-file:<absolute dir>`.
 //!
 //! Each secret is one file, named like the keychain key it holds
-//! ([`crate::files::encode_key_filename`]) with `.sealed` added, and
+//! ([`crate::files::key_file`]) with `.sealed` added, and
 //! encrypted with AES-256-GCM under a key derived from a passphrase with
 //! PBKDF2-HMAC-SHA256 ([`ITERATIONS`] iterations, a random 16 byte salt).
 //! The key name is the associated data, so a file moved to another name
@@ -127,10 +127,7 @@ impl Vault {
     }
 
     fn file(&self, key: &str) -> PathBuf {
-        self.dir.join(format!(
-            "{}{SUFFIX}",
-            crate::files::encode_key_filename(key)
-        ))
+        crate::files::key_file(&self.dir, key, SUFFIX)
     }
 
     /// The key, unlocking the vault (or creating it) on first use.

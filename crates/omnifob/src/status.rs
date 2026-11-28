@@ -105,13 +105,6 @@ impl App {
     pub(crate) async fn status(&self, json: bool, check: bool) -> anyhow::Result<ExitCode> {
         let now = Timestamp::now();
         let active = active_profile();
-        if self.config.integrations.is_empty() && !json {
-            println!(
-                "No integrations configured in {}",
-                paths::config_file()?.display()
-            );
-            return Ok(ExitCode::SUCCESS);
-        }
         let secrets = omnifob_core::store::description()?;
         // Before reading the stored state, which a check may renew.
         let mut checked: Vec<Option<Result<String, Failure>>> = if check {
@@ -208,6 +201,7 @@ impl App {
                 })
                 .collect();
             let value = json!({
+                "version": env!("CARGO_PKG_VERSION"),
                 "config": paths::config_file()?,
                 "secrets": secrets,
                 "active_profile": active.as_ref().map(|a| &a.0),
@@ -230,6 +224,12 @@ impl App {
         for problem in skills.iter().filter_map(crate::skill::Copy::problem) {
             println!("Note: {problem}");
         }
+        if rows.is_empty() {
+            println!(
+                "No integrations configured in {}",
+                paths::config_file()?.display()
+            );
+        }
         let name_width = rows
             .iter()
             .map(|r| r.name.chars().count())
@@ -242,8 +242,11 @@ impl App {
                 None => "not synced".to_string(),
             };
             println!(
-                "{:<name_width$}  {:<kind_width$}  {}, {} profiles, {synced}",
-                row.name, row.kind, row.state, row.profiles
+                "{:<name_width$}  {:<kind_width$}  {}, {}, {synced}",
+                row.name,
+                row.kind,
+                row.state,
+                crate::profiles_count(row.profiles)
             );
         }
         if rows

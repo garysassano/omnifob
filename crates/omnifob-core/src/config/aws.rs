@@ -447,8 +447,7 @@ pub struct CrossPartitionRole {
     /// The destination partition's STS Region, exported as `AWS_REGION`.
     pub region: String,
     /// Where the token is requested; defaults to the integration's
-    /// `default_region`, then the portal's Region
-    /// ([`CrossPartitionRole::source_region`]).
+    /// `default_region`, then the portal's Region.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_region: Option<String>,
     /// How the token is signed; ES384 unless set.
@@ -459,8 +458,7 @@ pub struct CrossPartitionRole {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
     /// Session length, 15 minutes to the destination role's maximum (at most
-    /// 12 hours); defaults to one hour
-    /// ([`CrossPartitionRole::DEFAULT_DURATION`]).
+    /// 12 hours); defaults to one hour.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

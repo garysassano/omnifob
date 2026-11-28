@@ -277,7 +277,7 @@ The AWS console signs out one identity when another signs in, so a second profil
 | `safari`    | Safari         | WebKit   | (macOS only)                                         | no                  |
 | `orion`     | Orion          | WebKit   | (macOS only)                                         | no                  |
 
-- `profile`: a browser profile per fob profile, `--profile-directory=fob <integration> <account> <role>`, which the browser creates on first use and reuses after; delete one in the browser's profile manager.
+- `profile`: a browser profile per fob profile, `--profile-directory=fob <integration> <account> <role>`, which the browser creates on first use and reuses after; delete one in the browser's profile manager. A profile id with characters a Windows folder name cannot hold, or a trailing dot, gets a short hash after its name so no two profiles share a folder.
 - `container`: a container (Firefox's Container Tabs) per fob profile, opened as `ext+granted-containers:name=<profile id>&url=<console URL>`. It needs the [Granted Containers](https://addons.mozilla.org/en-US/firefox/addon/granted/) add-on in that browser, which creates the container, named after the profile, the first time.
 
 `isolate = "none"` opens every console in the browser profile sign-ins use instead. Asking a browser for a kind of isolation it does not have (`isolate = "container"` on Chrome) fails when the config loads. fob knows no reliable command-line switch for Opera's and Arc's profiles, and Safari and Orion take none, so their consoles are not kept apart. Sign-ins and other providers' consoles open in the browser profile `profile` names, since they rely on the session already there.
@@ -365,7 +365,7 @@ fob status --check        # also ask each provider whether the sign-in still wor
 fob check                 # do the sign-ins work? (exit status 1 if not; -q for scripts, --json)
 fob check --integration acme   # only this sign-in
 fob check prod admin      # do this profile's credentials work, and what do they act as?
-fob rename acme work      # rename an integration; keeps its sign-in and profiles
+fob rename acme work      # rename an integration; keeps its sign-in, profiles and the config entries naming them
 fob revoke --all          # delete every minted token and clear every cached credential
 fob logout --all          # sign out of every integration
 ```
@@ -398,7 +398,7 @@ fob activate powershell | Out-String | Invoke-Expression   # PowerShell
 
 Then `fob use prod admin` exports the credentials into the current shell, and `fob unuse` removes them. Switching profiles removes variables the previous one set and the new one does not. `OMNIFOB_PROFILE` names the active profile and `OMNIFOB_EXPIRES_AT` (RFC 3339) says when its credentials expire, for a shell prompt; `fob status` shows both. `fob activate` and `fob unuse` work even when the config or `profiles.json` is broken, so a typo does not break every new shell. The wrapper also recognises `use` and `unuse` after `--config <path>`. In PowerShell the wrapper finds the `fob` binary on `PATH`, so it works with `pwsh` on Linux and macOS too.
 
-The same line enables tab completion of commands, integration names and profile ids (`fob exec cf<TAB>`), read live from your discovered profiles. Only completion, without the `fob use` wrapper: `source <(COMPLETE=bash fob)`, `source <(COMPLETE=zsh fob)` or `COMPLETE=fish fob | source`.
+The same line enables tab completion of commands, integration names and profile ids (`fob exec cf<TAB>`), read live from your discovered profiles. Only completion, without the `fob use` wrapper: `eval "$(COMPLETE=bash fob)"`, `eval "$(COMPLETE=zsh fob)"` or `COMPLETE=fish fob | source`. Candidates follow the command: `fob discover aws` offers `aws-sso` integrations, `fob cf` Cloudflare ones, `fob export gcp-adc` Google profiles and `fob list --account` account IDs, and `fob --config other.toml exec <TAB>` completes from `other.toml`.
 
 ### With other tools
 

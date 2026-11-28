@@ -413,14 +413,18 @@ fn a_bad_integration_name_points_at_fob_rename_which_fixes_it() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("still names 'my portal' (my portal/dev/*)"),
+        stderr.contains("renamed 'my portal/...' references in")
+            && stderr.contains("[agent] profiles"),
         "{stderr}"
     );
-    assert!(!stderr.contains("other/*/*"), "{stderr}");
     assert!(fob.secret("aws-sso/acme/token").exists());
     assert!(!fob.secret("aws-sso/my portal/token").exists());
     let config = std::fs::read_to_string(fob.config_file()).unwrap();
     assert!(config.contains("[integrations.acme]"), "{config}");
+    assert!(
+        config.contains(r#"profiles = ["acme/dev/*", "other/*/*"]"#),
+        "{config}"
+    );
     let (stdout, _) = fob.ok(&["status"]);
     assert!(
         stdout.contains("signed in until 2100-01-01 00:00 UTC"),
@@ -504,7 +508,7 @@ async fn a_device_sign_in_starts_and_finishes_in_two_steps() {
     let (_, stderr) = texts(&output);
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("signed in to 'acme'"), "{stderr}");
-    assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
+    assert!(stderr.contains("acme: 1 profile"), "{stderr}");
     assert!(fob.secret("aws-sso/acme/token").exists());
     assert!(!fob.secret("aws-sso/acme/pending").exists());
 
@@ -539,7 +543,7 @@ async fn login_signs_in_and_syncs() {
     assert!(!fob.keyring().exists());
     let (_, stderr) = fob.ok(&["login", "acme", "--device-code", "--no-browser"]);
     assert!(stderr.contains("code: ABCD-EFGH"), "{stderr}");
-    assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
+    assert!(stderr.contains("acme: 1 profile"), "{stderr}");
     let token = fob.secret("aws-sso/acme/token");
     assert!(token.exists());
     #[cfg(unix)]
@@ -567,7 +571,7 @@ async fn login_keeps_a_working_sign_in() {
         "{stderr}"
     );
     assert!(!stderr.contains("approve"), "{stderr}");
-    assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
+    assert!(stderr.contains("acme: 1 profile"), "{stderr}");
 }
 
 #[test]
@@ -740,7 +744,8 @@ async fn state_is_private_and_locks_are_named_by_the_whole_profile_id() {
     fob.ok(&["creds", "acme/prod/Admin"]);
     let state = fob.root.join("state").join("omnifob");
     assert!(
-        entries(&state.join("locks")).contains(&"credentials-acme%2Fprod%2FAdmin.lock".to_string()),
+        entries(&state.join("locks"))
+            .contains(&"credentials-acme%2Fprod%2F%41dmin.lock".to_string()),
         "{:?}",
         entries(&state.join("locks"))
     );
@@ -1227,7 +1232,7 @@ async fn sync_saves_what_synced_and_reports_the_rest() {
     mount_portal(&server, &[("111111111111", "Dev")]).await;
 
     let stderr = fob.fails(&["sync"]);
-    assert!(stderr.contains("fob: acme: 1 profiles"), "{stderr}");
+    assert!(stderr.contains("fob: acme: 1 profile"), "{stderr}");
     for name in ["other", "zeta"] {
         assert!(stderr.contains(&format!("syncing '{name}'")), "{stderr}");
     }
@@ -1609,7 +1614,7 @@ async fn sync_forgets_the_credentials_of_profiles_that_went_away() {
     server.reset().await;
     mount_portal(&server, &[("111111111111", "Dev")]).await;
     let (_, stderr) = fob.ok(&["sync"]);
-    assert!(stderr.contains("acme: 1 profiles"), "{stderr}");
+    assert!(stderr.contains("acme: 1 profile"), "{stderr}");
     let (stdout, _) = fob.ok(&["list"]);
     assert_eq!(lines(&stdout), ["acme/dev/Admin"]);
     assert!(dev.exists());
@@ -3178,8 +3183,8 @@ async fn revoking_everything_survives_a_lost_profile_cache() {
 }
 
 /// `fob exec --revoke` deletes the token when fob is stopped with SIGTERM,
-/// which it passes on to the command, and after Ctrl-C, which the terminal
-/// sends to both.
+/// SIGINT or SIGHUP sent to fob alone, which it passes on to the command,
+/// and after Ctrl-C, which the terminal sends to both.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn exec_revokes_the_token_when_stopped() {
@@ -3187,13 +3192,20 @@ async fn exec_revokes_the_token_when_stopped() {
     mount_cloudflare(&server).await;
     let fob = cloudflare_fob("cf-signals", &server);
     fob.ok_with_stdin(&["login", "cf", "--token-stdin"], "boot-secret\n");
-    for (n, signal) in [(1, libc::SIGTERM), (2, libc::SIGINT)] {
+    for (n, signal, group) in [
+        (1, libc::SIGTERM, false),
+        (2, libc::SIGINT, true),
+        (3, libc::SIGINT, false),
+        (4, libc::SIGHUP, false),
+    ] {
         use std::os::unix::process::CommandExt;
         let started = fob.root.join(format!("started-{n}"));
         let script = format!("echo > '{}'; exec sleep 30", started.display());
         let child = fob
             .command(&["exec", "cf/acme/dev", "--revoke", "--", "sh", "-c", &script])
             .process_group(0)
+            // No terminal, as in CI: a signal fob gets is its alone.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -3208,11 +3220,7 @@ async fn exec_revokes_the_token_when_stopped() {
         }
         let pid = child.id() as libc::pid_t;
         // SAFETY: plain kill(2) calls on the child and its process group.
-        if signal == libc::SIGTERM {
-            unsafe { libc::kill(pid, signal) };
-        } else {
-            unsafe { libc::kill(-pid, signal) };
-        }
+        unsafe { libc::kill(if group { -pid } else { pid }, signal) };
         let output = child.wait_with_output().unwrap();
         let (_, stderr) = texts(&output);
         assert_eq!(output.status.code(), Some(128 + signal), "{stderr}");
@@ -3225,6 +3233,32 @@ async fn exec_revokes_the_token_when_stopped() {
             Some(format!("minted-{n}").as_str())
         );
     }
+}
+
+/// `fob exec --revoke` exits with the command's whole 32-bit exit code on
+/// Windows, after revoking the token.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_keeps_windows_exit_codes_above_255() {
+    let server = MockServer::start().await;
+    mount_cloudflare(&server).await;
+    let fob = cloudflare_fob("cf-exit-code", &server);
+    fob.ok_with_stdin(&["login", "cf", "--token-stdin"], "boot-secret\n");
+    let output = fob
+        .command(&[
+            "exec",
+            "cf/acme/dev",
+            "--revoke",
+            "--",
+            "cmd",
+            "/c",
+            "exit 1000",
+        ])
+        .output()
+        .unwrap();
+    let (_, stderr) = texts(&output);
+    assert_eq!(output.status.code(), Some(1000), "{stderr}");
+    assert!(stderr.contains("fob: revoked the token"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

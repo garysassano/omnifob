@@ -108,7 +108,9 @@ fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
 fn use_native() -> anyhow::Result<(String, Arc<CredentialStore>)> {
     let keyutils = || Ok(("keyutils".to_string(), use_store("keyutils")?));
     if !session_bus_may_exist(
-        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").as_deref(),
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
+            .filter(|a| !a.is_empty())
+            .as_deref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
     ) {
         tracing::debug!("no D-Bus session bus, so no Secret Service; using keyutils");
@@ -323,7 +325,7 @@ mod wsl {
     }
 
     fn file(cx: &Context, key: &str) -> anyhow::Result<PathBuf> {
-        Ok(dir(cx)?.join(format!("{}.dpapi", crate::files::encode_key_filename(key))))
+        Ok(crate::files::key_file(&dir(cx)?, key, ".dpapi"))
     }
 
     /// Runs a DPAPI script with base64 on stdin; returns base64 from stdout.
@@ -443,7 +445,7 @@ mod wsl {
 /// commands; this store keeps secrets where the next command finds them,
 /// without touching the real keychain. It does not protect them at all:
 /// every secret is written unencrypted, one file per key, named by
-/// [`crate::files::encode_key_filename`] (so `aws-sso/acme/token` is
+/// [`crate::files::key_file`] (so `aws-sso/acme/token` is
 /// `aws-sso%2Facme%2Ftoken`). To keep it from being
 /// chosen by accident, it needs an absolute directory, says so on stderr
 /// whenever it is used, and on Unix creates the directory `0700` and the
@@ -511,7 +513,7 @@ pub mod test_files {
             Ok(Entry::new_with_credential(Arc::new(File {
                 service: service.to_string(),
                 user: user.to_string(),
-                path: self.dir.join(crate::files::encode_key_filename(user)),
+                path: crate::files::key_file(&self.dir, user, ""),
             })))
         }
 
@@ -726,7 +728,7 @@ mod tests {
         assert_eq!(super::lock_file_name("aws-sso-acme"), "aws-sso-acme.lock");
         assert_eq!(
             super::lock_file_name("credentials-acme/111111111111/Admin"),
-            "credentials-acme%2F111111111111%2FAdmin.lock"
+            "credentials-acme%2F111111111111%2F%41dmin.lock"
         );
         // With `_` for every other character these were one lock.
         assert_ne!(

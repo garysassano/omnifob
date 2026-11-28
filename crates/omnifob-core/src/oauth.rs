@@ -5,6 +5,8 @@
 
 use std::io::{ErrorKind, Read as _, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -93,13 +95,34 @@ impl Loopback {
 
     /// Waits up to [`CALLBACK_TIMEOUT`] for the callback on `path` with
     /// `state`, off the async runtime's threads, and returns the code. See
-    /// [`wait_for_code`].
+    /// [`wait_for_code`]. Dropping the future (a cancelled sign-in, a
+    /// caller's timeout) stops the wait within a poll and frees the port.
     pub async fn code(self, path: &str, state: &str, provider: &str) -> anyhow::Result<String> {
         let (path, state, provider) = (path.to_string(), state.to_string(), provider.to_string());
-        tokio::task::spawn_blocking(move || {
-            wait_for_code(&self.listener, &path, &state, CALLBACK_TIMEOUT, &provider)
+        let cancel = Cancel(Arc::new(AtomicBool::new(false)));
+        let cancelled = cancel.0.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            wait(
+                &self.listener,
+                &path,
+                &state,
+                CALLBACK_TIMEOUT,
+                &provider,
+                &cancelled,
+            )
         })
-        .await?
+        .await?;
+        drop(cancel);
+        result
+    }
+}
+
+/// Sets its flag when dropped, which ends the blocking wait it belongs to.
+struct Cancel(Arc<AtomicBool>);
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -189,10 +212,32 @@ pub fn wait_for_code(
     timeout: Duration,
     provider: &str,
 ) -> anyhow::Result<String> {
+    wait(
+        listener,
+        path,
+        state,
+        timeout,
+        provider,
+        &AtomicBool::new(false),
+    )
+}
+
+/// [`wait_for_code`], which also ends when `cancelled` is set.
+fn wait(
+    listener: &TcpListener,
+    path: &str,
+    state: &str,
+    timeout: Duration,
+    provider: &str,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<String> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
     let mut pending: Vec<Pending> = Vec::new();
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("the sign-in was cancelled");
+        }
         let now = Instant::now();
         if now >= deadline {
             bail!(
@@ -540,17 +585,6 @@ mod tests {
     }
 
     #[test]
-    fn pkce_challenge_is_rfc_7636_s256() {
-        // The example from RFC 7636, appendix B.
-        assert_eq!(
-            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        let (verifier, _) = pkce().unwrap();
-        assert!((43..=128).contains(&verifier.len()), "{}", verifier.len());
-    }
-
-    #[test]
     fn waiting_for_the_callback_times_out() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let err = wait_for_code(&listener, "/callback", "s", Duration::from_millis(200), "X")
@@ -574,9 +608,25 @@ mod tests {
             challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+        let (verifier, _) = pkce().unwrap();
+        assert!((43..=128).contains(&verifier.len()), "{}", verifier.len());
         let a = random_string(32).unwrap();
         assert_eq!(a.len(), 43);
         assert_ne!(a, random_string(32).unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_wait_frees_the_port() {
+        let loopback = Loopback::bind(0).unwrap();
+        let port = loopback.port();
+        let waited =
+            tokio::time::timeout(Duration::from_millis(100), loopback.code("/cb", "s", "X")).await;
+        assert!(waited.is_err(), "no callback came");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Loopback::bind(port).is_err() {
+            assert!(Instant::now() < deadline, "port {port} stayed bound");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

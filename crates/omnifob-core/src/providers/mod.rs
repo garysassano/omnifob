@@ -1134,10 +1134,24 @@ pub fn rename_sign_in(old: &str, new: &str, integration: &Integration) -> anyhow
                 _ => (azure::keys(old), azure::keys(new)),
             };
             let mut moved = false;
+            let mut done: Vec<(&String, String)> = Vec::new();
             for (i, (from, to)) in from.iter().zip(to).enumerate() {
                 // The first key is the sign-in itself: what "kept the sign-in" means.
-                let renamed = store::rename(from, &to)?;
+                let renamed = match store::rename(from, &to) {
+                    Ok(renamed) => renamed,
+                    Err(e) => {
+                        // Move back what moved, so a sign-in is never left
+                        // split between two names.
+                        for (from, to) in done.iter().rev() {
+                            let _ = store::rename(to, from);
+                        }
+                        return Err(e);
+                    }
+                };
                 moved = moved || (renamed && i == 0);
+                if renamed {
+                    done.push((from, to));
+                }
             }
             Ok(moved)
         }

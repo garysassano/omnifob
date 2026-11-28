@@ -89,7 +89,11 @@ impl Credentials {
         let (Some(issued), Some(expires)) = (self.issued_at, self.expires_at) else {
             return false;
         };
-        let lifetime = expires.duration_since(issued);
+        // A clock that went back, or a provider's odd timestamps, must not
+        // make a negative lifetime that never asks for renewal.
+        let lifetime = expires
+            .duration_since(issued)
+            .max(jiff::SignedDuration::ZERO);
         expires.duration_since(now) < lifetime / 4 + EXPIRY_MARGIN
     }
 

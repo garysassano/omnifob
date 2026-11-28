@@ -18,7 +18,7 @@ impl App {
             providers::forget_credentials(&synced.profiles);
         }
         let moved = providers::rename_sign_in(old, new, &integration)?;
-        if let Err(e) = write_atomically(&path, &renamed) {
+        if let Err(e) = write_atomically(&path, &renamed.text) {
             // Put the sign-in back so nothing is left half renamed.
             let _ = providers::rename_sign_in(new, old, &integration);
             return Err(e);
@@ -40,20 +40,11 @@ impl App {
                 "fob: ~/.aws/config still has profiles for '{old}'; run `fob export aws-config --write` to update them"
             );
         }
-        let stale: Vec<&str> = self
-            .config
-            .agent
-            .profiles
-            .iter()
-            .flatten()
-            .filter(|p| p.starts_with(&format!("{old}/")))
-            .map(String::as_str)
-            .collect();
-        if !stale.is_empty() {
+        if !renamed.references.is_empty() {
             eprintln!(
-                "fob: [agent] profiles in {} still names '{old}' ({}); rename it there so agents keep these profiles",
+                "fob: renamed '{old}/...' references in {}: {}",
                 path.display(),
-                stale.join(", ")
+                renamed.references.join(", ")
             );
         }
         Ok(())

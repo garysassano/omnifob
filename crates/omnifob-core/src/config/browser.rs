@@ -324,6 +324,7 @@ impl BrowserType {
                     (ProgramFilesX86, r"Mozilla Firefox\firefox.exe"),
                     (ProgramFiles, r"Firefox Developer Edition\firefox.exe"),
                     (ProgramFiles, r"Firefox Nightly\firefox.exe"),
+                    (LocalAppData, r"Mozilla Firefox\firefox.exe"),
                 ],
                 macos: &[
                     ("Firefox.app", "firefox"),
@@ -339,22 +340,34 @@ impl BrowserType {
                 ],
             },
             Self::Zen => Install {
-                windows: &[(ProgramFiles, r"Zen Browser\zen.exe")],
+                windows: &[
+                    (ProgramFiles, r"Zen Browser\zen.exe"),
+                    (LocalAppData, r"Zen Browser\zen.exe"),
+                ],
                 macos: &[("Zen.app", "zen"), ("Zen Browser.app", "zen")],
                 linux: &["zen-browser", "zen", "app.zen_browser.zen"],
             },
             Self::Librewolf => Install {
-                windows: &[(ProgramFiles, r"LibreWolf\librewolf.exe")],
+                windows: &[
+                    (ProgramFiles, r"LibreWolf\librewolf.exe"),
+                    (LocalAppData, r"LibreWolf\librewolf.exe"),
+                ],
                 macos: &[("LibreWolf.app", "librewolf")],
                 linux: &["librewolf", "io.gitlab.librewolf-community"],
             },
             Self::Waterfox => Install {
-                windows: &[(ProgramFiles, r"Waterfox\waterfox.exe")],
+                windows: &[
+                    (ProgramFiles, r"Waterfox\waterfox.exe"),
+                    (LocalAppData, r"Waterfox\waterfox.exe"),
+                ],
                 macos: &[("Waterfox.app", "waterfox")],
                 linux: &["waterfox", "net.waterfox.waterfox"],
             },
             Self::Floorp => Install {
-                windows: &[(ProgramFiles, r"Ablaze Floorp\floorp.exe")],
+                windows: &[
+                    (ProgramFiles, r"Ablaze Floorp\floorp.exe"),
+                    (LocalAppData, r"Ablaze Floorp\floorp.exe"),
+                ],
                 macos: &[("Floorp.app", "floorp")],
                 linux: &["floorp", "one.ablaze.floorp"],
             },
@@ -462,8 +475,14 @@ impl Browser {
         };
         if self.kind == BrowserType::Command {
             let (program, args) = self.custom_command(&target);
+            // The URL's argument, which validation makes sure exists; a
+            // wrapper's own arguments (`flatpak run <app>`) come before it.
+            let url_at = self.command[1..]
+                .iter()
+                .position(|arg| arg.contains("{url}"))
+                .unwrap_or(args.len());
             return Ok(match isolation {
-                Isolation::Profile => (program, isolated_profile_args(args, &profile.id)),
+                Isolation::Profile => (program, isolated_profile_args(args, url_at, &profile.id)),
                 _ => (program, args),
             });
         }
@@ -582,8 +601,12 @@ impl Browser {
             })
         } else if crate::platform::is_wsl() {
             // The Windows browser first: that is the desktop's browser, and
-            // it reaches fob's sign-in listener on 127.0.0.1 in WSL.
-            find_windows(&install, wsl_windows_root).or_else(|| find_linux(&install))
+            // it reaches fob's sign-in listener on 127.0.0.1 in WSL. Only
+            // where WSL can start Windows programs; otherwise a Linux one.
+            crate::platform::wsl_interop()
+                .then(|| find_windows(&install, wsl_windows_root))
+                .flatten()
+                .or_else(|| find_linux(&install))
         } else {
             find_linux(&install)
         };
@@ -729,11 +752,14 @@ fn location_from_path(kind: BrowserType, path: &str) -> anyhow::Result<Location>
     let trimmed = text.trim_end_matches('/');
     if trimmed.ends_with(".app") {
         let bundle = PathBuf::from(trimmed);
-        let binary = kind
-            .install()
-            .macos
-            .first()
-            .map_or_else(|| kind.name().to_string(), |(_, b)| (*b).to_string());
+        // A renamed or custom bundle (`Google Chrome Canary.app`) names its
+        // program in its Info.plist.
+        let binary = bundle_executable(&bundle).unwrap_or_else(|| {
+            kind.install()
+                .macos
+                .first()
+                .map_or_else(|| kind.name().to_string(), |(_, b)| (*b).to_string())
+        });
         return Ok(Location {
             program: bundle.join("Contents/MacOS").join(binary),
             bundle: Some(bundle),
@@ -746,6 +772,22 @@ fn location_from_path(kind: BrowserType, path: &str) -> anyhow::Result<Location>
         program: path.clone(),
         bundle,
     })
+}
+
+/// The program a macOS app bundle runs: `CFBundleExecutable` in its
+/// `Contents/Info.plist`, when that is XML, as browsers ship it.
+fn bundle_executable(bundle: &Path) -> Option<String> {
+    let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
+    plist_string(&plist, "CFBundleExecutable")
+}
+
+/// The `<string>` that follows `<key>key</key>` in an XML property list.
+fn plist_string(plist: &str, key: &str) -> Option<String> {
+    let after = &plist[plist.find(&format!("<key>{key}</key>"))? + key.len() + 11..];
+    let value = after.trim_start().strip_prefix("<string>")?;
+    let value = &value[..value.find("</string>")?];
+    let value = value.trim().replace("&amp;", "&");
+    (!value.is_empty() && !value.contains('/')).then_some(value)
 }
 
 fn find_macos<'a>(
@@ -787,18 +829,43 @@ fn find_linux(install: &Install) -> Option<Location> {
     })
 }
 
-/// A Windows install folder as WSL sees it. Program Files is where WSL
-/// mounts `C:` by default; the per-user `%LOCALAPPDATA%` is asked of
-/// Windows once, only when a browser is not in Program Files.
+/// A Windows install folder as WSL sees it: Program Files on `C:`, where
+/// WSL mounts it ([`wsl_c_drive`]); the per-user `%LOCALAPPDATA%` is asked
+/// of Windows once, only when a browser is not in Program Files.
 fn wsl_windows_root(root: WindowsRoot) -> Option<PathBuf> {
     match root {
-        ProgramFiles => Some(PathBuf::from("/mnt/c/Program Files")),
-        ProgramFilesX86 => Some(PathBuf::from("/mnt/c/Program Files (x86)")),
+        ProgramFiles => Some(wsl_c_drive().join("Program Files")),
+        ProgramFilesX86 => Some(wsl_c_drive().join("Program Files (x86)")),
         LocalAppData => {
             static LOCAL_APP_DATA: OnceLock<Option<PathBuf>> = OnceLock::new();
             LOCAL_APP_DATA.get_or_init(wsl_local_app_data).clone()
         }
     }
+}
+
+/// Where WSL mounts `C:`: under `/mnt/`, or the `root` of `[automount]` in
+/// `/etc/wsl.conf`.
+fn wsl_c_drive() -> PathBuf {
+    let conf = std::fs::read_to_string("/etc/wsl.conf").unwrap_or_default();
+    PathBuf::from(automount_root(&conf).unwrap_or_else(|| "/mnt/".to_string())).join("c")
+}
+
+/// The `root` of `[automount]` in a `wsl.conf`'s text, if set.
+fn automount_root(conf: &str) -> Option<String> {
+    let mut in_automount = false;
+    for line in conf.lines() {
+        let line = line.split(['#', ';']).next().unwrap_or_default().trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_automount = section.trim().eq_ignore_ascii_case("automount");
+        } else if in_automount
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("root")
+        {
+            let value = value.trim().trim_matches('"');
+            return (!value.is_empty()).then(|| value.to_string());
+        }
+    }
+    None
 }
 
 fn wsl_local_app_data() -> Option<PathBuf> {
@@ -809,7 +876,7 @@ fn wsl_local_app_data() -> Option<PathBuf> {
     // cmd.exe warns about a Linux working directory, so start it in C:.
     let output = Command::new("cmd.exe")
         .args(["/d", "/c", "echo %LOCALAPPDATA%"])
-        .current_dir("/mnt/c")
+        .current_dir(wsl_c_drive())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -830,26 +897,37 @@ fn wsl_local_app_data() -> Option<PathBuf> {
 
 /// `args` with the profile folder of fob profile `id` in place of any
 /// `--profile-directory` the command names, and without first-run pages.
-fn isolated_profile_args(args: Vec<String>, id: &str) -> Vec<String> {
+/// The flags go just before `args[url_at]`, the URL's argument, so a
+/// wrapper such as `flatpak run com.google.Chrome {url}` passes them to the
+/// browser rather than taking them itself.
+fn isolated_profile_args(args: Vec<String>, url_at: usize, id: &str) -> Vec<String> {
     let skipped = ["--no-first-run", "--no-default-browser-check"];
-    [
+    let flags = [
         format!("--profile-directory={}", chromium_profile_directory(id)),
         skipped[0].to_string(),
         skipped[1].to_string(),
-    ]
-    .into_iter()
-    .chain(
-        args.into_iter().filter(|arg| {
-            !arg.starts_with("--profile-directory=") && !skipped.contains(&arg.as_str())
-        }),
-    )
-    .collect()
+    ];
+    let url_at = url_at.min(args.len());
+    let mut out = Vec::with_capacity(args.len() + flags.len());
+    for (i, arg) in args.into_iter().enumerate() {
+        if i == url_at {
+            out.extend(flags.iter().cloned());
+        }
+        if !arg.starts_with("--profile-directory=") && !skipped.contains(&arg.as_str()) {
+            out.push(arg);
+        }
+    }
+    if !out.contains(&flags[0]) {
+        out.extend(flags);
+    }
+    out
 }
 
 /// The Chromium profile folder for fob profile `id`: `fob` and the id's
 /// segments, separated by spaces. Characters a Windows folder name cannot
 /// hold become `_`, and trailing dots and spaces, which Windows drops from a
-/// folder name, are left out.
+/// folder name, are left out. When either changed the name, a short hash of
+/// the id follows, so `acme/Ops.` and `acme/Ops` keep separate folders.
 fn chromium_profile_directory(id: &str) -> String {
     let mut dir = String::from("fob");
     for segment in id.split('/') {
@@ -862,7 +940,16 @@ fn chromium_profile_directory(id: &str) -> String {
             }
         }));
     }
-    dir.trim_end_matches(['.', ' ']).to_string()
+    let trimmed = dir.trim_end_matches(['.', ' ']);
+    if trimmed == format!("fob {}", id.replace('/', " ")) {
+        return dir;
+    }
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, id.as_bytes());
+    let hash: String = digest.as_ref()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{trimmed} {hash}")
 }
 
 /// How the Firefox containers of some profiles look, e.g. red with a
@@ -1182,6 +1269,11 @@ mod tests {
         )
         .unwrap();
         let aws = aws_profile("acme/prod-eu/Admin:Access");
+        let access = chromium_profile_directory(&aws.id);
+        assert!(
+            access.starts_with("fob acme prod-eu Admin_Access "),
+            "{access}"
+        );
         let console = |name: &str, profile: &Profile| {
             config.browsers[name]
                 .console_command_for(URL, profile)
@@ -1192,7 +1284,7 @@ mod tests {
             (
                 "/opt/chrome/chrome".to_string(),
                 strings(&[
-                    "--profile-directory=fob acme prod-eu Admin_Access",
+                    &format!("--profile-directory={access}"),
                     "--no-first-run",
                     "--no-default-browser-check",
                     URL,
@@ -1204,10 +1296,10 @@ mod tests {
             (
                 "chrome".to_string(),
                 strings(&[
-                    "--profile-directory=fob acme prod-eu Admin_Access",
+                    "--new-window",
+                    &format!("--profile-directory={access}"),
                     "--no-first-run",
                     "--no-default-browser-check",
-                    "--new-window",
                     URL,
                 ])
             )
@@ -1216,11 +1308,33 @@ mod tests {
             console("plain", &aws),
             ("/opt/chrome/chrome".to_string(), strings(&[URL]))
         );
-        // Windows drops trailing dots and spaces from folder names.
+        // Windows drops trailing dots and spaces from folder names; a hash
+        // keeps the names apart that would then be one.
         assert_eq!(
-            chromium_profile_directory("acme/prod/Ops. "),
-            "fob acme prod Ops"
+            chromium_profile_directory("acme/prod/Admin"),
+            "fob acme prod Admin"
         );
+        let ops = chromium_profile_directory("acme/prod/Ops. ");
+        assert!(ops.starts_with("fob acme prod Ops "), "{ops}");
+        assert_ne!(ops, chromium_profile_directory("acme/prod/Ops."));
+        assert_ne!(ops, chromium_profile_directory("acme/prod/Ops"));
+        // A wrapper's own arguments stay in front of the profile flags.
+        let flatpak = Config::parse(
+            r#"
+            [browsers.flatpak]
+            type = "command"
+            command = ["flatpak", "run", "com.google.Chrome", "{url}"]
+            engine = "chromium"
+            "#,
+        )
+        .unwrap();
+        let (program, args) = flatpak.browsers["flatpak"]
+            .console_command_for(URL, &aws)
+            .unwrap();
+        assert_eq!(program, "flatpak");
+        assert_eq!(&args[..2], ["run", "com.google.Chrome"]);
+        assert_eq!(args[2], format!("--profile-directory={access}"));
+        assert_eq!(args.last().unwrap(), URL);
         let (program, args) = console("firefox", &aws);
         assert_eq!(program, "/usr/bin/firefox");
         assert_eq!(&args[..2], ["-P", "work"]);
@@ -1443,7 +1557,41 @@ mod tests {
             })
         );
 
+        // Firefox installed for one user.
+        let firefox = file("local/Mozilla Firefox/firefox.exe");
+        assert_eq!(
+            find_windows(&BrowserType::Firefox.install(), windows_root).map(|l| l.program),
+            Some(firefox)
+        );
+
+        // macOS: a custom bundle names its program in Info.plist.
+        let canary = root.join("Google Chrome Canary.app");
+        file("Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary");
+        std::fs::write(
+            canary.join("Contents/Info.plist"),
+            "<plist><dict>\n\t<key>CFBundleExecutable</key>\n\t<string>Google Chrome Canary</string>\n</dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(
+            location_from_path(BrowserType::Chrome, &canary.display().to_string())
+                .unwrap()
+                .program,
+            canary.join("Contents/MacOS/Google Chrome Canary")
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn wsl_mounts_drives_where_wsl_conf_says() {
+        assert_eq!(automount_root(""), None);
+        assert_eq!(
+            automount_root(
+                "[boot]\nroot = /x/\n[automount]\nenabled = true\nroot = \"/win/\" # drives\n"
+            ),
+            Some("/win/".to_string())
+        );
+        assert_eq!(automount_root("[automount]\nroot =\n"), None);
     }
 
     #[test]
