@@ -132,6 +132,20 @@ pub(crate) fn templates(config: &CloudflareConfig) -> BTreeMap<String, Cloudflar
     all
 }
 
+/// One template by name: the config's, else the built-in one, built once
+/// per process rather than for every profile `fob list` labels.
+pub(crate) fn template<'a>(
+    config: &'a CloudflareConfig,
+    name: &str,
+) -> Option<&'a CloudflareTemplate> {
+    static BUILTIN: std::sync::OnceLock<BTreeMap<String, CloudflareTemplate>> =
+        std::sync::OnceLock::new();
+    config
+        .templates
+        .get(name)
+        .or_else(|| BUILTIN.get_or_init(builtin_templates).get(name))
+}
+
 fn bootstrap_key(integration: &str) -> String {
     format!("cloudflare/{integration}/bootstrap")
 }

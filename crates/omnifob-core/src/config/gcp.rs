@@ -39,6 +39,17 @@ impl GcpConfig {
         if self.client_id.is_some() != self.client_secret.is_some() {
             return Err("client_id and client_secret go together".to_string());
         }
+        super::check_not_blank("client_id", self.client_id.as_deref())?;
+        super::check_not_blank("client_secret", self.client_secret.as_deref())?;
+        if let Some(projects) = &self.projects
+            && (projects.is_empty() || projects.iter().any(|p| p.trim().is_empty()))
+        {
+            return Err(
+                "projects must name at least one project, and none may be empty; leave it out \
+                 for every project"
+                    .to_string(),
+            );
+        }
         for (label, sa) in &self.service_accounts {
             check_service_account_email(&format!("service_accounts.{label}.email"), &sa.email)?;
             for delegate in &sa.delegates {

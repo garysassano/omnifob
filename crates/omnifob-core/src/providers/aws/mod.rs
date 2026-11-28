@@ -28,6 +28,29 @@ pub(crate) fn service_endpoint(variable: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Points an AWS SDK client's config at the API's endpoint: the URL
+/// [`service_endpoint`] gives, or else the SDK's own, dual-stack or FIPS as
+/// `AWS_USE_DUALSTACK_ENDPOINT` and `AWS_USE_FIPS_ENDPOINT` ask. The SDKs
+/// refuse FIPS or dual-stack with a custom URL, so the flags go only
+/// without one; and like them, omnifob does not fall back to IPv4 where a
+/// Region has no dual-stack endpoint.
+macro_rules! aws_endpoint {
+    ($config:expr, $variable:expr) => {{
+        let config = $config;
+        match crate::providers::aws::service_endpoint($variable) {
+            Some(url) => config.endpoint_url(url),
+            None => {
+                let cx = crate::Context::current();
+                let endpoints = cx.endpoints();
+                config
+                    .use_dual_stack(endpoints.aws_dual_stack)
+                    .use_fips(endpoints.aws_fips)
+            }
+        }
+    }};
+}
+pub(crate) use aws_endpoint;
+
 /// The `RoleSessionName` of a role whose config names none: `omnifob`, or
 /// `omnifob-agent` for a coding agent, so CloudTrail tells the sessions
 /// agents started from the user's own.

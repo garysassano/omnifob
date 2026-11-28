@@ -81,8 +81,12 @@ impl App {
         mut template: omnifob_core::config::CloudflareTemplate,
         replace: bool,
     ) -> anyhow::Result<()> {
-        // Before signing in or picking permissions, which the name would waste.
+        // Before signing in or picking permissions, which the name or a bad
+        // option would waste.
         omnifob_core::config::check_name("template name", name)?;
+        template
+            .check_options()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let config = match self.config.integration(integration)? {
             Integration::Cloudflare(c) => c.clone(),
             other => bail!(

@@ -524,3 +524,100 @@ async fn a_no_session_role_is_assumed_with_the_key_for_up_to_twelve_hours() {
         assert!(error.contains(message), "{role}: {error}");
     }
 }
+
+/// `fob discover aws` on an IAM user: the user's ARN is the simulator's
+/// policy source, and a role in its account whose trust policy names the
+/// user is found, labelled after the role alone.
+#[tokio::test]
+async fn discovery_searches_the_users_own_account() {
+    use omnifob_core::providers::aws::discover::{Basis, Options, Origin, Source, discover_from};
+
+    let (_guard, server) = setup().await;
+    let text = r#"
+        [integrations.legacy]
+        type = "aws-iam"
+        region = "eu-west-1"
+    "#;
+    let config = Config::parse(text).unwrap();
+    let Integration::AwsIam(iam) = &config.integrations["legacy"] else {
+        unreachable!()
+    };
+    login(&server, "legacy", iam).await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=GetSessionToken"))
+        .respond_with(sts("GetSessionToken", &temporary("ASIASESSION")))
+        .mount(&server)
+        .await;
+    let user = "arn:aws:iam::123456789012:user/me";
+    let encode = |json: &str| -> String {
+        json.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
+    let role = |name: &str, principal: &str| {
+        let trust = encode(&format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"sts:AssumeRole"}}]}}"#
+        ));
+        format!(
+            "<member><Path>/</Path><RoleName>{name}</RoleName><Arn>arn:aws:iam::123456789012:role/{name}</Arn><AssumeRolePolicyDocument>{trust}</AssumeRolePolicyDocument></member>"
+        )
+    };
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=ListRoles"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<ListRolesResponse><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{}{}</Roles></ListRolesResult></ListRolesResponse>",
+            role("Deploy", user),
+            role("Other", "arn:aws:iam::999999999999:root"),
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .and(body_string_contains("PolicySourceArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Auser%2Fme"))
+        .and(body_string_contains("ContextKeyValues.member.1=User"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<SimulatePrincipalPolicyResponse><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::123456789012:role/Deploy</EvalResourceName><EvalDecision>allowed</EvalDecision></member></EvaluationResults></SimulatePrincipalPolicyResult></SimulatePrincipalPolicyResponse>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let profiles = aws::iam::discover("legacy", iam).await.unwrap();
+    let session = &profiles[0];
+    let origin = Origin::identity(&config, session).unwrap();
+    let discovery = discover_from(
+        "legacy",
+        &origin,
+        vec![Source {
+            account_id: "123456789012".into(),
+            segment: "123456789012".into(),
+            via_role: "session".into(),
+            profile_id: session.id.clone(),
+        }],
+        Options::default(),
+    )
+    .await
+    .unwrap();
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    let found: Vec<_> = discovery
+        .found
+        .iter()
+        .map(|f| (f.label.as_str(), f.role.role_arn.as_str(), f.basis))
+        .collect();
+    assert_eq!(
+        found,
+        [(
+            "deploy",
+            "arn:aws:iam::123456789012:role/Deploy",
+            Basis::Simulated
+        )]
+    );
+}

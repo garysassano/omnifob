@@ -794,6 +794,21 @@ pub fn aws_iam_user_toml(user: &AwsIamUser) -> String {
     out
 }
 
+/// `[integrations.<name>.roles."<label>"]` tables that name only a role
+/// ARN, as `fob discover aws` writes them for `aws-iam` and `aws-login`.
+pub fn role_arns_toml(integration: &str, roles: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (label, arn) in roles {
+        out.push_str(&format!(
+            "\n[integrations.{}.roles.{}]\nrole_arn = {}\n",
+            toml_key(integration),
+            toml_str(label),
+            toml_str(arn)
+        ));
+    }
+    out
+}
+
 /// `[integrations.<name>.roles."<label>"]` tables.
 pub fn iam_roles_toml(
     integration: &str,

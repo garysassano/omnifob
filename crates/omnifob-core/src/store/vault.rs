@@ -249,11 +249,24 @@ impl Vault {
         };
         // Written aside and linked into place, which fails if the header
         // appeared meanwhile, so two processes never both create a vault.
+        // The name is the process's and a counter's, so two threads of one
+        // process do not share it.
+        static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let staged = self
             .dir
-            .join(format!("{HEADER}.{}.new", std::process::id()));
-        crate::files::write_private(&staged, serde_json::to_vec_pretty(&header)?)?;
-        let linked = std::fs::hard_link(&staged, self.header_path());
+            .join(format!("{HEADER}.{}.{n}.new", std::process::id()));
+        let contents = serde_json::to_vec_pretty(&header)?;
+        crate::files::write_private(&staged, &contents)?;
+        let linked = match std::fs::hard_link(&staged, self.header_path()) {
+            // File systems without hard links (FUSE, 9p, sshfs): created in
+            // place instead, which fails as well if it exists.
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                tracing::debug!("no hard link for the vault header ({e}); creating it in place");
+                create_new_private(&self.header_path(), &contents)
+            }
+            other => other,
+        };
         let _ = std::fs::remove_file(&staged);
         match linked {
             Ok(()) => {
@@ -519,6 +532,25 @@ impl CredentialApi for Sealed {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Creates `path` with `contents`, readable by its owner only on Unix;
+/// fails with `AlreadyExists` if it is there.
+fn create_new_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 #[cfg(test)]

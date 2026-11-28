@@ -58,7 +58,9 @@ struct Inner {
     keychain: Keychain,
     /// The keychain once chosen: choosing one may probe D-Bus, so it waits
     /// until a secret is needed.
-    store: OnceLock<Result<store::Selected, String>>,
+    /// Chosen on first use; a failure is not kept, so a keychain that was
+    /// unreachable (a D-Bus session not up yet) is tried again.
+    store: OnceLock<store::Selected>,
     wsl_dpapi: bool,
     /// One client for every request, so they share TLS setup and pooled
     /// connections. `None` builds one per request: the fallback context
@@ -142,6 +144,12 @@ pub struct Endpoints {
     pub cloudflare_api: Option<String>,
     /// The Cloudflare dashboard's OAuth endpoints. `OMNIFOB_CLOUDFLARE_DASH`.
     pub cloudflare_dash: Option<String>,
+    /// AWS calls go to dual-stack (IPv6) endpoints, where no URL above
+    /// replaces them. `AWS_USE_DUALSTACK_ENDPOINT=true`, as the SDKs read it.
+    pub aws_dual_stack: bool,
+    /// AWS calls go to FIPS endpoints, where no URL above replaces them.
+    /// `AWS_USE_FIPS_ENDPOINT=true`.
+    pub aws_fips: bool,
 }
 
 /// The AWS APIs whose endpoint variable is read.
@@ -184,6 +192,9 @@ impl Endpoints {
             google: get("OMNIFOB_GOOGLE_ENDPOINT"),
             cloudflare_api: get("OMNIFOB_CLOUDFLARE_API"),
             cloudflare_dash: get("OMNIFOB_CLOUDFLARE_DASH"),
+            aws_dual_stack: get("AWS_USE_DUALSTACK_ENDPOINT")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true")),
+            aws_fips: get("AWS_USE_FIPS_ENDPOINT").is_some_and(|v| v.eq_ignore_ascii_case("true")),
         }
     }
 
@@ -321,7 +332,8 @@ pub struct Entered {
 impl Drop for Entered {
     fn drop(&mut self) {
         let previous = self.previous.take();
-        CURRENT.with(|current| *current.borrow_mut() = previous);
+        // During the thread's teardown the slot is gone, and so is the need.
+        let _ = CURRENT.try_with(|current| *current.borrow_mut() = previous);
     }
 }
 
@@ -370,7 +382,9 @@ impl Context {
     /// this thread, else the installed one, else one from the environment.
     pub fn current() -> Self {
         CURRENT
-            .with(|current| current.borrow().clone())
+            .try_with(|current| current.borrow().clone())
+            .ok()
+            .flatten()
             .unwrap_or_else(|| {
                 INSTALLED
                     .get_or_init(|| {
@@ -453,6 +467,12 @@ impl Context {
         })
     }
 
+    /// Whether secrets live in this process's memory only, so no other
+    /// process shares them, nor needs a lock file to guard them.
+    pub(crate) fn in_memory(&self) -> bool {
+        matches!(self.0.keychain, Keychain::Memory)
+    }
+
     pub(crate) fn mfa_prompt(&self) -> Option<&MfaPrompt> {
         self.0.mfa.as_deref()
     }
@@ -467,11 +487,13 @@ impl Context {
 
     /// The keychain, chosen on first use.
     pub(crate) fn store(&self) -> anyhow::Result<&store::Selected> {
-        self.0
-            .store
-            .get_or_init(|| store::select(self, &self.0.keychain).map_err(|e| format!("{e:#}")))
-            .as_ref()
-            .map_err(|e| anyhow!("no usable keychain: {e}"))
+        if let Some(selected) = self.0.store.get() {
+            return Ok(selected);
+        }
+        let selected = store::select(self, &self.0.keychain)
+            .map_err(|e| anyhow!("no usable keychain: {e:#}"))?;
+        // Another thread may have chosen meanwhile; the first choice stays.
+        Ok(self.0.store.get_or_init(|| selected))
     }
 }
 
@@ -510,6 +532,12 @@ mod tests {
             ("OMNIFOB_AWS_ENDPOINT", "http://mock"),
         ]));
         assert_eq!(all.aws_service("AWS_ENDPOINT_URL_STS"), Some("http://mock"));
+        assert!(!all.aws_dual_stack && !all.aws_fips);
+        let ipv6 = Endpoints::from_vars(vars(&[
+            ("AWS_USE_DUALSTACK_ENDPOINT", "True"),
+            ("AWS_USE_FIPS_ENDPOINT", "false"),
+        ]));
+        assert!(ipv6.aws_dual_stack && !ipv6.aws_fips);
     }
 
     #[test]

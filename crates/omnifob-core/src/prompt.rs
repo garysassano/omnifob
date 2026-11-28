@@ -23,22 +23,24 @@ pub fn unattended<F: Future>(future: F) -> impl Future<Output = F::Output> + use
         struct Restore(bool);
         impl Drop for Restore {
             fn drop(&mut self) {
-                UNATTENDED.set(self.0);
+                // Not during the thread's teardown, when it is gone.
+                let _ = UNATTENDED.try_with(|u| u.set(self.0));
             }
         }
-        let _restore = Restore(UNATTENDED.replace(true));
+        let _restore = Restore(UNATTENDED.try_with(|u| u.replace(true)).unwrap_or(true));
         future.as_mut().poll(cx)
     })
 }
 
 /// Whether prompts are off here, inside an [`unattended`] future.
 pub(crate) fn is_unattended() -> bool {
-    UNATTENDED.get()
+    // A thread being torn down asks nobody.
+    UNATTENDED.try_with(|u| u.get()).unwrap_or(true)
 }
 
 /// A six-digit code from the MFA device `serial`, for `what` (a profile id).
 pub fn mfa_code(serial: &str, what: &str) -> anyhow::Result<String> {
-    if UNATTENDED.get() {
+    if is_unattended() {
         return Err(mfa_needed(
             what,
             format!(

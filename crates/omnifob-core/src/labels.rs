@@ -179,8 +179,7 @@ fn template_access(config: &Config, profile: &Profile) -> Option<Access> {
     else {
         return None;
     };
-    let templates = crate::providers::cloudflare::templates(cloudflare);
-    let template = templates.get(template)?;
+    let template = crate::providers::cloudflare::template(cloudflare, template)?;
     let permissions: Vec<&String> = template
         .permissions
         .iter()

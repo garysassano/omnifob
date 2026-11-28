@@ -432,6 +432,21 @@ pub async fn check(integration: &str, config: &TokenConfig) -> Result<String> {
     let Some(Stored(values)) = store::get(&secrets_key(integration))? else {
         return Err(Error::not_signed_in(integration));
     };
+    // A secret added to the config after the sign-in is not stored yet.
+    let missing: Vec<String> = secrets(config)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !values.contains_key(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::needs_login(
+            integration,
+            format!(
+                "'{integration}' has no stored value for {}",
+                missing.join(", ")
+            ),
+        ));
+    }
     let Some(check) = verification(config)? else {
         return Ok("token stored; this provider has no check".to_string());
     };

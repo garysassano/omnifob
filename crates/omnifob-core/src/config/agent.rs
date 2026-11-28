@@ -15,12 +15,13 @@ pub struct AgentConfig {
     /// `"acme/dev/*"` or `"*/*/ReadOnly"`. Unset, agents may use every profile.
     #[serde(default)]
     pub profiles: Option<Vec<String>>,
-    /// The longest lifetime of credentials an agent gets, e.g. "15m", for
-    /// profiles whose lifetime omnifob chooses (Cloudflare tokens, chained
-    /// and IAM users' roles, cross-partition roles, Google service
-    /// accounts, and `command` integrations that set `ttl`). Longer ones
-    /// are asked for with this lifetime and not cached. At least 15
-    /// minutes, the shortest AWS session.
+    /// The longest lifetime of credentials an agent gets, e.g. "15m".
+    /// Where omnifob chooses the lifetime (Cloudflare tokens, chained and IAM
+    /// users' roles, cross-partition roles, Google service accounts, and
+    /// `command` integrations that set `ttl`), longer ones are asked for
+    /// with this lifetime; AWS sessions whose length the provider sets are
+    /// shortened with STS `GetScopedCredentials`. Neither is cached. At
+    /// least 15 minutes, the shortest AWS session.
     #[serde(default, with = "opt_duration")]
     #[cfg_attr(test, schemars(with = "Option<String>"))]
     pub max_ttl: Option<SignedDuration>,

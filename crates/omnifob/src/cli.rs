@@ -346,12 +346,13 @@ pub(crate) enum ImportCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum DiscoverCommand {
-    /// IAM roles an Identity Center role may assume, in its account or another
-    /// one of the integration, found with iam:ListRoles and the policy
-    /// simulator (needs both; assumes nothing)
+    /// IAM roles an Identity Center role, an IAM user or a console sign-in
+    /// may assume, in its account or another one of the integration, found
+    /// with iam:ListRoles and the policy simulator (or the source's own
+    /// policies when the simulator is refused); assumes nothing
     Aws {
-        /// The aws-sso integration to search
-        #[arg(add = ArgValueCandidates::new(aws_sso_candidates))]
+        /// The aws-sso, aws-iam or aws-login integration to search
+        #[arg(add = ArgValueCandidates::new(aws_candidates))]
         integration: String,
         /// Search with this permission set only (repeatable); every one when left out
         #[arg(long = "via", value_name = "PERMISSION_SET")]
@@ -367,6 +368,11 @@ pub(crate) enum DiscoverCommand {
         /// and agents, instead of config
         #[arg(long, conflicts_with = "write")]
         json: bool,
+        /// When neither the simulator nor the source's policies can be read,
+        /// list the roles whose trust policy lets the source in, unchecked
+        /// (printed for review, never written)
+        #[arg(long)]
+        trust_only: bool,
     },
 }
 
@@ -560,9 +566,17 @@ pub(crate) fn integration_candidates() -> Vec<CompletionCandidate> {
     integrations_where(|_| true)
 }
 
-/// `aws-sso` integration names for shell completion.
-fn aws_sso_candidates() -> Vec<CompletionCandidate> {
-    integrations_where(|i| matches!(i, omnifob_core::Integration::AwsSso(_)))
+/// Names of the AWS integrations `fob discover aws` searches, for shell
+/// completion.
+fn aws_candidates() -> Vec<CompletionCandidate> {
+    integrations_where(|i| {
+        matches!(
+            i,
+            omnifob_core::Integration::AwsSso(_)
+                | omnifob_core::Integration::AwsIam(_)
+                | omnifob_core::Integration::AwsLogin(_)
+        )
+    })
 }
 
 /// Cloudflare integration names for shell completion.

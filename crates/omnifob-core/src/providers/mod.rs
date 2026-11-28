@@ -424,6 +424,36 @@ pub fn via_role(config: &Config, profile: &Profile) -> Option<(String, String)> 
     }
 }
 
+/// `creds` of an AWS profile shortened to end within `max`, for an agent
+/// under `[agent] max_ttl`: STS `GetScopedCredentials` makes a copy of the
+/// session that ends sooner. Credentials that end within `max` anyway, and
+/// those of profiles that are not AWS sessions (a program's, which may be
+/// an access key), are returned as they are. The copy is not cached.
+pub async fn scoped_for_agent(
+    config: &Config,
+    profile: &Profile,
+    creds: Credentials,
+    max: jiff::SignedDuration,
+    description: &str,
+) -> Result<Credentials> {
+    let outlives = creds.expires_at.is_some_and(|at| {
+        Timestamp::now()
+            .saturating_add(max)
+            .is_ok_and(|limit| at > limit)
+    });
+    if !outlives || !profile.target.is_aws() || matches!(profile.target, Target::Command { .. }) {
+        return Ok(creds);
+    }
+    let integration = config.integration(&profile.integration)?;
+    let region = match crate::provision::aws_region(&creds) {
+        Some(region) => region.to_string(),
+        None => aws_console_partition(&profile.integration, integration, &profile.target)?
+            .default_region()
+            .to_string(),
+    };
+    Ok(aws::sts::scoped_credentials(&creds, &region, max, description).await?)
+}
+
 /// The `ttl` to ask for so credentials last at most `max`: `max` when the
 /// requested or chosen lifetime is longer, else the requested `ttl`. A
 /// profile whose provider sets the lifetime keeps it.
@@ -680,9 +710,23 @@ pub struct ConsoleOptions {
 
 /// Whether `fob console` needs credentials for this profile: AWS roles sign
 /// in with them, an IAM user's own console session comes from its access key
-/// and other providers' consoles need none.
-pub fn console_needs_credentials(profile: &Profile) -> bool {
-    profile.target.is_aws() && !matches!(profile.target, Target::AwsIamSession { .. })
+/// and other providers' consoles need none, nor does a `command`
+/// integration's own `console` URL.
+pub fn console_needs_credentials(config: &Config, profile: &Profile) -> bool {
+    console_signs_in(config, profile) && !matches!(profile.target, Target::AwsIamSession { .. })
+}
+
+/// Whether the profile's console URL is an AWS federation link, which signs
+/// in by itself in any browser profile, so it may open in one of its own.
+/// Other consoles rely on the browser's own sign-in, as does an `aws`
+/// command's configured `console` URL.
+pub fn console_signs_in(config: &Config, profile: &Profile) -> bool {
+    let own_url = matches!(profile.target, Target::Command { .. })
+        && matches!(
+            config.integration(&profile.integration),
+            Ok(Integration::Command(c)) if c.console.is_some()
+        );
+    profile.target.is_aws() && !own_url
 }
 
 /// The credentials to pass to [`console_url`]: always new ones, never cached,
@@ -691,7 +735,7 @@ pub fn console_needs_credentials(profile: &Profile) -> bool {
 /// expire, and cached credentials are handed out until five minutes before.
 /// The new credentials also replace the cached ones.
 pub async fn console_credentials(config: &Config, profile: &Profile) -> Result<Credentials> {
-    if !console_needs_credentials(profile) {
+    if !console_needs_credentials(config, profile) {
         return Ok(Credentials::default());
     }
     credentials(config, profile, false, None).await
@@ -1439,7 +1483,7 @@ mod tests {
             aws_console_partition("portal", portal, &target).unwrap(),
             Partition::UsGov
         );
-        assert!(console_needs_credentials(&profile));
+        assert!(console_needs_credentials(&config, &profile));
         // The integration's console_duration is for Identity Center roles;
         // the flag applies.
         let hours = |h| ConsoleOptions {
@@ -1696,9 +1740,9 @@ mod tests {
         assert!(check_console_options(&config, &cloudflare, &ConsoleOptions::default()).is_ok());
         let error = check_console_options(&config, &cloudflare, &region("eu-west-1")).unwrap_err();
         assert!(error.to_string().contains("only to AWS"), "{error}");
-        assert!(!console_needs_credentials(&cloudflare));
-        assert!(!console_needs_credentials(&session));
-        assert!(console_needs_credentials(&chained));
-        assert!(console_needs_credentials(&iam_role("prod")));
+        assert!(!console_needs_credentials(&config, &cloudflare));
+        assert!(!console_needs_credentials(&config, &session));
+        assert!(console_needs_credentials(&config, &chained));
+        assert!(console_needs_credentials(&config, &iam_role("prod")));
     }
 }

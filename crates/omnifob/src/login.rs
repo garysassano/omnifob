@@ -54,7 +54,13 @@ impl App {
         let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
         let items: Vec<String> = names
             .iter()
-            .map(|n| format!("{n:width$}  {}", self.config.integrations[*n].kind()))
+            .map(|n| {
+                let kind = self.config.integrations[*n].kind();
+                let state = crate::sync::describe_sign_in(&self.config, n);
+                format!("{n:width$}  {kind:17}  {state}")
+                    .trim_end()
+                    .to_string()
+            })
             .collect();
         let picked = dialoguer::FuzzySelect::new()
             .with_prompt("Integration")
