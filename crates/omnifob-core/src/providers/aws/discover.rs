@@ -1,10 +1,12 @@
-//! `fob discover aws`: roles an Identity Center role may assume in its own
-//! account, which Identity Center does not list.
+//! `fob discover aws`: roles an Identity Center role may assume, in its own
+//! account or another account of the integration, which Identity Center
+//! does not list.
 //!
 //! For each account, the credentials of one of its sources (a permission
 //! set) list its IAM roles (`iam:ListRoles`). For each source, fob keeps
-//! the roles whose trust policy lets the account, or the source role
-//! itself, call `sts:AssumeRole`, and asks the policy simulator
+//! the roles of every listed account whose trust policy lets the source's
+//! account, or the source role itself, call `sts:AssumeRole`, and asks the
+//! policy simulator
 //! (`iam:SimulatePrincipalPolicy`) whether the source role's own policies
 //! allow it. Nothing is assumed, so no `AssumeRole` reaches CloudTrail.
 //!
@@ -104,14 +106,33 @@ pub async fn discover(
             .or_default()
             .push(source);
     }
-    let results: Vec<Result<Discovery>> =
-        futures_util::stream::iter(accounts.into_values().map(|mut sources| async move {
-            sources.sort_by(|a, b| a.via_role.cmp(&b.via_role));
-            search_account(integration, config, sources).await
-        }))
-        .buffer_unordered(CONCURRENCY)
-        .collect()
-        .await;
+    let partition = config.partition()?;
+    // Every account's roles first, so each source can be matched against the
+    // roles of the integration's other accounts as well as its own.
+    let listed: Vec<Result<(Lister, Option<AccountRoles>)>> = futures_util::stream::iter(
+        accounts
+            .into_values()
+            .map(|sources| list_account(integration, config, partition, sources)),
+    )
+    .buffer_unordered(CONCURRENCY)
+    .collect()
+    .await;
+    let mut listers = Vec::new();
+    let mut listings = Vec::new();
+    for result in listed {
+        let (lister, roles) = result?;
+        listers.push(lister);
+        listings.extend(roles);
+    }
+    let listings = &listings;
+    let results: Vec<Result<Discovery>> = futures_util::stream::iter(
+        listers
+            .into_iter()
+            .map(|lister| search_account(lister, listings, partition)),
+    )
+    .buffer_unordered(CONCURRENCY)
+    .collect()
+    .await;
     let mut discovery = Discovery::default();
     for result in results {
         let found = result?;
@@ -170,32 +191,44 @@ fn stops_everything(error: crate::Error) -> std::result::Result<String, crate::E
     }
 }
 
-/// The roles the sources of one account may assume there. The account's
-/// roles are listed once, with the first source whose credentials may, and
-/// every source is then simulated, with the lister's credentials or its
-/// own: a permission set that may not list roles can still be simulated by
-/// one that may, and one that may list but not simulate does not stop the
-/// others.
-async fn search_account(
-    integration: &str,
-    config: &AwsSsoConfig,
+/// An account's roles, as one of its permission sets listed them.
+struct AccountRoles {
+    account_id: String,
+    /// The account's segment in profile ids.
+    segment: String,
+    roles: Vec<Role>,
+}
+
+/// One account's sources and their clients, and the permission set that
+/// listed its roles, or why none could, for each.
+struct Lister<'a> {
     sources: Vec<Source>,
-) -> Result<Discovery> {
-    let partition = config.partition()?;
-    let mut discovery = Discovery::default();
+    clients: Clients<'a>,
+    listed: std::result::Result<String, BTreeMap<String, String>>,
+}
+
+/// Lists an account's roles once, with the first of its sources by name
+/// whose credentials may.
+async fn list_account<'a>(
+    integration: &'a str,
+    config: &'a AwsSsoConfig,
+    partition: Partition,
+    mut sources: Vec<Source>,
+) -> Result<(Lister<'a>, Option<AccountRoles>)> {
+    sources.sort_by(|a, b| a.via_role.cmp(&b.via_role));
     let mut clients = Clients {
         integration,
         config,
         partition,
         made: BTreeMap::new(),
     };
-    let mut refused: BTreeMap<&str, String> = BTreeMap::new();
+    let mut refused = BTreeMap::new();
     let mut listed = None;
     for source in &sources {
         let iam = match clients.get(source).await? {
             Ok(iam) => iam,
             Err(reason) => {
-                refused.insert(&source.via_role, reason);
+                refused.insert(source.via_role.clone(), reason);
                 continue;
             }
         };
@@ -205,22 +238,62 @@ async fn search_account(
                 break;
             }
             Err(e) => {
-                refused.insert(&source.via_role, stops_everything(e)?);
+                refused.insert(source.via_role.clone(), stops_everything(e)?);
             }
         }
     }
-    let Some((lister, roles)) = listed else {
-        discovery.skipped = sources
-            .iter()
-            .map(|source| Skipped {
-                source: source.clone(),
-                reason: refused.remove(source.via_role.as_str()).unwrap_or_default(),
-            })
-            .collect();
-        return Ok(discovery);
+    let (listed, roles) = match listed {
+        Some((lister, roles)) => (
+            Ok(lister),
+            Some(AccountRoles {
+                account_id: sources[0].account_id.clone(),
+                segment: sources[0].segment.clone(),
+                roles,
+            }),
+        ),
+        None => (Err(refused), None),
+    };
+    Ok((
+        Lister {
+            sources,
+            clients,
+            listed,
+        },
+        roles,
+    ))
+}
+
+/// The roles the sources of one account may assume, in their account or
+/// another one listed. Every source is simulated, with the lister's
+/// credentials or its own: a permission set that may not list roles can
+/// still be simulated by one that may, and one that may list but not
+/// simulate does not stop the others.
+async fn search_account(
+    lister: Lister<'_>,
+    listings: &[AccountRoles],
+    partition: Partition,
+) -> Result<Discovery> {
+    let Lister {
+        sources,
+        mut clients,
+        listed,
+    } = lister;
+    let mut discovery = Discovery::default();
+    let lister = match listed {
+        Ok(lister) => lister,
+        Err(mut refused) => {
+            discovery.skipped = sources
+                .iter()
+                .map(|source| Skipped {
+                    source: source.clone(),
+                    reason: refused.remove(&source.via_role).unwrap_or_default(),
+                })
+                .collect();
+            return Ok(discovery);
+        }
     };
     for source in &sources {
-        match search(&mut clients, &lister, &roles, partition, source).await {
+        match search(&mut clients, &lister, listings, partition, source).await {
             Ok((found, unreadable)) => {
                 discovery.found.extend(found);
                 discovery.unreadable.extend(unreadable);
@@ -294,17 +367,22 @@ async fn source_credentials(
     Ok(fresh)
 }
 
-/// The roles among `roles` that one source may assume, and those whose
-/// trust policy could not be read. The simulator is called with the
-/// credentials of `lister`, the permission set that listed the roles, or
-/// with the source's own when `lister`'s may not call it.
+/// The roles of the listed accounts that one source may assume, and those
+/// whose trust policy could not be read. The simulator is called with the
+/// credentials of `lister`, the permission set that listed the source's
+/// account, or with the source's own when `lister`'s may not call it.
 async fn search(
     clients: &mut Clients<'_>,
     lister: &str,
-    roles: &[Role],
+    listings: &[AccountRoles],
     partition: Partition,
     source: &Source,
 ) -> Result<(Vec<Found>, Vec<String>)> {
+    let roles = &listings
+        .iter()
+        .find(|a| a.account_id == source.account_id)
+        .context("the source's account was not listed")?
+        .roles;
     // The role Identity Center made for the permission set in this account:
     // `AWSReservedSSO_<permission set>_<16 hex digits>`, so a permission set
     // named `Admin` does not take `AWSReservedSSO_Admin_ReadOnly_...`.
@@ -336,30 +414,33 @@ async fn search(
     };
     let mut candidates = Vec::new();
     let mut unreadable = Vec::new();
-    for role in roles {
-        if role.arn == source_arn
-            || role.path.starts_with("/aws-service-role/")
-            || role.path.starts_with("/aws-reserved/")
-        {
-            continue;
-        }
-        let Some(document) = &role.trust else {
-            continue;
-        };
-        match trusts(document, &requester) {
-            Ok(Some(trust)) => candidates.push((role, trust)),
-            Ok(None) => {}
-            // One role's policy does not end the account's search.
-            Err(e) => unreadable.push(format!("{} ({e:#})", role.arn)),
+    for account in listings {
+        for role in &account.roles {
+            if role.arn == source_arn
+                || role.path.starts_with("/aws-service-role/")
+                || role.path.starts_with("/aws-reserved/")
+            {
+                continue;
+            }
+            let Some(document) = &role.trust else {
+                continue;
+            };
+            match trusts(document, &requester) {
+                Ok(Some(trust)) => candidates.push((account, role, trust)),
+                Ok(None) => {}
+                // One role's policy does not end the account's search.
+                Err(e) => unreadable.push(format!("{} ({e:#})", role.arn)),
+            }
         }
     }
-    let arns: Vec<&str> = candidates.iter().map(|(r, _)| r.arn.as_str()).collect();
+    let arns: Vec<&str> = candidates.iter().map(|(_, r, _)| r.arn.as_str()).collect();
     let (simulator, decisions) = simulate(clients, lister, source, &requester, &arns).await?;
     let mut kept = Vec::new();
-    for (role, trust) in candidates {
+    for (account, role, trust) in candidates {
         let Some(decision) = decisions.get(&role.arn) else {
             continue;
         };
+        let same_account = account.account_id == source.account_id;
         let mut conditions = trust.conditions;
         let assumable = match decision.decision.as_str() {
             "allowed" => true,
@@ -367,7 +448,8 @@ async fn search(
             // source's role ARN needs nothing from the source's policies,
             // unless the organization's SCPs or the permissions boundary
             // refuse, which the simulator reports for one role at a time.
-            "implicitDeny" if trust.by_arn && decision.boundary != Some(false) => {
+            // Another account's role always needs the source's policies too.
+            "implicitDeny" if same_account && trust.by_arn && decision.boundary != Some(false) => {
                 let iam = clients
                     .made(&simulator)
                     .context("the simulating permission set has no client")?;
@@ -387,13 +469,24 @@ async fn search(
             _ => false,
         };
         if assumable {
-            kept.push((role, conditions));
+            // Another account's role is labelled after both accounts.
+            let label = if same_account {
+                format!("{}-{}", source.segment, crate::profile::slug(&role.name))
+            } else {
+                format!(
+                    "{}-{}-{}",
+                    source.segment,
+                    account.segment,
+                    crate::profile::slug(&role.name)
+                )
+            };
+            kept.push((label, role, conditions));
         }
     }
     let found = kept
         .into_iter()
-        .map(|(role, conditions)| Found {
-            label: format!("{}-{}", source.segment, crate::profile::slug(&role.name)),
+        .map(|(label, role, conditions)| Found {
+            label,
             role: ChainedRole {
                 via_account_id: source.account_id.clone(),
                 via_role: source.via_role.clone(),

@@ -2273,6 +2273,127 @@ async fn discovery_trusts_a_role_that_names_the_permission_set_and_notes_missing
     );
 }
 
+/// A simulation that allows every role it is asked about.
+fn allow_all(request: &Request) -> ResponseTemplate {
+    let results: String = form_urlencoded::parse(&request.body)
+        .filter(|(k, _)| k.starts_with("ResourceArns.member."))
+        .map(|(_, arn)| {
+            format!(
+                "<member><EvalResourceName>{arn}</EvalResourceName>\
+                 <EvalResourceDecision>allowed</EvalResourceDecision></member>"
+            )
+        })
+        .collect();
+    ResponseTemplate::new(200).set_body_string(format!(
+        r#"<SimulatePrincipalPolicyResponse><SimulatePrincipalPolicyResult><IsTruncated>false</IsTruncated><EvaluationResults><member><EvalActionName>sts:AssumeRole</EvalActionName><EvalResourceName>arn:aws:iam::${{Account}}:${{RelativeId}}</EvalResourceName><EvalDecision>allowed</EvalDecision><ResourceSpecificResults>{results}</ResourceSpecificResults></member></EvaluationResults></SimulatePrincipalPolicyResult></SimulatePrincipalPolicyResponse>"#
+    ))
+}
+
+#[tokio::test]
+async fn discovery_finds_roles_in_another_account_that_trust_the_permission_set() {
+    use omnifob_core::providers::aws::discover::{Source, discover};
+    use wiremock::matchers::header_regex;
+
+    let (_guard, server) = setup().await;
+    device_login(&server, "cross", 3600).await;
+    for (account, key) in [("111111111111", "AKIAHUB"), ("222222222222", "AKIASPOKE")] {
+        Mock::given(method("GET"))
+            .and(path("/federation/credentials"))
+            .and(query_param("account_id", account))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "roleCredentials": {
+                    "accessKeyId": key,
+                    "secretAccessKey": "secret",
+                    "sessionToken": "session",
+                    "expiration": 4_102_444_800_000i64,
+                }
+            })))
+            .mount(&server)
+            .await;
+    }
+    let sso = "/aws-reserved/sso.amazonaws.com/";
+    let hub_root = r#"{"AWS":"arn:aws:iam::111111111111:root"}"#;
+    let spoke_root = r#"{"AWS":"arn:aws:iam::222222222222:root"}"#;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListRoles"))
+        .and(header_regex("authorization", "Credential=AKIAHUB/"))
+        .respond_with(iam_roles(&[(
+            sso,
+            "AWSReservedSSO_ops_0123456789abcdef",
+            hub_root,
+        )]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The spoke's `deploy` trusts the hub account; `local`, its own.
+    let spoke = iam_roles_body(&[
+        (sso, "AWSReservedSSO_ops_0123456789abcdef", spoke_root),
+        ("/", "deploy", hub_root),
+        ("/", "local", spoke_root),
+    ])
+    .replace(
+        "<Arn>arn:aws:iam::111111111111:",
+        "<Arn>arn:aws:iam::222222222222:",
+    );
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=ListRoles"))
+        .and(header_regex("authorization", "Credential=AKIASPOKE/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(spoke))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("Action=SimulatePrincipalPolicy"))
+        .respond_with(allow_all)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let source = |account: &str, segment: &str| Source {
+        account_id: account.into(),
+        segment: segment.into(),
+        via_role: "ops".into(),
+        profile_id: format!("cross/{segment}/ops"),
+    };
+    let discovery = discover(
+        "cross",
+        &config(),
+        vec![
+            source("111111111111", "hub"),
+            source("222222222222", "spoke"),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(discovery.skipped.is_empty(), "{:?}", discovery.skipped);
+    let found: Vec<_> = discovery
+        .found
+        .iter()
+        .map(|f| {
+            (
+                f.label.as_str(),
+                f.role.via_account_id.as_str(),
+                f.role.role_arn.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "hub-spoke-deploy",
+                "111111111111",
+                "arn:aws:iam::222222222222:role/deploy"
+            ),
+            (
+                "spoke-local",
+                "222222222222",
+                "arn:aws:iam::222222222222:role/local"
+            ),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn discovery_without_a_sign_in_asks_for_one() {
     use omnifob_core::providers::aws::discover::{Source, discover};
