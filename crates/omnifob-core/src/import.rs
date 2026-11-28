@@ -648,6 +648,35 @@ fn subdomain(start_url: &str) -> String {
     }
 }
 
+/// The name `fob import aws` would give a portal without an `sso-session`
+/// name, which `fob add` suggests too.
+pub fn portal_name(start_url: &str) -> String {
+    subdomain(start_url)
+}
+
+/// The Region in a regional portal URL of a multi-Region instance
+/// (`https://<instance>.<region>.portal.amazonaws.com` or
+/// `https://<instance>.portal.<region>.app.aws`), which must be its
+/// `sso_region`. An `awsapps.com` URL does not say where the instance runs.
+pub fn portal_region(start_url: &str) -> Option<String> {
+    let host = start_url
+        .split_once("://")
+        .map_or(start_url, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let region = match labels.as_slice() {
+        [_, region, "portal", "amazonaws", "com"] => *region,
+        [_, "portal", region, "app", "aws"] => *region,
+        _ => return None,
+    };
+    crate::providers::aws::partition::check_region_name(region)
+        .is_ok()
+        .then(|| region.to_string())
+}
+
 /// A TOML string, quoted and escaped.
 fn toml_str(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
@@ -1452,6 +1481,33 @@ credential_process = /usr/bin/creds
             sections[1].1["region"], "eu-north-1",
             "a header resets the depth"
         );
+    }
+
+    #[test]
+    fn regional_portal_urls_name_their_region() {
+        for (url, region) in [
+            (
+                "https://ssoins-1111aaaa2222bbbb.eu-west-1.portal.amazonaws.com",
+                Some("eu-west-1"),
+            ),
+            (
+                "https://ssoins-1111aaaa2222bbbb.portal.us-west-2.app.aws/",
+                Some("us-west-2"),
+            ),
+            (
+                "HTTPS://SSOINS-1.PORTAL.EU-CENTRAL-1.APP.AWS",
+                Some("eu-central-1"),
+            ),
+            ("https://acme.awsapps.com/start", None),
+            ("https://ssoins-1.bad#.portal.amazonaws.com", None),
+            (
+                "https://evil.example/ssoins-1.eu-west-1.portal.amazonaws.com",
+                None,
+            ),
+        ] {
+            assert_eq!(portal_region(url).as_deref(), region, "{url}");
+        }
+        assert_eq!(portal_name("https://acme.awsapps.com/start"), "acme");
     }
 
     #[test]

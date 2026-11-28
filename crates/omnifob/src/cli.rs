@@ -71,6 +71,65 @@ pub(crate) enum Command {
         )]
         wait: bool,
     },
+    /// Add an integration to the config: pick a type and answer a few
+    /// questions, or give everything as options
+    #[command(after_help = "Examples:\n  \
+        fob add                      pick a type and answer its questions\n  \
+        fob add gcp                  a Google account, named google\n  \
+        fob add hetzner --login      a token preset, then sign in\n  \
+        fob add aws-sso acme --start-url https://acme.awsapps.com/start --sso-region eu-west-1\n\n\
+        Chained roles, templates and the other keys are edited in the config file; \
+        see docs/guides/configuration.md")]
+    Add {
+        /// The type (aws-sso, aws-login, aws-iam, gcp, azure, cloudflare-token,
+        /// cloudflare-oauth) or a token preset (hetzner, vercel, github, ...);
+        /// without it, pick one from a list
+        #[arg(add = ArgValueCandidates::new(add_kind_candidates))]
+        kind: Option<String>,
+        /// The integration's name, the first part of its profile ids;
+        /// suggested when omitted
+        name: Option<String>,
+        /// aws-sso: the AWS access portal URL
+        #[arg(long, value_name = "URL")]
+        start_url: Option<String>,
+        /// aws-sso: the Region IAM Identity Center runs in (read from a
+        /// regional portal URL)
+        #[arg(long, value_name = "REGION")]
+        sso_region: Option<String>,
+        /// aws-login: the Region to sign in through
+        #[arg(long, value_name = "REGION")]
+        login_region: Option<String>,
+        /// AWS types: the Region exported as AWS_REGION
+        #[arg(long, value_name = "REGION")]
+        region: Option<String>,
+        /// aws-iam: the user's MFA device
+        #[arg(long, value_name = "ARN")]
+        mfa_serial: Option<String>,
+        /// azure: the tenant (ID or domain); by default every tenant
+        #[arg(long)]
+        tenant: Option<String>,
+        /// gcp: offer only this project; repeat for more
+        #[arg(long = "project", value_name = "PROJECT")]
+        projects: Vec<String>,
+        /// cloudflare-oauth: your OAuth client's ID
+        #[arg(long)]
+        client_id: Option<String>,
+        /// cloudflare-token: who owns the bootstrap token (default user)
+        #[arg(long, value_enum)]
+        token_type: Option<AddTokenType>,
+        /// cloudflare-token: the account an account-owned token belongs to
+        #[arg(long)]
+        account_id: Option<String>,
+        /// token: a non-secret variable for the provider's tools; repeat for more
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
+        /// Sign in right after adding it, as `fob login` does
+        #[arg(long, conflicts_with = "print")]
+        login: bool,
+        /// Print the integration's TOML instead of writing it
+        #[arg(long)]
+        print: bool,
+    },
     /// Forget an integration's sign-in and cached credentials
     Logout {
         /// The integration; without it, pick one from a list
@@ -472,6 +531,15 @@ pub(crate) enum CloudflareCommand {
     },
 }
 
+/// Who owns a Cloudflare bootstrap token, for `fob add`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum AddTokenType {
+    /// Owned by you: reaches every account you belong to
+    User,
+    /// Owned by one account, which `--account-id` names
+    Account,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum CredsFormat {
     /// `{"profile", "env", "expires_at"}`
@@ -577,6 +645,19 @@ fn aws_candidates() -> Vec<CompletionCandidate> {
                 | omnifob_core::Integration::AwsLogin(_)
         )
     })
+}
+
+/// What `fob add` takes: the integration types, then the token presets.
+fn add_kind_candidates() -> Vec<CompletionCandidate> {
+    crate::add::KINDS
+        .iter()
+        .map(|(kind, title)| CompletionCandidate::new(*kind).help(Some((*title).into())))
+        .chain(
+            omnifob_core::providers::token::PRESETS
+                .iter()
+                .map(|p| CompletionCandidate::new(p.name).help(Some(p.title.into()))),
+        )
+        .collect()
 }
 
 /// Cloudflare integration names for shell completion.
